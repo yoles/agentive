@@ -1,0 +1,1553 @@
+<!DOCTYPE html>
+<html lang="fr" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agentive — UX Design Directions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --background: #FFFFFF;
+    --foreground: #09090B;
+    --card: #FAFAFA;
+    --card-foreground: #09090B;
+    --muted: #F4F4F5;
+    --muted-foreground: #71717A;
+    --border: #E4E4E7;
+    --ring: #8B5CF6;
+    --primary: #8B5CF6;
+    --primary-foreground: #FFFFFF;
+    --destructive: #DC2626;
+    --destructive-foreground: #FFFFFF;
+    --success: #059669;
+    --warning: #D97706;
+    --radius: 8px;
+  }
+
+  .dark {
+    --background: #09090B;
+    --foreground: #FAFAFA;
+    --card: #18181B;
+    --card-foreground: #FAFAFA;
+    --muted: #27272A;
+    --muted-foreground: #A1A1AA;
+    --border: #27272A;
+    --ring: #8B5CF6;
+    --primary: #8B5CF6;
+    --primary-foreground: #FAFAFA;
+    --destructive: #EF4444;
+    --destructive-foreground: #FAFAFA;
+    --success: #10B981;
+    --warning: #F59E0B;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Geist', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    background: var(--background);
+    color: var(--foreground);
+    font-feature-settings: "tnum" on;
+    transition: background-color 0.2s, color 0.2s;
+  }
+
+  .mono { font-family: 'Geist Mono', monospace; }
+
+  /* Top navigation */
+  .top-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--background);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .logo-mark {
+    width: 24px;
+    height: 24px;
+    background: linear-gradient(135deg, #8B5CF6, #6366F1);
+    border-radius: 6px;
+  }
+
+  .space-tabs { display: flex; gap: 4px; }
+
+  .space-tab {
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .space-tab:hover { background: var(--muted); color: var(--foreground); }
+  .space-tab.active { background: var(--muted); color: var(--foreground); }
+
+  .theme-toggle {
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--muted-foreground);
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .theme-toggle:hover { background: var(--card); }
+
+  /* Main container */
+  .main-container { display: flex; height: calc(100vh - 57px); }
+
+  /* Sidebar */
+  .sidebar {
+    width: 240px;
+    border-right: 1px solid var(--border);
+    padding: 16px 12px;
+    background: var(--background);
+    overflow-y: auto;
+  }
+
+  .sidebar-section { margin-bottom: 24px; }
+
+  .sidebar-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0 8px;
+    margin-bottom: 8px;
+  }
+
+  .sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    font-size: 13px;
+    color: var(--muted-foreground);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sidebar-item:hover { background: var(--muted); color: var(--foreground); }
+  .sidebar-item.active { background: var(--muted); color: var(--foreground); }
+
+  .sidebar-item .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--muted-foreground);
+    flex-shrink: 0;
+  }
+
+  .sidebar-item.active .dot { background: var(--primary); }
+
+  .shortcut {
+    margin-left: auto;
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+    color: var(--muted-foreground);
+    padding: 2px 5px;
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
+
+  /* Content area */
+  .content { flex: 1; overflow-y: auto; }
+  .space-view { display: none; }
+  .space-view.active { display: block; }
+
+  /* ===== DASHBOARD (Trade Republic Calm) ===== */
+  .dashboard { padding: 48px 64px; max-width: 1440px; }
+
+  .dashboard-header { margin-bottom: 48px; }
+
+  .dashboard-header h1 {
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    letter-spacing: -0.02em;
+  }
+
+  .dashboard-header p {
+    font-size: 14px;
+    color: var(--muted-foreground);
+  }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 24px;
+    margin-bottom: 48px;
+  }
+
+  .metric-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+  }
+
+  .metric-label {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    margin-bottom: 12px;
+  }
+
+  .metric-value {
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-bottom: 6px;
+  }
+
+  .metric-trend {
+    font-size: 12px;
+    color: var(--success);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .metric-trend.down { color: var(--destructive); }
+
+  .section-block {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 32px;
+    margin-bottom: 24px;
+  }
+
+  .section-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    letter-spacing: -0.01em;
+  }
+
+  .section-subtitle {
+    font-size: 13px;
+    color: var(--muted-foreground);
+    margin-bottom: 24px;
+  }
+
+  .activity-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .activity-item:last-child { border-bottom: none; padding-bottom: 0; }
+  .activity-item:first-child { padding-top: 0; }
+
+  .agent-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    flex-shrink: 0;
+    color: var(--foreground);
+  }
+
+  .agent-avatar.dev { background: rgba(139, 92, 246, 0.15); color: var(--primary); }
+  .agent-avatar.reviewer { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+  .agent-avatar.analyst { background: rgba(59, 130, 246, 0.15); color: #3B82F6; }
+
+  .activity-content { flex: 1; min-width: 0; }
+
+  .activity-text {
+    font-size: 14px;
+    margin-bottom: 4px;
+    line-height: 1.5;
+  }
+
+  .activity-text strong { font-weight: 600; }
+
+  .activity-meta {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .pending-item {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .pending-item:last-child { border-bottom: none; padding-bottom: 0; }
+  .pending-item:first-child { padding-top: 0; }
+
+  .pending-content { flex: 1; }
+
+  .pending-title { font-size: 14px; font-weight: 500; margin-bottom: 2px; }
+
+  .pending-meta { font-size: 12px; color: var(--muted-foreground); }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--muted);
+    color: var(--muted-foreground);
+    border-radius: 4px;
+  }
+
+  .badge.success { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+  .badge.warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+  .badge.primary { background: rgba(139, 92, 246, 0.15); color: var(--primary); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+
+  .btn:hover { background: var(--muted); }
+
+  .btn-primary {
+    background: var(--primary);
+    color: var(--primary-foreground);
+    border-color: var(--primary);
+  }
+
+  .btn-primary:hover { opacity: 0.9; background: var(--primary); }
+
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+  /* ===== CHAT (Trade Republic Calm) ===== */
+  .chat-layout { display: flex; height: 100%; }
+
+  .chat-sidebar {
+    width: 280px;
+    border-right: 1px solid var(--border);
+    padding: 20px 12px;
+    overflow-y: auto;
+  }
+
+  .chat-sidebar-title {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 0 8px;
+    margin-bottom: 12px;
+  }
+
+  .chat-history-item {
+    padding: 10px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 4px;
+  }
+
+  .chat-history-item:hover { background: var(--muted); }
+  .chat-history-item.active { background: var(--muted); }
+
+  .chat-history-title {
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-history-meta {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .chat-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-header {
+    padding: 16px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .chat-header-title {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .chat-header-meta {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    max-width: 720px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .chat-message { display: flex; gap: 12px; }
+
+  .chat-message.user {
+    justify-content: flex-end;
+  }
+
+  .chat-message.user .chat-bubble {
+    background: var(--muted);
+  }
+
+  .chat-bubble-wrapper { max-width: 80%; }
+
+  .chat-author {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .chat-author-name { font-size: 13px; font-weight: 600; }
+
+  .chat-author-meta { font-size: 11px; color: var(--muted-foreground); font-family: 'Geist Mono', monospace; }
+
+  .chat-bubble {
+    padding: 12px 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .chat-bubble p { margin-bottom: 10px; }
+  .chat-bubble p:last-child { margin-bottom: 0; }
+
+  .chat-bubble code {
+    font-family: 'Geist Mono', monospace;
+    font-size: 12px;
+    background: var(--muted);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* Workflow card inline */
+  .workflow-card {
+    margin-top: 12px;
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .workflow-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .workflow-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .workflow-eta {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .workflow-step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    font-size: 13px;
+  }
+
+  .step-icon {
+    width: 16px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+  }
+
+  .step-icon.done { color: var(--success); }
+  .step-icon.running { color: var(--primary); animation: pulse 1.5s ease-in-out infinite; }
+  .step-icon.pending { color: var(--muted-foreground); opacity: 0.5; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .step-name { font-weight: 500; }
+  .step-meta { margin-left: auto; font-size: 11px; color: var(--muted-foreground); font-family: 'Geist Mono', monospace; }
+
+  /* Output card */
+  .output-card {
+    margin-top: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .output-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .output-title {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .output-preview {
+    padding: 16px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--muted-foreground);
+    max-height: 180px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .output-preview::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    background: linear-gradient(180deg, transparent, var(--card));
+  }
+
+  .output-actions {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .chat-input-area {
+    padding: 16px 32px 24px;
+    border-top: 1px solid var(--border);
+    max-width: 720px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .chat-input-wrapper {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .chat-input-wrapper:focus-within {
+    border-color: var(--ring);
+    outline: 2px solid var(--ring);
+    outline-offset: -1px;
+  }
+
+  .chat-input {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--foreground);
+    font-family: inherit;
+    font-size: 14px;
+    resize: none;
+    min-height: 40px;
+    line-height: 1.5;
+  }
+
+  .chat-input::placeholder { color: var(--muted-foreground); }
+
+  .chat-input-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .chat-input-hint {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  /* ===== TRACE EXPLORER (Linear dense) ===== */
+  .trace-layout { display: flex; height: 100%; }
+
+  .trace-sidebar {
+    width: 340px;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+  }
+
+  .trace-sidebar-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .trace-sidebar-title { font-size: 13px; font-weight: 600; }
+
+  .trace-tree { padding: 8px 0; }
+
+  .trace-node {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .trace-node:hover { background: var(--muted); }
+  .trace-node.active { background: var(--muted); border-left: 2px solid var(--primary); padding-left: 14px; }
+
+  .trace-node-indent-1 { padding-left: 32px; }
+  .trace-node-indent-2 { padding-left: 48px; }
+  .trace-node.active.trace-node-indent-1 { padding-left: 30px; }
+  .trace-node.active.trace-node-indent-2 { padding-left: 46px; }
+
+  .trace-node-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .trace-status {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .trace-status.success { background: var(--success); }
+  .trace-status.running { background: var(--primary); animation: pulse 1.5s ease-in-out infinite; }
+  .trace-status.pending { background: var(--muted-foreground); opacity: 0.4; }
+  .trace-status.error { background: var(--destructive); }
+
+  .trace-duration {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px;
+    color: var(--muted-foreground);
+    margin-left: auto;
+  }
+
+  .trace-detail {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 32px;
+  }
+
+  .trace-detail-header {
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .trace-detail-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    letter-spacing: -0.01em;
+  }
+
+  .trace-detail-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--muted-foreground);
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .trace-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  .trace-metric {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+  }
+
+  .trace-metric-label {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    margin-bottom: 6px;
+  }
+
+  .trace-metric-value {
+    font-size: 16px;
+    font-weight: 600;
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .trace-section {
+    margin-bottom: 24px;
+  }
+
+  .trace-section-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 10px;
+  }
+
+  .trace-code {
+    font-family: 'Geist Mono', monospace;
+    font-size: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    line-height: 1.6;
+    color: var(--muted-foreground);
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .trace-code .keyword { color: var(--primary); }
+  .trace-code .string { color: var(--success); }
+  .trace-code .number { color: var(--warning); }
+
+  .trace-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 24px;
+  }
+
+  /* ===== CONFIG (hybrid) ===== */
+  .config-layout { max-width: 880px; padding: 48px 64px; }
+
+  .config-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 32px;
+  }
+
+  .config-header h1 {
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .mode-toggle {
+    display: flex;
+    background: var(--muted);
+    padding: 3px;
+    border-radius: 6px;
+    gap: 2px;
+  }
+
+  .mode-option {
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .mode-option.active {
+    background: var(--background);
+    color: var(--foreground);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+
+  .wizard-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 32px;
+  }
+
+  .step-dot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .step-circle {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+  }
+
+  .step-circle.done { background: var(--primary); color: var(--primary-foreground); }
+  .step-circle.current {
+    background: var(--background);
+    border: 2px solid var(--primary);
+    color: var(--primary);
+  }
+
+  .step-label {
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+
+  .step-label.current { color: var(--foreground); font-weight: 500; }
+
+  .step-line {
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  .config-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 32px;
+    margin-bottom: 16px;
+  }
+
+  .config-panel h2 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    letter-spacing: -0.01em;
+  }
+
+  .config-panel-subtitle {
+    font-size: 13px;
+    color: var(--muted-foreground);
+    margin-bottom: 24px;
+  }
+
+  .form-group { margin-bottom: 20px; }
+
+  .form-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+
+  .form-input, .form-textarea, .form-select {
+    width: 100%;
+    padding: 9px 12px;
+    font-size: 14px;
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--foreground);
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+
+  .form-input:focus, .form-textarea:focus, .form-select:focus {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.2);
+  }
+
+  .form-textarea {
+    min-height: 120px;
+    resize: vertical;
+    font-family: 'Geist Mono', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+
+  .form-helper {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    margin-top: 4px;
+  }
+
+  .archetype-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+  }
+
+  .archetype-option {
+    padding: 12px;
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .archetype-option:hover { border-color: var(--muted-foreground); }
+  .archetype-option.selected { border-color: var(--primary); background: rgba(139, 92, 246, 0.08); }
+
+  .archetype-name { font-size: 12px; font-weight: 500; }
+
+  .config-actions {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 24px;
+  }
+</style>
+</head>
+<body>
+
+<nav class="top-nav">
+  <div class="logo">
+    <div class="logo-mark"></div>
+    <span>Agentive</span>
+    <span class="badge mono" style="margin-left: 6px;">Pôle Dev</span>
+  </div>
+  <div class="space-tabs">
+    <button class="space-tab active" onclick="showSpace('dashboard', this)">Dashboard</button>
+    <button class="space-tab" onclick="showSpace('chat', this)">Chat</button>
+    <button class="space-tab" onclick="showSpace('trace', this)">Trace</button>
+    <button class="space-tab" onclick="showSpace('config', this)">Config</button>
+  </div>
+  <button class="theme-toggle" onclick="toggleTheme()">DARK / LIGHT</button>
+</nav>
+
+<div class="main-container">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">Espaces</div>
+      <div class="sidebar-item active"><span class="dot"></span>Dashboard<span class="shortcut">⌘1</span></div>
+      <div class="sidebar-item"><span class="dot"></span>Chat<span class="shortcut">⌘2</span></div>
+      <div class="sidebar-item"><span class="dot"></span>Trace Explorer<span class="shortcut">⌘3</span></div>
+      <div class="sidebar-item"><span class="dot"></span>Configuration<span class="shortcut">⌘4</span></div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Département</div>
+      <div class="sidebar-item active"><span class="dot"></span>Pôle Dev</div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Agents actifs</div>
+      <div class="sidebar-item"><span class="dot" style="background: var(--primary);"></span>Dev Lead</div>
+      <div class="sidebar-item"><span class="dot" style="background: var(--primary);"></span>Code Producer</div>
+      <div class="sidebar-item"><span class="dot"></span>Code Reviewer</div>
+      <div class="sidebar-item"><span class="dot"></span>Architect Analyst</div>
+      <div class="sidebar-item"><span class="dot"></span>Test Engineer</div>
+      <div class="sidebar-item"><span class="dot"></span>CI/CD Watcher</div>
+      <div class="sidebar-item"><span class="dot"></span>Doc Writer</div>
+      <div class="sidebar-item"><span class="dot"></span>Sprint Reporter</div>
+      <div class="sidebar-item"><span class="dot"></span>Code Researcher</div>
+    </div>
+  </aside>
+
+  <main class="content">
+
+    <!-- DASHBOARD -->
+    <section class="space-view active" id="dashboard">
+      <div class="dashboard">
+        <div class="dashboard-header">
+          <h1>Bonjour John</h1>
+          <p>Cette nuit, le Pôle Dev a complété 3 tâches et détecté 2 points d'attention.</p>
+        </div>
+
+        <div class="metric-grid">
+          <div class="metric-card">
+            <div class="metric-label">Tâches cette semaine</div>
+            <div class="metric-value">14</div>
+            <div class="metric-trend">+3 vs semaine dernière</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Score qualité moyen</div>
+            <div class="metric-value">A-</div>
+            <div class="metric-trend">+5% ce mois</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Taux de retry</div>
+            <div class="metric-value">8.2%</div>
+            <div class="metric-trend">-2.1% vs cible</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">En attente validation</div>
+            <div class="metric-value">2</div>
+            <div class="metric-trend" style="color: var(--muted-foreground);">Ouverts depuis 12 min</div>
+          </div>
+        </div>
+
+        <div class="section-block">
+          <h2 class="section-title">Résumé de la nuit</h2>
+          <p class="section-subtitle">Généré par Sprint Reporter · 08:12</p>
+
+          <div class="activity-item">
+            <div class="agent-avatar reviewer">CR</div>
+            <div class="activity-content">
+              <div class="activity-text"><strong>Code Reviewer</strong> a validé 3 outputs du Code Producer sur le projet Acme — scores A, A-, B+.</div>
+              <div class="activity-meta">03:41 · Projet Acme</div>
+            </div>
+          </div>
+
+          <div class="activity-item">
+            <div class="agent-avatar dev">DL</div>
+            <div class="activity-content">
+              <div class="activity-text"><strong>Dev Lead</strong> a orchestré le scaffolding du module paiements. Dépendances analysées, 12 tests écrits, documentation générée.</div>
+              <div class="activity-meta">04:22 · Projet Acme · 18 min</div>
+            </div>
+          </div>
+
+          <div class="activity-item">
+            <div class="agent-avatar analyst">CW</div>
+            <div class="activity-content">
+              <div class="activity-text"><strong>CI/CD Watcher</strong> a détecté 2 vulnérabilités overnight (pkg <code class="mono">lodash</code>, pkg <code class="mono">axios</code>). Correctifs préparés par Code Producer, prêts à valider.</div>
+              <div class="activity-meta">06:08 · Pôle Dev</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-block">
+          <h2 class="section-title">En attente de validation</h2>
+          <p class="section-subtitle">2 outputs à approuver</p>
+
+          <div class="pending-item">
+            <div class="pending-content">
+              <div class="pending-title">Patch sécurité lodash 4.17.21 → 4.17.23</div>
+              <div class="pending-meta">Code Producer · Score: A- · Il y a 12 min</div>
+            </div>
+            <span class="badge success">Grade A-</span>
+            <button class="btn btn-primary btn-sm">Valider</button>
+          </div>
+
+          <div class="pending-item">
+            <div class="pending-content">
+              <div class="pending-title">Patch sécurité axios 1.6.2 → 1.6.8</div>
+              <div class="pending-meta">Code Producer · Score: B+ · Il y a 8 min</div>
+            </div>
+            <span class="badge success">Grade B+</span>
+            <button class="btn btn-primary btn-sm">Valider</button>
+          </div>
+        </div>
+
+        <div class="section-block">
+          <h2 class="section-title">Recommandations</h2>
+          <p class="section-subtitle">Suggestions proactives des agents</p>
+
+          <div class="activity-item">
+            <div class="agent-avatar analyst">AA</div>
+            <div class="activity-content">
+              <div class="activity-text"><strong>Architect Analyst</strong> suggère un refactoring du module <code class="mono">auth/session.ts</code> — complexité cyclomatique 18 (seuil: 15).</div>
+              <div class="activity-meta">Estimation: 45 min · Priorité: moyenne</div>
+            </div>
+            <button class="btn btn-sm">Ouvrir dans Chat</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT -->
+    <section class="space-view" id="chat">
+      <div class="chat-layout">
+        <aside class="chat-sidebar">
+          <div class="chat-sidebar-title">Conversations</div>
+          <div class="chat-history-item active">
+            <div class="chat-history-title">Module paiements Acme</div>
+            <div class="chat-history-meta">Il y a 12 min · Dev Lead</div>
+          </div>
+          <div class="chat-history-item">
+            <div class="chat-history-title">Refactoring auth/session</div>
+            <div class="chat-history-meta">Hier · Architect Analyst</div>
+          </div>
+          <div class="chat-history-item">
+            <div class="chat-history-title">Tests end-to-end checkout</div>
+            <div class="chat-history-meta">Lundi · Test Engineer</div>
+          </div>
+          <div class="chat-history-item">
+            <div class="chat-history-title">Veille vulnérabilités CI</div>
+            <div class="chat-history-meta">Lundi · CI/CD Watcher</div>
+          </div>
+          <div class="chat-history-item">
+            <div class="chat-history-title">Documentation API v2</div>
+            <div class="chat-history-meta">Vendredi · Doc Writer</div>
+          </div>
+        </aside>
+
+        <div class="chat-main">
+          <div class="chat-header">
+            <div>
+              <div class="chat-header-title">Module paiements Acme</div>
+              <div class="chat-header-meta">Projet Acme · 5 agents · Lancé à 09:12</div>
+            </div>
+            <button class="btn btn-sm">Voir dans Trace</button>
+          </div>
+
+          <div class="chat-messages">
+            <div class="chat-message user">
+              <div class="chat-bubble-wrapper">
+                <div class="chat-author" style="justify-content: flex-end;">
+                  <span class="chat-author-meta">09:12</span>
+                  <span class="chat-author-name">Toi</span>
+                </div>
+                <div class="chat-bubble">
+                  Scaffold le module paiements pour Acme, brief dans le ticket #142. Utilise les conventions habituelles du projet.
+                </div>
+              </div>
+            </div>
+
+            <div class="chat-message">
+              <div class="agent-avatar dev">DL</div>
+              <div class="chat-bubble-wrapper">
+                <div class="chat-author">
+                  <span class="chat-author-name">Dev Lead</span>
+                  <span class="chat-author-meta">09:12</span>
+                </div>
+                <div class="chat-bubble">
+                  <p>Compris. Ticket #142 chargé — intégration Stripe avec webhooks, 3 endpoints (create, status, refund). Je mobilise :</p>
+                  <p><strong>Architect Analyst</strong> pour l'analyse des dépendances existantes, <strong>Code Producer</strong> pour l'implémentation, <strong>Test Engineer</strong> pour les tests unitaires et d'intégration, <strong>Code Reviewer</strong> en sortie.</p>
+                  <p>ETA : <code>~12 min</code>. Je te préviens dès que c'est prêt à valider.</p>
+                </div>
+
+                <div class="workflow-card">
+                  <div class="workflow-header">
+                    <span class="workflow-title">Workflow en cours</span>
+                    <span class="workflow-eta">7 min 24s · ETA 12 min</span>
+                  </div>
+                  <div class="workflow-step">
+                    <span class="step-icon done">✓</span>
+                    <span class="step-name">Dev Lead</span>
+                    <span class="step-meta">Décomposition (12s)</span>
+                  </div>
+                  <div class="workflow-step">
+                    <span class="step-icon done">✓</span>
+                    <span class="step-name">Architect Analyst</span>
+                    <span class="step-meta">Dépendances (1m 42s)</span>
+                  </div>
+                  <div class="workflow-step">
+                    <span class="step-icon running">⟳</span>
+                    <span class="step-name">Code Producer</span>
+                    <span class="step-meta">En cours · 4m 28s</span>
+                  </div>
+                  <div class="workflow-step">
+                    <span class="step-icon pending">○</span>
+                    <span class="step-name">Test Engineer</span>
+                    <span class="step-meta">En attente</span>
+                  </div>
+                  <div class="workflow-step">
+                    <span class="step-icon pending">○</span>
+                    <span class="step-name">Code Reviewer</span>
+                    <span class="step-meta">En attente</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="chat-message">
+              <div class="agent-avatar analyst">AA</div>
+              <div class="chat-bubble-wrapper">
+                <div class="chat-author">
+                  <span class="chat-author-name">Architect Analyst</span>
+                  <span class="chat-author-meta">09:14</span>
+                </div>
+                <div class="chat-bubble">
+                  <p>Analyse terminée. Le projet utilise déjà <code>stripe</code> v14.18.0 et <code>zod</code> pour la validation. Je recommande d'étendre l'abstraction existante <code>src/lib/payment/provider.ts</code> plutôt que de créer un nouveau module isolé.</p>
+                  <p>2 fichiers à modifier, 4 à créer. Patterns de sécurité du projet respectés (webhook signature verification, idempotency keys).</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="chat-message">
+              <div class="agent-avatar dev" style="background: rgba(16, 185, 129, 0.15); color: var(--success);">CP</div>
+              <div class="chat-bubble-wrapper">
+                <div class="chat-author">
+                  <span class="chat-author-name">Code Producer</span>
+                  <span class="chat-author-meta">09:19</span>
+                </div>
+                <div class="chat-bubble">
+                  <p>Implémentation complète. 4 nouveaux fichiers, 2 modifications, 12 tests unitaires + 3 tests d'intégration. Prêt pour review.</p>
+                </div>
+
+                <div class="output-card">
+                  <div class="output-header">
+                    <span class="output-title">Module paiements — Output</span>
+                    <span class="badge success">En cours de review</span>
+                  </div>
+                  <div class="output-preview">// src/modules/payments/stripe-provider.ts
+import { Stripe } from 'stripe';
+import { z } from 'zod';
+import { PaymentProvider } from '@/lib/payment/provider';
+
+export class StripePaymentProvider implements PaymentProvider {
+  constructor(private client: Stripe) {}
+
+  async createPayment(input: CreatePaymentInput): Promise&lt;Payment&gt; {
+    const validated = CreatePaymentSchema.parse(input);
+    const intent = await this.client.paymentIntents.create({
+      amount: validated.amount,
+      currency: validated.currency,...</div>
+                  <div class="output-actions">
+                    <button class="btn btn-primary btn-sm">Valider</button>
+                    <button class="btn btn-sm">Commenter</button>
+                    <button class="btn btn-sm">Voir le Trace</button>
+                    <button class="btn btn-sm">Relancer avec ajustements</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-input-area">
+            <div class="chat-input-wrapper">
+              <textarea class="chat-input" placeholder="Décris ta tâche en langage naturel — ex: 'Scaffold le module paiements' ou tape /"></textarea>
+              <div class="chat-input-actions">
+                <span class="chat-input-hint">⌘↵ pour envoyer · / pour les commandes · @ pour mentionner un agent</span>
+                <button class="btn btn-primary btn-sm">Envoyer</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TRACE EXPLORER -->
+    <section class="space-view" id="trace">
+      <div class="trace-layout">
+        <aside class="trace-sidebar">
+          <div class="trace-sidebar-header">
+            <span class="trace-sidebar-title">Workflow · Module paiements Acme</span>
+          </div>
+          <div class="trace-tree">
+            <div class="trace-node">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">dev_lead.decompose</span>
+              <span class="trace-duration">12ms</span>
+            </div>
+            <div class="trace-node trace-node-indent-1">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">memory.push_context</span>
+              <span class="trace-duration">8ms</span>
+            </div>
+            <div class="trace-node trace-node-indent-1">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">llm.decompose_call</span>
+              <span class="trace-duration">1.2s</span>
+            </div>
+            <div class="trace-node">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">architect_analyst.analyze</span>
+              <span class="trace-duration">1.42s</span>
+            </div>
+            <div class="trace-node trace-node-indent-1">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">tool.read_codebase</span>
+              <span class="trace-duration">340ms</span>
+            </div>
+            <div class="trace-node trace-node-indent-1 active">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">llm.analyze_dependencies</span>
+              <span class="trace-duration">980ms</span>
+            </div>
+            <div class="trace-node">
+              <span class="trace-status running"></span>
+              <span class="trace-node-name mono">code_producer.implement</span>
+              <span class="trace-duration">4m 28s</span>
+            </div>
+            <div class="trace-node trace-node-indent-1">
+              <span class="trace-status success"></span>
+              <span class="trace-node-name mono">tool.scaffold_files</span>
+              <span class="trace-duration">210ms</span>
+            </div>
+            <div class="trace-node trace-node-indent-1">
+              <span class="trace-status running"></span>
+              <span class="trace-node-name mono">llm.generate_code</span>
+              <span class="trace-duration">4m 18s</span>
+            </div>
+            <div class="trace-node">
+              <span class="trace-status pending"></span>
+              <span class="trace-node-name mono">test_engineer.write_tests</span>
+              <span class="trace-duration">—</span>
+            </div>
+            <div class="trace-node">
+              <span class="trace-status pending"></span>
+              <span class="trace-node-name mono">code_reviewer.review</span>
+              <span class="trace-duration">—</span>
+            </div>
+          </div>
+        </aside>
+
+        <div class="trace-detail">
+          <div class="trace-detail-header">
+            <div class="trace-detail-title">llm.analyze_dependencies</div>
+            <div class="trace-detail-meta">
+              <span>Agent: Architect Analyst</span>
+              <span>Model: claude-sonnet-4-6</span>
+              <span>09:13:22 → 09:13:24</span>
+              <span>980ms</span>
+            </div>
+          </div>
+
+          <div class="trace-metrics">
+            <div class="trace-metric">
+              <div class="trace-metric-label">Latency</div>
+              <div class="trace-metric-value">980ms</div>
+            </div>
+            <div class="trace-metric">
+              <div class="trace-metric-label">Tokens in/out</div>
+              <div class="trace-metric-value">3.2k / 812</div>
+            </div>
+            <div class="trace-metric">
+              <div class="trace-metric-label">Cost</div>
+              <div class="trace-metric-value">$0.024</div>
+            </div>
+            <div class="trace-metric">
+              <div class="trace-metric-label">Quality score</div>
+              <div class="trace-metric-value">A</div>
+            </div>
+          </div>
+
+          <div class="trace-section">
+            <div class="trace-section-title">Memory chunks injected (Push Memory)</div>
+            <div class="trace-code">[<span class="string">"project-conventions-acme/typescript-strict-mode"</span> <span class="keyword">→</span> sim <span class="number">0.94</span>]
+[<span class="string">"project-conventions-acme/payment-patterns"</span> <span class="keyword">→</span> sim <span class="number">0.91</span>]
+[<span class="string">"project-conventions-acme/error-handling"</span> <span class="keyword">→</span> sim <span class="number">0.87</span>]
+Total: <span class="number">3</span> chunks, budget <span class="number">2347</span>/3072 tokens (<span class="number">76%</span>)</div>
+          </div>
+
+          <div class="trace-section">
+            <div class="trace-section-title">Input (prompt condensé)</div>
+            <div class="trace-code">Task: analyze_dependencies
+Scope: module paiements Stripe
+Context: ticket #142
+Codebase roots: src/lib/payment/, src/modules/, tests/
+Existing deps: stripe@14.18.0, zod@3.22.4, vitest@1.0.4...</div>
+          </div>
+
+          <div class="trace-section">
+            <div class="trace-section-title">Decision</div>
+            <div class="trace-code">Extend existing PaymentProvider abstraction
+Rationale: respects project pattern (3 similar modules found)
+Confidence: 0.89
+Alternative considered: isolated module (rejected: inconsistent with codebase)</div>
+          </div>
+
+          <div class="trace-actions">
+            <button class="btn">Ouvrir dans Config</button>
+            <button class="btn">Voir dans Chat</button>
+            <button class="btn">Exporter trace</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONFIG -->
+    <section class="space-view" id="config">
+      <div class="config-layout">
+        <div class="config-header">
+          <h1>Configurer Code Producer</h1>
+          <div class="mode-toggle">
+            <div class="mode-option active">Wizard</div>
+            <div class="mode-option">Expert</div>
+          </div>
+        </div>
+
+        <div class="wizard-progress">
+          <div class="step-dot">
+            <div class="step-circle done">✓</div>
+            <span class="step-label">Identité</span>
+          </div>
+          <div class="step-line"></div>
+          <div class="step-dot">
+            <div class="step-circle current">2</div>
+            <span class="step-label current">Archétype & Prompt</span>
+          </div>
+          <div class="step-line"></div>
+          <div class="step-dot">
+            <div class="step-circle">3</div>
+            <span class="step-label">Contrats</span>
+          </div>
+          <div class="step-line"></div>
+          <div class="step-dot">
+            <div class="step-circle">4</div>
+            <span class="step-label">Outils</span>
+          </div>
+          <div class="step-line"></div>
+          <div class="step-dot">
+            <div class="step-circle">5</div>
+            <span class="step-label">Mémoire</span>
+          </div>
+          <div class="step-line"></div>
+          <div class="step-dot">
+            <div class="step-circle">6</div>
+            <span class="step-label">Validation</span>
+          </div>
+        </div>
+
+        <div class="config-panel">
+          <h2>Archétype & Prompt système</h2>
+          <p class="config-panel-subtitle">Choisis l'archétype principal de l'agent et décris son rôle précisément.</p>
+
+          <div class="form-group">
+            <label class="form-label">Archétype principal</label>
+            <div class="archetype-grid">
+              <div class="archetype-option">
+                <div class="archetype-name">Orchestrateur</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Chercheur</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Analyste</div>
+              </div>
+              <div class="archetype-option selected">
+                <div class="archetype-name">Producteur</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Stratège</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Contrôleur</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Veilleur</div>
+              </div>
+              <div class="archetype-option">
+                <div class="archetype-name">Communicateur</div>
+              </div>
+            </div>
+            <div class="form-helper">Archétypes secondaires activables en mode expert.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">System prompt</label>
+            <textarea class="form-textarea" spellcheck="false">Tu es Code Producer, agent spécialisé en production de code TypeScript/Python de qualité production.
+
+Tu produis du code respectant strictement:
+- Les conventions du projet (namespace: project-conventions-{project})
+- Les contrats input/output définis
+- Les patterns de sécurité existants
+
+Tu ne génères JAMAIS de code sans tests associés.
+Tu documentes les décisions non-triviales avec des commentaires courts.</textarea>
+            <div class="form-helper">Le prompt est éditable à chaud. Les changements s'appliquent aux nouvelles exécutions.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Modèle LLM</label>
+            <select class="form-select">
+              <option>claude-sonnet-4-6</option>
+              <option>claude-opus-4-7</option>
+              <option>gpt-4o</option>
+            </select>
+            <div class="form-helper">Le Contrôleur utilisera un modèle différent (principe de diversité).</div>
+          </div>
+        </div>
+
+        <div class="config-actions">
+          <button class="btn">← Précédent</button>
+          <button class="btn btn-primary">Suivant →</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  function toggleTheme() {
+    document.documentElement.classList.toggle('dark');
+  }
+
+  function showSpace(spaceId, el) {
+    document.querySelectorAll('.space-view').forEach(v => v.classList.remove('active'));
+    document.querySelectorAll('.space-tab').forEach(t => t.classList.remove('active'));
+    document.getElementById(spaceId).classList.add('active');
+    el.classList.add('active');
+
+    // Update sidebar active state
+    const sidebarItems = document.querySelectorAll('.sidebar-section:first-child .sidebar-item');
+    sidebarItems.forEach(item => item.classList.remove('active'));
+    const indexMap = { dashboard: 0, chat: 1, trace: 2, config: 3 };
+    sidebarItems[indexMap[spaceId]].classList.add('active');
+  }
+
+  // Keyboard shortcuts
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey) {
+      const shortcuts = { '1': 'dashboard', '2': 'chat', '3': 'trace', '4': 'config' };
+      if (shortcuts[e.key]) {
+        e.preventDefault();
+        const tab = document.querySelector(`.space-tab:nth-child(${parseInt(e.key)})`);
+        if (tab) showSpace(shortcuts[e.key], tab);
+      }
+    }
+  });
+</script>
+
+</body>
+</html>
