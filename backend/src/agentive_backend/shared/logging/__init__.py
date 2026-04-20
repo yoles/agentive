@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 import structlog
+from structlog.typing import EventDict
 
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.correlation import get_correlation_id
 
 
-def _add_correlation_id(_: object, __: str, event_dict: dict) -> dict:
+def _add_correlation_id(_: Any, __: str, event_dict: EventDict) -> EventDict:
     """structlog processor — inject correlation_id if bound."""
     cid = get_correlation_id()
     if cid is not None:
@@ -50,4 +52,5 @@ def configure_logging() -> None:
 
 def get_logger(name: str) -> structlog.BoundLogger:
     """Return a structlog BoundLogger for the given module name."""
-    return structlog.get_logger(name)
+    logger: structlog.BoundLogger = structlog.get_logger(name)
+    return logger
