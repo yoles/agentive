@@ -19,8 +19,12 @@ from agentive_backend.shared.config import settings
 # Alembic Config object
 config = context.config
 
-# Inject owner URL for migrations
-config.set_main_option("sqlalchemy.url", str(settings.database_url_owner))
+# Inject owner URL for migrations.
+# Escape `%` → `%%` because Alembic passes the URL through ConfigParser which
+# uses `%` for interpolation. An URL-encoded password containing `%2B` (the `+`
+# char) would otherwise break with `ValueError: invalid interpolation syntax`.
+_owner_dsn = str(settings.database_url_owner).replace("%", "%%")
+config.set_main_option("sqlalchemy.url", _owner_dsn)
 
 # Interpret config for logging
 if config.config_file_name is not None:

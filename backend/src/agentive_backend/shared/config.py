@@ -8,13 +8,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import quote_plus
 
 from cryptography.fernet import Fernet, InvalidToken
-from pydantic import Field, PostgresDsn, SecretStr, model_validator
+from pydantic import Field, PostgresDsn, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Sentinel strings used in `.env.example` — any match forbids production use.
 _DEV_DEFAULT_SENTINELS: tuple[str, ...] = (
+    "change_me",
     "change_me_dev_token",
     "change_me_fernet_key",
     "change_me_app_dev",
@@ -28,8 +30,8 @@ class Settings(BaseSettings):
 
     See `.env.example` at the repo root for documented variables.
 
-    Production safety: the model validator below refuses to boot with any
-    ``change_me_*`` placeholder if ``NODE_ENV == "production"`` to fail fast
+    Production safety: model validators below refuse to boot with any
+    ``change_me*`` placeholder if ``NODE_ENV == "production"`` to fail fast
     instead of silently running with dev credentials.
     """
 
@@ -50,28 +52,25 @@ class Settings(BaseSettings):
 
     # ─── Auth (Story 1.7) ───
     agentive_api_token: SecretStr = Field(
-        default=SecretStr("change_me_dev_token"), alias="AGENTIVE_API_TOKEN"
+        default=SecretStr("change_me"), alias="AGENTIVE_API_TOKEN"
     )
 
     # ─── Encryption (Story 9.2) ───
-    # Fernet requires 32 url-safe base64 bytes. The sentinel default is intentionally
-    # invalid so `Fernet(key)` fails fast if it is ever instantiated with the default.
     agentive_encryption_key: SecretStr = Field(
-        default=SecretStr("change_me_fernet_key"), alias="AGENTIVE_ENCRYPTION_KEY"
+        default=SecretStr("change_me"), alias="AGENTIVE_ENCRYPTION_KEY"
     )
 
-    # ─── Database ───
-    database_url: PostgresDsn = Field(
-        default=PostgresDsn(
-            "postgresql+psycopg://agentive_app:change_me_app_dev@localhost:5432/agentive"
-        ),
-        alias="DATABASE_URL",
+    # ─── PostgreSQL (composants — la DSN est construite côté app via `computed_field`) ───
+    # On stocke les composants plutôt qu'une DSN complète pour pouvoir
+    # URL-encoder le password si nécessaire (supports `@`, `/`, `:`, `%`, etc.).
+    postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
+    postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
+    postgres_db: str = Field(default="agentive", alias="POSTGRES_DB")
+    postgres_app_password: SecretStr = Field(
+        default=SecretStr("change_me"), alias="POSTGRES_APP_PASSWORD"
     )
-    database_url_owner: PostgresDsn = Field(
-        default=PostgresDsn(
-            "postgresql+psycopg://agentive_owner:change_me_owner_dev@localhost:5432/agentive"
-        ),
-        alias="DATABASE_URL_OWNER",
+    postgres_owner_password: SecretStr = Field(
+        default=SecretStr("change_me"), alias="POSTGRES_OWNER_PASSWORD"
     )
 
     # ─── LLM Providers (Stories 1.6 + 9.3) ───
@@ -85,6 +84,30 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173", "https://localhost:8443"],
         alias="AGENTIVE_CORS_ALLOW_ORIGINS",
     )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Computed DSNs — URL-encoded to support passwords with `@`, `/`, `:`, `%`.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def database_url(self) -> PostgresDsn:
+        """Runtime DSN for agentive_app (RLS-scoped)."""
+        encoded = quote_plus(self.postgres_app_password.get_secret_value())
+        return PostgresDsn(
+            f"postgresql+psycopg://agentive_app:{encoded}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def database_url_owner(self) -> PostgresDsn:
+        """DSN for Alembic migrations (agentive_owner role)."""
+        encoded = quote_plus(self.postgres_owner_password.get_secret_value())
+        return PostgresDsn(
+            f"postgresql+psycopg://agentive_owner:{encoded}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
 
     @property
     def is_production(self) -> bool:
@@ -100,20 +123,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_dev_defaults_in_production(self) -> "Settings":
-        """Fail-fast if a placeholder value is detected while ``NODE_ENV=production``.
-
-        This prevents a misconfigured prod deploy from silently booting with
-        known-bad dev credentials / tokens / encryption keys.
-
-        In development we only emit a warning (via stderr, since structlog may
-        not be configured yet) to alert the developer without blocking hot-reload.
-        """
+        """Fail-fast on `change_me*` placeholder in production; warn in dev."""
         violations: list[str] = []
         secret_fields = {
             "AGENTIVE_API_TOKEN": self.agentive_api_token.get_secret_value(),
             "AGENTIVE_ENCRYPTION_KEY": self.agentive_encryption_key.get_secret_value(),
-            "DATABASE_URL": str(self.database_url),
-            "DATABASE_URL_OWNER": str(self.database_url_owner),
+            "POSTGRES_APP_PASSWORD": self.postgres_app_password.get_secret_value(),
+            "POSTGRES_OWNER_PASSWORD": self.postgres_owner_password.get_secret_value(),
         }
         for name, value in secret_fields.items():
             if any(sentinel in value for sentinel in _DEV_DEFAULT_SENTINELS):
@@ -129,8 +145,6 @@ class Settings(BaseSettings):
             )
 
         # Development / test : warn loudly but do not block.
-        # Using sys.stderr directly because structlog may not be configured yet
-        # (Settings() is instantiated at module import time).
         import sys
         print(
             "⚠️  agentive-backend config WARNING: dev placeholder values detected for "
@@ -144,12 +158,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_invalid_fernet_key_in_production(self) -> "Settings":
-        """Validate the Fernet encryption key format in production.
-
-        In dev we tolerate the sentinel default (so `uv run` doesn't break),
-        but in prod the key must be a valid Fernet key — otherwise the first
-        call to `Fernet(key)` crashes a potentially business-critical code path.
-        """
+        """Validate the Fernet encryption key format in production."""
         if self.environment != "production":
             return self
 
