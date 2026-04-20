@@ -14,8 +14,6 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from agentive_backend import __version__
 from agentive_backend.app.lifespan import lifespan
@@ -63,7 +61,7 @@ def create_app() -> FastAPI:
 
     # ─── Exception handling (RFC 7807) ───
     @app.exception_handler(AgentiveError)
-    async def handle_agentive_error(request: Request, exc: AgentiveError) -> JSONResponse:
+    async def handle_agentive_error(_request: Request, exc: AgentiveError) -> JSONResponse:
         """Convert AgentiveError to RFC 7807 Problem Details response."""
         body: dict[str, Any] = {
             "type": exc.type,
@@ -98,13 +96,13 @@ def create_app() -> FastAPI:
         """
         factory = get_session_factory()
         try:
-            async with factory() as session:  # type: AsyncSession
+            async with factory() as session:
                 await session.execute(text("SELECT 1"))
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={"status": "ready", "checks": {"db": "ok"}},
             )
-        except Exception as exc:  # noqa: BLE001 — readiness must swallow all failures
+        except Exception as exc:  # readiness must swallow all failures
             log.warning(
                 "readiness_check_failed",
                 error_class=exc.__class__.__name__,
@@ -131,7 +129,7 @@ def serve() -> None:
 
     uvicorn.run(
         "agentive_backend.app.main:app",
-        host="0.0.0.0",  # noqa: S104 (container runs inside Docker network)
+        host="0.0.0.0",  # container runs inside Docker network
         port=8000,
         reload=settings.is_development,
         access_log=False,  # structlog handles request logging via middleware

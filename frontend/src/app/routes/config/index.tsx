@@ -4,7 +4,7 @@ export const Route = createFileRoute("/config/")({
   component: ConfigPage,
 });
 
-function ConfigPage() {
+export function ConfigPage() {
   return (
     <section aria-labelledby="config-heading" className="flex flex-col gap-6">
       <header>

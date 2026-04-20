@@ -4,7 +4,7 @@ export const Route = createFileRoute("/chat/")({
   component: ChatPage,
 });
 
-function ChatPage() {
+export function ChatPage() {
   return (
     <section aria-labelledby="chat-heading" className="mx-auto flex max-w-3xl flex-col gap-6">
       <header>

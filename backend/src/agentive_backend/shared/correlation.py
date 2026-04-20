@@ -35,7 +35,5 @@ def require_correlation_id() -> str:
     """Return the correlation ID — raise if none bound (should never happen post-middleware)."""
     value = _correlation_id_var.get()
     if value is None:
-        raise RuntimeError(
-            "No correlation_id bound to this context — middleware not executed ?"
-        )
+        raise RuntimeError("No correlation_id bound to this context — middleware not executed ?")
     return value

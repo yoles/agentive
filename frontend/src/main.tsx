@@ -31,11 +31,9 @@ createRoot(rootElement, {
   // (async / effect / event handlers). Logged for now; Story 1.9 wires them
   // into structlog + Sentry.
   onUncaughtError: (error, errorInfo) => {
-    // eslint-disable-next-line no-console
     console.error("[uncaught]", error, errorInfo);
   },
   onCaughtError: (error, errorInfo) => {
-    // eslint-disable-next-line no-console
     console.error("[caught]", error, errorInfo);
   },
 }).render(

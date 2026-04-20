@@ -4,7 +4,7 @@ export const Route = createFileRoute("/trace/")({
   component: TracePage,
 });
 
-function TracePage() {
+export function TracePage() {
   return (
     <section aria-labelledby="trace-heading" className="flex flex-col gap-6">
       <header>

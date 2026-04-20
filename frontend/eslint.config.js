@@ -39,6 +39,13 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
+      // ─── Fast-refresh allowlist ───
+      // `Route` = TanStack Router file-route export (data, not a component).
+      // `buttonVariants` = shadcn/ui cva variants co-located with the component.
+      "react-refresh/only-export-components": [
+        "error",
+        { allowExportNames: ["Route", "buttonVariants"] },
+      ],
       // ─── Layered architecture: app → features → shared ───
       "boundaries/element-types": [
         "error",

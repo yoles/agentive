@@ -1,6 +1,8 @@
 [importlinter]
 root_package = agentive_backend
-include_external_packages = False
+# Required by Contract 3 — external forbidden modules (sqlalchemy, psycopg, …)
+# can only be analyzed when import-linter builds their import graph too.
+include_external_packages = True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CANONICAL CONTRACT FILE FOR AGENTIVE BACKEND
@@ -37,21 +39,22 @@ modules =
     agentive_backend.features.m12_trace
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Contract 2 — Layered architecture : app → features → shared → infra
+# Contract 2 — Layered architecture : app → features → infra → shared
 # Higher layers may depend on lower layers, never the reverse.
-#   `app` may import features, shared, infra.
-#   `features` may import shared, infra (but not other features — see Contract 1).
-#   `shared` may import infra (for concrete adapters) but not features.
-#   `infra` may not import features or shared business logic.
+#   `app` may import features, infra, shared.
+#   `features` may import infra, shared (but not other features — see Contract 1).
+#   `infra` may import shared (e.g. `shared.config` for DSNs) but not features.
+#   `shared` is the kernel: cross-cutting utilities (config, logging, correlation,
+#   contracts). It must not depend on infra or business logic.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:layered]
-name = Layered architecture (app → features → shared → infra)
+name = Layered architecture (app → features → infra → shared)
 type = layers
 layers =
     agentive_backend.app
     agentive_backend.features
-    agentive_backend.shared
     agentive_backend.infra
+    agentive_backend.shared
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 3 — Direct DB access forbidden outside of infra.db / shared.repositories
@@ -66,8 +69,6 @@ source_modules =
     agentive_backend.features
 forbidden_modules =
     sqlalchemy
-    sqlalchemy.ext.asyncio
-    sqlalchemy.orm
     asyncpg
     psycopg
     psycopg2

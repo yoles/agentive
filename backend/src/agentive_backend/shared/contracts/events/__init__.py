@@ -13,6 +13,4 @@ from __future__ import annotations
 
 def describe_event(event_type: str) -> dict[str, object]:
     """Placeholder — event schema registry implemented Story 1.4."""
-    raise NotImplementedError(
-        "Event schema registry implemented Story 1.4 (event bus runtime)."
-    )
+    raise NotImplementedError("Event schema registry implemented Story 1.4 (event bus runtime).")

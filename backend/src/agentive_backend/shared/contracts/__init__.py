@@ -18,6 +18,5 @@ class ContractBase:
         super().__init_subclass__(**kwargs)
         if cls.schema_version == "0.0.0":
             raise NotImplementedError(
-                f"Contract {cls.__name__} must declare schema_version "
-                "(implemented Story 2.2)."
+                f"Contract {cls.__name__} must declare schema_version (implemented Story 2.2)."
             )

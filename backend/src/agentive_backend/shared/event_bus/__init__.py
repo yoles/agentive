@@ -12,8 +12,10 @@ Feature modules communicate EXCLUSIVELY via this bus — direct imports between
 
 from __future__ import annotations
 
+from typing import Any
 
-def publish(event_type: str, payload: dict) -> None:
+
+def publish(event_type: str, payload: dict[str, Any]) -> None:
     """Publish an event via the outbox pattern.
 
     To be implemented in Story 1.4.
