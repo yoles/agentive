@@ -1,21 +1,63 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
+# `init` interne lance 2 scripts Docker concurrents sur le même workspace →
+# les sérialiser évite les courses de création/écriture sur package.json / pyproject.toml.
+.NOTPARALLEL:
+
+# Use $(CURDIR) (make built-in, always absolute, no shell expansion) rather
+# than $(PWD) which relies on the shell and is affected by `cd` / spaces.
+WORKDIR := $(CURDIR)
+
+# Map the host UID/GID into containers so generated files (uv.lock, .venv,
+# node_modules, dist) are owned by the developer, not root.
+# Wrapped with `?=` + fallback to `1000:1000` to keep CI parity.
+HOST_UID ?= $(shell id -u 2>/dev/null || echo 1000)
+HOST_GID ?= $(shell id -g 2>/dev/null || echo 1000)
+USER_FLAG := -u $(HOST_UID):$(HOST_GID)
 
 PROJECT := agentive
 DC := docker compose
 DC_DEV := docker compose
 DC_PROD := docker compose -f docker-compose.yml -f docker-compose.prod.yml
 
-# Images officielles latest stable (Sprint 0)
-IMG_NODE := node:24-alpine
-IMG_PYTHON := python:3.14-slim
-IMG_GITLEAKS := zricethezav/gitleaks:latest
-IMG_PRECOMMIT := ghcr.io/pre-commit/action:latest
+# Images — pinned to explicit versions. Bump deliberately + verify reproducibility.
+# For full supply-chain hardening, append `@sha256:...` digests (see Story 9.6).
+IMG_NODE := node:24-alpine3.21
+IMG_PYTHON := python:3.14.4-slim
+IMG_GITLEAKS := zricethezav/gitleaks:v8.30.1
 IMG_PGVECTOR := pgvector/pgvector:pg17
+IMG_ALPINE := alpine:3.21
+# `age` est fourni par le package `age` dans Alpine 3.21 (v1.2.x).
+# On l'installe à la volée dans un container éphémère au lieu de dépendre
+# d'une image pre-built (aucune image publique officielle de `FiloSottile/age`).
 
-# Helper : exécuter une commande dans un container éphémère avec le workdir monté
-RUN_NODE = docker run --rm -v $(PWD):/workspace -w /workspace $(IMG_NODE)
-RUN_PYTHON = docker run --rm -v $(PWD):/workspace -w /workspace $(IMG_PYTHON)
+# Helper : execute a command in an ephemeral container with the workdir mounted.
+# Paths are quoted so spaces in $(CURDIR) don't break the invocation.
+RUN_NODE = docker run --rm $(USER_FLAG) -v "$(WORKDIR):/workspace" -w /workspace $(IMG_NODE)
+RUN_PYTHON = docker run --rm $(USER_FLAG) -v "$(WORKDIR):/workspace" -w /workspace $(IMG_PYTHON)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# GUARDS (internal targets, used as prerequisites)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.PHONY: _check-env
+_check-env:  ## (interne) vérifie qu'un fichier .env existe à la racine
+	@if [ ! -f "$(WORKDIR)/.env" ]; then \
+		echo "❌ .env absent à la racine — copier .env.example :"; \
+		echo "   cp .env.example .env && ${EDITOR:-vi} .env"; \
+		exit 1; \
+	fi
+
+.PHONY: _validate-msg
+_validate-msg:  ## (interne) valide MSG pour éviter shell injection dans `migrate-new`
+	@if [ -z "$(MSG)" ]; then \
+		echo "❌ MSG= obligatoire (ex: make migrate-new MSG=\"add user table\")"; \
+		exit 1; \
+	fi
+	@if echo '$(MSG)' | grep -qE '[^A-Za-z0-9 _.,:\/\-]'; then \
+		echo "❌ MSG contient des caractères interdits (autorisés : A-Za-z0-9 _.,:/-)"; \
+		exit 1; \
+	fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HELP
@@ -29,45 +71,45 @@ help: ## Affiche l'aide (cette liste)
 	@awk 'BEGIN {FS = ":.*##"; OFS = "  "} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SCAFFOLDING (init one-time)
+# SCAFFOLDING (init one-time) — séquentiel, pas parallélisable
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 .PHONY: init
-init: init-frontend init-backend ## Scaffolde frontend + backend via containers éphémères (one-time)
-	@echo "✅ Init terminée. Prochain pas : make up"
+init: init-backend init-frontend ## Scaffolde frontend + backend via containers éphémères (one-time)
+	@echo "✅ Init terminée. Prochain pas : cp .env.example .env && make up"
 
 .PHONY: init-frontend
-init-frontend: ## Scaffolde frontend/ via node:24-alpine (Vite + shadcn v4 + deps)
+init-frontend: ## Scaffolde frontend/ via node:24 (Vite + shadcn primitives + deps)
 	@echo "🎨 Scaffolding frontend via $(IMG_NODE)..."
 	@mkdir -p frontend
-	@docker run --rm -v $(PWD):/workspace -w /workspace $(IMG_NODE) sh -c "\
+	@docker run --rm $(USER_FLAG) -v "$(WORKDIR):/workspace" -w /workspace $(IMG_NODE) sh -c '\
 		if [ ! -f frontend/package.json ]; then \
 			npm create vite@latest frontend -- --template react-ts --yes; \
 		else \
-			echo '  frontend/package.json existe déjà, skip création Vite'; \
+			echo "  frontend/package.json existe déjà, skip création Vite"; \
 		fi && \
 		cd frontend && \
 		npm install @tanstack/react-router @tanstack/react-query zustand react-hook-form zod react-markdown rehype-sanitize lucide-react cmdk next-themes tailwindcss@latest @tailwindcss/vite@latest class-variance-authority clsx tailwind-merge && \
 		npm install -D openapi-typescript vitest @testing-library/react @testing-library/jest-dom jsdom eslint-plugin-jsx-a11y eslint-plugin-boundaries @vitejs/plugin-react \
-	"
+	'
 	@echo "✅ Frontend scaffold terminé"
 
 .PHONY: init-backend
-init-backend: ## Scaffolde backend/ via python:3.14-slim (FastAPI + uv + deps)
+init-backend: ## Scaffolde backend/ via python:3.14 (FastAPI + uv + deps)
 	@echo "🐍 Scaffolding backend via $(IMG_PYTHON)..."
 	@mkdir -p backend
-	@docker run --rm -v $(PWD):/workspace -w /workspace $(IMG_PYTHON) sh -c "\
+	@docker run --rm $(USER_FLAG) -v "$(WORKDIR):/workspace" -w /workspace $(IMG_PYTHON) sh -c '\
 		pip install --quiet --no-cache-dir --root-user-action=ignore uv && \
 		cd backend && \
 		if [ ! -f pyproject.toml ]; then \
-			uv init --package agentive-backend . --no-readme; \
+			uv init --package --name agentive-backend --no-readme --no-pin-python; \
 		else \
-			echo '  backend/pyproject.toml existe déjà, skip uv init'; \
+			echo "  backend/pyproject.toml existe déjà, skip uv init"; \
 		fi && \
-		uv add --no-sync fastapi 'uvicorn[standard]' 'sqlalchemy[asyncio]' alembic pgvector pydantic pydantic-settings langgraph langchain-anthropic langchain-openai mcp python-multipart sse-starlette structlog cryptography slowapi fastembed apscheduler psycopg[binary] && \
-		uv add --no-sync --dev pytest pytest-asyncio ruff mypy 'langgraph-cli[inmem]' import-linter polyfactory testcontainers cyclonedx-py && \
+		uv add --no-sync fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" alembic pgvector pydantic pydantic-settings langgraph langchain-anthropic langchain-openai mcp python-multipart sse-starlette structlog cryptography slowapi apscheduler "psycopg[binary]>=3.2" && \
+		uv add --no-sync --dev pytest pytest-asyncio pytest-cov ruff mypy "langgraph-cli[inmem]" import-linter polyfactory testcontainers "cyclonedx-bom>=5" && \
 		uv sync \
-	"
+	'
 	@echo "✅ Backend scaffold terminé"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -75,7 +117,7 @@ init-backend: ## Scaffolde backend/ via python:3.14-slim (FastAPI + uv + deps)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 .PHONY: up
-up: ## Démarre le stack dev (db + backend + frontend + caddy) en arrière-plan
+up: _check-env ## Démarre le stack dev (db + backend + frontend + caddy) en arrière-plan
 	$(DC_DEV) up -d
 	@echo "✅ Stack démarré. Accès : https://localhost:8443 (self-signed)"
 	@$(DC_DEV) ps
@@ -113,7 +155,7 @@ backend-shell: ## Ouvre un shell dans le container backend
 
 .PHONY: backend-install
 backend-install: ## (Re)synchronise les dépendances Python (uv sync)
-	@docker run --rm -v $(PWD)/backend:/app -w /app $(IMG_PYTHON) sh -c "\
+	@docker run --rm $(USER_FLAG) -v "$(WORKDIR)/backend:/app" -w /app $(IMG_PYTHON) sh -c "\
 		pip install --quiet --no-cache-dir --root-user-action=ignore uv && uv sync \
 	"
 
@@ -122,7 +164,7 @@ migrate: ## Applique les migrations Alembic (alembic upgrade head)
 	$(DC_DEV) run --rm backend uv run alembic upgrade head
 
 .PHONY: migrate-new
-migrate-new: ## Crée une nouvelle migration (usage: make migrate-new MSG="description")
+migrate-new: _validate-msg ## Crée une nouvelle migration (usage: make migrate-new MSG="description")
 	$(DC_DEV) run --rm backend uv run alembic revision --autogenerate -m "$(MSG)"
 
 .PHONY: migrate-init
@@ -151,7 +193,7 @@ frontend-shell: ## Ouvre un shell dans le container frontend
 
 .PHONY: frontend-install
 frontend-install: ## (Re)synchronise les dépendances Node (npm install)
-	@docker run --rm -v $(PWD)/frontend:/app -w /app $(IMG_NODE) npm install
+	@docker run --rm $(USER_FLAG) -v "$(WORKDIR)/frontend:/app" -w /app $(IMG_NODE) npm install
 
 .PHONY: test-frontend
 test-frontend: ## Exécute les tests Vitest
@@ -162,7 +204,7 @@ lint-frontend: ## Lint frontend (eslint + tsc noEmit)
 	$(DC_DEV) run --rm frontend sh -c "npm run lint && npx tsc --noEmit"
 
 .PHONY: gen-api-types
-gen-api-types: ## Génère les types TS depuis le schéma OpenAPI du backend
+gen-api-types: up ## Génère les types TS depuis le schéma OpenAPI du backend
 	$(DC_DEV) run --rm frontend sh -c "npx openapi-typescript http://backend:8000/openapi.json -o src/shared/api/types.ts"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -184,16 +226,37 @@ db-shell: ## Ouvre psql sur la DB (role agentive_owner)
 	$(DC_DEV) exec db psql -U agentive_owner -d agentive
 
 .PHONY: db-reset
-db-reset: ## DROP DATABASE + recreate + migrations (DANGER : perte données)
-	$(DC_DEV) exec db psql -U postgres -c "DROP DATABASE IF EXISTS agentive;"
-	$(DC_DEV) exec db psql -U postgres -c "CREATE DATABASE agentive OWNER agentive_owner;"
+db-reset: ## DROP DATABASE + recreate via recreate du volume (DANGER : perte données)
+	@echo "⚠️  DANGER : db-reset supprime TOUTES les données."
+	@echo "  Cette commande détruit le volume Postgres, supprimant DB + rôles, puis"
+	@echo "  recrée tout via init.sql + migrations."
+	@read -rp "  Confirmer avec 'yes' : " confirm; test "$$confirm" = "yes" || (echo "abandon" && exit 1)
+	$(DC_DEV) stop db
+	$(DC_DEV) rm -f db
+	docker volume rm -f agentive_agentive_db_data
+	$(DC_DEV) up -d db
+	@echo "⏳ Attente DB healthy (30s)..."
+	@sleep 30
 	$(MAKE) migrate
+	@echo "✅ DB réinitialisée (rôles + schema)"
 
 .PHONY: db-backup
-db-backup: ## pg_dump de la DB vers ./backups/agentive-YYYYMMDD.sql
+db-backup: ## pg_dump robuste vers ./backups/agentive-YYYYMMDD-HHMMSS.sql
 	@mkdir -p backups
-	$(DC_DEV) exec -T db pg_dump -U agentive_owner agentive > "backups/agentive-$$(date +%Y%m%d).sql"
-	@echo "✅ Backup: backups/agentive-$$(date +%Y%m%d).sql"
+	@timestamp=$$(date +%Y%m%d-%H%M%S); \
+	 tmpfile="backups/agentive-$${timestamp}.sql.tmp"; \
+	 finalfile="backups/agentive-$${timestamp}.sql"; \
+	 set -e; \
+	 echo "🗄️  pg_dump → $$finalfile"; \
+	 $(DC_DEV) exec -T db pg_dump -U agentive_owner -d agentive --no-owner --no-acl --clean --if-exists > "$$tmpfile" \
+	   || { rm -f "$$tmpfile"; echo "❌ pg_dump échoué"; exit 1; }; \
+	 if [ ! -s "$$tmpfile" ]; then \
+	   rm -f "$$tmpfile"; \
+	   echo "❌ backup vide — DB accessible ?"; \
+	   exit 1; \
+	 fi; \
+	 mv "$$tmpfile" "$$finalfile"; \
+	 echo "✅ Backup OK : $$finalfile ($$(wc -c < "$$finalfile") bytes)"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PRE-COMMIT + SECURITY
@@ -201,19 +264,23 @@ db-backup: ## pg_dump de la DB vers ./backups/agentive-YYYYMMDD.sql
 
 .PHONY: precommit-install
 precommit-install: ## Installe les git hooks pre-commit (via image Docker pre-commit)
-	@echo "🪝 Installation des git hooks pre-commit via Docker..."
-	@mkdir -p .git/hooks
-	@cp infra/scripts/pre-commit.sh .git/hooks/pre-commit 2>/dev/null || echo "  (pre-commit.sh à créer en T5)"
-	@chmod +x .git/hooks/pre-commit 2>/dev/null || true
-	@echo "✅ pre-commit hook installé (exécution via Docker)"
+	@set -e; \
+	 if [ ! -f "$(WORKDIR)/infra/scripts/pre-commit.sh" ]; then \
+	   echo "❌ infra/scripts/pre-commit.sh absent — impossible d'installer le hook"; \
+	   exit 1; \
+	 fi; \
+	 mkdir -p .git/hooks; \
+	 cp infra/scripts/pre-commit.sh .git/hooks/pre-commit; \
+	 chmod +x .git/hooks/pre-commit; \
+	 echo "✅ pre-commit hook installé ($(WORKDIR)/.git/hooks/pre-commit)"
 
 .PHONY: precommit-run
 precommit-run: ## Exécute manuellement tous les hooks pre-commit sur tous les fichiers
-	@docker run --rm -v $(PWD):/src $(IMG_GITLEAKS) detect --source="/src" --no-banner -v
+	@docker run --rm $(USER_FLAG) -v "$(WORKDIR):/src" $(IMG_GITLEAKS) detect --source="/src" --no-banner -v
 
 .PHONY: gitleaks
 gitleaks: ## Scan gitleaks sur le repo
-	docker run --rm -v $(PWD):/src $(IMG_GITLEAKS) detect --source="/src" --no-banner -v
+	docker run --rm $(USER_FLAG) -v "$(WORKDIR):/src" $(IMG_GITLEAKS) detect --source="/src" --no-banner -v
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BENCHMARKS (Sprint 0 Stories 1.2 + 1.3)
@@ -232,9 +299,19 @@ spike-m3: ## Exécute le spike M3 LangGraph (Story 1.2)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 .PHONY: clean
-clean: ## Supprime node_modules, __pycache__, caches (préserve volumes Docker)
-	@find . -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name 'node_modules' -o -name '.venv' -o -name 'dist' -o -name 'build' \) -prune -exec rm -rf {} \; 2>/dev/null || true
-	@echo "✅ Caches nettoyés"
+clean: ## Supprime caches dans backend/ et frontend/ (blast radius restreint)
+	@rm -rf \
+		"$(WORKDIR)/backend/.venv" \
+		"$(WORKDIR)/backend/.pytest_cache" \
+		"$(WORKDIR)/backend/.mypy_cache" \
+		"$(WORKDIR)/backend/.ruff_cache" \
+		"$(WORKDIR)/backend/build" \
+		"$(WORKDIR)/backend/dist" \
+		"$(WORKDIR)/frontend/node_modules" \
+		"$(WORKDIR)/frontend/dist" \
+		"$(WORKDIR)/frontend/.vite"
+	@find "$(WORKDIR)/backend" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	@echo "✅ Caches nettoyés (backend/.venv, frontend/node_modules, etc.)"
 
 .PHONY: pull
 pull: ## Pull toutes les images Docker utilisées par le stack

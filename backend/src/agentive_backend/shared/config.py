@@ -104,10 +104,10 @@ class Settings(BaseSettings):
 
         This prevents a misconfigured prod deploy from silently booting with
         known-bad dev credentials / tokens / encryption keys.
-        """
-        if self.environment != "production":
-            return self
 
+        In development we only emit a warning (via stderr, since structlog may
+        not be configured yet) to alert the developer without blocking hot-reload.
+        """
         violations: list[str] = []
         secret_fields = {
             "AGENTIVE_API_TOKEN": self.agentive_api_token.get_secret_value(),
@@ -119,11 +119,27 @@ class Settings(BaseSettings):
             if any(sentinel in value for sentinel in _DEV_DEFAULT_SENTINELS):
                 violations.append(name)
 
-        if violations:
+        if not violations:
+            return self
+
+        if self.environment == "production":
             raise ValueError(
                 "Refusing to start in production with dev placeholder values for: "
                 f"{', '.join(violations)}. Set the corresponding env vars to real secrets."
             )
+
+        # Development / test : warn loudly but do not block.
+        # Using sys.stderr directly because structlog may not be configured yet
+        # (Settings() is instantiated at module import time).
+        import sys
+        print(
+            "⚠️  agentive-backend config WARNING: dev placeholder values detected for "
+            f"{', '.join(violations)}. "
+            "The default AGENTIVE_API_TOKEN is PUBLIC (committed in .env.example) — "
+            "anyone can authenticate. Override via environment variables for any "
+            "non-throwaway deployment.",
+            file=sys.stderr,
+        )
         return self
 
     @model_validator(mode="after")

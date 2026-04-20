@@ -3,11 +3,21 @@ root_package = agentive_backend
 include_external_packages = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CANONICAL CONTRACT FILE FOR AGENTIVE BACKEND
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Invocation : `lint-imports --config .import-linter` (from repo root)
+# OR       : `lint-imports --config ../.import-linter` (from backend/)
+#
+# This is the SINGLE SOURCE OF TRUTH for import boundary rules.
+# `backend/pyproject.toml` references this file via `contract_config_file`
+# so `lint-imports` invoked without `--config` inside backend/ picks it up.
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 1 — Features are isolated from each other
 # No feature module may import from another feature module.
 # Inter-feature communication goes ONLY through:
-#   - shared.event_bus (events)
-#   - shared.contracts (shared schemas)
+#   - agentive_backend.shared.event_bus (events)
+#   - agentive_backend.shared.contracts (shared schemas)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:features-isolated]
 name = Feature modules must not import from each other
@@ -28,8 +38,11 @@ modules =
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 2 — Layered architecture : app → features → shared → infra
-# Features may depend on shared + infra, but not on app.
-# Shared may not depend on features. Infra may not depend on features.
+# Higher layers may depend on lower layers, never the reverse.
+#   `app` may import features, shared, infra.
+#   `features` may import shared, infra (but not other features — see Contract 1).
+#   `shared` may import infra (for concrete adapters) but not features.
+#   `infra` may not import features or shared business logic.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:layered]
 name = Layered architecture (app → features → shared → infra)
@@ -41,19 +54,20 @@ layers =
     agentive_backend.infra
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Contract 3 — Direct DB access forbidden outside repositories / infra
-# No feature module may import sqlalchemy or asyncpg directly.
-# All DB access goes through shared.repositories.
+# Contract 3 — Direct DB access forbidden outside of infra.db / shared.repositories
+# No feature module may import sqlalchemy / psycopg directly.
+# All DB access goes through `agentive_backend.shared.repositories`, which is
+# the ONLY shared module permitted to talk to SQLAlchemy.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[importlinter:contract:no-direct-db-access]
-name = Features must not import sqlalchemy or asyncpg directly
+[importlinter:contract:no-direct-db-access-from-features]
+name = Feature modules must not import sqlalchemy / psycopg directly
 type = forbidden
 source_modules =
     agentive_backend.features
 forbidden_modules =
     sqlalchemy
     sqlalchemy.ext.asyncio
+    sqlalchemy.orm
     asyncpg
     psycopg
-ignore_imports =
-    agentive_backend.features.** -> agentive_backend.shared.repositories.**
+    psycopg2

@@ -1,8 +1,10 @@
 name: CI
 
+# Trigger sur toutes les branches (AC8 de la Story 1.1) + tous les PRs vers main.
+# Feature branches bénéficient du feedback CI sans attendre le merge.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
 
@@ -108,10 +110,11 @@ jobs:
           "
 
   # ─── Build ───
+  # Attend lint + tests : un test cassé n'avance pas jusqu'au build (pipeline fail-fast).
   build:
     name: Build Docker images
     runs-on: ubuntu-latest
-    needs: [lint-backend, lint-frontend]
+    needs: [lint-backend, lint-frontend, test-backend, test-frontend, gitleaks]
     steps:
       - uses: actions/checkout@v4
       - name: Build backend image

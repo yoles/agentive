@@ -1,11 +1,12 @@
 # gitleaks config — Agentive
-# Detects secrets on pre-commit (via Docker zricethezav/gitleaks:latest)
+# Detects secrets on pre-commit (via Docker zricethezav/gitleaks)
 # Reference : https://github.com/gitleaks/gitleaks
 
 title = "Agentive gitleaks config"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Extend default config (detects AWS, GCP, Azure, Slack, Stripe, etc.)
+# Extend default config (detects AWS, GCP, Azure, Slack, Stripe,
+# generic OpenAI `sk-...`, etc.)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [extend]
 useDefault = true
@@ -23,46 +24,80 @@ keywords = ["sk-ant-", "ANTHROPIC_API_KEY"]
 
 [[rules]]
 id = "openai-project-key"
-description = "OpenAI project/API key"
-regex = '''sk-(proj|svcacct)-[a-zA-Z0-9_-]{32,}'''
+description = "OpenAI project/service-account/legacy API key"
+# Covers sk-proj-, sk-svcacct-, and legacy sk-test/sk-live/any sk- >= 32 chars.
+# Character class includes URL-safe base64 (-/_) so keys produced by
+# secrets.token_urlsafe() or similar helpers are matched.
+regex = '''sk-(proj|svcacct|test|live|[A-Za-z0-9])[A-Za-z0-9_-]{31,}'''
 tags = ["llm", "openai", "credential"]
-keywords = ["sk-proj-", "sk-svcacct-", "OPENAI_API_KEY"]
+keywords = ["sk-proj-", "sk-svcacct-", "sk-test", "sk-live", "OPENAI_API_KEY"]
 
 [[rules]]
 id = "voyage-api-key"
 description = "Voyage AI API key"
-regex = '''pa-[a-zA-Z0-9_-]{32,}'''
+regex = '''pa-[A-Za-z0-9_-]{32,}'''
 tags = ["llm", "voyage", "credential"]
 keywords = ["pa-", "VOYAGE_API_KEY"]
 
 [[rules]]
 id = "agentive-api-token"
 description = "Agentive API token in clear text in a committed file"
-regex = '''AGENTIVE_API_TOKEN\s*=\s*[a-zA-Z0-9+/=]{32,}'''
+# Includes URL-safe base64 characters (`-`, `_`) so tokens generated via
+# Python `secrets.token_urlsafe(32)` or similar are caught, not only those
+# produced by `openssl rand -base64 32` (which uses `+`, `/`, `=`).
+regex = '''AGENTIVE_API_TOKEN\s*=\s*[A-Za-z0-9+/=_-]{32,}'''
 tags = ["agentive", "credential"]
 keywords = ["AGENTIVE_API_TOKEN"]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Allowlist — false positives
+# Allowlist — narrowly-scoped false-positive suppression
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Paths are ANCHORED (^...$) to prevent accidental matches on nested files
+# bearing the same basename (e.g. `backend/src/.../docs/leaked.md`).
+# Allowlist regexes apply ONLY to content in these paths — we do NOT whitelist
+# `change_me_*` globally anymore because a global regex would allow any line
+# containing that substring (e.g. `# TODO change_me - REAL=sk-ant-XYZ`).
 
-[allowlist]
-description = "Allowlist for example / placeholder files"
-paths = [
-    '''\.env\.example$''',
-    '''\.env\.encrypted$''',
-    '''\.gitleaks\.toml$''',
-    '''_bmad-output/.*''',
-    '''_bmad/.*''',
-    '''docs/.*\.md$''',
-    '''.*README\.md$''',
-    '''.*CONVENTIONS\.md$''',
-    '''.*SECURITY\.md$''',
+[[allowlists]]
+description = "Allowlist example / encrypted env files (scoped to specific paths)"
+targetRules = [
+    "anthropic-api-key",
+    "openai-project-key",
+    "voyage-api-key",
+    "agentive-api-token",
 ]
+paths = [
+    '''^\.env\.example$''',
+    '''^\.env\.encrypted$''',
+]
+# Only placeholder sentinel values inside the above files are allowed.
 regexes = [
-    '''change_me_.*''',
+    '''change_me_[A-Za-z0-9_-]*''',
     '''sk-(ant|proj|svcacct)-your-key-here''',
     '''pa-your-key-here''',
-    '''example-[a-zA-Z0-9_-]+''',
-    '''placeholder-[a-zA-Z0-9_-]+''',
+]
+
+[[allowlists]]
+description = "Allowlist gitleaks config itself (contains rule literals)"
+targetRules = [
+    "anthropic-api-key",
+    "openai-project-key",
+    "voyage-api-key",
+    "agentive-api-token",
+]
+paths = [
+    '''^\.gitleaks\.toml$''',
+]
+
+[[allowlists]]
+description = "Allowlist tool-produced artifacts outside application code (ALL rules, default + custom)"
+# No `targetRules` → applies to every gitleaks rule (default + custom).
+# Intentional : planning docs / BMAD framework / Claude tooling are not
+# application code, they contain example secrets in prose (e.g. `sk-test...`
+# as a canary illustration). They are already sandboxed from runtime use.
+paths = [
+    '''^_bmad/''',                                 # BMAD framework tooling
+    '''^_bmad-output/planning-artifacts/''',       # Planning docs (anchored path)
+    '''^_bmad-output/implementation-artifacts/''', # Story specs
+    '''^\.claude/''',                              # Claude Code tooling
 ]
