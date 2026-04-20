@@ -86,7 +86,7 @@ Le problème fondamental résolu : les frameworks d'agents IA existants (CrewAI,
 
 | Attribut | Valeur |
 |---|---|
-| **Type** | Application web (SPA, 4 espaces UI : Dashboard, Config, Chat, Topologie) |
+| **Type** | Application web (SPA, 4 espaces UI MVP : Dashboard, Config, Chat, Trace — Topology View M9 ajoutée en Growth) |
 | **Domaine** | AI Infrastructure / Agent Orchestration |
 | **Complexité** | Haute — orchestration multi-agents, RAG, méta-agent, architecture inter-départements |
 | **Contexte** | Greenfield — nouveau projet, pas de codebase existant |
@@ -347,7 +347,7 @@ Le problème fondamental résolu : les frameworks d'agents IA existants (CrewAI,
 |---|---|
 | **Type** | SPA (Single Page Application) |
 | **Framework** | React |
-| **Espaces UI** | 4 espaces : Dashboard, Config, Chat, Topologie |
+| **Espaces UI** | 4 espaces MVP : Dashboard, Config, Chat, Trace (M12 Trace Explorer). Topology View (M9) ajoutée en Growth comme 5ème espace. |
 | **Mode UI** | Wizard guidé (principal) + Mode expert (avancé) |
 | **Routing** | Client-side routing, 4 routes principales |
 | **Streaming** | SSE (Server-Sent Events) pour les réponses agents en temps réel |
@@ -368,7 +368,7 @@ Le problème fondamental résolu : les frameworks d'agents IA existants (CrewAI,
 - **Responsive adaptatif** — les 4 espaces s'adaptent aux écrans tablette/mobile pour consultation
 - **Chat Mobile** — le Chat (M7) doit être pleinement fonctionnel sur mobile (validation en déplacement)
 - **Dashboard Mobile** — consultation des métriques et statuts, pas d'édition
-- **Config & Topologie** — desktop uniquement recommandé, layout simplifié sur mobile
+- **Config & Trace** — desktop uniquement recommandé, layout simplifié sur mobile (Topology M9 également desktop-only quand livrée en Growth)
 
 ### Performance Targets
 
