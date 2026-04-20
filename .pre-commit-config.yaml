@@ -49,13 +49,24 @@ repos:
         pass_filenames: false
 
   # ─── Generic file checks (offline, no Docker needed) ───
+  # NOTE : ces hooks sont un compromis pragmatique vs l'amendement
+  # « Docker-first total » : ils nécessitent `pre-commit` runtime sur l'hôte
+  # (`pipx run pre-commit run --all-files` suffit sans install persistant).
+  # Ils restent utiles comme filet de sécurité léger (formatage, large-files,
+  # merge conflicts). Si un contributeur veut zéro install hôte, il peut
+  # commenter ce bloc — les hooks Docker-based couvrent l'essentiel.
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^\.env\.encrypted$
       - id: end-of-file-fixer
+        exclude: ^\.env\.encrypted$
       - id: check-yaml
       - id: check-added-large-files
         args: ['--maxkb=1024']
       - id: check-merge-conflict
       - id: detect-private-key
+        # Exclude SOPS-encrypted file (its BEGIN/END markers trigger false positives
+        # once the placeholder is replaced by a real SOPS payload).
+        exclude: ^\.env\.encrypted$
