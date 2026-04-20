@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Agentive Design System — CSS Variables (Dark default + Light)
+   Source canonique : _bmad-output/planning-artifacts/ux-design-specification.md § Visual Design Foundation
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+@theme {
+  --radius: 0.5rem; /* 8px */
+  --font-sans: "Geist Sans", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ─── Dark theme (default) ─── */
+:root {
+  --background: 240 10% 3.9%;
+  --foreground: 0 0% 98%;
+
+  --card: 240 10% 9%;
+  --card-foreground: 0 0% 98%;
+
+  --popover: 240 10% 9%;
+  --popover-foreground: 0 0% 98%;
+
+  --muted: 240 4% 15%;
+  --muted-foreground: 240 5% 65%;
+
+  --border: 240 4% 15%;
+  --input: 240 4% 15%;
+  --ring: 262 83% 58%;
+
+  --primary: 262 83% 58%;
+  --primary-foreground: 0 0% 98%;
+
+  --secondary: 240 4% 15%;
+  --secondary-foreground: 0 0% 98%;
+
+  --accent: 240 4% 15%;
+  --accent-foreground: 0 0% 98%;
+
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 98%;
+
+  --status-success: 160 84% 39%;
+  --status-running: 262 83% 58%;
+  --status-pending: 240 5% 45%;
+  --status-warning: 38 92% 50%;
+  --status-error: 0 84% 60%;
+}
+
+/* ─── Light theme ─── */
+.light {
+  --background: 0 0% 100%;
+  --foreground: 240 10% 3.9%;
+
+  --card: 0 0% 98%;
+  --card-foreground: 240 10% 3.9%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 240 10% 3.9%;
+
+  --muted: 240 5% 96%;
+  --muted-foreground: 240 4% 46%;
+
+  --border: 240 6% 90%;
+  --input: 240 6% 90%;
+  --ring: 262 83% 58%;
+
+  --primary: 262 83% 58%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 240 5% 96%;
+  --secondary-foreground: 240 10% 3.9%;
+
+  --accent: 240 5% 96%;
+  --accent-foreground: 240 10% 3.9%;
+
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+
+  --status-success: 160 84% 34%;
+  --status-running: 262 83% 58%;
+  --status-pending: 240 5% 45%;
+  --status-warning: 25 94% 43%;
+  --status-error: 0 72% 51%;
+}
+
+/* ─── Base styles ─── */
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    color-scheme: dark light;
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: var(--font-sans);
+    font-feature-settings: "tnum";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

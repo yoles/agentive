@@ -1,0 +1,68 @@
+# gitleaks config — Agentive
+# Detects secrets on pre-commit (via Docker zricethezav/gitleaks:latest)
+# Reference : https://github.com/gitleaks/gitleaks
+
+title = "Agentive gitleaks config"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Extend default config (detects AWS, GCP, Azure, Slack, Stripe, etc.)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[extend]
+useDefault = true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Custom rules — LLM providers (Anthropic, OpenAI, Voyage)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-[a-zA-Z0-9_-]{32,}'''
+tags = ["llm", "anthropic", "credential"]
+keywords = ["sk-ant-", "ANTHROPIC_API_KEY"]
+
+[[rules]]
+id = "openai-project-key"
+description = "OpenAI project/API key"
+regex = '''sk-(proj|svcacct)-[a-zA-Z0-9_-]{32,}'''
+tags = ["llm", "openai", "credential"]
+keywords = ["sk-proj-", "sk-svcacct-", "OPENAI_API_KEY"]
+
+[[rules]]
+id = "voyage-api-key"
+description = "Voyage AI API key"
+regex = '''pa-[a-zA-Z0-9_-]{32,}'''
+tags = ["llm", "voyage", "credential"]
+keywords = ["pa-", "VOYAGE_API_KEY"]
+
+[[rules]]
+id = "agentive-api-token"
+description = "Agentive API token in clear text in a committed file"
+regex = '''AGENTIVE_API_TOKEN\s*=\s*[a-zA-Z0-9+/=]{32,}'''
+tags = ["agentive", "credential"]
+keywords = ["AGENTIVE_API_TOKEN"]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Allowlist — false positives
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[allowlist]
+description = "Allowlist for example / placeholder files"
+paths = [
+    '''\.env\.example$''',
+    '''\.env\.encrypted$''',
+    '''\.gitleaks\.toml$''',
+    '''_bmad-output/.*''',
+    '''_bmad/.*''',
+    '''docs/.*\.md$''',
+    '''.*README\.md$''',
+    '''.*CONVENTIONS\.md$''',
+    '''.*SECURITY\.md$''',
+]
+regexes = [
+    '''change_me_.*''',
+    '''sk-(ant|proj|svcacct)-your-key-here''',
+    '''pa-your-key-here''',
+    '''example-[a-zA-Z0-9_-]+''',
+    '''placeholder-[a-zA-Z0-9_-]+''',
+]

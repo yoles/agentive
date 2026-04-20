@@ -1,0 +1,59 @@
+[importlinter]
+root_package = agentive_backend
+include_external_packages = False
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 1 — Features are isolated from each other
+# No feature module may import from another feature module.
+# Inter-feature communication goes ONLY through:
+#   - shared.event_bus (events)
+#   - shared.contracts (shared schemas)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:features-isolated]
+name = Feature modules must not import from each other
+type = independence
+modules =
+    agentive_backend.features.m1_company_architect
+    agentive_backend.features.m2_agent_registry
+    agentive_backend.features.m3_workflow_engine
+    agentive_backend.features.m4_memory_manager
+    agentive_backend.features.m5_tool_hub
+    agentive_backend.features.m6_dashboard
+    agentive_backend.features.m7_chat
+    agentive_backend.features.m8_agent_configurator
+    agentive_backend.features.m9_topology
+    agentive_backend.features.m10_reporting
+    agentive_backend.features.m11_scheduler
+    agentive_backend.features.m12_trace
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 2 — Layered architecture : app → features → shared → infra
+# Features may depend on shared + infra, but not on app.
+# Shared may not depend on features. Infra may not depend on features.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:layered]
+name = Layered architecture (app → features → shared → infra)
+type = layers
+layers =
+    agentive_backend.app
+    agentive_backend.features
+    agentive_backend.shared
+    agentive_backend.infra
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 3 — Direct DB access forbidden outside repositories / infra
+# No feature module may import sqlalchemy or asyncpg directly.
+# All DB access goes through shared.repositories.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:no-direct-db-access]
+name = Features must not import sqlalchemy or asyncpg directly
+type = forbidden
+source_modules =
+    agentive_backend.features
+forbidden_modules =
+    sqlalchemy
+    sqlalchemy.ext.asyncio
+    asyncpg
+    psycopg
+ignore_imports =
+    agentive_backend.features.** -> agentive_backend.shared.repositories.**

@@ -1,0 +1,88 @@
+# Caddy dev config — self-signed certificates, ports 8080/8443 exposés
+# Reverse proxy :
+#   - `/api/*` → backend:8000
+#   - `/*`     → frontend:5173 (Vite HMR)
+
+{
+    # Auto-HTTPS via CA interne Caddy pour dev
+    local_certs
+    # Admin API désactivée
+    admin off
+    # Désactive les redirects HTTP→HTTPS automatiques de Caddy qui utilisent
+    # le port canonique 443 au lieu de notre port dev 8443 mappé sur l'hôte.
+    # Le bloc `:80 { ... }` en bas de fichier gère le redirect manuellement.
+    auto_https disable_redirects
+}
+
+# HTTPS listener pour `localhost` (Caddy génère un cert self-signed localement)
+localhost {
+    tls internal
+
+    # Security headers (OWASP baseline)
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: ws: wss:; font-src 'self' data:; frame-ancestors 'none'"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+        -Server
+    }
+
+    # CORS preflight
+    @cors_preflight {
+        method OPTIONS
+    }
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin "http://localhost:5173"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Authorization, Content-Type, X-Correlation-ID"
+        header Access-Control-Max-Age "3600"
+        respond 204
+    }
+
+    # Backend API routes
+    handle /api/* {
+        reverse_proxy backend:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # SSE endpoint — streaming-friendly
+    handle /sse/* {
+        reverse_proxy backend:8000 {
+            flush_interval -1
+            header_up Connection ""
+        }
+    }
+
+    # Health / Ready
+    handle /health {
+        reverse_proxy backend:8000
+    }
+    handle /ready {
+        reverse_proxy backend:8000
+    }
+
+    # Frontend (Vite dev server avec HMR via WebSocket)
+    handle {
+        reverse_proxy frontend:5173 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+}
+
+# HTTP listener → redirect vers HTTPS (port 8443 explicite pour dev)
+# Note : en dev, on accède principalement via https://localhost:8443 directement.
+# Cette route est un convenience redirect pour les utilisateurs qui tapent http://localhost:8080.
+:80 {
+    redir https://localhost:8443{uri} 308
+}

@@ -1,0 +1,19 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+
+# SOPS — forcer diff en JSON pour .env.encrypted (utile pour review)
+.env.encrypted diff=sopsdiffer
+*.sops.yaml diff=sopsdiffer
+
+# Linguist overrides (optionnel)
+*.md linguist-documentation=true

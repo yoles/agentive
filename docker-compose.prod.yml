@@ -1,0 +1,47 @@
+# Agentive — Docker Compose production overrides
+# Usage : `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
+#
+# Sprint 0 : stub — à compléter avant déploiement prod.
+# TODO Sprint 1+ :
+#   - Multi-stage Dockerfile production (backend target=prod, frontend target=prod avec build Vite servi par Caddy)
+#   - Caddy ports 80/443 (auto-HTTPS Let's Encrypt)
+#   - Volumes persistants avec backup automatisé
+#   - Healthchecks stricts
+#   - Resource limits (memory/cpu)
+#   - Secrets via SOPS (pas d'env vars en clair)
+
+services:
+  db:
+    # Production : pas de port exposé vers l'hôte (accès via network interne uniquement)
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+
+  backend:
+    build:
+      target: prod
+    ports: !reset []  # Pas d'accès direct, passe par Caddy
+    environment:
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2'
+
+  frontend:
+    build:
+      target: prod
+    ports: !reset []  # Pas d'accès direct, passe par Caddy
+
+  caddy:
+    ports: !reset
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - agentive_caddy_data:/data
+      - agentive_caddy_config:/config

@@ -1,0 +1,161 @@
+# generated: 2026-04-19
+# last_updated: 2026-04-19
+# project: Agentive
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - SM typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-04-19
+last_updated: 2026-04-19T12:50
+project: Agentive
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  # ============================================================
+  # MVP — Sprint 0 to Sprint 3
+  # ============================================================
+
+  # Epic 1: Foundation & Spike Validation (Sprint 0)
+  epic-1: in-progress
+  1-1-scaffolding-minimal-viable: review
+  1-2-spike-m3-langgraph: backlog
+  1-3-benchmark-m4-pgvector-hnsw: backlog
+  1-4-core-event-bus: backlog
+  1-5-core-repositories-migrations: backlog
+  1-6-core-llm-abstraction: backlog
+  1-7-core-auth-token-statique: backlog
+  1-8-design-system-foundation: backlog
+  1-9-observability-caddy-ci: backlog
+  epic-1-retrospective: optional
+
+  # Epic 2: Agent Platform (Sprint 1)
+  epic-2: backlog
+  2-1-creer-agent-template-depuis-archetype: backlog
+  2-2-configurer-agent-complet: backlog
+  2-3-mode-wizard-vs-expert: backlog
+  2-4-distinction-template-vs-instance: backlog
+  2-5-tool-hub-mcp-assignation: backlog
+  2-6-execution-outils-sandbox-bwrap: backlog
+  2-7-agent-playground: backlog
+  2-8-review-conversationnelle-controleur: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: Memory & Knowledge System (Sprint 1)
+  epic-3: backlog
+  3-1-stockage-recherche-vectorielle-pgvector: backlog
+  3-2-namespaces-isoles-4-types: backlog
+  3-3-ttl-chunk-archivage-automatique: backlog
+  3-4-scoring-decroissance-temporelle: backlog
+  3-5-push-memory-proactif: backlog
+  3-6-purge-manuelle-embedding-router: backlog
+  epic-3-retrospective: optional
+
+  # Epic 4: Workflow Orchestration Engine (Sprint 2)
+  epic-4: backlog
+  4-1-creer-workflow: backlog
+  4-2-executer-workflow-checkpointing: backlog
+  4-3-orchestration-hybride: backlog
+  4-4-dry-run-predictif: backlog
+  4-5-mise-en-place-automatique: backlog
+  4-6-interrompre-relancer-fallback-llm: backlog
+  4-7-resumes-passage-automatiques: backlog
+  epic-4-retrospective: optional
+
+  # Epic 5: Dev Department (Pôle Pilote) (Sprint 2)
+  epic-5: backlog
+  5-1-dev-lead-orchestrateur: backlog
+  5-2-code-researcher-exploration: backlog
+  5-3-architect-analyst-code-producer: backlog
+  5-4-code-reviewer-test-engineer: backlog
+  5-5-cicd-watcher-pipelines: backlog
+  5-6-doc-writer-sprint-reporter: backlog
+  epic-5-retrospective: optional
+
+  # Epic 6: Chat Interface & Human-in-the-Loop (Sprint 3)
+  epic-6: backlog
+  6-1-chat-ui-streaming-sse: backlog
+  6-2-slash-commands-autocompletion: backlog
+  6-3-workflow-inline-multi-auteur: backlog
+  6-4-output-cards-validation-inline: backlog
+  6-5-command-palette-cmdk: backlog
+  epic-6-retrospective: optional
+
+  # Epic 7: Dashboard, Alerts & Scheduler (Sprint 3)
+  epic-7: backlog
+  7-1-dashboard-metriques-temps-reel: backlog
+  7-2-sprint-reporter-resume-narratif: backlog
+  7-3-scheduler-workflows-recurrents: backlog
+  7-4-configuration-seuils-alerte: backlog
+  7-5-notifications-proactives-alertbanner: backlog
+  7-6-monitoring-qualite-retry-benchmark: backlog
+  epic-7-retrospective: optional
+
+  # Epic 8: Trace Explorer & Agent Debugger (Sprint 3)
+  epic-8: backlog
+  8-1-trace-explorer-tree-detail: backlog
+  8-2-metriques-contextuelles-overlay: backlog
+  8-3-navigation-contextuelle-trace: backlog
+  8-4-agent-debugger-diagnostic: backlog
+  8-5-event-hooks-bus-evenements: backlog
+  epic-8-retrospective: optional
+
+  # Epic 9: Security, Audit & Trust Controls (cross-cutting Sprint 0-3)
+  epic-9: backlog
+  9-1-audit-trail-middleware-partitioned: backlog
+  9-2-chiffrement-at-rest-fernet: backlog
+  9-3-gestion-cles-api-llm: backlog
+  9-4-budget-caps-departement-workflow: backlog
+  9-5-rate-limiting-multi-provider: backlog
+  9-6-secrets-management-sops-gitleaks: backlog
+  epic-9-retrospective: optional
+
+  # ============================================================
+  # Growth — Sprint 4-5 (stories à détailler lors du cycle Growth)
+  # ============================================================
+
+  # Epic 10: 2nd Department — Design/UX (Sprint 4)
+  epic-10: backlog
+  epic-10-retrospective: optional
+
+  # Epic 11: Company Architect (M1) — Wizard 7 étapes (Sprint 5)
+  epic-11: backlog
+  epic-11-retrospective: optional
+
+  # Epic 12: Multi-User & Permissions (Sprint 4-5)
+  epic-12: backlog
+  epic-12-retrospective: optional
+
+  # Epic 13: Topology View, Reporting & Growth Innovations (Sprint 5)
+  epic-13: backlog
+  epic-13-retrospective: optional
