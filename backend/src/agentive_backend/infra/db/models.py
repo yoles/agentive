@@ -289,11 +289,23 @@ class OutboxEvent(Base):
 class AuditEvent(Base):
     """Audit log — partitioned by month, immutable (REVOKE DELETE/UPDATE).
 
-    Detailed partitioning logic is handled in the Alembic migration (SQL DDL).
-    This ORM model is only used for INSERTs (via agentive_audit_admin role).
+    The actual partitioning is declared via ``__table_args__`` below AND in
+    the Alembic migration. The migration remains the source of truth for
+    partition ranges + grants — the ORM declaration is here so a caller
+    accidentally running ``Base.metadata.create_all()`` produces a
+    compatible (partitioned) table instead of a plain one that would
+    later conflict with the migration.
+
+    Write access reserved to ``agentive_audit_admin`` (INSERT-only).
     """
 
     __tablename__ = "audit_events"
+
+    # Tell SQLAlchemy this is a RANGE-partitioned table on ``created_at``.
+    # Requires SQLAlchemy 2.0+ PostgreSQL dialect.
+    __table_args__ = {
+        "postgresql_partition_by": "RANGE (created_at)",
+    }
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
@@ -310,5 +322,3 @@ class AuditEvent(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), primary_key=True, nullable=False
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-
-    # Note : partitioned by RANGE (created_at) in Alembic migration

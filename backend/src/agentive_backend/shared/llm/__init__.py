@@ -9,3 +9,10 @@ Future public API :
 """
 
 from __future__ import annotations
+
+from typing import Any
+
+
+async def complete(messages: Any, **kwargs: Any) -> Any:
+    """Placeholder — implemented in Story 1.6."""
+    raise NotImplementedError("LLM provider abstraction implemented in Story 1.6")

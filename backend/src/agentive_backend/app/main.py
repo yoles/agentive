@@ -41,12 +41,20 @@ def create_app() -> FastAPI:
     )
 
     # ─── CORS ───
+    # Explicit allowlists — CORS spec forbids wildcards with `allow_credentials=True`.
+    # Origins are configurable via `AGENTIVE_CORS_ALLOW_ORIGINS` (JSON list).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Correlation-ID",
+            "Accept",
+            "Accept-Language",
+        ],
         expose_headers=["X-Correlation-ID"],
     )
 
@@ -81,7 +89,13 @@ def create_app() -> FastAPI:
 
     @app.get("/ready", tags=["infra"])
     async def ready() -> JSONResponse:
-        """Readiness probe — verifies DB connectivity."""
+        """Readiness probe — verifies DB connectivity.
+
+        On failure the response body exposes only a constant ``"error"`` label
+        to avoid leaking implementation details (exception class names, driver
+        errors) to unauthenticated callers. Full diagnostics are logged
+        server-side with correlation ID.
+        """
         factory = get_session_factory()
         try:
             async with factory() as session:  # type: AsyncSession
@@ -90,11 +104,15 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_200_OK,
                 content={"status": "ready", "checks": {"db": "ok"}},
             )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("readiness_check_failed", error=str(exc))
+        except Exception as exc:  # noqa: BLE001 — readiness must swallow all failures
+            log.warning(
+                "readiness_check_failed",
+                error_class=exc.__class__.__name__,
+                error=str(exc),
+            )
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"status": "not_ready", "checks": {"db": f"error: {exc.__class__.__name__}"}},
+                content={"status": "not_ready", "checks": {"db": "error"}},
             )
 
     # ─── API versioned router (empty Sprint 0 — features plug in Sprint 1+) ───

@@ -9,16 +9,16 @@ Python 3.14 stdlib provides ``uuid.uuid7``. If unavailable, fallback to ULID
 
 from __future__ import annotations
 
-import uuid
 from contextvars import ContextVar
+
+from agentive_backend.shared.utils import uuid_v7
 
 _correlation_id_var: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
 
 def new_correlation_id() -> str:
     """Generate a new correlation ID (UUID v7 — time-ordered)."""
-    # Python 3.14+ : uuid.uuid7() — sortable temporellement
-    return str(uuid.uuid7())
+    return str(uuid_v7())
 
 
 def set_correlation_id(value: str) -> None:
