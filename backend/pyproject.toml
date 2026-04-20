@@ -123,6 +123,17 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Import boundaries — contract file at repo root `.import-linter`
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# The full contract definitions live in the repository root `.import-linter`
+# file (consumed by `lint-imports --config /path/to/.import-linter`).
+# This section just points tooling at them for consistency.
+[tool.importlinter]
+root_package = "agentive_backend"
+include_external_packages = false
+contract_config_file = "../.import-linter"
+
 [dependency-groups]
 dev = [
     "cyclonedx-bom>=5",

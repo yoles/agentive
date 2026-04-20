@@ -396,39 +396,73 @@ def upgrade() -> None:
         ) PARTITION BY RANGE (created_at)
         """
     )
-    # Partitions initiales : avril 2026 + mai 2026
+    # Partitions : 12 mois glissants pré-créés (2026-04 → 2027-03)
+    # pour éviter la fenêtre de crash si le worker d'auto-partitionnement
+    # (Story 9.1 / 7.3) n'est pas encore déployé.
+    _partitions = [
+        ("2026_04", "2026-04-01", "2026-05-01"),
+        ("2026_05", "2026-05-01", "2026-06-01"),
+        ("2026_06", "2026-06-01", "2026-07-01"),
+        ("2026_07", "2026-07-01", "2026-08-01"),
+        ("2026_08", "2026-08-01", "2026-09-01"),
+        ("2026_09", "2026-09-01", "2026-10-01"),
+        ("2026_10", "2026-10-01", "2026-11-01"),
+        ("2026_11", "2026-11-01", "2026-12-01"),
+        ("2026_12", "2026-12-01", "2027-01-01"),
+        ("2027_01", "2027-01-01", "2027-02-01"),
+        ("2027_02", "2027-02-01", "2027-03-01"),
+        ("2027_03", "2027-03-01", "2027-04-01"),
+    ]
+    for suffix, start, end in _partitions:
+        op.execute(
+            f"""
+            CREATE TABLE audit_events_{suffix} PARTITION OF audit_events
+            FOR VALUES FROM ('{start}') TO ('{end}')
+            """
+        )
+    # DEFAULT partition : safety net — absorbe toute ligne hors des partitions
+    # explicites (future-proof si le worker d'auto-partitionnement tarde).
+    # À surveiller : si elle grossit, c'est que le worker cron n'a pas pris le relais.
     op.execute(
         """
-        CREATE TABLE audit_events_2026_04 PARTITION OF audit_events
-        FOR VALUES FROM ('2026-04-01') TO ('2026-05-01')
-        """
-    )
-    op.execute(
-        """
-        CREATE TABLE audit_events_2026_05 PARTITION OF audit_events
-        FOR VALUES FROM ('2026-05-01') TO ('2026-06-01')
+        CREATE TABLE audit_events_default PARTITION OF audit_events DEFAULT
         """
     )
     # Note : partition creation automatique mensuelle à implémenter via pg_cron
-    # ou cron sidecar (Story 9.1 T1 ou scheduler M11 Story 7.3)
+    # ou cron sidecar (Story 9.1 T1 ou scheduler M11 Story 7.3) — la DEFAULT
+    # partition est un filet de sécurité, pas un substitut au worker.
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 6. RLS (Row Level Security) — activée sur tables critiques
+    # 6. RLS (Row Level Security) — activée sur toutes tables tenant-scoped
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tables avec colonne tenant_id UUID NULL → RLS obligatoire.
+    # `FORCE` applique la RLS même pour le rôle propriétaire (`agentive_owner`),
+    # évitant le bypass silencieux lors d'opérations admin/migrations.
+    # `WITH CHECK` garantit que les INSERT/UPDATE ne peuvent pas créer/modifier
+    # des lignes en dehors du tenant courant (pas seulement les lectures).
     rls_tables = [
         "memory_chunks",
         "chunk_embeddings",
+        "namespaces",
         "workflows",
         "workflow_runs",
+        "agent_templates",
         "agent_instances",
+        "prompts",
+        "outbox_events",
         "audit_events",
     ]
     for table in rls_tables:
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
         op.execute(
             f"""
             CREATE POLICY tenant_isolation ON {table}
             USING (
+                tenant_id IS NULL
+                OR tenant_id = current_setting('app.tenant_id', true)::uuid
+            )
+            WITH CHECK (
                 tenant_id IS NULL
                 OR tenant_id = current_setting('app.tenant_id', true)::uuid
             )
@@ -459,21 +493,48 @@ def upgrade() -> None:
     for table in app_writable_tables:
         op.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {table} TO agentive_app")
 
-    # agentive_app : INSERT-only sur audit_events (pas de modification/suppression)
-    op.execute("GRANT SELECT, INSERT ON TABLE audit_events TO agentive_app")
-    op.execute("GRANT SELECT, INSERT ON TABLE audit_events_2026_04 TO agentive_app")
-    op.execute("GRANT SELECT, INSERT ON TABLE audit_events_2026_05 TO agentive_app")
+    # agentive_app : aucun droit sur audit_events (lecture seule réservée à
+    # agentive_audit_admin pour l'intégrité auditable).
+    # Les lignes audit_events sont écrites via un canal dédié :
+    # - soit via agentive_audit_admin (le middleware/interceptor d'audit),
+    # - soit via un trigger BEFORE INSERT sur les tables métier (à implémenter
+    #   Story 9.1 pour tracer les mutations).
+    # L'app runtime n'a donc pas de droit direct sur audit_events — elle publie
+    # un event via outbox_events qu'un worker d'audit (rôle audit_admin) persiste.
 
-    # agentive_audit_admin : SELECT-only sur audit_events + toutes partitions
-    op.execute("GRANT SELECT ON TABLE audit_events TO agentive_audit_admin")
-    op.execute("GRANT SELECT ON TABLE audit_events_2026_04 TO agentive_audit_admin")
-    op.execute("GRANT SELECT ON TABLE audit_events_2026_05 TO agentive_audit_admin")
+    # Liste des partitions audit (alignée sur les 12 mois + default créés plus haut)
+    _audit_partitions = [
+        "audit_events_2026_04", "audit_events_2026_05", "audit_events_2026_06",
+        "audit_events_2026_07", "audit_events_2026_08", "audit_events_2026_09",
+        "audit_events_2026_10", "audit_events_2026_11", "audit_events_2026_12",
+        "audit_events_2027_01", "audit_events_2027_02", "audit_events_2027_03",
+        "audit_events_default",
+    ]
 
-    # Immutabilité : REVOKE DELETE/UPDATE sur audit_events parent + partitions
-    # (seul INSERT autorisé → pas de tamper possible)
-    op.execute("REVOKE DELETE, UPDATE ON TABLE audit_events FROM agentive_app")
-    op.execute("REVOKE DELETE, UPDATE ON TABLE audit_events_2026_04 FROM agentive_app")
-    op.execute("REVOKE DELETE, UPDATE ON TABLE audit_events_2026_05 FROM agentive_app")
+    # agentive_audit_admin : INSERT + SELECT sur audit_events parent + partitions (AC6)
+    op.execute("GRANT SELECT, INSERT ON TABLE audit_events TO agentive_audit_admin")
+    for partition in _audit_partitions:
+        op.execute(f"GRANT SELECT, INSERT ON TABLE {partition} TO agentive_audit_admin")
+
+    # agentive_app : REVOKE toute écriture sur audit_events (y compris SELECT).
+    # init.sql applique DEFAULT PRIVILEGES SELECT/INSERT/UPDATE/DELETE pour
+    # agentive_app — on les retire explicitement sur les tables d'audit pour
+    # enforcer la séparation des rôles définie par AC6.
+    op.execute(
+        "REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE audit_events FROM agentive_app"
+    )
+    for partition in _audit_partitions:
+        op.execute(
+            f"REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE {partition} FROM agentive_app"
+        )
+
+    # Immutabilité : REVOKE DELETE/UPDATE pour agentive_audit_admin aussi
+    # (seul INSERT autorisé → pas de tamper possible sur l'audit trail).
+    op.execute("REVOKE DELETE, UPDATE ON TABLE audit_events FROM agentive_audit_admin")
+    for partition in _audit_partitions:
+        op.execute(
+            f"REVOKE DELETE, UPDATE ON TABLE {partition} FROM agentive_audit_admin"
+        )
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 8. Seed data : 1 user owner (John)
@@ -488,10 +549,22 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop everything (reverse order)."""
-    # Drop audit partitions
-    op.execute("DROP TABLE IF EXISTS audit_events_2026_05")
-    op.execute("DROP TABLE IF EXISTS audit_events_2026_04")
+    """Drop everything except the `vector` extension (reverse order).
+
+    Note : on ne DROP PAS l'extension `vector` — elle a été créée par
+    `init.sql` (rôle postgres), et d'autres schémas/schemas applicatifs
+    pourraient en dépendre. Un downgrade ne doit affecter que le schéma
+    applicatif Agentive.
+    """
+    # Drop audit partitions (DEFAULT + 12 mois)
+    for partition in [
+        "audit_events_default",
+        "audit_events_2027_03", "audit_events_2027_02", "audit_events_2027_01",
+        "audit_events_2026_12", "audit_events_2026_11", "audit_events_2026_10",
+        "audit_events_2026_09", "audit_events_2026_08", "audit_events_2026_07",
+        "audit_events_2026_06", "audit_events_2026_05", "audit_events_2026_04",
+    ]:
+        op.execute(f"DROP TABLE IF EXISTS {partition}")
     op.execute("DROP TABLE IF EXISTS audit_events")
 
     # Drop tenant-ready tables
@@ -510,5 +583,7 @@ def downgrade() -> None:
     op.drop_table("sessions")
     op.drop_table("users")
 
-    # Drop extension
-    op.execute("DROP EXTENSION IF EXISTS vector")
+    # NOTE: l'extension `vector` N'EST PAS droppée — elle a été créée par
+    # `init.sql` (rôle superuser postgres) et peut être utilisée par d'autres
+    # schémas. Un downgrade du schéma applicatif ne doit pas toucher aux
+    # extensions database-wide.

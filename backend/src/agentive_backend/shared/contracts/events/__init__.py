@@ -1,6 +1,6 @@
 """Event schemas — published on the event bus.
 
-**Stub Sprint 0** — filled progressively.
+**Stub Sprint 0** — filled progressively starting Story 1.4 (event bus runtime).
 
 Naming convention : `module.entity.action`
     - m2.agent.created
@@ -9,3 +9,10 @@ Naming convention : `module.entity.action`
 """
 
 from __future__ import annotations
+
+
+def describe_event(event_type: str) -> dict[str, object]:
+    """Placeholder — event schema registry implemented Story 1.4."""
+    raise NotImplementedError(
+        "Event schema registry implemented Story 1.4 (event bus runtime)."
+    )
