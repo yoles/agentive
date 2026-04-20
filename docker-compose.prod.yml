@@ -1,14 +1,20 @@
 # Agentive — Docker Compose production overrides
 # Usage : `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
 #
-# Sprint 0 : stub — à compléter avant déploiement prod.
+# Sprint 0 : stub — les stages `prod` backend/frontend ne sont PAS encore
+# définis dans les Dockerfiles. Ce fichier sera complété avant déploiement prod.
+#
 # TODO Sprint 1+ :
-#   - Multi-stage Dockerfile production (backend target=prod, frontend target=prod avec build Vite servi par Caddy)
+#   - Multi-stage Dockerfile production (backend target=prod, frontend target=prod avec build Vite servi par Caddy — le stage `prod` frontend existe déjà, c'est le backend qui reste TODO)
 #   - Caddy ports 80/443 (auto-HTTPS Let's Encrypt)
 #   - Volumes persistants avec backup automatisé
-#   - Healthchecks stricts
-#   - Resource limits (memory/cpu)
 #   - Secrets via SOPS (pas d'env vars en clair)
+#   - Resource limits (memory/cpu)
+#   - Healthchecks stricts
+#
+# IMPORTANT : tant que le fichier est un stub, ne pas l'utiliser en prod. Le
+# `target: prod` backend DÉCLENCHERAIT UNE ERREUR DOCKER BUILD puisque le
+# Dockerfile backend n'a pas encore ce stage. On le commente dans l'attente.
 
 services:
   db:
@@ -21,8 +27,8 @@ services:
           cpus: '2'
 
   backend:
-    build:
-      target: prod
+    # build:
+    #   target: prod  # TODO Sprint 1+ : ajouter stage `prod` à backend/Dockerfile
     ports: !reset []  # Pas d'accès direct, passe par Caddy
     environment:
       LOG_LEVEL: INFO
@@ -34,8 +40,10 @@ services:
 
   frontend:
     build:
-      target: prod
+      target: prod  # frontend/Dockerfile a déjà un stage `prod` (Caddy static)
     ports: !reset []  # Pas d'accès direct, passe par Caddy
+    # Dev-only volumes retirés en prod (images auto-contenues)
+    volumes: !reset []
 
   caddy:
     ports: !reset

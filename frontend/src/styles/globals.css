@@ -1,114 +1,117 @@
 @import "tailwindcss";
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Agentive Design System — CSS Variables (Dark default + Light)
+   Agentive Design System — Tailwind v4 tokens + Dark/Light themes
    Source canonique : _bmad-output/planning-artifacts/ux-design-specification.md § Visual Design Foundation
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Tailwind v4 syntax : color tokens live inside `@theme` so utilities like
+   `bg-background`, `text-foreground`, `border-border`, `ring-ring` are
+   generated as real classes. The CSS variables below use the canonical hex
+   values from UX-DR2 (dark default + light override via `.light` class).
+*/
 
 @theme {
+  /* Radius */
   --radius: 0.5rem; /* 8px */
+
+  /* Font stacks */
   --font-sans: "Geist Sans", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* ─── Color tokens (Dark theme default — see UX-DR2) ─── */
+  --color-background: #09090b; /* neutral-950 */
+  --color-foreground: #fafafa; /* neutral-50  */
+
+  --color-card: #18181b; /* neutral-900 */
+  --color-card-foreground: #fafafa;
+
+  --color-popover: #18181b;
+  --color-popover-foreground: #fafafa;
+
+  --color-muted: #27272a; /* neutral-800 */
+  --color-muted-foreground: #a1a1aa; /* neutral-400 */
+
+  --color-border: #27272a;
+  --color-input: #27272a;
+  --color-ring: #8b5cf6; /* violet-500 */
+
+  --color-primary: #8b5cf6; /* violet-500 accent */
+  --color-primary-foreground: #fafafa;
+
+  --color-secondary: #27272a;
+  --color-secondary-foreground: #fafafa;
+
+  --color-accent: #27272a;
+  --color-accent-foreground: #fafafa;
+
+  --color-destructive: #ef4444; /* red-500 */
+  --color-destructive-foreground: #fafafa;
+
+  /* Semantic status colors — restricted to workflow/agent states (UX-DR3) */
+  --color-status-success: #10b981; /* emerald-500 */
+  --color-status-running: #8b5cf6;
+  --color-status-pending: #71717a; /* neutral-500 */
+  --color-status-warning: #f59e0b; /* amber-500 */
+  --color-status-error: #ef4444;
 }
 
-/* ─── Dark theme (default) ─── */
-:root {
-  --background: 240 10% 3.9%;
-  --foreground: 0 0% 98%;
-
-  --card: 240 10% 9%;
-  --card-foreground: 0 0% 98%;
-
-  --popover: 240 10% 9%;
-  --popover-foreground: 0 0% 98%;
-
-  --muted: 240 4% 15%;
-  --muted-foreground: 240 5% 65%;
-
-  --border: 240 4% 15%;
-  --input: 240 4% 15%;
-  --ring: 262 83% 58%;
-
-  --primary: 262 83% 58%;
-  --primary-foreground: 0 0% 98%;
-
-  --secondary: 240 4% 15%;
-  --secondary-foreground: 0 0% 98%;
-
-  --accent: 240 4% 15%;
-  --accent-foreground: 0 0% 98%;
-
-  --destructive: 0 84% 60%;
-  --destructive-foreground: 0 0% 98%;
-
-  --status-success: 160 84% 39%;
-  --status-running: 262 83% 58%;
-  --status-pending: 240 5% 45%;
-  --status-warning: 38 92% 50%;
-  --status-error: 0 84% 60%;
-}
-
-/* ─── Light theme ─── */
+/* ─── Light theme override ─── */
 .light {
-  --background: 0 0% 100%;
-  --foreground: 240 10% 3.9%;
+  --color-background: #ffffff;
+  --color-foreground: #09090b;
 
-  --card: 0 0% 98%;
-  --card-foreground: 240 10% 3.9%;
+  --color-card: #fafafa;
+  --color-card-foreground: #09090b;
 
-  --popover: 0 0% 100%;
-  --popover-foreground: 240 10% 3.9%;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #09090b;
 
-  --muted: 240 5% 96%;
-  --muted-foreground: 240 4% 46%;
+  --color-muted: #f4f4f5; /* neutral-100 */
+  --color-muted-foreground: #71717a; /* neutral-500 */
 
-  --border: 240 6% 90%;
-  --input: 240 6% 90%;
-  --ring: 262 83% 58%;
+  --color-border: #e4e4e7; /* neutral-200 */
+  --color-input: #e4e4e7;
 
-  --primary: 262 83% 58%;
-  --primary-foreground: 0 0% 100%;
+  --color-primary-foreground: #ffffff;
 
-  --secondary: 240 5% 96%;
-  --secondary-foreground: 240 10% 3.9%;
+  --color-secondary: #f4f4f5;
+  --color-secondary-foreground: #09090b;
 
-  --accent: 240 5% 96%;
-  --accent-foreground: 240 10% 3.9%;
+  --color-accent: #f4f4f5;
+  --color-accent-foreground: #09090b;
 
-  --destructive: 0 72% 51%;
-  --destructive-foreground: 0 0% 100%;
+  --color-destructive: #dc2626; /* red-600 */
+  --color-destructive-foreground: #ffffff;
 
-  --status-success: 160 84% 34%;
-  --status-running: 262 83% 58%;
-  --status-pending: 240 5% 45%;
-  --status-warning: 25 94% 43%;
-  --status-error: 0 72% 51%;
+  --color-status-success: #059669; /* emerald-600 */
+  --color-status-warning: #d97706; /* amber-600 */
+  --color-status-error: #dc2626;
 }
 
 /* ─── Base styles ─── */
 @layer base {
-  * {
-    border-color: hsl(var(--border));
-  }
-
   html {
     color-scheme: dark light;
   }
 
   body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
+    background-color: var(--color-background);
+    color: var(--color-foreground);
     font-family: var(--font-sans);
+    /* Tabular numbers par défaut pour métriques & timestamps (UX-DR4) */
     font-feature-settings: "tnum";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
 
+  /* Focus visible — ring violet 2px + offset 2px (UX-DR37) */
   :focus-visible {
-    outline: 2px solid hsl(var(--ring));
+    outline: 2px solid var(--color-ring);
     outline-offset: 2px;
   }
 
+  /* `prefers-reduced-motion` (UX-DR41) */
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,

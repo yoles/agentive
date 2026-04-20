@@ -5,11 +5,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Sprint 0 : stub — activer en Sprint 1+ avec cyclonedx-py + npm audit
+# Least-privilege : stub has no permissions. When implemented Sprint 1+,
+# will require `contents: read` (+ `security-events: write` if publishing SARIF).
+permissions: {}
+
 jobs:
   sbom-stub:
     name: SBOM (stub)
     runs-on: ubuntu-latest
     steps:
       - name: Placeholder
-        run: echo "SBOM generation — activé Sprint 1+"
+        run: echo "SBOM generation — activated Sprint 1+ (cyclonedx-py + npm audit)"

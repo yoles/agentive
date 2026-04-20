@@ -39,7 +39,10 @@ export function Sidebar() {
       </div>
       <nav className="flex flex-col gap-1 px-3" aria-label="Espaces">
         {spaces.map(({ to, label, shortcut, Icon }) => {
-          const isActive = location.pathname.startsWith(to);
+          // Match `/chat` and `/chat/...` (route segment) but NOT `/chat-history`.
+          const isActive =
+            location.pathname === to ||
+            location.pathname.startsWith(`${to}/`);
           return (
             <Link
               key={to}

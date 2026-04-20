@@ -1,71 +1,86 @@
 # Caddy dev config — self-signed certificates, ports 8080/8443 exposés
+#
 # Reverse proxy :
-#   - `/api/*` → backend:8000
-#   - `/*`     → frontend:5173 (Vite HMR)
+#   - `/api/*` (+ /api exact match) → backend:8000
+#   - `/sse/*` → backend:8000 (SSE-tuned)
+#   - /health, /ready → backend:8000
+#   - `/*` → frontend:5173 (Vite HMR WebSocket tunneled)
+#
+# SECURITY NOTES (dev-only posture) :
+#   - HSTS INTENTIONALLY NOT EMITTED on dev self-signed localhost (poisons browser
+#     cache for any other app on localhost). HSTS is only served from the prod
+#     Caddyfile with a real domain + Let's Encrypt.
+#   - CSP is strict by default, but script-src + style-src allow 'unsafe-inline'
+#     + 'unsafe-eval' ONLY in dev because Vite HMR injects inline scripts. A
+#     production CSP with nonces + no unsafe-* is in `Caddyfile` (prod).
+#   - CORS headers apply to EVERY API response (not just OPTIONS preflight) so
+#     browsers actually accept cross-origin responses when someone talks to :8443
+#     from :5173 directly (rare — usually everything is same-origin).
 
 {
-    # Auto-HTTPS via CA interne Caddy pour dev
     local_certs
-    # Admin API désactivée
     admin off
-    # Désactive les redirects HTTP→HTTPS automatiques de Caddy qui utilisent
-    # le port canonique 443 au lieu de notre port dev 8443 mappé sur l'hôte.
-    # Le bloc `:80 { ... }` en bas de fichier gère le redirect manuellement.
     auto_https disable_redirects
 }
 
-# HTTPS listener pour `localhost` (Caddy génère un cert self-signed localement)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HTTPS on localhost (mapped to host port 8443 by docker-compose)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 localhost {
     tls internal
 
-    # Security headers (OWASP baseline)
+    # ─── Global security headers (NO HSTS on localhost) ───
     header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
         Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: ws: wss:; font-src 'self' data:; frame-ancestors 'none'"
+        # CSP — dev-specific. Vite inlines scripts during HMR; production
+        # Caddyfile uses nonces + no unsafe-inline.
+        # `connect-src 'self' ws: wss:` allows Vite HMR WebSocket + API same-origin.
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self' data:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         Permissions-Policy "geolocation=(), microphone=(), camera=()"
         -Server
     }
 
-    # CORS preflight
-    @cors_preflight {
-        method OPTIONS
+    # ─── CORS — apply to EVERY response on /api, /sse, /health, /ready ───
+    # We intentionally hard-code `http://localhost:5173` as the only allowed
+    # origin ; cross-origin from any other host is rejected by the browser.
+    @api_like {
+        path /api/* /api /sse/* /health /ready
     }
-    handle @cors_preflight {
-        header Access-Control-Allow-Origin "http://localhost:5173"
-        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        header Access-Control-Allow-Headers "Authorization, Content-Type, X-Correlation-ID"
-        header Access-Control-Max-Age "3600"
-        respond 204
-    }
+    handle @api_like {
+        header {
+            Access-Control-Allow-Origin "http://localhost:5173"
+            Access-Control-Allow-Credentials "true"
+            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            Access-Control-Allow-Headers "Authorization, Content-Type, X-Correlation-ID, Accept, Accept-Language"
+            Access-Control-Expose-Headers "X-Correlation-ID"
+            Access-Control-Max-Age "3600"
+            Vary "Origin"
+        }
+        # Preflight short-circuit — return 204 immediately for OPTIONS.
+        @preflight method OPTIONS
+        respond @preflight 204
 
-    # Backend API routes
-    handle /api/* {
+        # SSE endpoint (streaming)
+        @sse path /sse/*
+        reverse_proxy @sse backend:8000 {
+            flush_interval -1
+            header_up Connection ""
+            transport http {
+                read_timeout 24h
+                write_timeout 24h
+            }
+        }
+
+        # API + health + ready → backend
         reverse_proxy backend:8000 {
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
         }
     }
 
-    # SSE endpoint — streaming-friendly
-    handle /sse/* {
-        reverse_proxy backend:8000 {
-            flush_interval -1
-            header_up Connection ""
-        }
-    }
-
-    # Health / Ready
-    handle /health {
-        reverse_proxy backend:8000
-    }
-    handle /ready {
-        reverse_proxy backend:8000
-    }
-
-    # Frontend (Vite dev server avec HMR via WebSocket)
+    # ─── Frontend (Vite dev server with HMR via WebSocket) ───
     handle {
         reverse_proxy frontend:5173 {
             header_up Host {host}
@@ -80,9 +95,13 @@ localhost {
     }
 }
 
-# HTTP listener → redirect vers HTTPS (port 8443 explicite pour dev)
-# Note : en dev, on accède principalement via https://localhost:8443 directement.
-# Cette route est un convenience redirect pour les utilisateurs qui tapent http://localhost:8080.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HTTP :80 → HTTPS :8443 redirect (dev convenience)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# We redirect to the literal dev port (8443) because running behind another
+# reverse proxy (codespaces, ngrok) would need a different override — change
+# here OR set `auto_https disable_redirects` + remove this block and access
+# https://localhost:8443 directly.
 :80 {
     redir https://localhost:8443{uri} 308
 }

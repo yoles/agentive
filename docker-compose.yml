@@ -1,23 +1,32 @@
 # Agentive — Docker Compose (dev stack)
 # Ports dev : Caddy 8080/8443 (prod : 80/443 via docker-compose.prod.yml)
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚠️  Toutes les variables `POSTGRES_*_PASSWORD`, `AGENTIVE_API_TOKEN`,
+# `AGENTIVE_ENCRYPTION_KEY` sont REQUIRED — il n'y a pas de defaults
+# intentionnellement. `docker compose up` échouera explicitement si `.env`
+# n'est pas présent (preferable à un boot silencieux avec creds faibles).
+# → `cp .env.example .env && $EDITOR .env` avant `make up`.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 services:
 
   # ─── Postgres 17 + pgvector (image officielle) ───
   db:
     image: pgvector/pgvector:pg17
-    container_name: agentive-db
     restart: unless-stopped
     environment:
+      # Superuser `postgres` : password dédié, PAS aliasé au password applicatif
+      # (séparation des rôles — superuser leak ne doit pas compromettre agentive_owner).
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-change_me_owner_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD required (cp .env.example .env)}
       POSTGRES_DB: agentive
-      # Passwords pour les rôles app/audit_admin/owner (consommés par init.sql)
-      POSTGRES_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-change_me_owner_dev}
-      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-change_me_app_dev}
-      POSTGRES_AUDIT_ADMIN_PASSWORD: ${POSTGRES_AUDIT_ADMIN_PASSWORD:-change_me_audit_dev}
+      # Passwords pour les 3 rôles applicatifs (consommés par init.sql via PGOPTIONS).
+      POSTGRES_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?required}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?required}
+      POSTGRES_AUDIT_ADMIN_PASSWORD: ${POSTGRES_AUDIT_ADMIN_PASSWORD:?required}
     ports:
-      - "127.0.0.1:5432:5432"  # Bind localhost only
+      - "127.0.0.1:5432:5432"  # Bind localhost only — dev debug access only
     volumes:
       - agentive_db_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -28,7 +37,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-      start_period: 10s
+      start_period: 15s
     networks:
       - agentive-net
 
@@ -38,22 +47,26 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       target: dev
-    container_name: agentive-backend
     restart: unless-stopped
     environment:
       PYTHONUNBUFFERED: "1"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:-change_me_dev_token}
-      AGENTIVE_ENCRYPTION_KEY: ${AGENTIVE_ENCRYPTION_KEY:-change_me_fernet_key}
-      DATABASE_URL: "postgresql+psycopg://agentive_app:${POSTGRES_APP_PASSWORD:-change_me_app_dev}@db:5432/agentive"
-      DATABASE_URL_OWNER: "postgresql+psycopg://agentive_owner:${POSTGRES_OWNER_PASSWORD:-change_me_owner_dev}@db:5432/agentive"
+      AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:?required}
+      AGENTIVE_ENCRYPTION_KEY: ${AGENTIVE_ENCRYPTION_KEY:?required}
+      # URLs construites via Pydantic Settings côté app (url-encoded) — ici on
+      # passe uniquement les composants et le password sera URL-encodé par la lib.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: agentive
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?required}
+      POSTGRES_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?required}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8000:8000"  # Localhost-only — all external traffic via Caddy
     volumes:
       - ./backend:/app
       - backend_venv:/app/.venv
@@ -61,8 +74,10 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
       interval: 10s
       timeout: 3s
-      retries: 5
-      start_period: 30s
+      retries: 6
+      # 60s tolère un cold start : uv sync (si venv vide), uvicorn boot, première
+      # connection DB. Acceptable vs NFR4 "stack healthy < 60s" car db déjà healthy.
+      start_period: 60s
     networks:
       - agentive-net
 
@@ -72,16 +87,17 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       target: dev
-    container_name: agentive-frontend
     restart: unless-stopped
     environment:
       NODE_ENV: development
-      VITE_API_URL: http://localhost:8000
-      VITE_AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:-change_me_dev_token}
+      # API base RELATIVE — client calls `/api/v1/...` via Caddy same-origin.
+      # NEVER put secrets in VITE_* (inlined into client bundle, PUBLIC).
+      VITE_API_BASE: ""
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:5173:5173"  # Localhost-only — external via Caddy
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -89,15 +105,15 @@ services:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173/"]
       interval: 10s
       timeout: 3s
-      retries: 5
-      start_period: 30s
+      retries: 6
+      # 60s tolère npm install (si node_modules volume vide) + Vite cold start.
+      start_period: 60s
     networks:
       - agentive-net
 
   # ─── Caddy reverse proxy (ports dev 8080/8443) ───
   caddy:
     image: caddy:2-alpine
-    container_name: agentive-caddy
     restart: unless-stopped
     ports:
       - "${CADDY_DEV_HTTP_PORT:-8080}:80"
@@ -107,15 +123,17 @@ services:
       - agentive_caddy_data:/data
       - agentive_caddy_config:/config
     depends_on:
-      - backend
-      - frontend
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
     healthcheck:
-      # TCP port 80 accepté = Caddy alive (no HTTP parsing — plus robuste vs BusyBox)
+      # TCP :80 open = Caddy process alive (HTTP parsing via BusyBox wget foireux avec TLS self-signed).
       test: ["CMD-SHELL", "nc -z 127.0.0.1 80 || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 15s
     networks:
       - agentive-net
 
