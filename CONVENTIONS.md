@@ -1,0 +1,46 @@
+# Conventions de développement Agentive
+
+> **Ce fichier est un résumé.** La source canonique complète des conventions est [`_bmad-output/planning-artifacts/architecture.md`](./_bmad-output/planning-artifacts/architecture.md) (sections "Implementation Patterns & Consistency Rules" et "AI Agent Guidelines").
+
+## Les 10 règles d'or (architecture.md lignes 2200-2215)
+
+1. **Suivre toutes les décisions architecturales documentées** — ne pas en dévier sans ouvrir un ADR dans `docs/decisions/`.
+2. **Conventions de nommage** : `snake_case` (Python / DB / JSON), `camelCase` (TypeScript), `PascalCase` (classes / components / types).
+3. **Communication inter-features** uniquement via bus d'événements (`shared.event_bus`) ou contrats partagés (`shared.contracts`). Jamais d'import direct d'un module feature vers un autre.
+4. **Accès DB uniquement** via `shared.repositories.*` — jamais d'`AsyncSession`/`asyncpg` directs dans le code applicatif (acceptable uniquement dans `infra/db/`).
+5. **Configuration uniquement** via `shared.config.settings` — jamais `os.environ` direct.
+6. **Toute nouvelle feature** suit la structure type :
+   - Frontend : `components/ + hooks/ + services/ + store/ + types/ + utils/ + index.ts` (barrel public API)
+   - Backend : `service.py + schemas.py + events.py + tests/ + __init__.py` (barrel public API)
+7. **Imports via barrel** : `from features.m3_workflow_engine import WorkflowEngine` ✅, jamais d'imports profonds (`from features.m3_workflow_engine.engine.internal import ...` ❌).
+8. **Tous les inputs externes** (user input, tool output) wrappés dans `<user_input>...</user_input>` ou `<tool_output>...</tool_output>` avant tout appel LLM (défense contre prompt injection).
+9. **Correlation ID** (UUID v7 / ULID) propagé dans tous les logs et events.
+10. **Tenant ID** présent dans tous les nouveaux endpoints, queries, logs, métriques (NULL acceptable MVP, prêt pour Growth multi-tenant).
+
+## Docker-first
+
+- **Aucun runtime sur l'hôte** : Python, Node, uv, etc. tournent exclusivement dans des containers.
+- **Makefile racine** = point d'entrée pour toute commande dev (`make dev`, `make test`, `make lint`, `make migrate`, ...).
+- **Init des projets via containers éphémères** : `docker run --rm -v $(PWD):/workspace -w /workspace <image>` pour `npm create vite`, `uv init`, etc.
+- **Versions latest stable** pinnées via tags Docker (`python:3.14-slim`, `node:24-alpine`, `pgvector/pgvector:pg17`, `caddy:2-alpine`).
+
+## Structure des dossiers (résumé)
+
+```
+backend/src/
+├── app/          # Bootstrap FastAPI (main, lifespan, middleware setup)
+├── features/     # M1-M12 (isolées, communication via event bus uniquement)
+├── shared/       # Transverse (config, repositories, event_bus, llm, auth, logging, metrics, contracts, exceptions)
+└── infra/        # Adapters (db/session.py, db/models.py, llm/*_adapter.py, mcp/client.py, mcp/sandbox.py)
+
+frontend/src/
+├── app/          # Bootstrap + routes file-based (4 espaces : dashboard, chat, trace, config)
+├── features/     # Espaces métier (dashboard, chat, trace, config, playground, command-palette, theme, auth)
+└── shared/       # Composants UI (shadcn primitives + layouts) + hooks + api + lib + types
+```
+
+## Enforcement
+
+- `.import-linter` (backend) : configure les boundaries entre `shared/`, `features/`, `infra/`. CI bloque les violations.
+- `eslint-plugin-boundaries` (frontend) : équivalent pour React/TS.
+- `pre-commit` : `gitleaks` + `ruff` + `eslint` bloquent les commits non-conformes.

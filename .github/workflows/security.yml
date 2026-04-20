@@ -1,0 +1,17 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Lundi 06:00 UTC
+  workflow_dispatch:
+
+# Sprint 0 : stub — activer en Sprint 1+ avec dependabot, trivy, etc.
+jobs:
+  security-stub:
+    name: Security scan (stub)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Dependency vulnerability scanning — activé Sprint 1+"

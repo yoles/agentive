@@ -1,0 +1,13 @@
+# SOPS config — Agentive
+# Utilisé par `sops` (via Docker) pour chiffrer `.env.encrypted`
+# Reference : https://github.com/getsops/sops
+
+creation_rules:
+  - path_regex: \.env\.encrypted$
+    encrypted_regex: '^(.*_KEY|.*_PASSWORD|.*_TOKEN|.*_SECRET|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOYAGE_API_KEY|DATABASE_URL.*)$'
+    # La clé age publique doit être ajoutée ci-dessous après `age-keygen`
+    # age:
+    #   - age1...
+  - path_regex: \.enc\.yaml$
+    # age:
+    #   - age1...

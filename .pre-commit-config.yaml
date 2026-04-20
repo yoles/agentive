@@ -1,0 +1,61 @@
+# Pre-commit hooks — tous exécutés dans des containers Docker
+# Aucun runtime n'est installé sur l'hôte
+# Installation : `make precommit-install`
+
+# Note : pre-commit lui-même (le runner) est exécuté via l'image
+# ghcr.io/pre-commit/pre-commit:latest si l'utilisateur n'a pas pre-commit
+# sur son host. Voir `infra/scripts/pre-commit.sh` (installé comme git hook).
+
+minimum_pre_commit_version: "3.0.0"
+
+default_stages: [pre-commit]
+
+repos:
+  # ─── Secrets detection (gitleaks via Docker) ───
+  - repo: local
+    hooks:
+      - id: gitleaks-docker
+        name: gitleaks (via Docker)
+        language: system
+        entry: bash infra/scripts/hooks/gitleaks.sh
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+  # ─── Python : ruff (lint + format) via Docker ───
+  - repo: local
+    hooks:
+      - id: ruff-check-docker
+        name: ruff check (via Docker)
+        language: system
+        entry: bash infra/scripts/hooks/ruff-check.sh
+        files: ^backend/.*\.py$
+        pass_filenames: false
+      - id: ruff-format-docker
+        name: ruff format (via Docker)
+        language: system
+        entry: bash infra/scripts/hooks/ruff-format.sh
+        files: ^backend/.*\.py$
+        pass_filenames: false
+
+  # ─── Frontend : eslint via Docker ───
+  - repo: local
+    hooks:
+      - id: eslint-docker
+        name: eslint (via Docker)
+        language: system
+        entry: bash infra/scripts/hooks/eslint.sh
+        files: ^frontend/.*\.(ts|tsx|js|jsx)$
+        pass_filenames: false
+
+  # ─── Generic file checks (offline, no Docker needed) ───
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: check-merge-conflict
+      - id: detect-private-key

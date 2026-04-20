@@ -1,0 +1,15 @@
+name: SBOM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Sprint 0 : stub — activer en Sprint 1+ avec cyclonedx-py + npm audit
+jobs:
+  sbom-stub:
+    name: SBOM (stub)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "SBOM generation — activé Sprint 1+"
