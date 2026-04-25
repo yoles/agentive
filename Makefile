@@ -290,9 +290,58 @@ gitleaks: ## Scan gitleaks sur le repo
 bench: ## Exécute les benchmarks M4 pgvector (Story 1.3)
 	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_m4
 
+# ━━━ Spike M3 LangGraph (Story 1.2 — gating critique #1) ━━━
+# Le spike valide 3 piliers sur LangGraph 1.1.8 : checkpointing Postgres natif,
+# scatter-gather, human-in-the-loop. Code isolé dans backend/spike/ — sera réécrit
+# proprement dans features/m3_workflow_engine/ à l'Epic 4 selon le verdict de
+# docs/decisions/m3-spike-result.md.
+
 .PHONY: spike-m3
-spike-m3: ## Exécute le spike M3 LangGraph (Story 1.2)
+spike-m3: up ## Spike M3 — workflow basique (Producer → QualityGate → Reviewer), MockLLM auto si pas de clé Anthropic
 	$(DC_DEV) run --rm backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-mock
+spike-m3-mock: up ## Spike M3 — force MockLLM (ignore ANTHROPIC_API_KEY)
+	$(DC_DEV) run --rm -e ANTHROPIC_API_KEY="" backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-real
+spike-m3-real: up ## Spike M3 — force Anthropic réel (échoue si ANTHROPIC_API_KEY absent)
+	@if [ -z "$$ANTHROPIC_API_KEY" ]; then \
+		echo "❌ ANTHROPIC_API_KEY absent — exporter la clé dans le shell avant cette cible"; \
+		echo "   (sinon utiliser make spike-m3-mock pour forcer MockLLM)"; \
+		exit 1; \
+	fi
+	$(DC_DEV) run --rm -e ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-crash
+spike-m3-crash: up ## Spike M3 — crash post-producer (kill -9), persiste thread_id pour resume
+	$(DC_DEV) run --rm -e CRASH_AFTER=producer backend uv run python -m spike.m3_langgraph || true
+	@if [ -f "$(WORKDIR)/backend/.spike-thread-id" ]; then \
+		echo "✅ thread_id persisté : $$(cat $(WORKDIR)/backend/.spike-thread-id)"; \
+		echo "   → relance via : make spike-m3-resume"; \
+	else \
+		echo "❌ pas de .spike-thread-id — le crash n'a peut-être pas eu lieu"; exit 1; \
+	fi
+
+.PHONY: spike-m3-resume
+spike-m3-resume: up ## Spike M3 — reprise sur le thread_id écrit par spike-m3-crash
+	@test -f "$(WORKDIR)/backend/.spike-thread-id" || { echo "❌ backend/.spike-thread-id absent — exécuter make spike-m3-crash d'abord"; exit 1; }
+	@TID="$$(cat $(WORKDIR)/backend/.spike-thread-id)"; \
+	 echo "▶️  Resume thread_id=$$TID"; \
+	 $(DC_DEV) run --rm -e SPIKE_RESUME_THREAD_ID=$$TID backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-scatter
+spike-m3-scatter: up ## Spike M3 — scatter-gather (3 summarizers en parallèle via Send)
+	$(DC_DEV) run --rm backend uv run python -m spike.m3_scatter_gather
+
+.PHONY: spike-m3-inspect
+spike-m3-inspect: up ## Spike M3 — inspecte le checkpoint Postgres pour un thread_id (THREAD_ID=<uuid>)
+	@test -n "$(THREAD_ID)" || { echo "❌ THREAD_ID requis — usage: make spike-m3-inspect THREAD_ID=<uuid>"; exit 1; }
+	$(DC_DEV) run --rm backend uv run python -m spike.inspect_checkpoint "$(THREAD_ID)"
+
+.PHONY: spike-m3-test
+spike-m3-test: up ## Spike M3 — exécute uniquement les tests pytest tests/spike/
+	$(DC_DEV) run --rm backend uv run pytest tests/spike/ -v
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STAGING (observe-only wrappers — le deploy réel passe par GitHub Actions)

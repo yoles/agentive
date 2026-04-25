@@ -15,7 +15,15 @@ dependencies = [
     # "fastembed>=0.3",
     "langchain-anthropic>=1.4.1",
     "langchain-openai>=1.1.14",
-    "langgraph>=1.1.8",
+    # ━━━ LangGraph version policy (Story 1.2 / Architecture G3) ━━━
+    # Pinning STRICT obligatoire : toute mise à jour majeure (1.x → 2.x) ou tout
+    # breaking change documenté CHANGELOG REQUIERT de relancer le spike Story 1.2
+    # (`make spike-m3 && pytest tests/spike/`) et de mettre à jour
+    # `docs/decisions/m3-spike-result.md` AVANT merge.
+    # Validation : 3 piliers (checkpoint Postgres, scatter-gather, HITL) restent
+    # fonctionnels après l'upgrade.
+    "langgraph==1.1.8",
+    "langgraph-checkpoint-postgres>=3.0.4",
     "mcp>=1.27.0",
     "pgvector>=0.4.2",
     "psycopg[binary]>=3.2",
@@ -89,6 +97,15 @@ warn_return_any = true
 module = "tests.*"
 strict = false
 disallow_untyped_defs = false
+
+# `spike/` contient du code de validation isolé (Story 1.2). Il sera réécrit
+# proprement dans `features/m3_workflow_engine/` à l'Epic 4 — jusque là, on
+# relâche mypy sur les retours de LangGraph (`StateGraph.compile()` retourne un
+# type interne complexe qu'il n'est pas utile de propager dans les signatures
+# du spike). Les tests `tests/spike/` valident la correction d'exécution.
+[[tool.mypy.overrides]]
+module = ["spike", "spike.*"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/agentive_backend"]

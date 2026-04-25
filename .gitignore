@@ -12,6 +12,10 @@
 !.env.staging.example
 !.env.encrypted
 
+# Spike M3 (Story 1.2) — thread_id transient file for crash/resume tests
+.spike-thread-id
+backend/.spike-thread-id
+
 # SOPS + age — private keys only (public keys *.pub / recipients are safe to commit)
 age.key
 *.age.key
