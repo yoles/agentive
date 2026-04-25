@@ -1,0 +1,104 @@
+# Agentive — Docker Compose staging overrides
+# Déployé sur le serveur idem-agency derrière Traefik v3.6 (déployé depuis
+# le repo séparé infrastructure_idem_helper/).
+#
+# Usage serveur :
+#   docker compose -f docker-compose.yml -f docker-compose.staging.yml \
+#     --env-file .env.staging -p agentive-staging up -d
+#
+# Différences vs dev :
+#   - `db` : pas de port exposé, resource limits
+#   - `backend` : target=prod, attaché à traefik_network + agentive-net, labels Traefik
+#   - `frontend` : target=prod (Caddy statique interne sur :80), attaché à traefik_network
+#   - `caddy` dev : désactivé (Traefik idem fait le reverse proxy + SSL)
+#
+# Préreq serveur :
+#   - `traefik_network` existe (créé par infrastructure_idem_helper)
+#   - DNS A `staging.agentive.idem-agency.fr` → IP serveur
+#   - `.env.staging` présent à la racine du deploy
+
+services:
+  db:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+
+  backend:
+    build:
+      target: prod
+    ports: !reset []
+    environment:
+      AGENTIVE_CORS_ALLOW_ORIGINS: ${AGENTIVE_CORS_ALLOW_ORIGINS}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+    volumes: !reset []
+    networks:
+      - agentive-net
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik_network"
+
+      # ─── Router HTTPS (API + SSE + health/ready) ───
+      - "traefik.http.routers.agentive-backend.rule=Host(`${STAGING_HOST}`) && (PathPrefix(`/api`) || PathPrefix(`/sse`) || Path(`/health`) || Path(`/ready`))"
+      - "traefik.http.routers.agentive-backend.entrypoints=websecure"
+      - "traefik.http.routers.agentive-backend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.agentive-backend.priority=100"
+      - "traefik.http.routers.agentive-backend.middlewares=security-headers@docker,rate-limit-api@docker"
+      - "traefik.http.services.agentive-backend.loadbalancer.server.port=8000"
+
+      # ─── Router HTTP jumeau (redirect → HTTPS) ───
+      - "traefik.http.routers.agentive-backend-http.rule=Host(`${STAGING_HOST}`) && (PathPrefix(`/api`) || PathPrefix(`/sse`) || Path(`/health`) || Path(`/ready`))"
+      - "traefik.http.routers.agentive-backend-http.entrypoints=web"
+      - "traefik.http.routers.agentive-backend-http.middlewares=agentive-redirect-to-https"
+      - "traefik.http.routers.agentive-backend-http.priority=100"
+
+      # ─── Middleware redirect (défini une fois, réutilisé par les 2 routers HTTP) ───
+      - "traefik.http.middlewares.agentive-redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.agentive-redirect-to-https.redirectscheme.permanent=true"
+
+  frontend:
+    build:
+      target: prod
+    ports: !reset []
+    volumes: !reset []
+    # Le healthcheck base teste :5173 (Vite dev). En prod l'image = Caddy alpine sur :80
+    # avec son propre HEALTHCHECK défini dans le Dockerfile (frontend/Dockerfile:75-76).
+    # `!reset null` retire l'override compose → Docker utilise le HEALTHCHECK Dockerfile.
+    healthcheck: !reset null
+    # depends_on base (backend healthy) conservé : assure l'ordre db → backend → frontend.
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik_network"
+
+      # ─── Router HTTPS (catch-all sur le host) ───
+      - "traefik.http.routers.agentive-frontend.rule=Host(`${STAGING_HOST}`)"
+      - "traefik.http.routers.agentive-frontend.entrypoints=websecure"
+      - "traefik.http.routers.agentive-frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.agentive-frontend.priority=10"
+      # Pas de `security-headers@docker` : l'image Caddy interne (frontend/Dockerfile stage prod)
+      # émet déjà HSTS/X-Frame/etc. Ajouter les headers Traefik ferait double-emit.
+      - "traefik.http.routers.agentive-frontend.middlewares=rate-limit@docker"
+      - "traefik.http.services.agentive-frontend.loadbalancer.server.port=80"
+
+      # ─── Router HTTP jumeau (redirect → HTTPS) ───
+      - "traefik.http.routers.agentive-frontend-http.rule=Host(`${STAGING_HOST}`)"
+      - "traefik.http.routers.agentive-frontend-http.entrypoints=web"
+      - "traefik.http.routers.agentive-frontend-http.middlewares=agentive-redirect-to-https"
+      - "traefik.http.routers.agentive-frontend-http.priority=10"
+
+  # Caddy dev : désactivé en staging (Traefik idem remplace ce rôle).
+  # `profiles: ["never"]` — ne démarre jamais en deploy staging (pas de `--profile never`).
+  caddy:
+    profiles:
+      - never
+
+networks:
+  agentive-net:
+    driver: bridge
+  traefik_network:
+    external: true
