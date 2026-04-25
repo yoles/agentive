@@ -39,6 +39,11 @@ frontend/src/
 └── shared/       # Composants UI (shadcn primitives + layouts) + hooks + api + lib + types
 ```
 
+## Versioning critique
+
+- **`langgraph` est pinné strictement** dans `backend/pyproject.toml` (`==1.1.8`, pas `>=` ni `~=`). Toute upgrade majeure (1.x → 2.x) ou tout breaking change documenté dans le CHANGELOG LangGraph **DOIT** déclencher la re-exécution du spike Story 1.2 (`make spike-m3 && docker compose run --rm backend uv run pytest tests/spike/`) et la mise à jour de [`docs/decisions/m3-spike-result.md`](./docs/decisions/m3-spike-result.md) **avant** le merge. Référence : Architecture G3 (lignes 2068-2072), Story 1.2 AC7.
+- Critères de re-validation : checkpointing Postgres, scatter-gather (`Send` + reducer `operator.add`), human-in-the-loop (`interrupt` / `Command(resume=...)`) restent fonctionnels.
+
 ## Enforcement
 
 - `.import-linter` (backend) : configure les boundaries entre `shared/`, `features/`, `infra/`. CI bloque les violations.
