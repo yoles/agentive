@@ -295,6 +295,26 @@ spike-m3: ## Exécute le spike M3 LangGraph (Story 1.2)
 	$(DC_DEV) run --rm backend uv run python -m spike.m3_langgraph
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGING (observe-only wrappers — le deploy réel passe par GitHub Actions)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Le workflow .github/workflows/deploy-staging.yml est la seule source de vérité
+# pour déployer. Ces cibles servent uniquement à consulter l'état staging depuis
+# une machine locale. Nécessite DEPLOY_USER + DEPLOY_HOST dans l'env shell.
+
+STAGING_COMPOSE := docker compose -f docker-compose.yml -f docker-compose.staging.yml -p agentive-staging
+STAGING_REMOTE := /opt/app/agentive-staging
+
+.PHONY: staging-logs
+staging-logs: ## Stream des logs staging via SSH (tail 100)
+	@test -n "$(DEPLOY_USER)" -a -n "$(DEPLOY_HOST)" || { echo "❌ DEPLOY_USER et DEPLOY_HOST requis"; exit 1; }
+	ssh $(DEPLOY_USER)@$(DEPLOY_HOST) 'cd $(STAGING_REMOTE) && $(STAGING_COMPOSE) logs -f --tail=100'
+
+.PHONY: staging-ps
+staging-ps: ## Statut des services staging via SSH
+	@test -n "$(DEPLOY_USER)" -a -n "$(DEPLOY_HOST)" || { echo "❌ DEPLOY_USER et DEPLOY_HOST requis"; exit 1; }
+	ssh $(DEPLOY_USER)@$(DEPLOY_HOST) 'cd $(STAGING_REMOTE) && $(STAGING_COMPOSE) ps'
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MISC
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

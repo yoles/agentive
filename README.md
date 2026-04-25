@@ -148,6 +148,27 @@ Pour prod, chiffrer `.env` avec SOPS + age (voir `docs/runbooks/rotate-secrets.m
 - Lint : `make lint` (ruff + eslint + jsx-a11y + tsc --noEmit)
 - CI : GitHub Actions (`.github/workflows/ci.yml`) — tout via Docker
 
+## 🚢 Déploiement staging
+
+Staging tourne sur `https://staging.agentive.idem-agency.fr`, derrière **Traefik**
+déployé indépendamment depuis le repo `infrastructure_idem_helper/` (reverse
+proxy + SSL Let's Encrypt auto).
+
+- **Trigger** : push sur `main` ou manuel (`workflow_dispatch`) → `.github/workflows/deploy-staging.yml`
+- **Mécanique** : `git archive HEAD` → SSH → `docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d` + `alembic upgrade head` + smoke tests
+- **Observation locale** : `make staging-logs` / `make staging-ps` (requiert `DEPLOY_USER` + `DEPLOY_HOST` dans l'env)
+- **Rollback** : `git revert <sha> && git push` (re-déclenche le workflow)
+
+### Prérequis (hors repo, one-time)
+
+1. DNS A-record `staging.agentive.idem-agency.fr` → IP du serveur idem **(avant le premier deploy, sinon Let's Encrypt HTTP-01 échoue)**.
+2. Sur le serveur : Traefik + `traefik_network` déployés via `infrastructure_idem_helper/`, user `deploy` dans le groupe `docker`, `mkdir -p /opt/app/agentive-staging && chown deploy:deploy /opt/app/agentive-staging`.
+3. GitHub repo → Settings → Environments → créer `staging` et ajouter les secrets :
+   - `SSH_PRIVATE_KEY` — clé privée OpenSSH raw (pas de base64)
+   - `DEPLOY_HOST` — hostname ou IP du serveur idem
+   - `DEPLOY_USER` — user SSH (ex: `deploy`)
+   - `STAGING_ENV_FILE` — contenu multi-ligne complet du `.env.staging` (voir `.env.staging.example` pour le template)
+
 ## 📦 License
 
 TBD (MIT envisagé pour le MVP)

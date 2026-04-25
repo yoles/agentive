@@ -7,7 +7,9 @@
 .env.dev
 .env.prod
 .env.production
+.env.staging
 !.env.example
+!.env.staging.example
 !.env.encrypted
 
 # SOPS + age — private keys only (public keys *.pub / recipients are safe to commit)
@@ -147,3 +149,8 @@ lerna-debug.log*
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 /spike_output/
 /benchmark_results/
+
+
+
+infrastructure/
+infrastructure_idem_helper/
