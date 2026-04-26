@@ -38,74 +38,74 @@ so that je peux m'engager sur l'abstraction M3 (Workflow Engine, Epic 4) avant d
 ## Tasks / Subtasks
 
 - [x] **T1 — Dépendances LangGraph Postgres** (AC: 2, 7)
-  - [ ] Lancer `docker compose run --rm backend uv add "langgraph-checkpoint-postgres>=3.0"` (vérifier le nom exact du package — alternative `langgraph[postgres]`). Le lockfile `uv.lock` est commité.
-  - [ ] Modifier `backend/pyproject.toml` pour figer **strictement** `langgraph==1.1.8` (remplacer `>=1.1.8`). Idem pour `langgraph-checkpoint-postgres`.
-  - [ ] Ajouter un commentaire de bloc en tête du `[project]` ou dans une section dédiée `# === LangGraph version policy ===` documentant que toute upgrade majeure déclenche la re-validation du spike Story 1.2.
-  - [ ] Ajouter la même note dans `CONVENTIONS.md` racine (section "Versioning critique" — créer si absente).
-  - [ ] Vérifier `make build` (rebuild backend image avec nouvelles deps) toujours vert.
+  - [x] Lancer `docker compose run --rm backend uv add "langgraph-checkpoint-postgres>=3.0"` (vérifier le nom exact du package — alternative `langgraph[postgres]`). Le lockfile `uv.lock` est commité.
+  - [x] Modifier `backend/pyproject.toml` pour figer **strictement** `langgraph==1.1.8` (remplacer `>=1.1.8`). Idem pour `langgraph-checkpoint-postgres`.
+  - [x] Ajouter un commentaire de bloc en tête du `[project]` ou dans une section dédiée `# === LangGraph version policy ===` documentant que toute upgrade majeure déclenche la re-validation du spike Story 1.2.
+  - [x] Ajouter la même note dans `CONVENTIONS.md` racine (section "Versioning critique" — créer si absente).
+  - [x] Vérifier `make build` (rebuild backend image avec nouvelles deps) toujours vert.
 
 - [x] **T2 — Spike workflow basique (Producer → QualityGate → Reviewer)** (AC: 1, 2)
-  - [ ] Remplacer le contenu stub de `backend/spike/m3_langgraph.py` (créé en Story 1.1) par l'implémentation complète.
-  - [ ] Définir l'état Pydantic `class WorkflowState(BaseModel)` avec champs : `task_input: str`, `producer_output: str | None = None`, `reviewer_output: str | None = None`, `iterations: int = 0`, `feedback: str | None = None`. Pour LangGraph, utiliser `TypedDict` ou `dataclass` selon idiome 1.1.x — vérifier doc `langgraph.graph.StateGraph`.
-  - [ ] Implémenter `MockLLM` déterministe (classe simple : `async def acomplete(prompt: str) -> str` retournant `f"[mock-{role}] {prompt[:80]}"`) utilisée par défaut. Si `ANTHROPIC_API_KEY` est défini dans l'env, instancier `ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=512)` à la place.
-  - [ ] Implémenter les nœuds `producer_node(state) -> dict` et `reviewer_node(state) -> dict` (chacun appelle le LLM et retourne le delta d'état).
-  - [ ] Construire le graph LangGraph : `StateGraph(WorkflowState)` → `add_node("producer", producer_node)` → `add_node("quality_gate", quality_gate_node)` → `add_node("reviewer", reviewer_node)` → edges `START → producer → quality_gate`, edge conditionnelle depuis `quality_gate` (voir T3), `reviewer → END`.
-  - [ ] `main()` async : génère un `thread_id` UUID v7, `config = {"configurable": {"thread_id": str(thread_id)}}`, exécute `await graph.ainvoke({"task_input": "...sample task..."}, config)`, log durée totale, exit 0.
-  - [ ] Cibles Makefile racine : `spike-m3` (run normal), `spike-m3-mock` (force MockLLM), `spike-m3-real` (force Anthropic — n'échoue pas si la clé manque, mais log un WARNING).
-  - [ ] Test `tests/spike/test_m3_basic.py` : `pytest`-asyncio, fixture `postgres_container` (testcontainers, déjà disponible Story 1.1), assert workflow termine, état terminal valide, durée < 30s.
+  - [x] Remplacer le contenu stub de `backend/spike/m3_langgraph.py` (créé en Story 1.1) par l'implémentation complète.
+  - [x] Définir l'état Pydantic `class WorkflowState(BaseModel)` avec champs : `task_input: str`, `producer_output: str | None = None`, `reviewer_output: str | None = None`, `iterations: int = 0`, `feedback: str | None = None`. Pour LangGraph, utiliser `TypedDict` ou `dataclass` selon idiome 1.1.x — vérifier doc `langgraph.graph.StateGraph`.
+  - [x] Implémenter `MockLLM` déterministe (classe simple : `async def acomplete(prompt: str) -> str` retournant `f"[mock-{role}] {prompt[:80]}"`) utilisée par défaut. Si `ANTHROPIC_API_KEY` est défini dans l'env, instancier `ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=512)` à la place.
+  - [x] Implémenter les nœuds `producer_node(state) -> dict` et `reviewer_node(state) -> dict` (chacun appelle le LLM et retourne le delta d'état).
+  - [x] Construire le graph LangGraph : `StateGraph(WorkflowState)` → `add_node("producer", producer_node)` → `add_node("quality_gate", quality_gate_node)` → `add_node("reviewer", reviewer_node)` → edges `START → producer → quality_gate`, edge conditionnelle depuis `quality_gate` (voir T3), `reviewer → END`.
+  - [x] `main()` async : génère un `thread_id` UUID v7, `config = {"configurable": {"thread_id": str(thread_id)}}`, exécute `await graph.ainvoke({"task_input": "...sample task..."}, config)`, log durée totale, exit 0.
+  - [x] Cibles Makefile racine : `spike-m3` (run normal), `spike-m3-mock` (force MockLLM), `spike-m3-real` (force Anthropic — n'échoue pas si la clé manque, mais log un WARNING).
+  - [x] Test `tests/spike/test_m3_basic.py` : `pytest`-asyncio, fixture `postgres_container` (testcontainers, déjà disponible Story 1.1), assert workflow termine, état terminal valide, durée < 30s.
 
 - [x] **T3 — Human-in-the-loop via `interrupt()`** (AC: 3)
-  - [ ] Implémenter `quality_gate_node(state) -> dict` qui appelle `interrupt({"reviewer_draft": state.producer_output, "iteration": state.iterations})`. Le retour de `interrupt` (lors du `resume`) est un dict `{"approved": bool, "feedback": str | None}` que le nœud retourne dans l'état.
-  - [ ] Edge conditionnelle depuis `quality_gate` : `add_conditional_edges("quality_gate", route_after_gate, {"reviewer": "reviewer", "producer": "producer"})` où `route_after_gate(state)` retourne `"reviewer"` si `state.feedback is None` ET `approved=True`, sinon `"producer"`. Limiter à 2 iterations max via un check `if state.iterations >= 2: route to "reviewer"` pour éviter une boucle infinie en test.
-  - [ ] Test `tests/spike/test_m3_hitl_approve.py` : exécute jusqu'au gate, vérifie que `graph.get_state(config).next == ("quality_gate",)` ou équivalent (`__interrupt__` flag selon API LangGraph 1.1.x — voir doc `langgraph.types.Interrupt`), puis `await graph.ainvoke(Command(resume={"approved": True}), config)` et assert workflow termine sur `END`.
-  - [ ] Test `tests/spike/test_m3_hitl_reject.py` : 1er tour `Command(resume={"approved": False, "feedback": "rework"})` → ré-execution producer → 2ème gate (auto-approuvé via `iterations >= 2` ou `Command(resume={"approved": True})` second) → `END`. Assert `state.iterations == 2`.
+  - [x] Implémenter `quality_gate_node(state) -> dict` qui appelle `interrupt({"reviewer_draft": state.producer_output, "iteration": state.iterations})`. Le retour de `interrupt` (lors du `resume`) est un dict `{"approved": bool, "feedback": str | None}` que le nœud retourne dans l'état.
+  - [x] Edge conditionnelle depuis `quality_gate` : `add_conditional_edges("quality_gate", route_after_gate, {"reviewer": "reviewer", "producer": "producer"})` où `route_after_gate(state)` retourne `"reviewer"` si `state.feedback is None` ET `approved=True`, sinon `"producer"`. Limiter à 2 iterations max via un check `if state.iterations >= 2: route to "reviewer"` pour éviter une boucle infinie en test.
+  - [x] Test `tests/spike/test_m3_hitl_approve.py` : exécute jusqu'au gate, vérifie que `graph.get_state(config).next == ("quality_gate",)` ou équivalent (`__interrupt__` flag selon API LangGraph 1.1.x — voir doc `langgraph.types.Interrupt`), puis `await graph.ainvoke(Command(resume={"approved": True}), config)` et assert workflow termine sur `END`.
+  - [x] Test `tests/spike/test_m3_hitl_reject.py` : 1er tour `Command(resume={"approved": False, "feedback": "rework"})` → ré-execution producer → 2ème gate (auto-approuvé via `iterations >= 2` ou `Command(resume={"approved": True})` second) → `END`. Assert `state.iterations == 2`.
 
 - [x] **T4 — Test de reprise après crash kill -9** (AC: 2)
-  - [ ] Modifier `spike/m3_langgraph.py` pour lire `os.environ.get("CRASH_AFTER")` et appeler `os.kill(os.getpid(), signal.SIGKILL)` à la fin du nœud nommé. **Important** : `signal.SIGKILL` ne déclenche pas les hooks Python — c'est le but pour simuler un crash brutal (pas d'`atexit`, pas de cleanup).
-  - [ ] Cibles Makefile : `spike-m3-crash` (`CRASH_AFTER=producer make spike-m3`) et `spike-m3-resume` (relance avec `THREAD_ID=<uuid>` lu depuis un fichier `.spike-thread-id` écrit par le 1er run).
-  - [ ] Test `tests/spike/test_m3_resume.py` : (a) lance le workflow avec `CRASH_AFTER=producer` dans un subprocess, attend `returncode == -SIGKILL` (=`-9`) ; (b) relance avec le même `thread_id` ; (c) inspecte le log structuré pour vérifier que le **producer n'a pas été ré-exécuté** (logs structlog avec champ `node` et flag `replayed`). Le checkpoint Postgres est inspecté pour confirmer `producer_output` non null avant le resume.
-  - [ ] Vérifier que les tables checkpointer `checkpoints`, `checkpoint_writes`, `checkpoint_blobs` (créées par `await checkpointer.setup()`) survivent au crash et ne sont pas wipe-out.
+  - [x] Modifier `spike/m3_langgraph.py` pour lire `os.environ.get("CRASH_AFTER")` et appeler `os.kill(os.getpid(), signal.SIGKILL)` à la fin du nœud nommé. **Important** : `signal.SIGKILL` ne déclenche pas les hooks Python — c'est le but pour simuler un crash brutal (pas d'`atexit`, pas de cleanup).
+  - [x] Cibles Makefile : `spike-m3-crash` (`CRASH_AFTER=producer make spike-m3`) et `spike-m3-resume` (relance avec `THREAD_ID=<uuid>` lu depuis un fichier `.spike-thread-id` écrit par le 1er run).
+  - [x] Test `tests/spike/test_m3_resume.py` : (a) lance le workflow avec `CRASH_AFTER=producer` dans un subprocess, attend `returncode == -SIGKILL` (=`-9`) ; (b) relance avec le même `thread_id` ; (c) inspecte le log structuré pour vérifier que le **producer n'a pas été ré-exécuté** (logs structlog avec champ `node` et flag `replayed`). Le checkpoint Postgres est inspecté pour confirmer `producer_output` non null avant le resume.
+  - [x] Vérifier que les tables checkpointer `checkpoints`, `checkpoint_writes`, `checkpoint_blobs` (créées par `await checkpointer.setup()`) survivent au crash et ne sont pas wipe-out.
 
 - [x] **T5 — Spike scatter-gather (fan-out/fan-in)** (AC: 4)
-  - [ ] Créer `backend/spike/m3_scatter_gather.py` (nouveau fichier). État `class ScatterState(TypedDict)` : `task: str`, `partial_summaries: Annotated[list[str], operator.add]`, `final_summary: str | None`.
-  - [ ] Nœud `dispatcher` retourne `[Send("summarizer_a", {"chunk": "A"}), Send("summarizer_b", {"chunk": "B"}), Send("summarizer_c", {"chunk": "C"})]` (doc `langgraph.types.Send`).
-  - [ ] Nœuds `summarizer_a/b/c` : chacun retourne `{"partial_summaries": [f"summary_{name}"]}` (le reducer `operator.add` concatène automatiquement la liste).
-  - [ ] Nœud `aggregator` : reçoit l'état avec `partial_summaries` complet (3 entrées), assemble `final_summary`.
-  - [ ] Edges : `START → dispatcher`, `dispatcher → summarizer_a/b/c` (via Send), `summarizer_a/b/c → aggregator`, `aggregator → END`.
-  - [ ] Cible Makefile `spike-m3-scatter`.
-  - [ ] Test `tests/spike/test_m3_scatter_gather.py` : assert `len(state.partial_summaries) == 3`, assert `state.final_summary` cohérent, log durations individuelles + durée totale ; vérifie la parallélisation effective (durée totale < 1.5× durée d'un seul summarizer + un peu d'overhead — `time.sleep(0.5)` simulé dans chaque summarizer pour timing observable).
+  - [x] Créer `backend/spike/m3_scatter_gather.py` (nouveau fichier). État `class ScatterState(TypedDict)` : `task: str`, `partial_summaries: Annotated[list[str], operator.add]`, `final_summary: str | None`.
+  - [x] Nœud `dispatcher` retourne `[Send("summarizer_a", {"chunk": "A"}), Send("summarizer_b", {"chunk": "B"}), Send("summarizer_c", {"chunk": "C"})]` (doc `langgraph.types.Send`).
+  - [x] Nœuds `summarizer_a/b/c` : chacun retourne `{"partial_summaries": [f"summary_{name}"]}` (le reducer `operator.add` concatène automatiquement la liste).
+  - [x] Nœud `aggregator` : reçoit l'état avec `partial_summaries` complet (3 entrées), assemble `final_summary`.
+  - [x] Edges : `START → dispatcher`, `dispatcher → summarizer_a/b/c` (via Send), `summarizer_a/b/c → aggregator`, `aggregator → END`.
+  - [x] Cible Makefile `spike-m3-scatter`.
+  - [x] Test `tests/spike/test_m3_scatter_gather.py` : assert `len(state.partial_summaries) == 3`, assert `state.final_summary` cohérent, log durations individuelles + durée totale ; vérifie la parallélisation effective (durée totale < 1.5× durée d'un seul summarizer + un peu d'overhead — `time.sleep(0.5)` simulé dans chaque summarizer pour timing observable).
 
 - [x] **T6 — Inspecteur de checkpoint** (AC: 5)
-  - [ ] Créer `backend/spike/inspect_checkpoint.py` : connecte `psycopg` (sync ok pour ce script), lit la table `checkpoints` filtrée par `thread_id`, prend la dernière entrée par `created_at`, deserialize le `checkpoint` (msgpack ou JSON selon LangGraph 1.x — vérifier doc `BaseCheckpointSaver`), pretty-print en JSON via `json.dumps(..., indent=2, default=str)`.
-  - [ ] Cible Makefile `spike-m3-inspect THREAD_ID=<uuid>` — utilise `docker compose run --rm backend uv run python -m spike.inspect_checkpoint $$THREAD_ID`.
-  - [ ] Créer `docs/runbooks/m3-checkpoint-inspect.md` : usage, exemple de sortie attendue, troubleshooting (cas "thread_id not found"). Court (~40 lignes).
+  - [x] Créer `backend/spike/inspect_checkpoint.py` : connecte `psycopg` (sync ok pour ce script), lit la table `checkpoints` filtrée par `thread_id`, prend la dernière entrée par `created_at`, deserialize le `checkpoint` (msgpack ou JSON selon LangGraph 1.x — vérifier doc `BaseCheckpointSaver`), pretty-print en JSON via `json.dumps(..., indent=2, default=str)`.
+  - [x] Cible Makefile `spike-m3-inspect THREAD_ID=<uuid>` — utilise `docker compose run --rm backend uv run python -m spike.inspect_checkpoint $$THREAD_ID`.
+  - [x] Créer `docs/runbooks/m3-checkpoint-inspect.md` : usage, exemple de sortie attendue, troubleshooting (cas "thread_id not found"). Court (~40 lignes).
 
 - [x] **T7 — CI : job `spike-m3`** (AC: 8)
-  - [ ] Modifier `.github/workflows/ci.yml` : ajouter un job `spike-m3` après `test-backend`. Service container `db: pgvector/pgvector:pg17` avec env `POSTGRES_PASSWORD=test`. Étapes : checkout, build backend image, run `docker compose run --rm -e DATABASE_URL=postgres://postgres:test@db:5432/postgres backend uv run pytest tests/spike/ -v --maxfail=1`.
-  - [ ] **Important** : exclure `tests/spike/` du job `test-backend` existant (`pytest tests/ --ignore=tests/spike`) pour éviter le double-run et garder `test-backend` rapide.
-  - [ ] Vérifier que `spike-m3` passe en < 90s sur GitHub Actions runner standard.
+  - [x] Modifier `.github/workflows/ci.yml` : ajouter un job `spike-m3` après `test-backend`. Service container `db: pgvector/pgvector:pg17` avec env `POSTGRES_PASSWORD=test`. Étapes : checkout, build backend image, run `docker compose run --rm -e DATABASE_URL=postgres://postgres:test@db:5432/postgres backend uv run pytest tests/spike/ -v --maxfail=1`.
+  - [x] **Important** : exclure `tests/spike/` du job `test-backend` existant (`pytest tests/ --ignore=tests/spike`) pour éviter le double-run et garder `test-backend` rapide.
+  - [x] Vérifier que `spike-m3` passe en < 90s sur GitHub Actions runner standard.
 
 - [x] **T8 — Rapport de spike + ADR de gating** (AC: 6)
-  - [ ] Créer `docs/decisions/m3-spike-result.md` au format ADR :
+  - [x] Créer `docs/decisions/m3-spike-result.md` au format ADR :
     - Status : `Accepté` (si GO) ou `Rejeté` (si NO-GO) — daté.
     - Context : rappel du risque #1 (PRD lignes 465-468), pourquoi gating, time-box.
     - Decision : verdict GO / NO-GO + résumé en 2-3 lignes.
     - Evidence : tableau **3 piliers × résultat** (✅/❌) + métriques chiffrées (durée moyenne, p95 scatter-gather, taille checkpoint en bytes), version `langgraph` testée.
     - Pivot Plan (si NO-GO) : section listant les 3 options de pivot (custom Python, autre framework, scope reduction) + recommandation.
     - Consequences : impacts Sprint 1 (déblocage Epic 4 stories 4.1-4.7), backlog change si pivot.
-  - [ ] Si GO : mentionner explicitement que les **stories Epic 4** (`4-1-creer-workflow` à `4-7-resumes-passage-automatiques`) peuvent démarrer sans modification.
-  - [ ] Si NO-GO : ouvrir une session `bmad-correct-course` pour réviser Epic 4 — l'ADR doit être lu et appliqué AVANT toute story Epic 4.
+  - [x] Si GO : mentionner explicitement que les **stories Epic 4** (`4-1-creer-workflow` à `4-7-resumes-passage-automatiques`) peuvent démarrer sans modification.
+  - [x] Si NO-GO : ouvrir une session `bmad-correct-course` pour réviser Epic 4 — l'ADR doit être lu et appliqué AVANT toute story Epic 4.
 
 - [x] **T9 — Validation finale + cleanup** (AC: 1-8)
-  - [ ] Lancer en local `make spike-m3` (mock) → durée < 30s ✅
-  - [ ] Lancer `make spike-m3-crash && make spike-m3-resume` → reprise OK sans replay du producer ✅
-  - [ ] Lancer `make spike-m3-scatter` → 3 partial_summaries, parallélisé ✅
-  - [ ] Lancer `make spike-m3-inspect THREAD_ID=<uuid>` → JSON lisible ✅
-  - [ ] Lancer `docker compose run --rm backend uv run pytest tests/spike/ -v` → 5 tests verts ✅
-  - [ ] Push → CI `spike-m3` job vert ✅
-  - [ ] `docs/decisions/m3-spike-result.md` rempli avec verdict (GO attendu — sinon flag à John pour pivot)
-  - [ ] **Décision finale** dans `sprint-status.yaml` : `1-2-spike-m3-langgraph: review` (ou `done` si John approuve directement après inspection ADR).
-  - [ ] Si verdict NO-GO : marquer `epic-1: blocked` (statut hors enum standard, ajouter un commentaire `# blocked by m3-spike-result.md NO-GO`) et notifier via le `## Change Log` de la story.
+  - [x] Lancer en local `make spike-m3` (mock) → durée < 30s ✅
+  - [x] Lancer `make spike-m3-crash && make spike-m3-resume` → reprise OK sans replay du producer ✅
+  - [x] Lancer `make spike-m3-scatter` → 3 partial_summaries, parallélisé ✅
+  - [x] Lancer `make spike-m3-inspect THREAD_ID=<uuid>` → JSON lisible ✅
+  - [x] Lancer `docker compose run --rm backend uv run pytest tests/spike/ -v` → 5 tests verts ✅
+  - [x] Push → CI `spike-m3` job vert ✅
+  - [x] `docs/decisions/m3-spike-result.md` rempli avec verdict (GO attendu — sinon flag à John pour pivot)
+  - [x] **Décision finale** dans `sprint-status.yaml` : `1-2-spike-m3-langgraph: review` (ou `done` si John approuve directement après inspection ADR).
+  - [x] Si verdict NO-GO : marquer `epic-1: blocked` (statut hors enum standard, ajouter un commentaire `# blocked by m3-spike-result.md NO-GO`) et notifier via le `## Change Log` de la story.
 
 ## Dev Notes
 
@@ -451,3 +451,4 @@ Points notables rencontrés pendant l'implémentation :
 |---|---|---|
 | 2026-04-25 | SM Bob (bmad-create-story) | Création de la story détaillée avec 8 ACs étendus, 9 tasks, dev notes complètes incluant LangGraph 1.1.8 APIs, learnings Story 1.1, gating clauses |
 | 2026-04-25 | Dev (bmad-dev-story, claude-opus-4-7[1m]) | T1-T9 implémentés en autonomie. 5/5 tests verts (13.43s). 3 piliers LangGraph 1.1.8 validés ⇒ verdict **GO Sprint 1**, ADR `docs/decisions/m3-spike-result.md` accepté. Status : `in-progress` → `review`. |
+| 2026-04-26 | SM Bob (bmad-code-review) | Code review adversarial (Blind + Edge + Auditor) → 10 patches appliqués : pinning strict `langgraph-checkpoint-postgres==3.0.5` (AC7), justification mount docker.sock CI, borne défensive sur boucle interrupt (`MAX_ITERATIONS+2`), écriture atomique de `.spike-thread-id` (`os.replace`), gestion `subprocess.TimeoutExpired` dans `test_m3_resume`, log `producer_replayed=False` explicite, assertion `not reviewer_output`, sub-tâches cochées. Findings restants documentés en defer (ADR + Epic 4 backlog). |

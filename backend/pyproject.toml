@@ -23,7 +23,9 @@ dependencies = [
     # Validation : 3 piliers (checkpoint Postgres, scatter-gather, HITL) restent
     # fonctionnels après l'upgrade.
     "langgraph==1.1.8",
-    "langgraph-checkpoint-postgres>=3.0.4",
+    # Pinned with langgraph (G3) — un saver Postgres qui change de version peut
+    # casser le format checkpoint sans déclencher le bump de langgraph lui-même.
+    "langgraph-checkpoint-postgres==3.0.5",
     "mcp>=1.27.0",
     "pgvector>=0.4.2",
     "psycopg[binary]>=3.2",

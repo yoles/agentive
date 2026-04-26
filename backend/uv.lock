@@ -51,7 +51,7 @@ requires-dist = [
     { name = "langchain-anthropic", specifier = ">=1.4.1" },
     { name = "langchain-openai", specifier = ">=1.1.14" },
     { name = "langgraph", specifier = "==1.1.8" },
-    { name = "langgraph-checkpoint-postgres", specifier = ">=3.0.4" },
+    { name = "langgraph-checkpoint-postgres", specifier = "==3.0.5" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "pgvector", specifier = ">=0.4.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },

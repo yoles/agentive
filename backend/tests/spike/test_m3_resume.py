@@ -62,12 +62,22 @@ async def test_resume_after_sigkill_does_not_replay_producer(
     env["SPIKE_THREAD_ID_FILE"] = str(thread_id_file)
     env["ANTHROPIC_API_KEY"] = ""  # force MockLLM in subprocess too
 
-    proc = subprocess.run(
-        [_python_executable(), "-c", crash_script],
-        env=env,
-        capture_output=True,
-        timeout=30,
-    )
+    try:
+        proc = subprocess.run(
+            [_python_executable(), "-c", crash_script],
+            env=env,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Without explicit handling pytest would surface a generic TimeoutExpired
+        # with no spike output — useless for diagnosis. Surface stdout/stderr so
+        # we know whether the subprocess hung pre-producer (DB connection, import)
+        # or post-producer (the SIGKILL itself never fired).
+        pytest.fail(
+            f"crash subprocess exceeded 30s timeout — likely a spike regression.\n"
+            f"stdout: {(exc.stdout or b'')!r}\nstderr: {(exc.stderr or b'')!r}"
+        )
     assert proc.returncode == -signal.SIGKILL, (
         f"expected SIGKILL exit (-9), got returncode={proc.returncode}\n"
         f"stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}"
@@ -85,7 +95,7 @@ async def test_resume_after_sigkill_does_not_replay_producer(
             "producer_output absent from checkpoint — the producer may have crashed before its return"
         )
         assert channel_values.get("iterations") == 1
-        assert channel_values.get("reviewer_output") in (None, ""), (
+        assert not channel_values.get("reviewer_output"), (
             "reviewer_output should NOT be set yet — reviewer ran AFTER the crash point"
         )
 
