@@ -110,9 +110,13 @@ jobs:
             git /src --redact --no-banner --config=/src/.gitleaks.toml
 
   # ─── Tests ───
-  # Tests run DIRECTLY on the runner (not inside a nested docker run) so we
-  # don't expose the host Docker socket to arbitrary PR code.
-  # testcontainers connects to the runner's daemon via standard env vars.
+  # testcontainers spawns sibling Postgres containers via the host Docker
+  # daemon — the pytest container therefore needs `/var/run/docker.sock` and
+  # `--network host`. Trade-off: PR code can reach the daemon. Mitigations :
+  # (1) le workflow ne tourne que sur push/PR du repo (pas de fork untrusted),
+  # (2) l'image est dev-only, sans secrets prod injectés ici, (3) le code des
+  # tests est revu dans le même PR. Migration future possible vers
+  # `services: postgres:` pour retirer le socket — voir Story 1.9 (CI hardening).
   test-backend:
     name: Test backend (pytest + testcontainers)
     runs-on: ubuntu-latest
@@ -128,10 +132,6 @@ jobs:
           tags: agentive-backend:ci
           load: true
           cache-from: type=gha,scope=backend-dev
-      # testcontainers requires access to the runner Docker daemon. GitHub
-      # Actions hosted runners already have Docker available — we do NOT mount
-      # /var/run/docker.sock into a nested container (PR RCE vector). Instead,
-      # we run pytest on the runner with the backend image providing deps.
       - name: Run pytest (excludes tests/spike — covered by spike-m3 job)
         run: |
           docker run --rm \
@@ -147,6 +147,10 @@ jobs:
   # scatter-gather). Job séparé du test-backend principal car (1) ce sont des
   # tests d'intégration plus lourds et (2) chaque upgrade majeure de langgraph
   # (politique G3) doit re-valider explicitement ces tests avant merge.
+  # Le mount de `/var/run/docker.sock` suit la même justification que
+  # `test-backend` ci-dessus (testcontainers stand-up Postgres via le daemon
+  # hôte) — voir le bloc de commentaires du job test-backend pour les
+  # mitigations et le plan de migration vers `services:` (Story 1.9).
   spike-m3:
     name: Spike M3 LangGraph (gating critique #1)
     runs-on: ubuntu-latest

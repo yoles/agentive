@@ -73,6 +73,22 @@ def _thread_id_file() -> Path:
     return Path(os.environ.get("SPIKE_THREAD_ID_FILE", _DEFAULT_THREAD_ID_FILE))
 
 
+def _write_thread_id_atomically(thread_id: str) -> None:
+    """Persist the thread id with atomic write semantics.
+
+    ``Path.write_text`` is *not* atomic — a concurrent reader (e.g. the
+    Makefile picking up ``.spike-thread-id`` right after a SIGKILL) can
+    observe a truncated or empty file. ``os.replace`` is atomic on POSIX
+    and on Windows, so writing to a sibling ``.tmp`` then replacing the
+    target eliminates the race entirely.
+    """
+    target = _thread_id_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(thread_id)
+    tmp.replace(target)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Mock LLM — deterministic, zero-cost, used by default in CI / dev.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -173,6 +189,13 @@ async def _wait_for_committed_state(
     """
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     deadline = time.monotonic() + timeout_s
+    # The ``async with`` here is the *short-lived poller* — distinct from the
+    # outer saver opened by ``run_spike``. The ``return`` below exits the
+    # context manager, which awaits ``__aexit__`` (closing the pool) BEFORE
+    # control returns to the caller. So by the time ``_maybe_crash_after``
+    # triggers SIGKILL, this poller has already released its connection. The
+    # crash only affects the *outer* saver in ``run_spike`` — which is the
+    # whole point of the test (simulate brutal loss with no cleanup).
     async with AsyncPostgresSaver.from_conn_string(dsn) as poller:
         while time.monotonic() < deadline:
             tup = await poller.aget_tuple(config)
@@ -229,9 +252,7 @@ async def producer_node(state: WorkflowState) -> dict[str, object]:
     """First agent: produces a draft from the task input + optional feedback."""
     task_input = state.get("task_input")
     if not task_input:
-        raise ValueError(
-            "producer_node requires a non-empty 'task_input' in the initial state"
-        )
+        raise ValueError("producer_node requires a non-empty 'task_input' in the initial state")
 
     iteration = state.get("iterations", 0)
     feedback = state.get("feedback")
@@ -390,9 +411,11 @@ async def run_spike(
         initial_input: override the default task input.
     """
     thread_id = thread_id or str(uuid.uuid4())
-    thread_id_path = _thread_id_file()
-    thread_id_path.parent.mkdir(parents=True, exist_ok=True)
-    thread_id_path.write_text(thread_id)
+    if not resume_existing:
+        # On a fresh run we (over)write the thread id so the Makefile / test
+        # harness can pick it up after a SIGKILL. On resume the file is already
+        # authoritative — keep the original crashed-run trace intact.
+        _write_thread_id_atomically(thread_id)
     logger.info(
         "spike start thread_id=%s resume_existing=%s auto_approve=%s",
         thread_id,
@@ -409,16 +432,34 @@ async def run_spike(
 
         if resume_existing:
             # ``None`` ⇒ LangGraph resumes the saved state without overwriting it.
+            # The producer is NOT re-executed — the durable proof is the resulting
+            # ``iterations`` count (must remain at the value committed pre-crash).
             result = await graph.ainvoke(None, config)
+            logger.info(
+                "producer_replayed=False thread_id=%s (resumed from checkpoint)",
+                thread_id,
+            )
         else:
             first_input = initial_input or {"task_input": "Write a haiku about resilience."}
             result = await graph.ainvoke(first_input, config)
 
         # Resume past every interrupt until the graph reaches END.
-        while result.get("__interrupt__"):
+        # Defensive iteration cap — MAX_ITERATIONS handles the in-graph retry
+        # logic; the +2 absorbs interrupts emitted at boundaries. Past this,
+        # a hung loop is a real LangGraph regression : fail loud rather than
+        # silently spin until pytest's outer timeout.
+        for _ in range(MAX_ITERATIONS + 2):
+            if not result.get("__interrupt__"):
+                break
             if not auto_approve:
                 break
             result = await graph.ainvoke(Command(resume={"approved": True}), config)
+        else:
+            raise RuntimeError(
+                f"run_spike: interrupt loop did not terminate after "
+                f"{MAX_ITERATIONS + 2} resume cycles on thread {thread_id} — "
+                "possible LangGraph regression on quality_gate auto-approve."
+            )
 
     duration = time.monotonic() - started
     logger.info("spike complete thread_id=%s total_duration_s=%.3f", thread_id, duration)
