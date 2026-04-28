@@ -1,6 +1,6 @@
 # Story 1.2: Spike M3 LangGraph — gating critique #1
 
-Status: review
+Status: done
 
 > 🚨 **GATING CRITIQUE #1 du projet Agentive**. Cette story conditionne le démarrage du Sprint 1. Si **un seul** des 3 piliers (checkpointing Postgres / scatter-gather / human-in-the-loop) échoue, le Sprint 1 est bloqué tant qu'un ADR de pivot n'est pas validé (PRD lignes 465-468, Architecture lignes 233-236, AR3 ligne 149).
 >
@@ -452,3 +452,4 @@ Points notables rencontrés pendant l'implémentation :
 | 2026-04-25 | SM Bob (bmad-create-story) | Création de la story détaillée avec 8 ACs étendus, 9 tasks, dev notes complètes incluant LangGraph 1.1.8 APIs, learnings Story 1.1, gating clauses |
 | 2026-04-25 | Dev (bmad-dev-story, claude-opus-4-7[1m]) | T1-T9 implémentés en autonomie. 5/5 tests verts (13.43s). 3 piliers LangGraph 1.1.8 validés ⇒ verdict **GO Sprint 1**, ADR `docs/decisions/m3-spike-result.md` accepté. Status : `in-progress` → `review`. |
 | 2026-04-26 | SM Bob (bmad-code-review) | Code review adversarial (Blind + Edge + Auditor) → 10 patches appliqués : pinning strict `langgraph-checkpoint-postgres==3.0.5` (AC7), justification mount docker.sock CI, borne défensive sur boucle interrupt (`MAX_ITERATIONS+2`), écriture atomique de `.spike-thread-id` (`os.replace`), gestion `subprocess.TimeoutExpired` dans `test_m3_resume`, log `producer_replayed=False` explicite, assertion `not reviewer_output`, sub-tâches cochées. Findings restants documentés en defer (ADR + Epic 4 backlog). |
+| 2026-04-26 | SM Bob (bmad-sm) | Clôture story : status `review` → `done` après validation des 10 patches post-review (commit `80f8ea5`). Verdict GO Sprint 1 maintenu. Sprint-status.yaml mis à jour. |
