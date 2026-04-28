@@ -109,6 +109,16 @@ disallow_untyped_defs = false
 module = ["spike", "spike.*"]
 ignore_errors = true
 
+# `scripts/` contient le harness de benchmark M4 (Story 1.3) + restore-test +
+# seed_dev. Code one-shot de mesure / outillage opérationnel — pas du code
+# applicatif. Les retours psycopg `dict_row` et numpy arrays nécessiteraient
+# énormément de cast/Protocol pour satisfaire mypy strict alors que la
+# correction d'exécution est validée par `tests/scripts/` + l'exécution
+# directe via `make bench`. Même pattern que `spike/` (Story 1.2).
+[[tool.mypy.overrides]]
+module = ["scripts", "scripts.*"]
+ignore_errors = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/agentive_backend"]
 python_files = ["test_*.py", "*_test.py"]

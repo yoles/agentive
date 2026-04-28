@@ -286,9 +286,40 @@ gitleaks: ## Scan gitleaks sur le repo
 # BENCHMARKS (Sprint 0 Stories 1.2 + 1.3)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━ Bench M4 pgvector HNSW (Story 1.3 — gating critique #2) ━━━
+# Pipeline : (1) make bench → baseline + ground truth (~1 min)
+#            (2) make bench-hnsw-fast → sweep réduit 8 combos (~10 min CI)
+#            (3) make bench-hnsw → sweep complet 27 combos (~25 min)
+#            (4) make bench-ivfflat → comparaison ivfflat (~10 min)
+#            (5) make bench-report → agrégation CSV + génération hnsw-tuning.md
+# Output : _bench_artifacts/*.csv + docs/decisions/hnsw-tuning.md
+
 .PHONY: bench
-bench: ## Exécute les benchmarks M4 pgvector (Story 1.3)
+bench: up ## Bench baseline (10k chunks + ground truth + mesure baseline) — Story 1.3
 	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_m4
+
+.PHONY: bench-hnsw
+bench-hnsw: up ## Sweep HNSW complet (27 combos m × ef_construction × ef_search) — ~25 min
+	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_hnsw
+
+.PHONY: bench-hnsw-fast
+bench-hnsw-fast: up ## Sweep HNSW réduit (8 combos) — ~10 min, pour CI
+	$(DC_DEV) run --rm -e BENCH_FAST=1 backend uv run python -m scripts.benchmark_hnsw
+
+.PHONY: bench-ivfflat
+bench-ivfflat: up ## Comparaison ivfflat (9 combos lists × probes) — ~10 min
+	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_ivfflat
+
+.PHONY: bench-aggregate
+bench-aggregate: ## Agrège les CSV bench HNSW+ivfflat → comparison_hnsw_vs_ivfflat.csv (P8 review)
+	$(DC_DEV) run --rm backend uv run python -m scripts._bench_aggregate
+
+.PHONY: bench-report
+bench-report: bench-aggregate ## Agrège + génère docs/decisions/hnsw-tuning.md
+	$(DC_DEV) run --rm backend uv run python -m scripts._bench_report
+	@mkdir -p docs/decisions
+	@cp backend/_bench_artifacts/hnsw-tuning.md docs/decisions/hnsw-tuning.md
+	@echo "✅ Report copied to docs/decisions/hnsw-tuning.md"
 
 # ━━━ Spike M3 LangGraph (Story 1.2 — gating critique #1) ━━━
 # Le spike valide 3 piliers sur LangGraph 1.1.8 : checkpointing Postgres natif,

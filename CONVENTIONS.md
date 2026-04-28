@@ -43,6 +43,8 @@ frontend/src/
 
 - **`langgraph` est pinné strictement** dans `backend/pyproject.toml` (`==1.1.8`, pas `>=` ni `~=`). Toute upgrade majeure (1.x → 2.x) ou tout breaking change documenté dans le CHANGELOG LangGraph **DOIT** déclencher la re-exécution du spike Story 1.2 (`make spike-m3 && docker compose run --rm backend uv run pytest tests/spike/`) et la mise à jour de [`docs/decisions/m3-spike-result.md`](./docs/decisions/m3-spike-result.md) **avant** le merge. Référence : Architecture G3 (lignes 2068-2072), Story 1.2 AC7.
 - Critères de re-validation : checkpointing Postgres, scatter-gather (`Send` + reducer `operator.add`), human-in-the-loop (`interrupt` / `Command(resume=...)`) restent fonctionnels.
+- **`pgvector` (image Docker `pgvector/pgvector:pg17`) — paramètres HNSW gating NFR4/NFR5**. Toute upgrade pgvector ≥ 0.5 OU tout changement des paramètres HNSW (`m`, `ef_construction`, `ef_search`) dans `backend/alembic/versions/*` **DOIT** déclencher `make bench && make bench-hnsw-fast && make bench-report` et la mise à jour de [`docs/decisions/hnsw-tuning.md`](./docs/decisions/hnsw-tuning.md) **avant** le merge. Référence : Story 1.3 AC8, Architecture lignes 570-573 + 818-847.
+- Critères de re-validation : recall@5 > 0.90 (NFR4), p95 latency < 200ms end-to-end avec reranking (NFR5), pas de régression > 10% vs baseline du précédent rapport.
 
 ## Enforcement
 
