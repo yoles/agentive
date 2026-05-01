@@ -1,16 +1,26 @@
 """Event schemas — published on the event bus.
 
-**Stub Sprint 0** — filled progressively starting Story 1.4 (event bus runtime).
+Naming convention : ``module.entity.action``
+    - ``system.app.started``, ``system.app.shutdown``, ``system.health.checked``
+    - ``m2.agent.created`` (Epic 2)
+    - ``m3.workflow.started``, ``m3.workflow.completed`` (Epic 4)
+    - ``m4.chunk.indexed``, ``m4.chunk.archived`` (Epic 3)
 
-Naming convention : `module.entity.action`
-    - m2.agent.created
-    - m3.workflow.started, m3.workflow.completed, m3.workflow.failed
-    - m4.chunk.indexed, m4.chunk.archived
+System events are published by :mod:`app.lifespan` at boot/shutdown and by
+:func:`app.main.create_app`'s ``/ready`` endpoint after each readiness probe.
+Module-specific event modules are stubbed and filled by their owning epics.
 """
 
 from __future__ import annotations
 
+from agentive_backend.shared.contracts.events.health_events import HealthCheckEvent
+from agentive_backend.shared.contracts.events.system_events import (
+    SystemShutdownEvent,
+    SystemStartedEvent,
+)
 
-def describe_event(event_type: str) -> dict[str, object]:
-    """Placeholder — event schema registry implemented Story 1.4."""
-    raise NotImplementedError("Event schema registry implemented Story 1.4 (event bus runtime).")
+__all__ = [
+    "HealthCheckEvent",
+    "SystemShutdownEvent",
+    "SystemStartedEvent",
+]

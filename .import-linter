@@ -72,3 +72,23 @@ forbidden_modules =
     asyncpg
     psycopg
     psycopg2
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 4 — Event bus internals are private to `shared.event_bus`
+# Features must use the public re-exports from `shared.event_bus`
+# (publish, subscribe, OutboxWorker, Event, …). Direct imports of
+# `shared.event_bus.publisher / .outbox / .subscriber / .naming`
+# are forbidden so we can refactor internals without breaking callers
+# (e.g. the planned Redis Streams migration — see
+# `docs/decisions/event-bus-migration-trigger.md`).
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:event-bus-only-public-api]
+name = Features must import only the public event_bus API (publish, subscribe)
+type = forbidden
+source_modules =
+    agentive_backend.features
+forbidden_modules =
+    agentive_backend.shared.event_bus.outbox
+    agentive_backend.shared.event_bus.publisher
+    agentive_backend.shared.event_bus.subscriber
+    agentive_backend.shared.event_bus.naming

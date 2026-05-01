@@ -20,7 +20,9 @@ from agentive_backend.app.lifespan import lifespan
 from agentive_backend.app.middleware import CorrelationIdMiddleware
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.shared.config import settings
+from agentive_backend.shared.contracts.events import HealthCheckEvent
 from agentive_backend.shared.correlation import get_correlation_id
+from agentive_backend.shared.event_bus import publish_and_commit
 from agentive_backend.shared.exceptions import AgentiveError
 
 log = structlog.get_logger(__name__)
@@ -93,15 +95,18 @@ def create_app() -> FastAPI:
         to avoid leaking implementation details (exception class names, driver
         errors) to unauthenticated callers. Full diagnostics are logged
         server-side with correlation ID.
+
+        On the **success path only** (P5) we best-effort publish a
+        :class:`HealthCheckEvent` so downstream observers (Trace Explorer M12,
+        Dashboard M6) can build liveness timelines. We deliberately skip the
+        publish on the failure path to avoid amplifying DB outage load with a
+        second session+INSERT against the same broken database (high-frequency
+        liveness probes would otherwise compound the incident).
         """
         factory = get_session_factory()
         try:
             async with factory() as session:
                 await session.execute(text("SELECT 1"))
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={"status": "ready", "checks": {"db": "ok"}},
-            )
         except Exception as exc:  # readiness must swallow all failures
             log.warning(
                 "readiness_check_failed",
@@ -112,6 +117,23 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "not_ready", "checks": {"db": "error"}},
             )
+
+        response_body = {"status": "ready", "checks": {"db": "ok"}}
+        # Best-effort event publish — success path only (P5).
+        try:
+            async with factory() as session:
+                await publish_and_commit(
+                    session,
+                    HealthCheckEvent.event_type,
+                    HealthCheckEvent(
+                        status=response_body["status"],
+                        checks=response_body["checks"],
+                    ),
+                )
+        except Exception:
+            log.warning("ready_event_publish_failed")
+
+        return JSONResponse(status_code=status.HTTP_200_OK, content=response_body)
 
     # ─── API versioned router (empty Sprint 0 — features plug in Sprint 1+) ───
     # from agentive_backend.features.m2_agent_registry import router as agents_router
