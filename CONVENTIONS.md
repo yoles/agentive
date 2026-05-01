@@ -45,6 +45,7 @@ frontend/src/
 - Critères de re-validation : checkpointing Postgres, scatter-gather (`Send` + reducer `operator.add`), human-in-the-loop (`interrupt` / `Command(resume=...)`) restent fonctionnels.
 - **`pgvector` (image Docker `pgvector/pgvector:pg17`) — paramètres HNSW gating NFR4/NFR5**. Toute upgrade pgvector ≥ 0.5 OU tout changement des paramètres HNSW (`m`, `ef_construction`, `ef_search`) dans `backend/alembic/versions/*` **DOIT** déclencher `make bench && make bench-hnsw-fast && make bench-report` et la mise à jour de [`docs/decisions/hnsw-tuning.md`](./docs/decisions/hnsw-tuning.md) **avant** le merge. Référence : Story 1.3 AC8, Architecture lignes 570-573 + 818-847.
 - Critères de re-validation : recall@5 > 0.90 (NFR4), p95 latency < 200ms end-to-end avec reranking (NFR5), pas de régression > 10% vs baseline du précédent rapport.
+- **`psycopg[binary]` est pinné `>=3.2.10`** dans `backend/pyproject.toml`. Versions 3.2.4 → 3.2.9 ont un memory leak dans `AsyncConnection.notifies()` quand le générateur n'est pas régulièrement consommé (cf [psycopg #962](https://github.com/psycopg/psycopg/issues/962), corrigé en 3.2.10). Le `OutboxWorker` dépend directement de cette API. Toute upgrade ≥ 3.3 **DOIT** être validée sous charge synthétique (script publiant 1000 events/s pendant 5 min, vérifier que le RSS du process backend ne croît pas linéairement) **avant** le merge. Référence : Story 1.4, `shared/event_bus/outbox.py`.
 
 ## Enforcement
 

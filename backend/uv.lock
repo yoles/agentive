@@ -17,6 +17,7 @@ dependencies = [
     { name = "langgraph-checkpoint-postgres" },
     { name = "mcp" },
     { name = "pgvector" },
+    { name = "prometheus-client" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -54,7 +55,8 @@ requires-dist = [
     { name = "langgraph-checkpoint-postgres", specifier = "==3.0.5" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "pgvector", specifier = ">=0.4.2" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "prometheus-client", specifier = ">=0.20" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2.10" },
     { name = "pydantic", specifier = ">=2.13.2" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "python-multipart", specifier = ">=0.0.26" },
@@ -1635,6 +1637,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/85/68/7717bd9e63ed254617a7d3dc9260904fb736d6ea203e58ffddcb186c64e4/polyfactory-3.3.0.tar.gz", hash = "sha256:237258b6ff43edf362ffd1f68086bb796466f786adfa002b0ac256dbf2246e9a", size = 348668, upload-time = "2026-02-22T09:46:28.01Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/34/b6f19941adcdaf415b5e8a8d577499f5b6a76b59cbae37f9b125a9ffe9f2/polyfactory-3.3.0-py3-none-any.whl", hash = "sha256:686abcaa761930d3df87b91e95b26b8d8cb9fdbbbe0b03d5f918acff5c72606e", size = 62707, upload-time = "2026-02-22T09:46:25.985Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/fb/d9aa83ffe43ce1f19e557c0971d04b90561b0cfd50762aafb01968285553/prometheus_client-0.25.0.tar.gz", hash = "sha256:5e373b75c31afb3c86f1a52fa1ad470c9aace18082d39ec0d2f918d11cc9ba28", size = 86035, upload-time = "2026-04-09T19:53:42.359Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/9b/d4b1e644385499c8346fa9b622a3f030dce14cd6ef8a1871c221a17a67e7/prometheus_client-0.25.0-py3-none-any.whl", hash = "sha256:d5aec89e349a6ec230805d0df882f3807f74fd6c1a2fa86864e3c2279059fed1", size = 64154, upload-time = "2026-04-09T19:53:41.324Z" },
 ]
 
 [[package]]

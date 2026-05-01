@@ -28,7 +28,15 @@ dependencies = [
     "langgraph-checkpoint-postgres==3.0.5",
     "mcp>=1.27.0",
     "pgvector>=0.4.2",
-    "psycopg[binary]>=3.2",
+    "prometheus-client>=0.20",
+    # ━━━ psycopg version policy (Story 1.4 / event_bus LISTEN/NOTIFY) ━━━
+    # Pin >=3.2.10 strict : versions 3.2.4 → 3.2.9 ont un memory leak dans
+    # `AsyncConnection.notifies()` quand le générateur n'est pas régulièrement
+    # consommé (https://github.com/psycopg/psycopg/issues/962, fix 3.2.10).
+    # Le worker outbox.OutboxWorker dépend de notifies() — toute upgrade > 3.3
+    # DOIT être validée sous charge (script publiant 1000 events/s pendant 5min,
+    # vérifier que le RSS du process ne croît pas) avant merge.
+    "psycopg[binary]>=3.2.10",
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
     "python-multipart>=0.0.26",
