@@ -2,20 +2,21 @@
 
 > **Ce fichier est un résumé.** La source canonique complète des conventions est [`_bmad-output/planning-artifacts/architecture.md`](./_bmad-output/planning-artifacts/architecture.md) (sections "Implementation Patterns & Consistency Rules" et "AI Agent Guidelines").
 
-## Les 10 règles d'or (architecture.md lignes 2200-2215)
+## Les 11 règles d'or (architecture.md lignes 2200-2215, +5 ajoutée Story 1.6)
 
 1. **Suivre toutes les décisions architecturales documentées** — ne pas en dévier sans ouvrir un ADR dans `docs/decisions/`.
 2. **Conventions de nommage** : `snake_case` (Python / DB / JSON), `camelCase` (TypeScript), `PascalCase` (classes / components / types).
 3. **Communication inter-features** uniquement via bus d'événements (`shared.event_bus`) ou contrats partagés (`shared.contracts`). Jamais d'import direct d'un module feature vers un autre.
 4. **Accès DB uniquement** via `shared.repositories.*` — jamais d'`AsyncSession`/`asyncpg` directs dans le code applicatif (acceptable uniquement dans `infra/db/`).
-5. **Configuration uniquement** via `shared.config.settings` — jamais `os.environ` direct.
-6. **Toute nouvelle feature** suit la structure type :
+5. **Accès LLM uniquement** via `shared.llm.LLMRouter` (Story 1.6) — jamais d'import direct `langchain_anthropic`/`langchain_openai`/`langchain_core`/`anthropic`/`openai` depuis `features/m*` ou `api/`. Enforcement par `import-linter` Contract 5. Cf [`docs/decisions/llm-abstraction.md`](./docs/decisions/llm-abstraction.md) et [`docs/runbooks/llm-usage.md`](./docs/runbooks/llm-usage.md).
+6. **Configuration uniquement** via `shared.config.settings` — jamais `os.environ` direct.
+7. **Toute nouvelle feature** suit la structure type :
    - Frontend : `components/ + hooks/ + services/ + store/ + types/ + utils/ + index.ts` (barrel public API)
    - Backend : `service.py + schemas.py + events.py + tests/ + __init__.py` (barrel public API)
-7. **Imports via barrel** : `from features.m3_workflow_engine import WorkflowEngine` ✅, jamais d'imports profonds (`from features.m3_workflow_engine.engine.internal import ...` ❌).
-8. **Tous les inputs externes** (user input, tool output) wrappés dans `<user_input>...</user_input>` ou `<tool_output>...</tool_output>` avant tout appel LLM (défense contre prompt injection).
-9. **Correlation ID** (UUID v7 / ULID) propagé dans tous les logs et events.
-10. **Tenant ID** présent dans tous les nouveaux endpoints, queries, logs, métriques (NULL acceptable MVP, prêt pour Growth multi-tenant).
+8. **Imports via barrel** : `from features.m3_workflow_engine import WorkflowEngine` ✅, jamais d'imports profonds (`from features.m3_workflow_engine.engine.internal import ...` ❌).
+9. **Tous les inputs externes** (user input, tool output) wrappés dans `<user_input>...</user_input>` ou `<tool_output>...</tool_output>` avant tout appel LLM (défense contre prompt injection).
+10. **Correlation ID** (UUID v7 / ULID) propagé dans tous les logs et events.
+11. **Tenant ID** présent dans tous les nouveaux endpoints, queries, logs, métriques (NULL acceptable MVP, prêt pour Growth multi-tenant).
 
 ## Docker-first
 

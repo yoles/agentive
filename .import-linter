@@ -125,3 +125,24 @@ forbidden_modules =
     agentive_backend.shared.event_bus.publisher
     agentive_backend.shared.event_bus.subscriber
     agentive_backend.shared.event_bus.naming
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 5 — LLM SDKs are private to shared.llm / infra.llm (Story 1.6)
+# Feature modules and HTTP route handlers must go through the public
+# `agentive_backend.shared.llm.LLMRouter` rather than reaching for the
+# vendor SDKs directly. Justifies NFR12 (graceful degradation), NFR20
+# (multi-provider) and NFR9 (no API keys in logs/traces) — see
+# `docs/decisions/llm-abstraction.md`.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:no-direct-llm-sdk-from-features]
+name = Feature modules and api/* must not import LangChain LLM SDKs directly
+type = forbidden
+source_modules =
+    agentive_backend.features
+    agentive_backend.api
+forbidden_modules =
+    langchain_anthropic
+    langchain_openai
+    langchain_core
+    anthropic
+    openai

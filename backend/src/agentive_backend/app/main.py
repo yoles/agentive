@@ -135,6 +135,11 @@ def create_app() -> FastAPI:
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=response_body)
 
+    # ─── Admin endpoints (Sprint 0 — operational introspection) ───
+    from agentive_backend.api.admin import llm_health_router
+
+    app.include_router(llm_health_router, prefix="/api/v1/admin")
+
     # ─── API versioned router (empty Sprint 0 — features plug in Sprint 1+) ───
     # from agentive_backend.features.m2_agent_registry import router as agents_router
     # app.include_router(agents_router, prefix="/api/v1")

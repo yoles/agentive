@@ -26,6 +26,13 @@ def _add_correlation_id(_: Any, __: str, event_dict: EventDict) -> EventDict:
 
 def configure_logging() -> None:
     """Configure structlog + stdlib logging with JSON output."""
+    # Import the LLM redaction processor lazily — at module-load time it would
+    # create a cycle ``shared.logging`` → ``shared.llm.redaction`` →
+    # ``shared.llm.__init__`` → ``shared.llm.router`` → ``shared.logging``.
+    # Importing it inside ``configure_logging`` defers the resolution until the
+    # full module graph is settled (Story 1.6 review fix-batch P-circ).
+    from agentive_backend.shared.llm.redaction import redact_api_keys_processor
+
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
@@ -39,6 +46,9 @@ def configure_logging() -> None:
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             _add_correlation_id,
             structlog.processors.dict_tracebacks,
+            # NFR9 — redact API keys BEFORE the JSON renderer so leaked keys
+            # never reach stdout. Story 1.6.
+            redact_api_keys_processor,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(
