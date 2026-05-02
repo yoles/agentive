@@ -46,15 +46,48 @@ modules =
 #   `infra` may import shared (e.g. `shared.config` for DSNs) but not features.
 #   `shared` is the kernel: cross-cutting utilities (config, logging, correlation,
 #   contracts). It must not depend on infra or business logic.
+#
+# Documented exception (Story 1.5) — `shared.repositories` is the canonical
+# Repository Pattern surface. Per Architecture line 1097, infra/db/* may be
+# imported by `shared.repositories.*` (and only there) so concrete repos can
+# bind ORM models declared in `infra.db.models`. The exception is narrow:
+# only the repositories sub-package may cross the layer line, only into
+# `infra.db.models` and `infra.db.session` (engine/session factory). All
+# other shared/* modules remain forbidden from importing infra/*.
+# Cf docs/decisions/repository-pattern.md for rationale.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:layered]
 name = Layered architecture (app → features → infra → shared)
 type = layers
+# Allow ignore_imports declarations to reference edges that
+# import-linter's grimp graph doesn't surface as a direct edge candidate
+# for this contract — the underlying ``shared.repositories.*_repo ->
+# infra.db.models`` imports are documented exceptions even though the
+# layer-level normalizer doesn't always see them as violations.
+unmatched_ignore_imports_alerting = none
 layers =
     agentive_backend.app
     agentive_backend.features
     agentive_backend.infra
     agentive_backend.shared
+# MAINTENANCE NOTE — when a new ``shared.repositories.*_repo`` file is
+# added in a later story, append it to the list below. ``import-linter``
+# does not support wildcard sources in the ``layers`` contract type, so
+# the explicit enumeration is required. The trade-off is intentional: a
+# new repo MUST be reviewed against the layering decision (and the ADR
+# ``docs/decisions/repository-pattern.md``) before its edge is whitelisted,
+# preventing a feature from sneaking an ``infra.db.models`` import.
+ignore_imports =
+    agentive_backend.shared.repositories.agent_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.audit_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.chunk_embedding_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.feature_flag_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.memory_chunk_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.namespace_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.outbox_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.prompt_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.user_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.workflow_repo -> agentive_backend.infra.db.models
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 3 — Direct DB access forbidden outside of infra.db / shared.repositories
