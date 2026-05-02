@@ -36,6 +36,7 @@
 
 generated: 2026-04-19
 last_updated: 2026-05-02
+# 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -53,7 +54,7 @@ development_status:
   1-3-benchmark-m4-pgvector-hnsw: done
   1-4-core-event-bus: done
   1-5-core-repositories-migrations: done
-  1-6-core-llm-abstraction: backlog
+  1-6-core-llm-abstraction: done
   1-7-core-auth-token-statique: backlog
   1-8-design-system-foundation: backlog
   1-9-observability-caddy-ci: backlog
