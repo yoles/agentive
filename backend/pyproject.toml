@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.18.4",
     "apscheduler>=3.11.2",
+    "bcrypt>=4.3",
     "cryptography>=46.0.7",
     "fastapi>=0.136.0",
     # NOTE: `fastembed` (local embedding backend) n'a pas de wheel prebuild Python 3.14
