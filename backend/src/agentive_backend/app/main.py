@@ -17,7 +17,7 @@ from sqlalchemy import text
 
 from agentive_backend import __version__
 from agentive_backend.app.lifespan import lifespan
-from agentive_backend.app.middleware import CorrelationIdMiddleware
+from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMiddleware
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.events import HealthCheckEvent
@@ -58,8 +58,13 @@ def create_app() -> FastAPI:
         expose_headers=["X-Correlation-ID"],
     )
 
-    # ─── Correlation ID ───
-    app.add_middleware(CorrelationIdMiddleware)
+    # ─── Middleware stack (LIFO execution order in Starlette) ───────────────
+    # Starlette executes middleware in reverse registration order.
+    # To ensure CorrelationIdMiddleware runs BEFORE AuthTokenMiddleware
+    # (so the correlation_id ContextVar is bound before the 401 is built),
+    # AuthTokenMiddleware must be registered FIRST.
+    app.add_middleware(AuthTokenMiddleware)  # registered first → runs SECOND
+    app.add_middleware(CorrelationIdMiddleware)  # registered second → runs FIRST
 
     # ─── Exception handling (RFC 7807) ───
     @app.exception_handler(AgentiveError)
@@ -136,9 +141,10 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=status.HTTP_200_OK, content=response_body)
 
     # ─── Admin endpoints (Sprint 0 — operational introspection) ───
-    from agentive_backend.api.admin import llm_health_router
+    from agentive_backend.api.admin import llm_health_router, rotate_token_router
 
     app.include_router(llm_health_router, prefix="/api/v1/admin")
+    app.include_router(rotate_token_router, prefix="/api/v1/admin")
 
     # ─── API versioned router (empty Sprint 0 — features plug in Sprint 1+) ───
     # from agentive_backend.features.m2_agent_registry import router as agents_router

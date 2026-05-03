@@ -37,6 +37,8 @@
 generated: 2026-04-19
 last_updated: 2026-05-02
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
+# 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
+# 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -55,7 +57,7 @@ development_status:
   1-4-core-event-bus: done
   1-5-core-repositories-migrations: done
   1-6-core-llm-abstraction: done
-  1-7-core-auth-token-statique: backlog
+  1-7-core-auth-token-statique: review
   1-8-design-system-foundation: backlog
   1-9-observability-caddy-ci: backlog
   epic-1-retrospective: optional

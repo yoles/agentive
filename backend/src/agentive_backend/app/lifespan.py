@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 
+import bcrypt
 from fastapi import FastAPI
 
 from agentive_backend.infra.db.session import get_session_factory
@@ -25,6 +28,79 @@ from agentive_backend.shared.llm.testing import MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
+
+
+# bcrypt hash version prefixes — 2a/2b/2y are all valid bcrypt outputs from
+# different implementations (PHP commonly emits $2y$, modern Python emits $2b$,
+# legacy ones $2a$). Any of them must be treated as "already hashed" — falling
+# through to plaintext compare would either crash production or silently store
+# the hash STRING as the comparison plaintext (auth bypass risk).
+_BCRYPT_PREFIX_RE = re.compile(r"^\$2[aby]\$\d{2}\$")
+
+
+def _init_auth_token(app: FastAPI) -> None:
+    """Initialise ``app.state.auth_token_hash`` from ``AGENTIVE_API_TOKEN``.
+
+    Mode detection:
+    * Matches ``$2[aby]$NN$`` (any standard bcrypt prefix) → already hashed.
+    * Anything else                                       → plaintext.
+
+    Hard guards (raise :class:`RuntimeError` to abort boot):
+    * Empty ``AGENTIVE_API_TOKEN``        → always rejected.
+    * Plaintext in production             → rejected with operator hint.
+    * Hash-looking value but malformed    → rejected via smoke ``bcrypt.checkpw``.
+    """
+    raw = settings.agentive_api_token.get_secret_value()
+
+    # P4 — empty token is never acceptable. Without this guard, an empty env
+    # var falls through to plaintext mode and ``verify_token("", "")`` returns
+    # True via ``hmac.compare_digest`` → unauthenticated requests would be
+    # accepted with a literal ``Authorization: Bearer `` header.
+    if not raw:
+        log.critical("auth.token_init_failed_empty", env=settings.environment)
+        raise RuntimeError(
+            "AGENTIVE_API_TOKEN is empty. Set it to a bcrypt hash (production) "
+            "or any non-empty plaintext value (dev/test)."
+        )
+
+    # P3 — accept all standard bcrypt prefixes ($2a$, $2b$, $2y$), not only $2b$.
+    is_bcrypt_shaped = bool(_BCRYPT_PREFIX_RE.match(raw))
+    mode = "bcrypt" if is_bcrypt_shaped else "plaintext"
+
+    # P12 — emit CRITICAL telemetry before fail-fast so operators see the
+    # cause even if the RuntimeError traceback is suppressed by a process
+    # supervisor.
+    if settings.is_production and mode == "plaintext":
+        log.critical(
+            "auth.token_init_failed_production_plaintext",
+            env=settings.environment,
+        )
+        raise RuntimeError(
+            "AGENTIVE_API_TOKEN must be a bcrypt hash in production. "
+            'Generate one with: python -c "'
+            "import bcrypt, secrets; "
+            "print(bcrypt.hashpw(secrets.token_urlsafe(32).encode(), bcrypt.gensalt(12)).decode())"
+            '"'
+        )
+
+    # P3 — smoke-check the hash structure so a truncated/corrupt $2b$ value
+    # does not boot silently and then 401 every request without explanation.
+    # ``bcrypt.checkpw`` raises ``ValueError`` on a malformed hash; we don't
+    # care about the boolean result, only that parsing succeeds.
+    if mode == "bcrypt":
+        try:
+            bcrypt.checkpw(b"smoke-test", raw.encode())
+        except (ValueError, TypeError) as exc:
+            log.critical("auth.token_init_failed_malformed_bcrypt", error=str(exc))
+            raise RuntimeError(
+                "AGENTIVE_API_TOKEN looks like a bcrypt hash (matched $2[aby]$ "
+                "prefix) but is malformed — bcrypt.checkpw could not parse it. "
+                "Re-generate the hash and verify there is no truncation or "
+                "stray whitespace."
+            ) from exc
+
+    app.state.auth_token_hash = raw
+    log.info("auth.token_initialized", mode=mode, env=settings.environment)
 
 
 def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRouter:
@@ -116,10 +192,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("agentive_startup", version=app.version)
     started_monotonic = time.monotonic()
 
+    # Initialise auth token hash from env (fail-fast in production if plaintext).
+    _init_auth_token(app)
+
     # Build the session factory FIRST so the LLM fallback callback can
     # close over it. The callback is wired into the LLMRouter at
     # construction time (no post-construction private-attribute mutation).
     session_factory = get_session_factory()
+    # P1 — middleware + admin endpoints (auth audit, rotate-token) read
+    # ``request.app.state.session_factory`` to schedule background outbox
+    # writes. Previously the factory was only a local in this scope, so
+    # every authenticated /api/v1/* request crashed with AttributeError.
+    app.state.session_factory = session_factory
 
     async def _publish_fallback(ctx: FallbackContext) -> None:
         """Publish ``m3.llm.fallback_triggered`` on the event bus.
@@ -231,6 +315,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     )
             except Exception:
                 log.exception("agentive_shutdown_event_publish_failed")
+
+            # P8 — drain pending audit fire-and-forget tasks BEFORE stopping
+            # the outbox worker. Without this, in-flight `system.token.used`
+            # writes get cancelled mid-transaction during a rolling deploy
+            # under load → the outbox row never commits → audit gap. We cap
+            # the wait at 5s so a hung task can't delay shutdown indefinitely.
+            from agentive_backend.app.middleware import _background_tasks
+
+            if _background_tasks:
+                pending = list(_background_tasks)
+                log.info("agentive_drain_background_tasks", count=len(pending))
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=5.0,
+                    )
+
             with contextlib.suppress(Exception):
                 await worker.stop()
             log.info("agentive_shutdown", uptime_seconds=uptime_seconds)
@@ -238,4 +339,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             _correlation_id_var.reset(shutdown_token)
 
 
-__all__ = ["_build_llm_router", "lifespan"]
+__all__ = ["_build_llm_router", "_init_auth_token", "lifespan"]
