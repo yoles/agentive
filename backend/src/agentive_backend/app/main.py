@@ -69,7 +69,18 @@ def create_app() -> FastAPI:
     # ─── Exception handling (RFC 7807) ───
     @app.exception_handler(AgentiveError)
     async def handle_agentive_error(_request: Request, exc: AgentiveError) -> JSONResponse:
-        """Convert AgentiveError to RFC 7807 Problem Details response."""
+        """Convert AgentiveError to RFC 7807 Problem Details response.
+
+        Body shape (RFC 7807 §3 — Extension Members at top-level, NOT nested) :
+
+        - Standard fields ``type`` / ``title`` / ``status`` / ``detail`` / ``correlation_id``
+          are written first.
+        - ``exc.context`` (extension members like ``agent_id``, ``module``, ``tenant_id``)
+          is then merged at the top-level. RFC 7807 standard fields take precedence —
+          colliding context keys are dropped and a structured WARNING is emitted with
+          the list of collisions, so callers can detect malicious or buggy ``raise``
+          sites without affecting the response shape.
+        """
         body: dict[str, Any] = {
             "type": exc.type,
             "title": exc.title,
@@ -79,7 +90,17 @@ def create_app() -> FastAPI:
         if exc.detail:
             body["detail"] = exc.detail
         if exc.context:
-            body["context"] = exc.context
+            reserved = {"type", "title", "status", "correlation_id", "detail"}
+            colliding = sorted(set(exc.context) & reserved)
+            if colliding:
+                log.warning(
+                    "rfc7807_context_collision",
+                    colliding_keys=colliding,
+                    exception_type=type(exc).__name__,
+                )
+            for k, v in exc.context.items():
+                if k not in reserved:
+                    body[k] = v
         return JSONResponse(
             status_code=exc.status,
             content=body,

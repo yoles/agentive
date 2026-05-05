@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-05
+last_updated: 2026-05-05  # Story 1.9 review
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -45,6 +45,11 @@ last_updated: 2026-05-05
 # 2026-05-05 — Story 1.8 review (10/10 tests verts, lint+typecheck+build verts, bundle JS gzip 189.21 KB)
 # 2026-05-05 — Story 1.8 spec amendments post-review (3 bad-spec) : AC2 radix-ui méta autorisé, AC4 slot pattern autorisé, AC1bis .npmrc prescrit. Patches code (24 findings) restent ouverts.
 # 2026-05-05 — Story 1.8 code review fix-batch (24 patches P-1 à P-24) : 19/19 tests verts (+9 vs baseline 10), lint+typecheck+build verts, bundle JS gzip 189.62 KB.
+# 2026-05-05 — Story 1.8 done (commit a83a346 sur main) + post-merge chore make dev-host (aec78c5)
+# 2026-05-05 — Story 1.9 created (ready-for-dev): Observability + Caddy + CI (last Core story Epic 1) — Caddyfile prod fonctionnel + redaction PII/key-name + RFC 7807 conformance tests + caddy validate CI + runbook observability. Anti-scope: pas d'OTel (Sprint 1), pas de Sentry, pas de hierarchical correlation H5 (Sprint 1).
+# 2026-05-05 — Story 1.9 in-progress (dev started)
+# 2026-05-05 — Story 1.9 review : 44 nouveaux tests verts (19 logging + 6 RFC 7807 + 19 frontend inchangés) + 0 régression sur 222 unit/health tests + caddy validate clean sur 2 Caddyfiles (3 modes) + make build OK. Spec amendment : CADDY_HOST_IS_TAILSCALE → CADDY_TLS_VALUE (env-templating Caddy idiomatique). Bug runtime attrapé : IPv6 regex masquait timestamps ISO 8601 → fix {3,7} + test régression dédié.
+# 2026-05-05 — Story 1.9 code review fix-batch (1 patch P-01) via /code-review:code-review adapté (multi-agent 5 Sonnet + 6 Haiku scoring sur working tree). 6 findings → 5 FP écartées au scoring (≤ 45) + 1 réelle (90/100) : Caddyfile email fallback Story 1.1 perdu → caddy validate échoue avec env vide. Fix : restauration fallback {$VAR:admin@example.com} dans Caddyfile + .env.example default `admin@example.com` (defense-in-depth car Caddy {$VAR:default} ne fire que si var unset, pas si vide). 3 modes validés post-fix.
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -64,8 +69,8 @@ development_status:
   1-5-core-repositories-migrations: done
   1-6-core-llm-abstraction: done
   1-7-core-auth-token-statique: done
-  1-8-design-system-foundation: review
-  1-9-observability-caddy-ci: backlog
+  1-8-design-system-foundation: done
+  1-9-observability-caddy-ci: review
   epic-1-retrospective: optional
 
   # Epic 2: Agent Platform (Sprint 1)
