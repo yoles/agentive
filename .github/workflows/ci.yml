@@ -112,6 +112,32 @@ jobs:
           docker run --rm -v "$PWD":/src:ro zricethezav/gitleaks:v8.30.1 \
             git /src --redact --no-banner --config=/src/.gitleaks.toml
 
+  # ─── Caddy config validation (Story 1.9) ───
+  # Lints Caddyfile (prod) + Caddyfile.dev avant tout merge. Bloque les PR qui
+  # cassent la grammaire ou les directives reverse-proxy. Coût : ~5s par run.
+  # Image officielle caddy:2-alpine (pas de dépendance sur build-dev-images).
+  caddy-validate:
+    name: Caddy validate (Caddyfile + Caddyfile.dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Caddyfile (prod)
+        run: |
+          docker run --rm \
+            -v "$PWD/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -e CADDY_HOST=example.com \
+            -e CADDY_LETS_ENCRYPT_EMAIL=admin@example.com \
+            -e CADDY_TLS_VALUE=internal \
+            -e CADDY_CORS_ALLOW_ORIGIN=https://example.com \
+            caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Validate Caddyfile.dev
+        run: |
+          docker run --rm \
+            -v "$PWD/infra/caddy/Caddyfile.dev:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
   # ─── Tests ───
   # testcontainers spawns sibling Postgres containers via the host Docker
   # daemon — the pytest container therefore needs `/var/run/docker.sock` and
@@ -310,6 +336,7 @@ jobs:
       - test-frontend
       - spike-m3
       - gitleaks
+      - caddy-validate
       - build-prod-frontend-bundle
     steps:
       - name: Summary

@@ -12,6 +12,9 @@
 !.env.staging.example
 !.env.encrypted
 
+# Claude Code runtime — session lock (sessionId, pid). NEVER commit.
+.claude/*.lock
+
 # Spike M3 (Story 1.2) — thread_id transient file for crash/resume tests
 .spike-thread-id
 backend/.spike-thread-id
