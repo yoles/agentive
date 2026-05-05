@@ -40,6 +40,11 @@ last_updated: 2026-05-05
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
 # 2026-05-05 — Story 1.7 done (commit 34ef300 sur main)
+# 2026-05-05 — Story 1.8 created (ready-for-dev): Design system foundation (16 primitives shadcn + Geist + ModeToggle + Cmd+1-4 + sidebar collapsable)
+# 2026-05-05 — Story 1.8 in-progress (dev started)
+# 2026-05-05 — Story 1.8 review (10/10 tests verts, lint+typecheck+build verts, bundle JS gzip 189.21 KB)
+# 2026-05-05 — Story 1.8 spec amendments post-review (3 bad-spec) : AC2 radix-ui méta autorisé, AC4 slot pattern autorisé, AC1bis .npmrc prescrit. Patches code (24 findings) restent ouverts.
+# 2026-05-05 — Story 1.8 code review fix-batch (24 patches P-1 à P-24) : 19/19 tests verts (+9 vs baseline 10), lint+typecheck+build verts, bundle JS gzip 189.62 KB.
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -59,7 +64,7 @@ development_status:
   1-5-core-repositories-migrations: done
   1-6-core-llm-abstraction: done
   1-7-core-auth-token-statique: done
-  1-8-design-system-foundation: backlog
+  1-8-design-system-foundation: review
   1-9-observability-caddy-ci: backlog
   epic-1-retrospective: optional
 
