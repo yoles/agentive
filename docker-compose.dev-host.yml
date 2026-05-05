@@ -1,0 +1,26 @@
+# docker-compose.dev-host.yml
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Override pour `make dev-host` — expose le frontend sur le réseau local
+# pour tester depuis un téléphone, une tablette ou une autre machine du LAN.
+#
+# Usage : `docker compose -f docker-compose.yml -f docker-compose.dev-host.yml up -d`
+#         (ou plus simplement `make dev-host`)
+#
+# Sécurité (dev seulement) :
+#   - Le frontend Vite est exposé sur 0.0.0.0:5173 (toutes interfaces).
+#   - Le backend reste sur 127.0.0.1:8000 — les requêtes /api/* sont relayées
+#     par le proxy Vite (cf `frontend/vite.config.ts`) sur le réseau Docker
+#     interne. Aucune exposition LAN du backend.
+#   - Caddy n'est pas utilisé dans ce mode (il serait limité à `localhost` par
+#     son site block et ne répondrait pas aux requêtes du LAN). Pour tester
+#     HTTPS/CORS en conditions réelles, utiliser `make up` (Caddy + localhost).
+#   - À utiliser uniquement sur un réseau de confiance — aucun TLS, aucun
+#     auth proxy, traffic en clair.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+services:
+  frontend:
+    # `!override` remplace entièrement la liste `ports` héritée (sinon docker
+    # compose les additionne → conflit 127.0.0.1:5173 + 0.0.0.0:5173).
+    ports: !override
+      - "0.0.0.0:5173:5173"

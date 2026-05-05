@@ -24,6 +24,29 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    // Proxy `/api`, `/sse`, `/health`, `/ready` to the backend container so
+    // that direct access to Vite (e.g. via `make dev-host` on a LAN IP) works
+    // without going through Caddy. Inactive when accessed via Caddy because
+    // Caddy already handles those paths before they reach Vite.
+    proxy: {
+      "/api": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+      },
+      "/sse": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+        ws: true,
+      },
+      "/health": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+      },
+      "/ready": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+      },
+    },
     watch: {
       usePolling: true, // Required for Docker volume mounts on some systems
     },
