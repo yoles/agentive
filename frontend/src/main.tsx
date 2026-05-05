@@ -4,6 +4,17 @@ import { createRouter, RouterProvider } from "@tanstack/react-router";
 import { ErrorBoundary } from "@/app/ErrorBoundary";
 import { Providers } from "@/app/providers";
 import { routeTree } from "@/app/routeTree.gen";
+
+// Self-hosted Geist Sans + Mono (UX-DR4). `@fontsource` bundles woff2 files
+// into dist/assets/ at build time and declares @font-face with
+// `font-display: swap` — no FOUT on reload, no Google Fonts CDN dependency.
+import "@fontsource/geist-sans/400.css";
+import "@fontsource/geist-sans/500.css";
+import "@fontsource/geist-sans/600.css";
+import "@fontsource/geist-sans/700.css";
+import "@fontsource/geist-mono/400.css";
+import "@fontsource/geist-mono/500.css";
+
 import "@/styles/globals.css";
 
 const router = createRouter({
