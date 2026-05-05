@@ -125,6 +125,26 @@ up: _check-env ## Démarre le stack dev (db + backend + frontend + caddy) en arr
 .PHONY: dev
 dev: up ## Alias de make up
 
+.PHONY: dev-host
+dev-host: _check-env ## Démarre le stack dev en exposant le frontend sur le LAN (0.0.0.0:5173)
+	@docker compose -f docker-compose.yml -f docker-compose.dev-host.yml up -d
+	@echo ""
+	@echo "✅ Stack dev-host démarré (frontend exposé sur le réseau local)"
+	@echo ""
+	@echo "  Accès local      : http://localhost:5173"
+	@PRIMARY_IP=$$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($$i=="src") {print $$(i+1); exit}}'); \
+	 if [ -n "$$PRIMARY_IP" ]; then \
+		echo "  Accès LAN        : http://$$PRIMARY_IP:5173"; \
+	 else \
+		echo "  Accès LAN        : (IP non détectée — exécuter 'ip addr' ou 'hostname -I')"; \
+	 fi
+	@echo ""
+	@echo "  Notes :"
+	@echo "    - /api/* est proxifié par Vite vers backend:8000 (réseau Docker interne)."
+	@echo "    - Caddy n'est PAS utilisé dans ce mode (binding localhost only)."
+	@echo "    - À utiliser sur un réseau de confiance uniquement (HTTP en clair)."
+	@echo "    - Stop : make down"
+
 .PHONY: down
 down: ## Arrête le stack dev (préserve volumes)
 	$(DC_DEV) down
