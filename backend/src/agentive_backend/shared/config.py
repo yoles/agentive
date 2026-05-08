@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     @model_validator(mode="after")
-    def _reject_dev_defaults_in_production(self) -> "Settings":
+    def _reject_dev_defaults_in_production(self) -> Settings:
         """Fail-fast on `change_me*` placeholder in production; warn in dev."""
         violations: list[str] = []
         secret_fields = {
@@ -146,6 +146,7 @@ class Settings(BaseSettings):
 
         # Development / test : warn loudly but do not block.
         import sys
+
         print(
             "⚠️  agentive-backend config WARNING: dev placeholder values detected for "
             f"{', '.join(violations)}. "
@@ -157,7 +158,7 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _reject_invalid_fernet_key_in_production(self) -> "Settings":
+    def _reject_invalid_fernet_key_in_production(self) -> Settings:
         """Validate the Fernet encryption key format in production."""
         if self.environment != "production":
             return self

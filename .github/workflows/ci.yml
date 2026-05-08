@@ -1,11 +1,14 @@
 name: CI
 
 # Toutes les branches (AC8 Story 1.1) + tous les PRs vers main.
+# `workflow_dispatch` permet de déclencher manuellement le job `bench-m4`
+# (Story 1.3, gating critique #2) qui n'est PAS dans la chaîne `build` régulière.
 on:
   push:
     branches: ["**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel in-flight runs for the same ref — avoid double-burn on rapid pushes.
 concurrency:
@@ -109,10 +112,40 @@ jobs:
           docker run --rm -v "$PWD":/src:ro zricethezav/gitleaks:v8.30.1 \
             git /src --redact --no-banner --config=/src/.gitleaks.toml
 
+  # ─── Caddy config validation (Story 1.9) ───
+  # Lints Caddyfile (prod) + Caddyfile.dev avant tout merge. Bloque les PR qui
+  # cassent la grammaire ou les directives reverse-proxy. Coût : ~5s par run.
+  # Image officielle caddy:2-alpine (pas de dépendance sur build-dev-images).
+  caddy-validate:
+    name: Caddy validate (Caddyfile + Caddyfile.dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Caddyfile (prod)
+        run: |
+          docker run --rm \
+            -v "$PWD/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -e CADDY_HOST=example.com \
+            -e CADDY_LETS_ENCRYPT_EMAIL=admin@example.com \
+            -e CADDY_TLS_VALUE=internal \
+            -e CADDY_CORS_ALLOW_ORIGIN=https://example.com \
+            caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Validate Caddyfile.dev
+        run: |
+          docker run --rm \
+            -v "$PWD/infra/caddy/Caddyfile.dev:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
   # ─── Tests ───
-  # Tests run DIRECTLY on the runner (not inside a nested docker run) so we
-  # don't expose the host Docker socket to arbitrary PR code.
-  # testcontainers connects to the runner's daemon via standard env vars.
+  # testcontainers spawns sibling Postgres containers via the host Docker
+  # daemon — the pytest container therefore needs `/var/run/docker.sock` and
+  # `--network host`. Trade-off: PR code can reach the daemon. Mitigations :
+  # (1) le workflow ne tourne que sur push/PR du repo (pas de fork untrusted),
+  # (2) l'image est dev-only, sans secrets prod injectés ici, (3) le code des
+  # tests est revu dans le même PR. Migration future possible vers
+  # `services: postgres:` pour retirer le socket — voir Story 1.9 (CI hardening).
   test-backend:
     name: Test backend (pytest + testcontainers)
     runs-on: ubuntu-latest
@@ -128,11 +161,7 @@ jobs:
           tags: agentive-backend:ci
           load: true
           cache-from: type=gha,scope=backend-dev
-      # testcontainers requires access to the runner Docker daemon. GitHub
-      # Actions hosted runners already have Docker available — we do NOT mount
-      # /var/run/docker.sock into a nested container (PR RCE vector). Instead,
-      # we run pytest on the runner with the backend image providing deps.
-      - name: Run pytest
+      - name: Run pytest (excludes tests/spike — covered by spike-m3 job)
         run: |
           docker run --rm \
             -e TESTCONTAINERS_RYUK_DISABLED=true \
@@ -140,7 +169,123 @@ jobs:
             --network host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             agentive-backend:ci \
-            uv run pytest --tb=short
+            uv run pytest --tb=short --ignore=tests/spike
+
+  # ─── Spike M3 LangGraph (Story 1.2 — gating critique #1) ───
+  # 5 tests verrouillent les 3 piliers LangGraph (checkpoint Postgres, HITL,
+  # scatter-gather). Job séparé du test-backend principal car (1) ce sont des
+  # tests d'intégration plus lourds et (2) chaque upgrade majeure de langgraph
+  # (politique G3) doit re-valider explicitement ces tests avant merge.
+  # Le mount de `/var/run/docker.sock` suit la même justification que
+  # `test-backend` ci-dessus (testcontainers stand-up Postgres via le daemon
+  # hôte) — voir le bloc de commentaires du job test-backend pour les
+  # mitigations et le plan de migration vers `services:` (Story 1.9).
+  spike-m3:
+    name: Spike M3 LangGraph (gating critique #1)
+    runs-on: ubuntu-latest
+    needs: build-dev-images
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Rebuild backend image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: dev
+          tags: agentive-backend:ci
+          load: true
+          cache-from: type=gha,scope=backend-dev
+      - name: Run pytest tests/spike/
+        run: |
+          docker run --rm \
+            -e TESTCONTAINERS_RYUK_DISABLED=true \
+            -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
+            --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            agentive-backend:ci \
+            uv run pytest tests/spike/ -v --tb=short --maxfail=1
+
+  # ─── Bench M4 pgvector HNSW (Story 1.3 — gating critique #2) ───
+  # Ce job mesure la performance ANN (recall@5, p95 latency) sur 10k chunks
+  # synthétiques 384 dims via le harness `scripts/benchmark_*.py`. Il valide
+  # NFR4 (recall@5 > 90%) + NFR5 (p95 < 200ms end-to-end).
+  #
+  # ⚠️ NE TOURNE PAS sur chaque push — uniquement sur déclenchement manuel
+  # (`workflow_dispatch` depuis l'UI GitHub Actions ou via `gh workflow run ci.yml`).
+  # Justification : c'est un bench de gating one-shot Story 1.3, pas un test
+  # régression sur chaque PR. Re-exécution recommandée :
+  #   - Avant chaque upgrade pgvector (cf CONVENTIONS.md "Versioning critique")
+  #   - Mensuelle automatique (Story 7.6 — à activer plus tard via cron schedule)
+  #
+  # Le job est volontairement absent des `needs:` du job `build` final pour ne
+  # pas bloquer les PR sur cette mesure.
+  bench-m4:
+    name: Bench M4 pgvector HNSW (gating critique #2)
+    runs-on: ubuntu-latest
+    needs: build-dev-images
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Rebuild backend image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: dev
+          tags: agentive-backend:ci
+          load: true
+          cache-from: type=gha,scope=backend-dev
+      - name: Start Postgres + run baseline bench
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yml up -d db
+          # Wait for db healthy — fail-fast après 30s (M4 review).
+          healthy=0
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.yml ps db --format json | grep -q '"Health":"healthy"'; then
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "❌ Postgres pas healthy après 30s — abort"
+            docker compose -f docker-compose.yml logs db
+            exit 1
+          fi
+          # Apply migrations
+          docker run --rm --network host \
+            -e POSTGRES_HOST=127.0.0.1 \
+            agentive-backend:ci \
+            uv run alembic upgrade head
+          # Run baseline + fast HNSW sweep + ivfflat + report.
+          # Le bind-mount sur _bench_artifacts/ permet à upload-artifact de
+          # picker les CSV ; la copie de hnsw-tuning.md vers docs/decisions/
+          # se fait dans une step séparée (cf P1 review) pour assurer la
+          # régénération de l'artefact committé.
+          docker run --rm --network host \
+            -e POSTGRES_HOST=127.0.0.1 \
+            -v "$PWD/backend/_bench_artifacts:/app/_bench_artifacts" \
+            agentive-backend:ci \
+            sh -c 'uv run python -m scripts.benchmark_m4 && BENCH_FAST=1 uv run python -m scripts.benchmark_hnsw && uv run python -m scripts.benchmark_ivfflat && uv run python -m scripts._bench_aggregate && uv run python -m scripts._bench_report'
+      - name: Copy regenerated tuning report into docs/decisions/
+        # P1 review fix : `_bench_report.py` écrit dans `_bench_artifacts/` (workdir
+        # container, bind-mount vers `backend/_bench_artifacts`). Pour que
+        # `upload-artifact` envoie la version régénérée et non la version commitée,
+        # on copie explicitement après le bench. Cf Makefile bench-report:317.
+        run: |
+          mkdir -p docs/decisions
+          cp backend/_bench_artifacts/hnsw-tuning.md docs/decisions/hnsw-tuning.md
+      - name: Upload bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-m4-artifacts
+          path: |
+            backend/_bench_artifacts/*.csv
+            docs/decisions/hnsw-tuning.md
+            docs/decisions/m4-bench-result.md
+          if-no-files-found: error
 
   test-frontend:
     name: Test frontend (vitest)
@@ -189,7 +334,9 @@ jobs:
       - lint-frontend
       - test-backend
       - test-frontend
+      - spike-m3
       - gitleaks
+      - caddy-validate
       - build-prod-frontend-bundle
     steps:
       - name: Summary

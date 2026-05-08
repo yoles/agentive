@@ -100,9 +100,7 @@ def upgrade() -> None:
         "feature_flags",
         sa.Column("name", sa.String(100), primary_key=True),
         sa.Column("enabled", sa.Boolean, nullable=False, server_default=sa.false()),
-        sa.Column(
-            "rollout_percentage", sa.Integer, nullable=False, server_default="0"
-        ),
+        sa.Column("rollout_percentage", sa.Integer, nullable=False, server_default="0"),
         sa.Column("description", sa.Text, nullable=True),
         sa.Column(
             "updated_at",
@@ -121,7 +119,9 @@ def upgrade() -> None:
             server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column("name", sa.String(255), nullable=False, unique=True),
-        sa.Column("type", sa.String(50), nullable=False),  # client/metier/operationnelle/contextuelle
+        sa.Column(
+            "type", sa.String(50), nullable=False
+        ),  # client/metier/operationnelle/contextuelle
         sa.Column("department", sa.String(100), nullable=True),
         sa.Column("project", sa.String(100), nullable=True),
         sa.Column("retention_policy", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
@@ -343,9 +343,7 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         sa.Column("tenant_id", UUID(as_uuid=True), nullable=True),
-        sa.UniqueConstraint(
-            "agent_template_id", "version", name="uq_prompt_template_version"
-        ),
+        sa.UniqueConstraint("agent_template_id", "version", name="uq_prompt_template_version"),
     )
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -504,10 +502,18 @@ def upgrade() -> None:
 
     # Liste des partitions audit (alignée sur les 12 mois + default créés plus haut)
     _audit_partitions = [
-        "audit_events_2026_04", "audit_events_2026_05", "audit_events_2026_06",
-        "audit_events_2026_07", "audit_events_2026_08", "audit_events_2026_09",
-        "audit_events_2026_10", "audit_events_2026_11", "audit_events_2026_12",
-        "audit_events_2027_01", "audit_events_2027_02", "audit_events_2027_03",
+        "audit_events_2026_04",
+        "audit_events_2026_05",
+        "audit_events_2026_06",
+        "audit_events_2026_07",
+        "audit_events_2026_08",
+        "audit_events_2026_09",
+        "audit_events_2026_10",
+        "audit_events_2026_11",
+        "audit_events_2026_12",
+        "audit_events_2027_01",
+        "audit_events_2027_02",
+        "audit_events_2027_03",
         "audit_events_default",
     ]
 
@@ -520,21 +526,15 @@ def upgrade() -> None:
     # init.sql applique DEFAULT PRIVILEGES SELECT/INSERT/UPDATE/DELETE pour
     # agentive_app — on les retire explicitement sur les tables d'audit pour
     # enforcer la séparation des rôles définie par AC6.
-    op.execute(
-        "REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE audit_events FROM agentive_app"
-    )
+    op.execute("REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE audit_events FROM agentive_app")
     for partition in _audit_partitions:
-        op.execute(
-            f"REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE {partition} FROM agentive_app"
-        )
+        op.execute(f"REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLE {partition} FROM agentive_app")
 
     # Immutabilité : REVOKE DELETE/UPDATE pour agentive_audit_admin aussi
     # (seul INSERT autorisé → pas de tamper possible sur l'audit trail).
     op.execute("REVOKE DELETE, UPDATE ON TABLE audit_events FROM agentive_audit_admin")
     for partition in _audit_partitions:
-        op.execute(
-            f"REVOKE DELETE, UPDATE ON TABLE {partition} FROM agentive_audit_admin"
-        )
+        op.execute(f"REVOKE DELETE, UPDATE ON TABLE {partition} FROM agentive_audit_admin")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 8. Seed data : 1 user owner (John)
@@ -559,10 +559,18 @@ def downgrade() -> None:
     # Drop audit partitions (DEFAULT + 12 mois)
     for partition in [
         "audit_events_default",
-        "audit_events_2027_03", "audit_events_2027_02", "audit_events_2027_01",
-        "audit_events_2026_12", "audit_events_2026_11", "audit_events_2026_10",
-        "audit_events_2026_09", "audit_events_2026_08", "audit_events_2026_07",
-        "audit_events_2026_06", "audit_events_2026_05", "audit_events_2026_04",
+        "audit_events_2027_03",
+        "audit_events_2027_02",
+        "audit_events_2027_01",
+        "audit_events_2026_12",
+        "audit_events_2026_11",
+        "audit_events_2026_10",
+        "audit_events_2026_09",
+        "audit_events_2026_08",
+        "audit_events_2026_07",
+        "audit_events_2026_06",
+        "audit_events_2026_05",
+        "audit_events_2026_04",
     ]:
         op.execute(f"DROP TABLE IF EXISTS {partition}")
     op.execute("DROP TABLE IF EXISTS audit_events")

@@ -33,12 +33,6 @@ const ERROR_NETWORK: Omit<ApiError, "status"> = {
   detail: "Could not reach the server. Check your connection.",
 };
 
-const ERROR_MALFORMED: Omit<ApiError, "status"> = {
-  type: "/errors/malformed",
-  title: "Malformed response",
-  detail: "The server returned an unparseable body.",
-};
-
 function isApiError(x: unknown): x is ApiError {
   return (
     typeof x === "object" &&

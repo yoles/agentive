@@ -125,6 +125,26 @@ up: _check-env ## Démarre le stack dev (db + backend + frontend + caddy) en arr
 .PHONY: dev
 dev: up ## Alias de make up
 
+.PHONY: dev-host
+dev-host: _check-env ## Démarre le stack dev en exposant le frontend sur le LAN (0.0.0.0:5173)
+	@docker compose -f docker-compose.yml -f docker-compose.dev-host.yml up -d
+	@echo ""
+	@echo "✅ Stack dev-host démarré (frontend exposé sur le réseau local)"
+	@echo ""
+	@echo "  Accès local      : http://localhost:5173"
+	@PRIMARY_IP=$$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($$i=="src") {print $$(i+1); exit}}'); \
+	 if [ -n "$$PRIMARY_IP" ]; then \
+		echo "  Accès LAN        : http://$$PRIMARY_IP:5173"; \
+	 else \
+		echo "  Accès LAN        : (IP non détectée — exécuter 'ip addr' ou 'hostname -I')"; \
+	 fi
+	@echo ""
+	@echo "  Notes :"
+	@echo "    - /api/* est proxifié par Vite vers backend:8000 (réseau Docker interne)."
+	@echo "    - Caddy n'est PAS utilisé dans ce mode (binding localhost only)."
+	@echo "    - À utiliser sur un réseau de confiance uniquement (HTTP en clair)."
+	@echo "    - Stop : make down"
+
 .PHONY: down
 down: ## Arrête le stack dev (préserve volumes)
 	$(DC_DEV) down
@@ -286,13 +306,113 @@ gitleaks: ## Scan gitleaks sur le repo
 # BENCHMARKS (Sprint 0 Stories 1.2 + 1.3)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━ Bench M4 pgvector HNSW (Story 1.3 — gating critique #2) ━━━
+# Pipeline : (1) make bench → baseline + ground truth (~1 min)
+#            (2) make bench-hnsw-fast → sweep réduit 8 combos (~10 min CI)
+#            (3) make bench-hnsw → sweep complet 27 combos (~25 min)
+#            (4) make bench-ivfflat → comparaison ivfflat (~10 min)
+#            (5) make bench-report → agrégation CSV + génération hnsw-tuning.md
+# Output : _bench_artifacts/*.csv + docs/decisions/hnsw-tuning.md
+
 .PHONY: bench
-bench: ## Exécute les benchmarks M4 pgvector (Story 1.3)
+bench: up ## Bench baseline (10k chunks + ground truth + mesure baseline) — Story 1.3
 	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_m4
 
+.PHONY: bench-hnsw
+bench-hnsw: up ## Sweep HNSW complet (27 combos m × ef_construction × ef_search) — ~25 min
+	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_hnsw
+
+.PHONY: bench-hnsw-fast
+bench-hnsw-fast: up ## Sweep HNSW réduit (8 combos) — ~10 min, pour CI
+	$(DC_DEV) run --rm -e BENCH_FAST=1 backend uv run python -m scripts.benchmark_hnsw
+
+.PHONY: bench-ivfflat
+bench-ivfflat: up ## Comparaison ivfflat (9 combos lists × probes) — ~10 min
+	$(DC_DEV) run --rm backend uv run python -m scripts.benchmark_ivfflat
+
+.PHONY: bench-aggregate
+bench-aggregate: ## Agrège les CSV bench HNSW+ivfflat → comparison_hnsw_vs_ivfflat.csv (P8 review)
+	$(DC_DEV) run --rm backend uv run python -m scripts._bench_aggregate
+
+.PHONY: bench-report
+bench-report: bench-aggregate ## Agrège + génère docs/decisions/hnsw-tuning.md
+	$(DC_DEV) run --rm backend uv run python -m scripts._bench_report
+	@mkdir -p docs/decisions
+	@cp backend/_bench_artifacts/hnsw-tuning.md docs/decisions/hnsw-tuning.md
+	@echo "✅ Report copied to docs/decisions/hnsw-tuning.md"
+
+# ━━━ Spike M3 LangGraph (Story 1.2 — gating critique #1) ━━━
+# Le spike valide 3 piliers sur LangGraph 1.1.8 : checkpointing Postgres natif,
+# scatter-gather, human-in-the-loop. Code isolé dans backend/spike/ — sera réécrit
+# proprement dans features/m3_workflow_engine/ à l'Epic 4 selon le verdict de
+# docs/decisions/m3-spike-result.md.
+
 .PHONY: spike-m3
-spike-m3: ## Exécute le spike M3 LangGraph (Story 1.2)
+spike-m3: up ## Spike M3 — workflow basique (Producer → QualityGate → Reviewer), MockLLM auto si pas de clé Anthropic
 	$(DC_DEV) run --rm backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-mock
+spike-m3-mock: up ## Spike M3 — force MockLLM (ignore ANTHROPIC_API_KEY)
+	$(DC_DEV) run --rm -e ANTHROPIC_API_KEY="" backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-real
+spike-m3-real: up ## Spike M3 — force Anthropic réel (échoue si ANTHROPIC_API_KEY absent)
+	@if [ -z "$$ANTHROPIC_API_KEY" ]; then \
+		echo "❌ ANTHROPIC_API_KEY absent — exporter la clé dans le shell avant cette cible"; \
+		echo "   (sinon utiliser make spike-m3-mock pour forcer MockLLM)"; \
+		exit 1; \
+	fi
+	$(DC_DEV) run --rm -e ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-crash
+spike-m3-crash: up ## Spike M3 — crash post-producer (kill -9), persiste thread_id pour resume
+	$(DC_DEV) run --rm -e CRASH_AFTER=producer backend uv run python -m spike.m3_langgraph || true
+	@if [ -f "$(WORKDIR)/backend/.spike-thread-id" ]; then \
+		echo "✅ thread_id persisté : $$(cat $(WORKDIR)/backend/.spike-thread-id)"; \
+		echo "   → relance via : make spike-m3-resume"; \
+	else \
+		echo "❌ pas de .spike-thread-id — le crash n'a peut-être pas eu lieu"; exit 1; \
+	fi
+
+.PHONY: spike-m3-resume
+spike-m3-resume: up ## Spike M3 — reprise sur le thread_id écrit par spike-m3-crash
+	@test -f "$(WORKDIR)/backend/.spike-thread-id" || { echo "❌ backend/.spike-thread-id absent — exécuter make spike-m3-crash d'abord"; exit 1; }
+	@TID="$$(cat $(WORKDIR)/backend/.spike-thread-id)"; \
+	 echo "▶️  Resume thread_id=$$TID"; \
+	 $(DC_DEV) run --rm -e SPIKE_RESUME_THREAD_ID=$$TID backend uv run python -m spike.m3_langgraph
+
+.PHONY: spike-m3-scatter
+spike-m3-scatter: up ## Spike M3 — scatter-gather (3 summarizers en parallèle via Send)
+	$(DC_DEV) run --rm backend uv run python -m spike.m3_scatter_gather
+
+.PHONY: spike-m3-inspect
+spike-m3-inspect: up ## Spike M3 — inspecte le checkpoint Postgres pour un thread_id (THREAD_ID=<uuid>)
+	@test -n "$(THREAD_ID)" || { echo "❌ THREAD_ID requis — usage: make spike-m3-inspect THREAD_ID=<uuid>"; exit 1; }
+	$(DC_DEV) run --rm backend uv run python -m spike.inspect_checkpoint "$(THREAD_ID)"
+
+.PHONY: spike-m3-test
+spike-m3-test: up ## Spike M3 — exécute uniquement les tests pytest tests/spike/
+	$(DC_DEV) run --rm backend uv run pytest tests/spike/ -v
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGING (observe-only wrappers — le deploy réel passe par GitHub Actions)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Le workflow .github/workflows/deploy-staging.yml est la seule source de vérité
+# pour déployer. Ces cibles servent uniquement à consulter l'état staging depuis
+# une machine locale. Nécessite DEPLOY_USER + DEPLOY_HOST dans l'env shell.
+
+STAGING_COMPOSE := docker compose -f docker-compose.yml -f docker-compose.staging.yml -p agentive-staging
+STAGING_REMOTE := /opt/app/agentive-staging
+
+.PHONY: staging-logs
+staging-logs: ## Stream des logs staging via SSH (tail 100)
+	@test -n "$(DEPLOY_USER)" -a -n "$(DEPLOY_HOST)" || { echo "❌ DEPLOY_USER et DEPLOY_HOST requis"; exit 1; }
+	ssh $(DEPLOY_USER)@$(DEPLOY_HOST) 'cd $(STAGING_REMOTE) && $(STAGING_COMPOSE) logs -f --tail=100'
+
+.PHONY: staging-ps
+staging-ps: ## Statut des services staging via SSH
+	@test -n "$(DEPLOY_USER)" -a -n "$(DEPLOY_HOST)" || { echo "❌ DEPLOY_USER et DEPLOY_HOST requis"; exit 1; }
+	ssh $(DEPLOY_USER)@$(DEPLOY_HOST) 'cd $(STAGING_REMOTE) && $(STAGING_COMPOSE) ps'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MISC

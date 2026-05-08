@@ -14,7 +14,8 @@ Si vous découvrez une vulnérabilité dans Agentive, merci de la signaler en pr
 - **Secrets management** :
   - `.env.encrypted` chiffré via SOPS + age (committé)
   - `gitleaks` pre-commit + GitHub secret scanning
-  - Aucune clé API en clair dans le code / logs / traces (redaction `structlog`)
+  - Aucune clé API en clair dans le code / logs / traces (redaction `structlog` 3-stage : key-name + PII + API keys — Story 1.9)
+  - Voir [`docs/runbooks/observability.md`](./docs/runbooks/observability.md) pour le guide pratique de consommation (logs JSON, RFC 7807, correlation_id, ajout de redaction patterns)
 - **Security headers Caddy** : HSTS, CSP avec nonces, X-Content-Type-Options=nosniff, X-Frame-Options=DENY, Referrer-Policy=strict-origin-when-cross-origin
 - **CORS** : whitelist explicite (pas de `*`)
 - **Rate limiting** : `slowapi` (FastAPI) avec queues + backoff exponentiel

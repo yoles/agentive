@@ -1,6 +1,8 @@
 [importlinter]
 root_package = agentive_backend
-include_external_packages = False
+# Required by Contract 3 — external forbidden modules (sqlalchemy, psycopg, …)
+# can only be analyzed when import-linter builds their import graph too.
+include_external_packages = True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CANONICAL CONTRACT FILE FOR AGENTIVE BACKEND
@@ -37,21 +39,55 @@ modules =
     agentive_backend.features.m12_trace
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Contract 2 — Layered architecture : app → features → shared → infra
+# Contract 2 — Layered architecture : app → features → infra → shared
 # Higher layers may depend on lower layers, never the reverse.
-#   `app` may import features, shared, infra.
-#   `features` may import shared, infra (but not other features — see Contract 1).
-#   `shared` may import infra (for concrete adapters) but not features.
-#   `infra` may not import features or shared business logic.
+#   `app` may import features, infra, shared.
+#   `features` may import infra, shared (but not other features — see Contract 1).
+#   `infra` may import shared (e.g. `shared.config` for DSNs) but not features.
+#   `shared` is the kernel: cross-cutting utilities (config, logging, correlation,
+#   contracts). It must not depend on infra or business logic.
+#
+# Documented exception (Story 1.5) — `shared.repositories` is the canonical
+# Repository Pattern surface. Per Architecture line 1097, infra/db/* may be
+# imported by `shared.repositories.*` (and only there) so concrete repos can
+# bind ORM models declared in `infra.db.models`. The exception is narrow:
+# only the repositories sub-package may cross the layer line, only into
+# `infra.db.models` and `infra.db.session` (engine/session factory). All
+# other shared/* modules remain forbidden from importing infra/*.
+# Cf docs/decisions/repository-pattern.md for rationale.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:layered]
-name = Layered architecture (app → features → shared → infra)
+name = Layered architecture (app → features → infra → shared)
 type = layers
+# Allow ignore_imports declarations to reference edges that
+# import-linter's grimp graph doesn't surface as a direct edge candidate
+# for this contract — the underlying ``shared.repositories.*_repo ->
+# infra.db.models`` imports are documented exceptions even though the
+# layer-level normalizer doesn't always see them as violations.
+unmatched_ignore_imports_alerting = none
 layers =
     agentive_backend.app
     agentive_backend.features
-    agentive_backend.shared
     agentive_backend.infra
+    agentive_backend.shared
+# MAINTENANCE NOTE — when a new ``shared.repositories.*_repo`` file is
+# added in a later story, append it to the list below. ``import-linter``
+# does not support wildcard sources in the ``layers`` contract type, so
+# the explicit enumeration is required. The trade-off is intentional: a
+# new repo MUST be reviewed against the layering decision (and the ADR
+# ``docs/decisions/repository-pattern.md``) before its edge is whitelisted,
+# preventing a feature from sneaking an ``infra.db.models`` import.
+ignore_imports =
+    agentive_backend.shared.repositories.agent_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.audit_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.chunk_embedding_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.feature_flag_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.memory_chunk_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.namespace_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.outbox_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.prompt_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.user_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.workflow_repo -> agentive_backend.infra.db.models
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 3 — Direct DB access forbidden outside of infra.db / shared.repositories
@@ -66,8 +102,47 @@ source_modules =
     agentive_backend.features
 forbidden_modules =
     sqlalchemy
-    sqlalchemy.ext.asyncio
-    sqlalchemy.orm
     asyncpg
     psycopg
     psycopg2
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 4 — Event bus internals are private to `shared.event_bus`
+# Features must use the public re-exports from `shared.event_bus`
+# (publish, subscribe, OutboxWorker, Event, …). Direct imports of
+# `shared.event_bus.publisher / .outbox / .subscriber / .naming`
+# are forbidden so we can refactor internals without breaking callers
+# (e.g. the planned Redis Streams migration — see
+# `docs/decisions/event-bus-migration-trigger.md`).
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:event-bus-only-public-api]
+name = Features must import only the public event_bus API (publish, subscribe)
+type = forbidden
+source_modules =
+    agentive_backend.features
+forbidden_modules =
+    agentive_backend.shared.event_bus.outbox
+    agentive_backend.shared.event_bus.publisher
+    agentive_backend.shared.event_bus.subscriber
+    agentive_backend.shared.event_bus.naming
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Contract 5 — LLM SDKs are private to shared.llm / infra.llm (Story 1.6)
+# Feature modules and HTTP route handlers must go through the public
+# `agentive_backend.shared.llm.LLMRouter` rather than reaching for the
+# vendor SDKs directly. Justifies NFR12 (graceful degradation), NFR20
+# (multi-provider) and NFR9 (no API keys in logs/traces) — see
+# `docs/decisions/llm-abstraction.md`.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[importlinter:contract:no-direct-llm-sdk-from-features]
+name = Feature modules and api/* must not import LangChain LLM SDKs directly
+type = forbidden
+source_modules =
+    agentive_backend.features
+    agentive_backend.api
+forbidden_modules =
+    langchain_anthropic
+    langchain_openai
+    langchain_core
+    anthropic
+    openai
