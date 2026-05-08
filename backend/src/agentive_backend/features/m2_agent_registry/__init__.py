@@ -1,6 +1,24 @@
-"""Agent Registry — Epic M2.
+"""Agent Registry — Epic M2 (Story 2.1+).
 
-**Stub Sprint 0** — feature module placeholder. Implementation arrives in the
-matching story. Present only so `import-linter` can verify the feature
-isolation contract declared in `.import-linter`.
+Public surface :
+* :func:`load_registry` — load the 8 universal archetypes from YAML at lifespan.
+* :class:`ArchetypeDefinition` — Pydantic v2 model of one archetype entry.
+* :data:`router` — FastAPI router exposing ``/api/v1/agents/*`` endpoints.
+* :class:`AgentRegistryService` — orchestration on top of ``AgentTemplateRepo``.
 """
+
+from __future__ import annotations
+
+from agentive_backend.features.m2_agent_registry.archetypes import (
+    ArchetypeDefinition,
+    load_registry,
+)
+from agentive_backend.features.m2_agent_registry.router import router
+from agentive_backend.features.m2_agent_registry.service import AgentRegistryService
+
+__all__ = [
+    "AgentRegistryService",
+    "ArchetypeDefinition",
+    "load_registry",
+    "router",
+]

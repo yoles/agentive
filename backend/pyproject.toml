@@ -41,6 +41,9 @@ dependencies = [
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
     "python-multipart>=0.0.26",
+    # Story 2.1 — used to load `features/m2_agent_registry/templates/archetype-schema.yaml`.
+    # Already a transitive dep (langgraph), now declared explicitly per direct usage.
+    "pyyaml>=6.0",
     "slowapi>=0.1.9",
     "sqlalchemy[asyncio]>=2.0.49",
     "sse-starlette>=3.3.4",
@@ -179,4 +182,5 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.15.11",
     "testcontainers>=4.14.2",
+    "types-pyyaml>=6.0",  # Story 2.1 — mypy stubs for `import yaml`.
 ]

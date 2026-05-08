@@ -161,15 +161,55 @@ def create_app() -> FastAPI:
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=response_body)
 
+    # ─── RFC 7807 422 for Pydantic body validation errors ─────────────────
+    # FastAPI's default 422 returns ``{"detail": [...]}`` — not RFC 7807. We
+    # override here so all 422 responses (Pydantic + AgentiveError.ValidationError)
+    # share the same ``application/problem+json`` shape (Story 2.1 AC3).
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # Story 2.1 P-06 — strip `input` from each error entry so a caller
+        # who accidentally posts a credential / PII into a typed field
+        # doesn't see it echoed back in the 422 response. The structured
+        # type/loc/msg/ctx are sufficient for client-side error rendering.
+        # `ctx` may also embed user input on certain validators; we drop it
+        # for the same reason. Operators still see the full raw error
+        # server-side via the structlog WARNING below.
+        sanitized_errors = [
+            {k: v for k, v in err.items() if k not in {"input", "ctx"}} for err in exc.errors()
+        ]
+        log.warning(
+            "request_validation_failed",
+            error_count=len(sanitized_errors),
+            error_types=[err.get("type") for err in sanitized_errors],
+        )
+        body: dict[str, Any] = {
+            "type": "/errors/validation",
+            "title": "Validation failed",
+            "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "correlation_id": get_correlation_id(),
+            "detail": "Request body validation failed",
+            "errors": sanitized_errors,
+        }
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=body,
+            media_type="application/problem+json",
+        )
+
     # ─── Admin endpoints (Sprint 0 — operational introspection) ───
     from agentive_backend.api.admin import llm_health_router, rotate_token_router
 
     app.include_router(llm_health_router, prefix="/api/v1/admin")
     app.include_router(rotate_token_router, prefix="/api/v1/admin")
 
-    # ─── API versioned router (empty Sprint 0 — features plug in Sprint 1+) ───
-    # from agentive_backend.features.m2_agent_registry import router as agents_router
-    # app.include_router(agents_router, prefix="/api/v1")
+    # ─── API versioned router — Story 2.1+ ────────────────────────────────
+    from agentive_backend.features.m2_agent_registry import router as agents_router
+
+    app.include_router(agents_router, prefix="/api/v1")
 
     return app
 
