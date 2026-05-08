@@ -1,6 +1,6 @@
 # Story 1.9: Observability foundations + Caddy + CI
 
-Status: review
+Status: Done
 
 > 🛡️ **Sixième et dernière story Core de l'Epic 1** (Sprint 0). Story de **complétion-et-durcissement** : la majorité du périmètre observabilité/Caddy/CI a déjà été livrée par les Stories 1.1-1.8. Cette story comble 5 gaps précis et verrouille la baseline.
 >

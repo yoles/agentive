@@ -32,6 +32,15 @@ export default defineConfig([
         { type: "styles", pattern: "src/styles/**" },
       ],
       "boundaries/ignore": ["**/*.test.{ts,tsx}"],
+      // Required so `boundaries/dependencies` can resolve `@/...` aliases (vite-tsconfig-paths)
+      // and bare-relative imports back to their element type. Without this, the rule
+      // is silent on violations because imports can't be mapped to elements.
+      "import/resolver": {
+        typescript: {
+          alwaysTryTypes: true,
+          project: "./tsconfig.json",
+        },
+      },
     },
     languageOptions: {
       // Match TS target (ES2023) — allows top-level await, class fields, `.at()`.
@@ -55,17 +64,43 @@ export default defineConfig([
         },
       ],
       // ─── Layered architecture: app → features → shared ───
-      "boundaries/element-types": [
+      // Migrated to v6 `boundaries/dependencies` (renamed from `element-types`)
+      // with object-based selectors. Cf. v5→v6 migration guide.
+      "boundaries/dependencies": [
         "error",
         {
           default: "disallow",
           rules: [
             // `app` can import from anywhere (bootstrap layer).
-            { from: "app", allow: ["app", "feature", "shared", "styles"] },
-            // `features` can import `shared` — NEVER another feature.
-            { from: "feature", allow: ["shared", "styles"] },
+            {
+              from: { type: "app" },
+              allow: [
+                { to: { type: "app" } },
+                { to: { type: "feature" } },
+                { to: { type: "shared" } },
+                { to: { type: "styles" } },
+              ],
+            },
+            // `features` can import `shared`, `styles`, and OWN feature files
+            // (barrel `index.ts` reexports). NEVER another feature.
+            {
+              from: { type: "feature" },
+              allow: [
+                {
+                  to: {
+                    type: "feature",
+                    captured: { feature: "{{ from.captured.feature }}" },
+                  },
+                },
+                { to: { type: "shared" } },
+                { to: { type: "styles" } },
+              ],
+            },
             // `shared` is a leaf — only other `shared` modules.
-            { from: "shared", allow: ["shared"] },
+            {
+              from: { type: "shared" },
+              allow: [{ to: { type: "shared" } }],
+            },
           ],
         },
       ],
