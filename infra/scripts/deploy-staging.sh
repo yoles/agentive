@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REMOTE_PATH="${REMOTE_PATH:-/opt/app}"
+REMOTE_PATH="${REMOTE_PATH:-/opt/app/agentive/staging}"
 cd "$REMOTE_PATH"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
