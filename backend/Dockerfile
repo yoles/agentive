@@ -11,7 +11,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_CACHE_DIR=/app/.uv-cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -59,8 +60,16 @@ COPY . .
 # Install local package (prod mode)
 RUN uv sync --frozen --no-group dev --no-dev
 
-# Non-root user for security
-RUN useradd -r -u 1001 -g root agentive && chown -R agentive:root /app
+# Non-root user for security.
+# `useradd -m` crée explicitement `/home/agentive` (sinon `useradd -r` seul
+# sur Debian respecte CREATE_HOME=no et le home dir n'existe pas → uv run
+# tente de créer `/home/agentive/.cache/uv` et échoue avec EACCES).
+# Le UV_CACHE_DIR pointe explicitement vers `/app/.uv-cache` pour ne pas
+# dépendre du home dir et garder un chemin prévisible (writable car chown
+# -R sous /app).
+RUN useradd -r -m -u 1001 -g root agentive \
+    && mkdir -p /app/.uv-cache \
+    && chown -R agentive:root /app
 USER agentive
 
 EXPOSE 8000
