@@ -1,0 +1,189 @@
+"""Service layer — Agent Registry orchestration (Story 2.1).
+
+The service sits between the FastAPI router and the repositories. It :
+
+1. Validates the requested archetype against the in-process registry.
+2. Builds the default ``agent_templates.config`` JSON from the archetype.
+3. Composes the row INSERT and the audit-event publish in a SINGLE
+   transaction (Story 2.1 P-02 atomicity fix). The repository's
+   :meth:`AgentTemplateRepo.create_in_session` accepts an external session
+   so the service owns the transaction boundary, then ``event_bus.publish``
+   (no commit) writes to ``outbox_events`` in the same transaction. Commit
+   happens when the ``with_tenant`` context exits.
+4. The mapping ``IntegrityError`` → :class:`ConflictError` lives in the
+   repository layer so ``features/`` stay free of ``sqlalchemy`` imports
+   (``import-linter`` Contract 3 — Story 2.1 P-01).
+5. After the transaction commits, best-effort ``emit_notify`` to wake the
+   outbox worker. NOTIFY failure is non-fatal (poll fallback Story 1.4).
+
+The audit event ``m2.agent_template.created`` is published via the
+event-bus bypass pattern documented in Epic 1 retrospective 2026-05-08
+(to be migrated to ``AuditEventRepo.record()`` in Story 9.1).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
+from agentive_backend.features.m2_agent_registry.schemas import (
+    ArchetypeDetail,
+    ArchetypeSummary,
+    ContractSkeletonView,
+    CreateTemplateResponse,
+)
+from agentive_backend.shared.contracts.events import AgentTemplateCreatedEvent
+from agentive_backend.shared.event_bus import emit_notify, publish
+from agentive_backend.shared.exceptions import NotFoundError, ValidationError
+from agentive_backend.shared.logging import get_logger
+
+if TYPE_CHECKING:
+    from agentive_backend.shared.repositories import AgentTemplateRepo
+
+_log = get_logger(__name__)
+
+
+class AgentRegistryService:
+    """Orchestrate archetype lookup + template creation."""
+
+    def __init__(
+        self,
+        *,
+        registry: Mapping[str, ArchetypeDefinition],
+        template_repo: AgentTemplateRepo,
+    ) -> None:
+        self._registry = registry
+        self._template_repo = template_repo
+
+    # ─── Archetypes ───────────────────────────────────────────────
+
+    def list_archetypes(self) -> list[ArchetypeSummary]:
+        """Return the 8 archetypes as lean summaries (no prompt_base / contracts)."""
+        return [
+            ArchetypeSummary(
+                id=a.id,
+                display_name=a.display_name,
+                icon_name=a.icon_name,
+                description=a.description,
+                default_role=a.default_role,
+            )
+            for a in self._registry.values()
+        ]
+
+    def get_archetype(self, archetype_id: str) -> ArchetypeDetail:
+        """Return one archetype with its full skeleton."""
+        archetype = self._registry.get(archetype_id)
+        if archetype is None:
+            raise NotFoundError(
+                detail=f"Unknown archetype '{archetype_id}'",
+                context={"archetype_id": archetype_id},
+            )
+        return ArchetypeDetail(
+            id=archetype.id,
+            display_name=archetype.display_name,
+            icon_name=archetype.icon_name,
+            description=archetype.description,
+            default_role=archetype.default_role,
+            prompt_base=archetype.prompt_base,
+            input_contract=ContractSkeletonView(**archetype.input_contract.model_dump()),
+            output_contract=ContractSkeletonView(**archetype.output_contract.model_dump()),
+        )
+
+    # ─── Templates ────────────────────────────────────────────────
+
+    async def create_template(
+        self,
+        *,
+        name: str,
+        archetype_id: str,
+        tenant_id: UUID | None = None,
+    ) -> CreateTemplateResponse:
+        """Persist a new ``agent_templates`` row + publish the audit event atomically.
+
+        Story 2.1 P-02 — the row INSERT and the outbox INSERT share a single
+        transaction so a partial-failure mid-flight cannot leave the system
+        in a state where the template exists with no audit trace. The bound
+        ``correlation_id`` ContextVar (set by ``CorrelationIdMiddleware``)
+        is auto-propagated by ``publish`` — no explicit pass.
+
+        Raises
+        ------
+        ValidationError
+            ``archetype_id`` is not one of the 8 universal archetypes.
+        ConflictError
+            ``(name, version=1, tenant_id)`` already exists. Translated by
+            :meth:`AgentTemplateRepo.create_in_session` from the underlying
+            ``IntegrityError`` so this module stays free of ``sqlalchemy``
+            imports (``import-linter`` Contract 3 — Story 2.1 P-01).
+        """
+        archetype = self._registry.get(archetype_id)
+        if archetype is None:
+            valid = ", ".join(sorted(self._registry.keys()))
+            raise ValidationError(
+                detail=f"Unknown archetype '{archetype_id}'. Valid archetypes: {valid}",
+                context={"valid_archetypes": sorted(self._registry.keys())},
+            )
+
+        config = archetype.to_template_config()
+        event_type = AgentTemplateCreatedEvent.event_type
+
+        # ─── Single transaction: row INSERT + outbox INSERT ───
+        # `with_tenant` opens an AsyncSession, binds tenant via SET LOCAL,
+        # commits on `__aexit__` if no exception. `create_in_session` and
+        # `publish(session=...)` both operate on the same session, so the
+        # transaction is atomic.
+        # TODO Story 9.1 — migrate to AuditEventRepo.record() (audit-event
+        # bypass cleanup, see Epic 1 retro 2026-05-08).
+        async with self._template_repo.with_tenant(tenant_id) as session:
+            template = await self._template_repo.create_in_session(
+                session,
+                name=name,
+                archetype=archetype.id,
+                config=config,
+                version=1,
+                tenant_id=tenant_id,
+            )
+            event = AgentTemplateCreatedEvent(
+                template_id=template.id,
+                name=template.name,
+                archetype=template.archetype,
+                version=template.version,
+                actor="system",
+                tenant_id=tenant_id,
+            )
+            event_id = await publish(event_type, event, session=session)
+            # commit happens at __aexit__ if no exception is raised.
+
+        # ─── Post-commit: best-effort NOTIFY ───
+        # Worker poll fallback (Story 1.4) covers any missed NOTIFY, so a
+        # failure here is logged but never re-raised — the row + outbox
+        # are already durable.
+        try:
+            await emit_notify(event_id, event_type)
+        except Exception:
+            _log.warning(
+                "event_bus_notify_failed_will_be_polled",
+                event_id=str(event_id),
+                event_type=event_type,
+            )
+
+        _log.info(
+            "agent_template_created",
+            template_id=str(template.id),
+            name=template.name,
+            archetype=template.archetype,
+            version=template.version,
+        )
+
+        return CreateTemplateResponse(
+            template_id=template.id,
+            name=template.name,
+            archetype=template.archetype,
+            version=template.version,
+            created_at=template.created_at,
+        )
+
+
+__all__ = ["AgentRegistryService"]

@@ -14,6 +14,7 @@ from typing import Any
 import bcrypt
 from fastapi import FastAPI
 
+from agentive_backend.features.m2_agent_registry import load_registry
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
 from agentive_backend.shared.config import settings
@@ -194,6 +195,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Initialise auth token hash from env (fail-fast in production if plaintext).
     _init_auth_token(app)
+
+    # Story 2.1 — load the 8 universal archetypes registry. Fail-fast if the
+    # YAML is missing/malformed (RuntimeError surfaces the cause to the
+    # operator instead of the app booting with an empty registry).
+    app.state.archetype_registry = load_registry()
+    log.info("archetype_registry_loaded", count=len(app.state.archetype_registry))
 
     # Build the session factory FIRST so the LLM fallback callback can
     # close over it. The callback is wired into the LLMRouter at

@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Outlet } from "@tanstack/react-router";
 import { useGlobalShortcuts } from "@/shared/hooks/useGlobalShortcuts";
+import { Toaster } from "@/shared/components/ui/sonner";
 import { Sidebar } from "./Sidebar";
 
 /**
@@ -32,6 +33,9 @@ export function AppLayout({
           <Outlet />
         </div>
       </main>
+      {/* Toaster mounted once at the app shell level so any feature can call
+          `toast(...)` without re-mounting. Story 2.1 — first feature consumer. */}
+      <Toaster richColors />
     </div>
   );
 }

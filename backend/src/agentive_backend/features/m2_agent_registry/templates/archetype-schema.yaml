@@ -1,0 +1,176 @@
+# 8 archétypes universels — registry chargé au lifespan FastAPI (Story 2.1).
+#
+# Convention (Story 2.1 §"Pièges connus" #6) : `id` = slug ASCII sans accents
+# (cohérence routing/CLI/JSON). `display_name` (avec accents) pour l'UI uniquement.
+#
+# Anti-scope (Story 2.1) : `prompt_base` est un *squelette* minimal — Story 2.2
+# étendra avec system_prompt complet, llm_model, llm_params, provider_chain,
+# error_policy. Le `input_contract` / `output_contract` est lui aussi un
+# squelette `{core, extras}` — la mécanique full des contrats élastiques arrive
+# Story 2.2 (versionnée + Pydantic v2 strict côté serveur).
+#
+# Source : prd.md:47, prd.md:496 (FR9), architecture.md:53.
+
+archetypes:
+  - id: orchestrateur
+    display_name: Orchestrateur
+    icon_name: compass
+    description: Coordonne plusieurs agents et workflows, séquence les étapes,
+      arbitre les priorités. Premier point d'entrée d'un département.
+    default_role: orchestrator
+    prompt_base: |-
+      Tu es un agent Orchestrateur. Ton rôle est de coordonner d'autres agents
+      pour atteindre un objectif métier. Tu décomposes les demandes en étapes,
+      délègues aux bons spécialistes, et synthétises les résultats.
+    input_contract:
+      core:
+        objective: string
+      extras: {}
+    output_contract:
+      core:
+        plan: array
+        delegations: array
+      extras: {}
+
+  - id: chercheur
+    display_name: Chercheur
+    icon_name: search
+    description: Explore des sources, identifie l'information pertinente,
+      ramène des références sourcées. Premier maillon de la chaîne RAG.
+    default_role: researcher
+    prompt_base: |-
+      Tu es un agent Chercheur. Tu explores les sources disponibles (mémoire
+      vectorielle, web, outils MCP) pour rapporter des éléments pertinents
+      avec leurs sources. Tu ne synthétises pas — tu collectes et qualifies.
+    input_contract:
+      core:
+        query: string
+      extras: {}
+    output_contract:
+      core:
+        findings: array
+        sources: array
+      extras: {}
+
+  - id: analyste
+    display_name: Analyste
+    icon_name: bar-chart
+    description: Synthétise et structure des données ou des findings bruts en
+      insights actionnables. Détecte patterns, contradictions, signaux faibles.
+    default_role: analyst
+    prompt_base: |-
+      Tu es un agent Analyste. À partir de findings ou de données brutes, tu
+      produis une synthèse structurée : insights, patterns, recommandations.
+      Tu cites toujours les sources d'origine pour traçabilité.
+    input_contract:
+      core:
+        findings: array
+      extras: {}
+    output_contract:
+      core:
+        insights: array
+        recommendations: array
+      extras: {}
+
+  - id: producteur
+    display_name: Producteur
+    icon_name: wrench
+    description: Génère le livrable concret (code, document, design, message).
+      Maillon principal de production — son output passe ensuite en review.
+    default_role: producer
+    prompt_base: |-
+      Tu es un agent Producteur. Ton rôle est de générer un livrable concret
+      conforme à un brief. Tu suis les conventions imposées et délivres un
+      artefact prêt à être reviewé. Tu n'effectues pas la review toi-même.
+    input_contract:
+      core:
+        brief: string
+      extras: {}
+    output_contract:
+      core:
+        artifact: string
+        metadata: object
+      extras: {}
+
+  - id: stratege
+    display_name: Stratège
+    icon_name: target
+    description: Définit la direction, priorise les options, cadre les
+      arbitrages. Travaille sur l'horizon long terme et les choix structurants.
+    default_role: strategist
+    prompt_base: |-
+      Tu es un agent Stratège. Tu prends du recul sur les options possibles,
+      tu cadres les arbitrages, tu recommandes une direction avec ses risques
+      explicites. Tu ne produis pas — tu oriente la production.
+    input_contract:
+      core:
+        context: string
+        options: array
+      extras: {}
+    output_contract:
+      core:
+        recommendation: string
+        tradeoffs: array
+      extras: {}
+
+  - id: controleur
+    display_name: Contrôleur
+    icon_name: shield-check
+    description: Review un livrable selon des critères qualité. Renvoie une
+      review conversationnelle avec sévérité (bloquant/suggestion/question).
+    default_role: controller
+    prompt_base: |-
+      Tu es un agent Contrôleur. Tu reviews un livrable et retournes des
+      commentaires localisés avec un niveau de sévérité (bloquant, suggestion,
+      question). Tu ne ré-écris jamais le livrable — c'est le rôle du Producteur.
+    input_contract:
+      core:
+        artifact: string
+        criteria: array
+      extras: {}
+    output_contract:
+      core:
+        verdict: string
+        comments: array
+      extras: {}
+
+  - id: veilleur
+    display_name: Veilleur
+    icon_name: eye
+    description: Surveille en continu une source ou un signal (RSS, webhook,
+      métrique) et déclenche une alerte/notification quand un seuil est atteint.
+    default_role: watcher
+    prompt_base: |-
+      Tu es un agent Veilleur. Tu surveilles un signal et tu produis une
+      notification structurée quand un seuil ou une condition est franchie.
+      Tu ne décides pas de l'action — tu signales.
+    input_contract:
+      core:
+        signal_source: string
+        threshold: object
+      extras: {}
+    output_contract:
+      core:
+        alert: object
+        timestamp: string
+      extras: {}
+
+  - id: communicateur
+    display_name: Communicateur
+    icon_name: message-square
+    description: Adapte un message à une audience cible (ton, format, longueur).
+      Dernier maillon avant diffusion externe (chat, email, notification).
+    default_role: communicator
+    prompt_base: |-
+      Tu es un agent Communicateur. Tu adaptes un contenu source à une audience
+      cible : ton, format, longueur. Tu préserves le sens, tu ajustes le canal.
+    input_contract:
+      core:
+        source: string
+        audience: string
+      extras: {}
+    output_contract:
+      core:
+        message: string
+        channel_hint: string
+      extras: {}
