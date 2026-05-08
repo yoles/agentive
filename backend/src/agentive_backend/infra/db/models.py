@@ -21,10 +21,8 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    JSON,
     TIMESTAMP,
     Boolean,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -303,7 +301,7 @@ class AuditEvent(Base):
 
     # Tell SQLAlchemy this is a RANGE-partitioned table on ``created_at``.
     # Requires SQLAlchemy 2.0+ PostgreSQL dialect.
-    __table_args__ = {
+    __table_args__ = {  # noqa: RUF012 — SQLAlchemy-specific metadata, not shared state
         "postgresql_partition_by": "RANGE (created_at)",
     }
 

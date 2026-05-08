@@ -1,27 +1,103 @@
-# Caddy prod config — auto-HTTPS Let's Encrypt OR Tailscale MagicDNS
-# Ports standards 80/443
+# Caddy prod config — auto-HTTPS Let's Encrypt OU Tailscale MagicDNS
 #
-# Sprint 0 : stub — à compléter avec le domaine de prod en déploiement initial
-
+# Variables d'environnement (REQUIRED en prod, ignorées en dev qui utilise Caddyfile.dev) :
+#   CADDY_HOST                       — domaine prod (ex: agentive.example.com OU agentive-host.tail-XYZ.ts.net)
+#   CADDY_LETS_ENCRYPT_EMAIL         — email valide pour ACME Let's Encrypt (utilisé par le bloc global)
+#   CADDY_TLS_VALUE                  — `internal` (Tailscale / self-signed) OU email ACME (Let's Encrypt).
+#                                      Default: `internal` (safer fail-soft : un démarrage sans cette var
+#                                      ne tente pas d'ACME mais fait du self-signed jusqu'à correction).
+#   CADDY_CORS_ALLOW_ORIGIN          — origin frontend autorisée (ex: https://agentive.example.com — souvent même host)
+#
+# Reverse proxy :
+#   - `/api/*`   → backend:8000
+#   - `/sse/*`   → backend:8000 (SSE-tuned : flush_interval -1, read/write_timeout 24h)
+#   - /health, /ready, /api → backend:8000
+#   - `/*`       → frontend:80 (image Caddy alpine stage prod servant le bundle Vite)
+#
+# Note CSP (`{http.request.uuid}` placeholder Caddy par requête) :
+#   La directive est posée pour le futur (SSR ou middleware injectant le nonce dans index.html).
+#   Pour Sprint 0 le frontend est un Vite SPA build classique sans inline scripts → la CSP
+#   n'a aucun script à valider, elle ne casse rien. Si plus tard un déploiement réel observe
+#   un blocage CSP, on bascule temporairement (ticket tech-debt) ou on injecte le nonce côté app.
 {
-    # Email pour Let's Encrypt (à configurer via env var ou update avant déploiement)
-    email {$CADDY_LETS_ENCRYPT_EMAIL:admin@example.com}
-    # Admin API désactivée
-    admin off
+	# Fallback `admin@example.com` pour fail-soft : un déployeur qui laisse
+	# `CADDY_LETS_ENCRYPT_EMAIL` vide (default `.env.example`) en mode
+	# `CADDY_TLS_VALUE=internal` ne fait PAS échouer `caddy validate` parsing
+	# avec « wrong argument count after 'email' ». L'email n'est utilisé par
+	# Caddy que pour ACME Let's Encrypt — ignoré en mode `internal`.
+	email {$CADDY_LETS_ENCRYPT_EMAIL:admin@example.com}
+	admin off
 }
 
-# TODO : remplacer par le domaine de prod réel
-# Exemple :
-# agentive.example.com {
-#     reverse_proxy /api/* backend:8000
-#     reverse_proxy /sse/*  backend:8000 {
-#         flush_interval -1
-#     }
-#     reverse_proxy frontend:5173
-#     ...
-# }
+{$CADDY_HOST} {
+	# ─── TLS ───
+	# `internal` = self-signed (mode Tailscale ou bootstrap local) ;
+	# email = ACME Let's Encrypt automatique avec cet email.
+	# Par défaut `internal` pour fail-soft (pas d'appels ACME ratés au boot).
+	tls {$CADDY_TLS_VALUE:internal}
 
-# Placeholder (dev self-signed par défaut si aucun domaine prod défini)
-:80 {
-    respond "Agentive prod config — configurer un domaine avant déploiement" 503
+	# ─── Security headers (prod) ───
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		# CSP avec nonce généré par Caddy à chaque requête.
+		# `{http.request.uuid}` est un placeholder Caddy résolu par requête.
+		# Voir note CSP en tête : Sprint 0 SPA build sans inline → pas d'impact ;
+		# un futur SSR/middleware injectera le nonce dans index.html.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'nonce-{http.request.uuid}'; style-src 'self' 'nonce-{http.request.uuid}'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+
+	# ─── CORS — appliqué à TOUTES les responses des routes API/SSE/health/ready ───
+	# Whitelist explicite via CADDY_CORS_ALLOW_ORIGIN — pas de `*`.
+	@api_like {
+		path /api/* /api /sse/* /health /ready
+	}
+	handle @api_like {
+		header {
+			Access-Control-Allow-Origin "{$CADDY_CORS_ALLOW_ORIGIN}"
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+			Access-Control-Allow-Headers "Authorization, Content-Type, X-Correlation-ID, Accept, Accept-Language"
+			Access-Control-Expose-Headers "X-Correlation-ID"
+			Access-Control-Max-Age "3600"
+			Vary "Origin"
+		}
+		# Preflight short-circuit — return 204 immediately for OPTIONS.
+		@preflight method OPTIONS
+		respond @preflight 204
+
+		# SSE endpoint (streaming agent → user, unidirectionnel — sse-starlette).
+		@sse path /sse/*
+		reverse_proxy @sse backend:8000 {
+			flush_interval -1
+			header_up Connection ""
+			transport http {
+				read_timeout 24h
+				write_timeout 24h
+			}
+		}
+
+		# API + health + ready → backend.
+		# X-Forwarded-{For,Proto} sont émis automatiquement par Caddy reverse_proxy
+		# (default behavior — pas besoin de header_up explicite).
+		reverse_proxy backend:8000
+	}
+
+	# ─── Frontend (Caddy interne stage prod sur :80, sert les statiques Vite build) ───
+	handle {
+		reverse_proxy frontend:80 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	log {
+		output stdout
+		format json
+		level INFO
+	}
 }

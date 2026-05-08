@@ -2,6 +2,15 @@
 
 Runbooks opérationnels pour Agentive — procédures concrètes pour des situations récurrentes.
 
+## Disponibles
+
+- [`event-bus-debug.md`](./event-bus-debug.md) — Debug du bus d'événements LISTEN/NOTIFY (Story 1.4)
+- [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)
+- [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
+- [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)
+- [`observability.md`](./observability.md) — Guide pratique observabilité : logs JSON, RFC 7807, correlation_id, redaction (Story 1.9)
+- [`repositories-usage.md`](./repositories-usage.md) — Utilisation Repository Pattern + RLS (Story 1.5)
+
 ## À implémenter (progressivement)
 
 - `restore-backup.md` — Procédure restore `pg_dump` depuis `backups/` (Sprint 1+)

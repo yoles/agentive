@@ -7,8 +7,21 @@
 .env.dev
 .env.prod
 .env.production
+.env.staging
 !.env.example
+!.env.staging.example
 !.env.encrypted
+
+# Claude Code runtime — session lock (sessionId, pid). NEVER commit.
+.claude/*.lock
+
+# Spike M3 (Story 1.2) — thread_id transient file for crash/resume tests
+.spike-thread-id
+backend/.spike-thread-id
+
+# Bench M4 (Story 1.3) — artefacts mesure (CSV, ground truth cache regenerable)
+_bench_artifacts/
+backend/_bench_artifacts/
 
 # SOPS + age — private keys only (public keys *.pub / recipients are safe to commit)
 age.key
@@ -44,6 +57,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!frontend/src/shared/lib/
 lib64/
 parts/
 sdist/
@@ -146,3 +160,8 @@ lerna-debug.log*
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 /spike_output/
 /benchmark_results/
+
+
+
+infrastructure/
+infrastructure_idem_helper/

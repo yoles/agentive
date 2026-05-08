@@ -28,7 +28,6 @@ export class ErrorBoundary extends Component<Props, State> {
     // In dev, bubble to console with full stack. In prod, later stories will
     // forward to structlog via the correlation_id channel (Story 1.9 + Sentry
     // if plugged in).
-    // eslint-disable-next-line no-console
     console.error("ErrorBoundary caught", error, info.componentStack);
   }
 

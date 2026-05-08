@@ -4,7 +4,7 @@ export const Route = createFileRoute("/dashboard/")({
   component: DashboardPage,
 });
 
-function DashboardPage() {
+export function DashboardPage() {
   return (
     <section aria-labelledby="dashboard-heading" className="flex flex-col gap-6">
       <header>

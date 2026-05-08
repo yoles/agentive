@@ -1,0 +1,88 @@
+name: Deploy Staging
+
+# Déploie agentive sur https://staging.agentive.idem-agency.fr via SSH.
+# Traefik (déployé depuis infrastructure_idem_helper) sert de reverse proxy +
+# terminaison TLS (Let's Encrypt auto) sur le serveur cible.
+#
+# Prérequis (hors repo) :
+#   - DNS A record `staging.agentive.idem-agency.fr` → IP serveur idem
+#   - User deploy dans groupe docker, path /opt/app/agentive-staging/ créé
+#   - GitHub environment `staging` avec les secrets ci-dessous
+#
+# Secrets requis :
+#   SSH_PRIVATE_KEY   — clé privée OpenSSH raw (pas de base64)
+#   DEPLOY_HOST       — hostname ou IP du serveur idem
+#   DEPLOY_USER       — user SSH (ex: deploy)
+#   STAGING_ENV_FILE  — contenu multi-ligne complet du .env.staging (voir template)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Queue les deploys sur la même branche (pas d'annulation en cours de migration).
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.agentive.idem-agency.fr
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Push code to server (git archive, deterministic)
+        # `git archive` ne copie que les fichiers trackés du commit courant —
+        # aucun .git, node_modules, .venv, _bmad_output, screenshots etc.
+        run: |
+          git archive --format=tar.gz HEAD \
+            | ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+                'mkdir -p /opt/app/agentive-staging && tar -xzf - -C /opt/app/agentive-staging'
+
+      - name: Write .env.staging on server
+        env:
+          ENV_FILE: ${{ secrets.STAGING_ENV_FILE }}
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'cat > /opt/app/agentive-staging/.env.staging && chmod 600 /opt/app/agentive-staging/.env.staging' \
+            <<< "$ENV_FILE"
+
+      - name: Run deploy script on server
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'bash /opt/app/agentive-staging/infra/scripts/deploy-staging.sh'
+
+      - name: Smoke tests
+        run: |
+          set -e
+          echo "▶ HTTPS health"
+          curl -fsS https://staging.agentive.idem-agency.fr/health
+          echo
+          echo "▶ HTTPS ready (DB connectivity)"
+          curl -fsS https://staging.agentive.idem-agency.fr/ready
+          echo
+          echo "▶ HTTPS frontend HTML"
+          curl -fsS https://staging.agentive.idem-agency.fr/ | grep -q '<!DOCTYPE html'
+          echo "▶ HTTP → HTTPS redirect"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -I http://staging.agentive.idem-agency.fr/)
+          [[ "$code" =~ ^30[178]$ ]] || { echo "❌ expected 301/307/308, got $code"; exit 1; }
+          echo "✅ All smoke tests passed"

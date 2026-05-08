@@ -35,7 +35,31 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-04-19T12:50
+last_updated: 2026-05-08  # Epic 2 in-progress + Story 2.1 ready-for-dev
+# 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
+# 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
+# 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
+# 2026-05-05 — Story 1.7 done (commit 34ef300 sur main)
+# 2026-05-05 — Story 1.8 created (ready-for-dev): Design system foundation (16 primitives shadcn + Geist + ModeToggle + Cmd+1-4 + sidebar collapsable)
+# 2026-05-05 — Story 1.8 in-progress (dev started)
+# 2026-05-05 — Story 1.8 review (10/10 tests verts, lint+typecheck+build verts, bundle JS gzip 189.21 KB)
+# 2026-05-05 — Story 1.8 spec amendments post-review (3 bad-spec) : AC2 radix-ui méta autorisé, AC4 slot pattern autorisé, AC1bis .npmrc prescrit. Patches code (24 findings) restent ouverts.
+# 2026-05-05 — Story 1.8 code review fix-batch (24 patches P-1 à P-24) : 19/19 tests verts (+9 vs baseline 10), lint+typecheck+build verts, bundle JS gzip 189.62 KB.
+# 2026-05-05 — Story 1.8 done (commit a83a346 sur main) + post-merge chore make dev-host (aec78c5)
+# 2026-05-05 — Story 1.9 created (ready-for-dev): Observability + Caddy + CI (last Core story Epic 1) — Caddyfile prod fonctionnel + redaction PII/key-name + RFC 7807 conformance tests + caddy validate CI + runbook observability. Anti-scope: pas d'OTel (Sprint 1), pas de Sentry, pas de hierarchical correlation H5 (Sprint 1).
+# 2026-05-05 — Story 1.9 in-progress (dev started)
+# 2026-05-05 — Story 1.9 review : 44 nouveaux tests verts (19 logging + 6 RFC 7807 + 19 frontend inchangés) + 0 régression sur 222 unit/health tests + caddy validate clean sur 2 Caddyfiles (3 modes) + make build OK. Spec amendment : CADDY_HOST_IS_TAILSCALE → CADDY_TLS_VALUE (env-templating Caddy idiomatique). Bug runtime attrapé : IPv6 regex masquait timestamps ISO 8601 → fix {3,7} + test régression dédié.
+# 2026-05-05 — Story 1.9 code review fix-batch (1 patch P-01) via /code-review:code-review adapté (multi-agent 5 Sonnet + 6 Haiku scoring sur working tree). 6 findings → 5 FP écartées au scoring (≤ 45) + 1 réelle (90/100) : Caddyfile email fallback Story 1.1 perdu → caddy validate échoue avec env vide. Fix : restauration fallback {$VAR:admin@example.com} dans Caddyfile + .env.example default `admin@example.com` (defense-in-depth car Caddy {$VAR:default} ne fire que si var unset, pas si vide). 3 modes validés post-fix.
+# 2026-05-08 — Story 1.9 done (commit 0ea1665 sur main) — Epic 1 (Foundation & Spike Validation / Sprint 0) marqué done — rétrospective complétée (epic-1-retro-2026-05-08.md).
+# 2026-05-08 — Epic 1 retrospective : 12 action items + 3 critical path C1-C3 + 2 significant discoveries.
+# 2026-05-08 — Décisions post-rétro : (1) `AuditEventRepo` BYPASS via `event_bus.publish_and_commit('m{N}.…')` jusqu'à Story 9.1 — tech-debt tracée. (2) `bubblewrap` ajouté à `backend/Dockerfile` stage `base` (dev+prod) — appliqué.
+# 2026-05-08 — ⚠️ REMINDER STORY 9.1 : ajouter T0 `audit-event bypass cleanup` — `git grep "event_bus.publish.*audit\|m2.tool.assigned\|m{N}.{verb}.{audited-object}"` pour migrer les events bypasses vers `AuditEventRepo.record()`. Cette dette est née en Epic 2 et doit être fermée avant que Story 9.1 ne soit marquée done.
+# 2026-05-08 — Critical Path restant avant Story 2.1 : C1 = `eslint-plugin-boundaries` v5→v6 migration (`element-types` → `dependencies`). C2 + C3 fermés.
+# 2026-05-08 — C1 fermé : `boundaries` v6 migration faite (frontend/eslint.config.js). 3 changements requis : (a) rule renommée `element-types` → `dependencies` avec object selectors, (b) `eslint-import-resolver-typescript` installé + configuré (CAUSE racine du silencement v5), (c) règle same-feature `captured.feature: "{{ from.captured.feature }}"` pour barrel `index.ts`. Smoke tests OK : shared→feature bloqué, cross-feature bloqué, same-feature autorisé. Lint clean + 19/19 tests verts. Voir epic-1-retro-2026-05-08.md §13. **Plus de blocker Critical Path — Story 2.1 unblocked.**
+# 2026-05-08 — Story 2.1 créée (ready-for-dev) via bmad-create-story : Créer un agent-template depuis un archétype universel. 8 archetypes registry YAML + POST /api/v1/agents/templates + GET /api/v1/agents/archetypes + ArchetypeSelector UX-DR17 + page /config/agents/new. Anti-scope strict : pas de versioning prompts (2.2), pas de wizard/expert (2.3), pas de template/instance (2.4), pas de tools (2.5), pas de sandbox (2.6), pas de playground (2.7), pas de review conversationnelle (2.8). Décisions Epic 1 retro intégrées : audit-event bypass `event_bus.publish_and_commit('m2.agent_template.created', ...)` avec TODO Story 9.1 (cleanup), boundaries v6 actif, smoke test runtime systématique en T6.4. AC1-AC8, T1-T6, ≥ 25 nouveaux tests prévus, 0 régression baseline 326+19. Epic 2 status: backlog → in-progress.
+# 2026-05-08 — Story 2.1 implémentée single-pass via bmad-dev-story (Status: Review). 35 nouveaux tests verts (9 registry + 11 routes unit + 2 lifespan + 6 e2e CI-only + 5 ArchetypeSelector + 2 new route) — 0 régression sur baseline (239 backend / 26 frontend). Migration Alembic 20260508_000000 ajoutée (fix `agent_templates.uq_agent_template NULLS NOT DISTINCT` — bug rétroactif Story 1.1/1.5 attrapé en smoke test runtime). Lint+typecheck+build verts. Toaster mounté dans AppLayout (Story 1.8 anti-scope levé en feature-1ère-consommatrice). Audit event bypass pattern correctement appliqué avec TODO Story 9.1 — `git grep "audit-event bypass cleanup"` trouvera la chaîne. PyYAML + types-pyyaml ajoutés en deps.
+# 2026-05-08 — Story 2.1 fix-batch P-01 à P-14 (méthodologie multi-agent code-review : Blind Hunter + Edge Case Hunter + Acceptance Auditor) + spec amendments B1 + B2. 4 critiques (P-01 Contract 3 violation IntegrityError → repo, P-02 atomicité audit-event single-transaction, P-03 test ordering scope-by-name, P-04 lifespan test rewrite ASGITransport) + 10 should-fix (P-05 strip name, P-06 strip input value 422 leak, P-07 migration pre-scan duplicates, P-08 503 graceful state missing, P-09 useArchetypeDetail empty-string, P-10 contract.core null-safe, P-11 toast 409 spécifique + focus, P-12 MappingProxyType immutable runtime, P-13 ContractList show extras, P-14 monkeypatch.setenv). 241 backend tests verts (+2 lifespan P-04) / 26 frontend tests verts. 0 régression. Smoke test re-validé : atomicité prouvée. Story 2.1 toujours en `review` — ready for second-pass code-review (recommended via different LLM).
+# 2026-05-08 — Tech-debt Story 2.1 traçable (10 defer) : D1 actor=system hardcoded → 9.1, D2 YAML path-based → zip-wheel migration, D3 ArchetypeSelector roving tabindex → Sprint 4+, D4 UUID validation $templateId → Story 2.2, D5 concurrent POST race test, D6 useCreateTemplate invalidate clé absente → Story 2.2, D7 migration scope creep acknowledged, D8 testcontainers CI-only inherited, D9 Toaster scope creep acknowledged, D10 prompt_base grapheme split → i18n.
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -47,21 +71,21 @@ development_status:
   # ============================================================
 
   # Epic 1: Foundation & Spike Validation (Sprint 0)
-  epic-1: in-progress
-  1-1-scaffolding-minimal-viable: review
-  1-2-spike-m3-langgraph: backlog
-  1-3-benchmark-m4-pgvector-hnsw: backlog
-  1-4-core-event-bus: backlog
-  1-5-core-repositories-migrations: backlog
-  1-6-core-llm-abstraction: backlog
-  1-7-core-auth-token-statique: backlog
-  1-8-design-system-foundation: backlog
-  1-9-observability-caddy-ci: backlog
-  epic-1-retrospective: optional
+  epic-1: done
+  1-1-scaffolding-minimal-viable: done
+  1-2-spike-m3-langgraph: done
+  1-3-benchmark-m4-pgvector-hnsw: done
+  1-4-core-event-bus: done
+  1-5-core-repositories-migrations: done
+  1-6-core-llm-abstraction: done
+  1-7-core-auth-token-statique: done
+  1-8-design-system-foundation: done
+  1-9-observability-caddy-ci: done
+  epic-1-retrospective: done
 
   # Epic 2: Agent Platform (Sprint 1)
-  epic-2: backlog
-  2-1-creer-agent-template-depuis-archetype: backlog
+  epic-2: in-progress
+  2-1-creer-agent-template-depuis-archetype: review
   2-2-configurer-agent-complet: backlog
   2-3-mode-wizard-vs-expert: backlog
   2-4-distinction-template-vs-instance: backlog
@@ -131,6 +155,13 @@ development_status:
   epic-8-retrospective: optional
 
   # Epic 9: Security, Audit & Trust Controls (cross-cutting Sprint 0-3)
+  # ⚠️ Story 9.1 — REMINDER post Epic 1 retro 2026-05-08 :
+  #   Avant T1 de Story 9.1, ajouter T0 « audit-event bypass cleanup » :
+  #     git grep -E "event_bus\.publish.*(audit|m[0-9]+\.[a-z]+\.[a-z]+)" -- backend/
+  #   pour identifier tous les `event_bus.publish_and_commit('m{N}.…')` Epic 2-8
+  #   qui ont contourné AuditEventRepo (NotImplementedError jusqu'à 9.1) et les
+  #   migrer vers `audit_repo.record(...)`. Cette dette est née Epic 2 (Story 2.5
+  #   Tool Hub assignation outils) — voir epic-1-retro-2026-05-08.md §10.
   epic-9: backlog
   9-1-audit-trail-middleware-partitioned: backlog
   9-2-chiffrement-at-rest-fernet: backlog
