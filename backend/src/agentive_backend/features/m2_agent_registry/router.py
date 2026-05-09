@@ -1,11 +1,14 @@
-"""``/api/v1/agents/*`` — Agent Registry endpoints (Story 2.1).
+"""``/api/v1/agents/*`` — Agent Registry endpoints (Story 2.1 + 2.2).
 
-Three endpoints :
+Five endpoints :
 
 * ``GET /agents/archetypes`` — lean list (UX-DR17 ArchetypeSelector).
 * ``GET /agents/archetypes/{id}`` — detail with prompt_base + contracts.
 * ``POST /agents/templates`` — create a new ``agent_templates`` row from an
   archetype + name. Returns 201 with the freshly committed row.
+* ``GET /agents/templates/{template_id}`` — Story 2.2 detail.
+* ``PUT /agents/templates/{template_id}`` — Story 2.2 PATCH-like update with
+  prompt versioning when ``system_prompt`` is included.
 
 All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). ``AgentiveError``
 is raised for domain failures and converted to RFC 7807 by the global handler
@@ -13,6 +16,8 @@ in ``app.main``.
 """
 
 from __future__ import annotations
+
+from uuid import UUID
 
 from fastapi import APIRouter, Request, status
 
@@ -22,10 +27,13 @@ from agentive_backend.features.m2_agent_registry.schemas import (
     ArchetypeSummary,
     CreateTemplateRequest,
     CreateTemplateResponse,
+    TemplateDetailResponse,
+    UpdateTemplateRequest,
+    UpdateTemplateResponse,
 )
 from agentive_backend.features.m2_agent_registry.service import AgentRegistryService
 from agentive_backend.shared.exceptions import DependencyError
-from agentive_backend.shared.repositories import AgentTemplateRepo
+from agentive_backend.shared.repositories import AgentTemplateRepo, PromptRepo
 
 router = APIRouter(tags=["agents"])
 
@@ -60,7 +68,12 @@ def _build_service(request: Request) -> AgentRegistryService:
         )
 
     template_repo = AgentTemplateRepo(session_factory=session_factory)
-    return AgentRegistryService(registry=registry, template_repo=template_repo)
+    prompt_repo = PromptRepo(session_factory=session_factory)
+    return AgentRegistryService(
+        registry=registry,
+        template_repo=template_repo,
+        prompt_repo=prompt_repo,
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -118,6 +131,47 @@ async def create_template(request: Request, body: CreateTemplateRequest) -> Crea
         archetype_id=body.archetype,
         tenant_id=None,  # Story 2.1 anti-scope — single-tenant MVP.
     )
+
+
+@router.get(
+    "/agents/templates/{template_id}",
+    response_model=TemplateDetailResponse,
+    summary="Get one agent-template (Story 2.2 — feeds the edit page)",
+)
+async def get_template(request: Request, template_id: UUID) -> TemplateDetailResponse:
+    """200 on success. ``template_id`` must be a valid UUID (FastAPI Path).
+
+    Errors :
+    * 404 — template not found (RFC 7807 ``/errors/not-found``).
+    * 422 — ``template_id`` is not a UUID (FastAPI auto-validates ``UUID``).
+    * 503 — lifespan state missing.
+    """
+    service = _build_service(request)
+    return await service.get_template_by_id(template_id, tenant_id=None)
+
+
+@router.put(
+    "/agents/templates/{template_id}",
+    response_model=UpdateTemplateResponse,
+    summary="Update an agent-template (PATCH-like — Story 2.2)",
+)
+async def update_template(
+    request: Request,
+    template_id: UUID,
+    body: UpdateTemplateRequest,
+) -> UpdateTemplateResponse:
+    """200 on success. PATCH-like semantics — see ``UpdateTemplateRequest``.
+
+    A new ``prompts`` row (and a ``version`` bump on ``agent_templates``) is
+    persisted only when ``system_prompt`` is included in the body.
+
+    Errors :
+    * 404 — template not found.
+    * 422 — Pydantic body validation OR ``template_id`` not a UUID.
+    * 503 — lifespan state missing.
+    """
+    service = _build_service(request)
+    return await service.update_template(template_id, body, tenant_id=None)
 
 
 __all__ = ["router"]

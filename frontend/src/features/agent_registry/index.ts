@@ -8,10 +8,24 @@
 export { ArchetypePreview } from "./ArchetypePreview";
 export { ArchetypeSelector } from "./ArchetypeSelector";
 export type { ArchetypeSelectorProps } from "./ArchetypeSelector";
-export { useArchetypeDetail, useArchetypes, useCreateTemplate } from "./hooks";
+export {
+  useArchetypeDetail,
+  useArchetypes,
+  useCreateTemplate,
+  useTemplate,
+  useUpdateTemplate,
+} from "./hooks";
 export type {
   ArchetypeDetail,
   ArchetypeSummary,
+  ContractDefinition,
   CreateTemplateRequest,
   CreateTemplateResponse,
+  ErrorPolicy,
+  LLMModel,
+  LLMParams,
+  ProviderId,
+  TemplateDetail,
+  UpdateTemplateRequest,
+  UpdateTemplateResponse,
 } from "./types";

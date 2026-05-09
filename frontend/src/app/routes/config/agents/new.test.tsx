@@ -138,6 +138,19 @@ describe("/config/agents/new", () => {
           ),
         );
       }
+      // Story 2.2 — la page détail (post-redirect) charge le template via GET.
+      if (url.endsWith(`/api/v1/agents/templates/${newTemplateId}`) && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            template_id: newTemplateId,
+            name: "Code Producer",
+            archetype: "producteur",
+            version: 1,
+            config: { prompt_base: "Tu es un producteur.", role: "producer" },
+            created_at: new Date().toISOString(),
+          }),
+        );
+      }
       return Promise.resolve(jsonResponse({}, { status: 404 }));
     });
 
@@ -152,9 +165,9 @@ describe("/config/agents/new", () => {
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
 
-    // Wait for the navigation: the placeholder template detail page exposes
-    // the template_id in a <code> block.
-    await screen.findByText(newTemplateId);
+    // Wait for the navigation: the Story 2.2 detail page renders the template
+    // name + archetype in the header once the GET resolves.
+    await screen.findByRole("heading", { name: /configuration de l'agent/i });
 
     // Verify the POST request was sent with the right body.
     const postCall = fetchMock.mock.calls.find(([, init]) => {
