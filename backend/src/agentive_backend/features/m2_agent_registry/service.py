@@ -134,8 +134,7 @@ class AgentRegistryService:
         # commits on `__aexit__` if no exception. `create_in_session` and
         # `publish(session=...)` both operate on the same session, so the
         # transaction is atomic.
-        # TODO Story 9.1 — migrate to AuditEventRepo.record() (audit-event
-        # bypass cleanup, see Epic 1 retro 2026-05-08).
+        # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
         async with self._template_repo.with_tenant(tenant_id) as session:
             template = await self._template_repo.create_in_session(
                 session,
