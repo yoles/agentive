@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-08  # Epic 2 in-progress + Story 2.1 ready-for-dev
+last_updated: 2026-05-09  # Story 2.1 done (post-fix Makefile parité CI) — Epic 2 in-progress, Story 2.2 prochaine
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -62,6 +62,8 @@ last_updated: 2026-05-08  # Epic 2 in-progress + Story 2.1 ready-for-dev
 # 2026-05-08 — Tech-debt Story 2.1 traçable (10 defer) : D1 actor=system hardcoded → 9.1, D2 YAML path-based → zip-wheel migration, D3 ArchetypeSelector roving tabindex → Sprint 4+, D4 UUID validation $templateId → Story 2.2, D5 concurrent POST race test, D6 useCreateTemplate invalidate clé absente → Story 2.2, D7 migration scope creep acknowledged, D8 testcontainers CI-only inherited, D9 Toaster scope creep acknowledged, D10 prompt_base grapheme split → i18n.
 # 2026-05-09 — Story 2.1 second-pass code-review (méthodologie /code-review:code-review adaptée local, 5 Sonnet + 15 Haiku scoring 0-100 sur commit e3234ac vs main). 17 findings bruts → 15 uniques après dédup → 3 retenus ≥ 80 (F3 100 integration tests <12, F6 100 spec Zod schemas.ts contradiction B2 non résolue, F8 100 TODO audit-event split sur 2 lignes casse `git grep`) + 1 anomalie scorer F14 (rationale décrit 100 mais score 0 — make smoke-test absent vs retro P1). Borderline 75 (F1 correlation_id payload, F10 test handler non-verbatim P-06, F11 docstring vs AgentInstanceRepo) loggés mais non patchés.
 # 2026-05-09 — Fix-batch P-15 à P-18 appliqué. P-15 service.py:137 TODO reformaté sur ligne unique (`git grep "audit-event bypass cleanup"` retourne maintenant 1 hit). P-16 +2 tests intégration test_create_template_e2e.py (`empty_name_returns_422_rfc7807` + `whitespace_only_name_returns_422_rfc7807`) → 12 tests intégration (8+4) ≥ AC7 minimum. P-17 spec md cleanup B2 (lignes 230 useState + 300 schemas.ts retiré + 329 note Bouton désactivé refactor). P-18 retro debt course-correct §15 (epic-1-retro-2026-05-08.md) : P1 deadline reportée Story 2.1 → Story 2.4/fin Sprint 1, DoD refinée (target distinct PAS dans make build, scope endpoints + assertions logs structurés). Story 2.1 reste `review` — re-vérifier `make test` (24+2=26 backend tests m2 attendus) avant bump done.
+# 2026-05-09 — Préalable au bump done : `make test` rouge localement (7 failed + 55 errors) — root cause `Makefile:test-backend` divergeait du job CI (manque `--network host` + mount `/var/run/docker.sock` + mount `.import-linter`). Fix appliqué (commit 1db1a54) : bascule `compose run` → `docker run` direct, mirror CI 1:1, tag image stable `agentive-backend:dev`. Re-run `make test` → **390 backend / 26 frontend tests verts, 0 failure, 0 error**. Bug environnemental, aucune régression code Story 2.1.
+# 2026-05-09 — Story 2.1 done — `make test` vert end-to-end (390 backend, dont 26 tests m2 attendus, + 26 frontend), 0 régression, fix Makefile tooling appliqué en amont. Epic 2 reste `in-progress` (7 stories backlog : 2.2 → 2.8). Prochaine action SM : `bmad-create-story` pour Story 2.2 (Configurer agent complet).
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -87,7 +89,7 @@ development_status:
 
   # Epic 2: Agent Platform (Sprint 1)
   epic-2: in-progress
-  2-1-creer-agent-template-depuis-archetype: review
+  2-1-creer-agent-template-depuis-archetype: done
   2-2-configurer-agent-complet: backlog
   2-3-mode-wizard-vs-expert: backlog
   2-4-distinction-template-vs-instance: backlog
