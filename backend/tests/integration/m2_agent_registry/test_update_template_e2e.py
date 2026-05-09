@@ -244,18 +244,31 @@ async def test_put_template_atomicity_rollback_on_publish_failure(
 
     monkeypatch.setattr(svc_module, "publish", _boom)
 
-    # ASGITransport propage les exceptions non-handled par défaut. La preuve
-    # d'atomicité est que le PUT FAILS (peu importe le code HTTP côté client)
-    # ET que le state DB n'a pas bougé. On capture l'exception pour l'asserter.
-    with pytest.raises(RuntimeError, match="simulated outbox publish failure"):
+    # P-07 fix (Story 2.2 review 2026-05-09) — l'assertion canonique de
+    # l'atomicité est : « QUEL QUE SOIT le code HTTP retourné (200, 500,
+    # ou exception non-handled), l'état DB doit être UNCHANGED ». La
+    # version précédente du test asservissait `pytest.raises(RuntimeError)`
+    # à un détail de plomberie ASGITransport qui pourrait changer si un
+    # global exception handler 500 était ajouté à l'app. On capture
+    # l'exception ou la response, peu importe — on vérifie ensuite la DB.
+    try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            await client.put(
+            resp = await client.put(
                 f"/api/v1/agents/templates/{template_id}",
                 headers=_auth_headers(),
                 json={"system_prompt": "should rollback"},
             )
+            # Si un handler global converti l'exception en 500, on l'accepte —
+            # l'atomicité de la transaction est testée par la DB ci-dessous.
+            assert resp.status_code in (500, 502, 503), (
+                f"Expected server error (500/502/503), got {resp.status_code}"
+            )
+    except RuntimeError as exc:
+        # Pas de handler global — l'exception remonte, ce qui est aussi
+        # un signal valide que la transaction n'a pas commit.
+        assert "simulated outbox publish failure" in str(exc)
 
-    # Rollback observed: version unchanged, no prompt row inserted.
+    # CONTRACT D'ATOMICITÉ : version unchanged + 0 prompt row pour ce template.
     async with seed_session_factory() as session:
         result = await session.execute(
             text("SELECT version FROM agent_templates WHERE id = :tid"),

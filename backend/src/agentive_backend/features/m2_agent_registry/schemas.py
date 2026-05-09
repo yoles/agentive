@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Archetypes — read-only, sourced from the YAML registry
@@ -159,9 +159,14 @@ class UpdateTemplateRequest(BaseModel):
 
     Tous les champs sont **optionnels** : seuls les champs présents écrasent
     la valeur précédente dans ``config``. Une nouvelle row ``prompts`` (bump
-    version) n'est insérée QUE SI ``system_prompt`` est dans le payload.
+    version) n'est insérée QUE SI ``system_prompt`` est dans le payload **ET**
+    diffère de la valeur courante (P-01 fix — comparaison côté service).
 
     ``extra="forbid"`` rejette tout champ inconnu (P-06 PII defense + scope).
+
+    P-03 fix — un payload entièrement vide (`{}`) ou avec UNIQUEMENT des champs
+    `null` est rejeté en 422 RFC 7807 plutôt que de produire un audit event
+    spurious sur un UPDATE no-op.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -173,6 +178,37 @@ class UpdateTemplateRequest(BaseModel):
     llm_params: LLMParams | None = None
     provider_chain: list[ProviderId] | None = Field(default=None, min_length=1, max_length=4)
     error_policy: ErrorPolicy | None = None
+
+    @field_validator("provider_chain", mode="after")
+    @classmethod
+    def _no_duplicates_in_provider_chain(cls, value: list[str] | None) -> list[str] | None:
+        """P-13 fix — un même provider présent deux fois dans la chain est
+        une erreur de config (le runtime fallback Story 4.6 retry-erait sur
+        le même provider, défaisant la stratégie de chain). Reject early.
+        """
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("provider_chain must not contain duplicate providers")
+        return value
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> UpdateTemplateRequest:
+        """P-03 fix — refuse les payloads complètement vides ; un PUT sans
+        intention claire produit un audit event spurious. Au moins un champ
+        non-None requis."""
+        if all(
+            getattr(self, field) is None
+            for field in (
+                "system_prompt",
+                "input_contract",
+                "output_contract",
+                "llm_model",
+                "llm_params",
+                "provider_chain",
+                "error_policy",
+            )
+        ):
+            raise ValueError("at least one field must be provided in the update payload")
+        return self
 
 
 class TemplateDetailResponse(BaseModel):

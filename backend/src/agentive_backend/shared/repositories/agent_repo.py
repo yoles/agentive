@@ -137,9 +137,15 @@ class AgentTemplateRepo(BaseRepo):
 
         ``template`` is the row already loaded via :meth:`get_by_id_in_session`
         in the same session — we mutate its attributes and let the unit-of-work
-        flush them. SQLAlchemy auto-increments ``updated_at`` if such a column
-        existed; Sprint 1 schema does not have one, so the modification time
-        is derivable from the matching ``prompts.created_at`` row.
+        flush them.
+
+        Sprint 1 schema has no ``updated_at`` column ; for a versioning
+        update (this method), the modification time is approximately
+        ``prompts.created_at`` of the matching row inserted right after.
+        For non-versioning updates (see :meth:`update_config_in_session`),
+        no `prompts` row is created, so the modification time is captured
+        only via the audit event ``m2.agent_template.updated`` row in the
+        outbox (P-17 docstring correction Story 2.2 code-review 2026-05-09).
 
         Raises:
             ConflictError: If the new ``(name, version, tenant_id)`` already

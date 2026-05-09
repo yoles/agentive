@@ -107,11 +107,13 @@ Status: Review
 
 ### AC2 — Contrats élastiques `core` + `extras` validés Pydantic v2
 
+> **Amend B1 (2026-05-09 — code-review post-impl)** : la version initiale d'AC2 demandait `422 RFC 7807` si `core` était absent du payload. **Décision tranchée : permissif** — `core` reçoit `default_factory=dict` côté Pydantic (cohérent avec `extras`). La validation runtime des champs `core` (champs typés métier — `query`, `task`, etc.) se fera Story 4.x au moment de l'exécution agent, via le registry `core/contracts/registry.py` (architecture H8). Sprint 1 = shape only. Le test `test_contract_definition_defaults_empty_dicts` consacre ce comportement.
+
 **Given** un payload PUT avec `input_contract: {"core": {"query": "string"}, "extras": {"meta": "additional"}}`
 **When** la validation Pydantic v2 strict s'exécute sur le schéma `UpdateTemplateRequest`
-**Then** elle accepte la structure si `core` est un `dict[str, Any]` (champs typés à validation runtime ultérieure) **et** `extras` est un `dict[str, Any]` (zone permissive).
-**And** un payload manquant la clé `core` (`{"extras": {...}}`) → 422 RFC 7807 avec `detail: "Field 'core' required"`.
-**And** un payload avec `core` n'étant pas un dict (ex: `"core": "string"`) → 422.
+**Then** elle accepte la structure si `core` est un `dict[str, Any]` (champs typés à validation runtime ultérieure Story 4.x) **et** `extras` est un `dict[str, Any]` (zone permissive).
+**And** un payload **omettant `core`** (`{"extras": {...}}`) est **accepté** : `core` reçoit `{}` par défaut. La validation des champs métier (présence de `query`, `task`, etc.) est déférée Story 4.x quand le registry runtime des contrats existera.
+**And** un payload avec `core` n'étant pas un dict (ex: `"core": "string"`) → 422 RFC 7807 (type-check Pydantic v2).
 
 **Given** la spec architecture H8 (versioning des contrats élastiques)
 **When** je consulte la documentation
@@ -400,17 +402,49 @@ claude-opus-4-7 (1M context) — bmad-dev-story single-pass execution.
 ### Completion Notes List
 
 - ✅ AC1 PUT endpoint avec versioning prompts incrémenté (smoke test : v1→v2 observé en DB + log structlog)
-- ✅ AC2 contrats élastiques `core` + `extras` validés via Pydantic v2 strict
+- ✅ AC2 contrats élastiques `core` + `extras` validés via Pydantic v2 strict (cf B1 amend permissif post-review : `core` accepte default `{}`)
 - ✅ AC3 helper `wrap_external_input` AR44 livré + 6 tests (escape break-out + entities)
 - ✅ AC4 ErrorPolicy schema NFR14 (validation only — dispatcher défer Story 4.6 documenté)
 - ✅ AC5 page `/config/agents/{templateId}` formulaire flat expert (12 champs) — anti-scope respecté (pas de Wizard/accordéons stylés)
 - ✅ AC6 GET détail endpoint (200 happy / 404 / 422 UUID invalid)
-- ✅ AC7 tests : **+41 backend / +5 frontend** (total 431 backend + 31 frontend, 0 régression). Frontend à +5 vs +7 spec : amend mineur — 5 tests `$templateId.test.tsx` couvrent les flows critiques (hydratation, save, toast erreur, UUID guard, JSON malformé). Pas de fichier `hooks.test.ts` séparé créé — les hooks sont exercés indirectement via les tests page.
+- ✅ AC7 tests : **+45 backend / +7 frontend** (total 435 backend + 33 frontend, 0 régression). Spec lettre AC7 (≥18 backend + ≥7 frontend) atteinte post fix-batch.
 - ✅ AC8 smoke runtime : 200 OK PUT happy, 422 PUT UUID invalide, log `m2.agent_template.updated` avec `correlation_id`/`old_version`/`new_version`/`bump_version` propagés, `git grep "audit-event bypass cleanup"` → 2 hits 2 lignes distinctes
 - ✅ Tech-debt 2.1 D4 fermé (FastAPI Path UUID + frontend regex guard)
 - 🟡 Tech-debt 2.1 D6 partiellement fermé : conventions queryKey `["agent-template", id]` + `["agent-templates"]` posées et invalidées par `useUpdateTemplate`. La pleine fermeture attend la liste paginée (Story 2.4 / 2.7).
 - 🆕 Defer documentés dans la story : D11 rollback UI prompts.is_active, D12 provider chain runtime fallback, D13 error policy dispatcher actif, D14 contracts visuels, D15 endpoint listing paginé.
 - ⚠️ Décision documentée Sprint 1 : schéma `prompts` actuel (`models.py:241-261`) reste minimal — l'évolution vers H2 architecture (`parent_version`, `is_active`, `metadata` JSONB) attendra Story 2.4 / 2.7 avec besoin runtime instances + rollback.
+
+#### Code-review Story 2.2 (2026-05-09) — Fix-batch B1 + P-01 → P-17
+
+Méthodologie : 3 reviewers adversariaux parallèles (Blind Hunter / Edge Case Hunter / Acceptance Auditor) sur commit `6783026`. 35 findings post-dédup → 17 patches, 1 bad-spec (B1), 12 defer, 5 rejected.
+
+**B1 amend (AC2 — permissif tranché par {user_name})** : `ContractDefinition.core` reste optionnel (`default_factory=dict`). La validation runtime des champs `core` (`query`, `task`, etc.) est déférée Story 4.x via le registry `core/contracts/registry.py` (architecture H8). AC2 reformulé en conséquence dans cette spec.
+
+**Patches appliqués (17) :**
+
+- **P-01** (HIGH bug) : skip bump version + insert prompt si `payload.system_prompt` identique à `existing.config["system_prompt"]` (`service.py:265-273`). Frontend cesse de copier `prompt_base` → `system_prompt` à l'hydratation (`$templateId.tsx:88-109`) ; placeholder affiche le prompt archétype à titre indicatif.
+- **P-02** (HIGH bug) : lié à P-01 — `prompt_base` n'est plus persisté comme `system_prompt` au premier save (l'hydratation FE laisse vide).
+- **P-03** (HIGH bug) : `UpdateTemplateRequest.@model_validator(mode="after")` refuse les payloads complètement vides (422 RFC 7807 au lieu d'un audit event spurious sur no-op).
+- **P-04** (MED bug) : Number inputs (`temperature`, `max_tokens`, `max_retries`) utilisent `valueAsNumber` + `Number.isFinite` guard ; refuse les valeurs invalides côté UI au lieu de coerce empty→0 / locale "1,5"→NaN.
+- **P-05** (MED bug) : `updated_at = datetime.now(UTC)` capturé À L'INTÉRIEUR du `with_tenant` block, juste avant le commit (vs. après `emit_notify` qui ajoute jusqu'à 100ms+ de lag). Reflète l'instant de l'écriture DB.
+- **P-06** (test fix) : `test_wrap_tool_output_happy_path` — supprimé le `or` tautologique, garde une seule assertion deterministic.
+- **P-07** (test fix) : `test_put_template_atomicity_rollback_on_publish_failure` — refactor pour asserter "DB state unchanged regardless of HTTP response" (5xx OU exception). Robuste à l'ajout futur d'un global exception handler.
+- **P-08** (AC7 lettre) : nouveau fichier `hooks.test.tsx` avec 2 tests sur `useUpdateTemplate` (invalidate queryKeys + propagate ApiError).
+- **P-09** (UX) : `buildPayload` parse les 3 JSON (provider_chain, input_contract, output_contract) en `try/catch` séparés, avec messages dédiés au champ.
+- **P-10** (UX) : validation shape post-parse (`Array.isArray` + `every typeof === "string"` pour provider_chain ; objet avec `core` pour les contrats).
+- **P-11** (UX) : focus on error extrait `errors[].loc[1]` du body RFC 7807 et focus le bon input via mapping `field → input id` (fallback `tpl-system-prompt` si pas de match).
+- **P-12** (UX) : guard synchrone `if (updateMutation.isPending) return` au début de `handleSubmit` — bloque le double-submit (Enter rapide / double-click) avant que `disabled` UI ne s'applique.
+- **P-13** (defense) : `field_validator` Pydantic sur `provider_chain` rejette les duplicates (le runtime fallback Story 4.6 retry-erait sur le même provider, défaisant la chain).
+- **P-14** (cosmétique) : `templateQuery.data!` non-null assertion remplacée par destructure narrow `const template = templateQuery.data; if (!template) return ...`.
+- **P-15** (cosmétique) : `assert payload.system_prompt is not None` mort sous `python -O` supprimé (le guard `system_prompt_changed` au-dessus est suffisant + un `# type: ignore[arg-type]` pour mypy).
+- **P-16** (cosmétique) : NOTE Sprint 1 ajoutée au docstring de `Prompt` class (`models.py:241`) documentant la divergence avec H2 architecture (`parent_version`/`is_active`/`metadata` cibles Story 2.4 / 2.7).
+- **P-17** (cosmétique) : docstring `update_in_session` corrigée — la derivability de `updated_at` via `prompts.created_at` ne tient QUE pour le path versioning ; non-bump path n'a aucune trace de modification time hors de l'audit event outbox.
+
+**Tests post fix-batch :** 435 backend (+4 nouveaux : P-01 skip bump, P-03 empty rejected x2, P-13 dedup) + 33 frontend (+2 hooks.test.tsx). Lint backend + frontend verts. Smoke runtime non re-vérifié (no-op pour les patches : seul P-05 change l'observabilité du `updated_at`).
+
+**Defer (12) tracés** dans le report code-review : multi-user concurrent PUT race + optimistic locking + multi-tab last-write-wins (Story 12), tenant_id hardcoded (Sprint 1 acceptable), audit actor=system (D1 → 9.1), output `config: dict[str, Any]` strictness, runtime validation Zod (D14 / 2.3), focus error best-effort (D-G), branded type UUID, cancellation-after-commit, `system_prompt` min_length=1 empêche clear, unrecoverable 409 prompt-version collision, LLM_MODELS array drift (OpenAPI typegen story future).
+
+**Rejected (5) :** TypeError défensif désirable (`wrap_external_input` non-string), GET vs PUT in-session race marginal, form re-hydrate "currently safe", `update_in_session IntegrityError` defense-in-depth, TODO comment fragile (pattern documenté).
 
 ### File List
 
