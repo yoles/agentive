@@ -227,7 +227,7 @@ Status: Review
   - `icons.ts` (`icon_name` slug → lucide-react component map, fallback `Compass`)
 - [x] T5.2 Créer la route TanStack file-based `frontend/src/app/routes/config/agents/new.tsx` avec :
   - `useArchetypes()` au mount
-  - state local `archetype` + `name` via `react-hook-form`
+  - state local `archetype` + `name` via `useState` (cf B2 — pas de `react-hook-form` Story 2.1, arrivée Story 2.2 quand le formulaire devient multi-champs)
   - layout `grid-cols-1 md:grid-cols-3` (selector 2 cols + preview/form 1 col)
   - submit → `useCreateTemplate().mutateAsync({archetype, name})` → toast + redirect via `useNavigate`
 - [x] T5.3 Créer la route placeholder `frontend/src/app/routes/config/agents/$templateId.tsx` (juste pour la redirect post-création — affiche template_id + message "Configuration détaillée Story 2.2").
@@ -297,7 +297,6 @@ Status: Review
 - `frontend/src/features/agent_registry/ArchetypePreview.tsx`
 - `frontend/src/features/agent_registry/api.ts`
 - `frontend/src/features/agent_registry/hooks.ts`
-- `frontend/src/features/agent_registry/schemas.ts` (Zod)
 - `frontend/src/features/agent_registry/ArchetypeSelector.test.tsx`
 - `frontend/src/app/routes/config/agents/new.tsx`
 - `frontend/src/app/routes/config/agents/$templateId.tsx` (placeholder Story 2.2)
@@ -327,7 +326,7 @@ Status: Review
 9. **TanStack Router file-based** : `frontend/src/app/routes/config/agents/new.tsx` génère automatiquement la route `/config/agents/new`. Pas de configuration manuelle. `routeTree.gen.ts` est régénéré au build/dev.
 10. **Boundaries v6** (post-rétro Epic 1 2026-05-08) : tout import `feature → other feature` est bloqué (ESLint error). `agent_registry` peut importer `shared`, mais pas `theme`. Si besoin d'accès cross-feature → passer par `shared/` ou par composition `app`-level.
 11. **MockProvider Story 1.6** : pas requis ici (pas d'appel LLM). Pas besoin de `_no_external_http` autouse non plus (pas d'appel HTTP externe).
-12. **Bouton désactivé** : `<Button disabled={!archetype || !name.trim()}>` — éviter `disabled={!form.formState.isValid}` qui peut être stale au premier render react-hook-form.
+12. **Bouton désactivé** : `<Button disabled={!archetype || !name.trim()}>` — vérification triviale via `useState` (cf B2). Pas de `react-hook-form` Story 2.1 ; quand il arrivera Story 2.2, attention à `disabled={!form.formState.isValid}` qui peut être stale au premier render.
 
 ### 📚 Learnings des stories précédentes à réutiliser
 
