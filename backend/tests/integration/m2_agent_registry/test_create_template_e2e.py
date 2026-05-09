@@ -271,9 +271,7 @@ async def test_create_template_empty_name_returns_422_rfc7807(
 
     # No row inserted, no audit event published.
     async with seed_session_factory() as session:
-        result = await session.execute(
-            text("SELECT COUNT(*) FROM agent_templates WHERE name = ''")
-        )
+        result = await session.execute(text("SELECT COUNT(*) FROM agent_templates WHERE name = ''"))
         assert int(result.scalar_one()) == 0
     count = await _count_outbox(seed_session_factory, "m2.agent_template.created", name="")
     assert count == 0
