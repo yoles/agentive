@@ -47,6 +47,9 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       target: dev
+    # Tag stable consommé par `docker run` direct dans Makefile (test-backend, spike-m3-test)
+    # — parité 1:1 avec le job CI test-backend (.github/workflows/ci.yml:174-181).
+    image: agentive-backend:dev
     restart: unless-stopped
     environment:
       PYTHONUNBUFFERED: "1"

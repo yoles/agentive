@@ -192,8 +192,22 @@ migrate-init: ## Crée la migration initiale (manuel, pas autogenerate)
 	$(DC_DEV) run --rm backend uv run alembic revision -m "initial schema"
 
 .PHONY: test-backend
-test-backend: ## Exécute les tests Python
-	$(DC_DEV) run --rm backend uv run pytest
+test-backend: ## Exécute les tests Python (parité CI : --network host + docker.sock + .import-linter)
+	# Mirror exact du job CI test-backend (.github/workflows/ci.yml:174-181) :
+	#  - --network host : testcontainers publie ses ports sur l'hôte → le container doit
+	#    résoudre `localhost` (override `host.docker.internal` casse 49 tests sur Linux).
+	#  - docker.sock : `PostgresContainer()` spawn des containers siblings via le daemon hôte.
+	#  - .import-linter : config vit à la racine (hors build context ./backend), nécessaire
+	#    pour `tests/integration/test_import_linter_contract*.py`.
+	docker run --rm \
+	  -e TESTCONTAINERS_RYUK_DISABLED=true \
+	  --network host \
+	  -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v $(PWD)/.import-linter:/.import-linter:ro \
+	  -v $(PWD)/backend:/app \
+	  -v agentive_backend_venv:/app/.venv \
+	  agentive-backend:dev \
+	  uv run pytest
 
 .PHONY: lint-backend
 lint-backend: ## Lint + format check Python (ruff + mypy)
@@ -391,8 +405,17 @@ spike-m3-inspect: up ## Spike M3 — inspecte le checkpoint Postgres pour un thr
 	$(DC_DEV) run --rm backend uv run python -m spike.inspect_checkpoint "$(THREAD_ID)"
 
 .PHONY: spike-m3-test
-spike-m3-test: up ## Spike M3 — exécute uniquement les tests pytest tests/spike/
-	$(DC_DEV) run --rm backend uv run pytest tests/spike/ -v
+spike-m3-test: ## Spike M3 — exécute uniquement les tests pytest tests/spike/ (parité CI)
+	# Mirror exact du job CI spike-m3 (.github/workflows/ci.yml:210-216) — voir
+	# justifications dans le bloc commentaires de `test-backend` ci-dessus.
+	docker run --rm \
+	  -e TESTCONTAINERS_RYUK_DISABLED=true \
+	  --network host \
+	  -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v $(PWD)/backend:/app \
+	  -v agentive_backend_venv:/app/.venv \
+	  agentive-backend:dev \
+	  uv run pytest tests/spike/ -v --tb=short --maxfail=1
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STAGING (observe-only wrappers — le deploy réel passe par GitHub Actions)
