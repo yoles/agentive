@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-09  # Story 2.1 done (post-fix Makefile parité CI) — Epic 2 in-progress, Story 2.2 prochaine
+last_updated: 2026-05-09  # Story 2.2 ready-for-dev (PUT templates + versioning prompts + UI expert minimale)
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -64,6 +64,7 @@ last_updated: 2026-05-09  # Story 2.1 done (post-fix Makefile parité CI) — Ep
 # 2026-05-09 — Fix-batch P-15 à P-18 appliqué. P-15 service.py:137 TODO reformaté sur ligne unique (`git grep "audit-event bypass cleanup"` retourne maintenant 1 hit). P-16 +2 tests intégration test_create_template_e2e.py (`empty_name_returns_422_rfc7807` + `whitespace_only_name_returns_422_rfc7807`) → 12 tests intégration (8+4) ≥ AC7 minimum. P-17 spec md cleanup B2 (lignes 230 useState + 300 schemas.ts retiré + 329 note Bouton désactivé refactor). P-18 retro debt course-correct §15 (epic-1-retro-2026-05-08.md) : P1 deadline reportée Story 2.1 → Story 2.4/fin Sprint 1, DoD refinée (target distinct PAS dans make build, scope endpoints + assertions logs structurés). Story 2.1 reste `review` — re-vérifier `make test` (24+2=26 backend tests m2 attendus) avant bump done.
 # 2026-05-09 — Préalable au bump done : `make test` rouge localement (7 failed + 55 errors) — root cause `Makefile:test-backend` divergeait du job CI (manque `--network host` + mount `/var/run/docker.sock` + mount `.import-linter`). Fix appliqué (commit 1db1a54) : bascule `compose run` → `docker run` direct, mirror CI 1:1, tag image stable `agentive-backend:dev`. Re-run `make test` → **390 backend / 26 frontend tests verts, 0 failure, 0 error**. Bug environnemental, aucune régression code Story 2.1.
 # 2026-05-09 — Story 2.1 done — `make test` vert end-to-end (390 backend, dont 26 tests m2 attendus, + 26 frontend), 0 régression, fix Makefile tooling appliqué en amont. Epic 2 reste `in-progress` (7 stories backlog : 2.2 → 2.8). Prochaine action SM : `bmad-create-story` pour Story 2.2 (Configurer agent complet).
+# 2026-05-09 — Story 2.2 créée (ready-for-dev) via bmad-create-story : PUT /api/v1/agents/templates/{id} + GET détail + versioning prompts (insertion table `prompts` à chaque édition + bump agent_templates.version) + helper `wrap_external_input` AR44 (shared/llm/security.py) + ErrorPolicy schema NFR14 (validation only — dispatcher défer Story 4.6) + page `/config/agents/{templateId}` formulaire expert minimal flat (ModeToggle/accordéons/Wizard = 2.3). AC1-AC8, T1-T7, ≥ 25 nouveaux tests prévus (≥ 18 backend + ≥ 7 frontend), 0 régression baseline 390+26. Décisions intégrées : audit-event bypass `event_bus.publish_and_commit('m2.agent_template.updated', ...)` avec TODO Story 9.1 (cleanup), atomicité single-transaction P-02 (template+prompt+event), smoke test runtime AC8. Tech-debt 2.1 D4 (UUID validation $templateId) fermé via FastAPI Path UUID + frontend regex guard ; D6 (queryKey ["agent-templates"]) partiellement fermé via conventions queryKey posées ; 5 nouveaux defer D11-D15 (rollback UI, provider chain runtime, error policy dispatcher, contracts visuels, listing paginé). Anti-scope strict : pas de Wizard/Expert toggle, pas d'accordéons stylés, pas de validation Zod, pas de liste templates, pas de rollback, pas de dispatcher runtime error_policy/provider_chain.
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -90,7 +91,7 @@ development_status:
   # Epic 2: Agent Platform (Sprint 1)
   epic-2: in-progress
   2-1-creer-agent-template-depuis-archetype: done
-  2-2-configurer-agent-complet: backlog
+  2-2-configurer-agent-complet: ready-for-dev
   2-3-mode-wizard-vs-expert: backlog
   2-4-distinction-template-vs-instance: backlog
   2-5-tool-hub-mcp-assignation: backlog
