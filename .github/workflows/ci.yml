@@ -162,12 +162,21 @@ jobs:
           load: true
           cache-from: type=gha,scope=backend-dev
       - name: Run pytest (excludes tests/spike — covered by spike-m3 job)
+        # `TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal` retiré : sur
+        # Linux+`--network host`, ce hostname ne résout pas (mapping
+        # `host-gateway` non auto-injecté), ce qui faisait échouer 49 tests
+        # d'intégration repos avec `psycopg.OperationalError: failed to resolve
+        # host`. Sans override, testcontainers détecte `--network host` et
+        # utilise `localhost`, qui est le bon endpoint puisque les ports du
+        # testcontainer sont publiés sur l'hôte.
+        # `.import-linter` mounté pour les tests `test_import_linter_contract*`
+        # (config vit à la racine du repo, hors du build context Docker `./backend`).
         run: |
           docker run --rm \
             -e TESTCONTAINERS_RYUK_DISABLED=true \
-            -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
             --network host \
             -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $PWD/.import-linter:/.import-linter:ro \
             agentive-backend:ci \
             uv run pytest --tb=short --ignore=tests/spike
 
@@ -196,10 +205,11 @@ jobs:
           load: true
           cache-from: type=gha,scope=backend-dev
       - name: Run pytest tests/spike/
+        # `TESTCONTAINERS_HOST_OVERRIDE` retiré pour la même raison que
+        # `test-backend` (cf bloc commentaires ci-dessus).
         run: |
           docker run --rm \
             -e TESTCONTAINERS_RYUK_DISABLED=true \
-            -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
             --network host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             agentive-backend:ci \
