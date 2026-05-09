@@ -66,6 +66,11 @@ build-backend = "uv_build"
 line-length = 100
 target-version = "py314"
 src = ["src"]
+# `.uv-cache/` vit dans WORKDIR (`/app`) depuis le commit 21b2eff (fix EACCES
+# sur l'user non-root en prod). Ruff exclut par défaut .mypy_cache / .ruff_cache
+# / .pytest_cache mais pas .uv-cache, donc `ruff check .` walk dans les deps
+# tierces et signale leurs warnings/erreurs comme s'ils étaient à nous.
+extend-exclude = [".uv-cache"]
 
 [tool.ruff.lint]
 select = [
