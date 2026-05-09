@@ -1,12 +1,18 @@
 /**
- * `/config/agents/$templateId` route tests — Story 2.2 T6.5.
+ * `/config/agents/$templateId` route tests — Story 2.2 T6.5 + Story 2.3 T6.2.
+ *
+ * Story 2.3 — Tests existants Story 2.2 adaptés pour la nouvelle structure
+ * Wizard/Expert : on force le mode `expert` au beforeEach pour préserver
+ * les assertions sur les inputs visibles. Un test dédié AC4 vérifie la
+ * préservation du `FormState` lors d'un switch mid-edit.
  *
  * Covers:
- * - GET /agents/templates/{id} hydrates the form fields.
+ * - GET /agents/templates/{id} hydrates the form fields (Expert mode).
  * - Save button → PUT /agents/templates/{id} with the expected body shape.
  * - Toast feedback on success.
  * - Toast feedback + structured error on 422 RFC 7807.
  * - UUID guard: route param non-UUID renders error state without firing GET.
+ * - AC4 — switch Wizard ↔ Expert preserves the `FormState`.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +30,7 @@ import {
 } from "@tanstack/react-router";
 import { Providers } from "@/app/providers";
 import { routeTree } from "@/app/routeTree.gen";
+import { useModeStore } from "@/features/agent_registry";
 
 const TEMPLATE_ID = "11111111-2222-3333-4444-555555555555";
 
@@ -72,11 +79,15 @@ describe("/config/agents/$templateId", () => {
   beforeEach(() => {
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
+    // Story 2.3 — force le mode Expert (tous les champs visibles) pour les
+    // tests existants Story 2.2 ; le test AC4 réinitialise au mode Wizard.
+    useModeStore.setState({ mode: "expert", hasHydrated: true });
   });
 
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    localStorage.removeItem("agentive.agent-config-mode");
   });
 
   it("hydrates the form from GET /agents/templates/{id}", async () => {
@@ -96,11 +107,14 @@ describe("/config/agents/$templateId", () => {
     // P-01/P-02 fix (Story 2.2 review 2026-05-09) — `system_prompt` n'est plus
     // hydraté depuis `config.prompt_base` ; le textarea reste vide et le
     // placeholder affiche le prompt archétype à titre indicatif.
-    const promptInput = screen.getByLabelText(/system prompt/i) as HTMLTextAreaElement;
+    // Story 2.3 — le label du textarea est "Prompt" (pas "System prompt", qui
+    // est le titre de l'accordéon). On cible précisément le textarea via id.
+    const promptInput = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
+    expect(promptInput).not.toBeNull();
     expect(promptInput.value).toBe("");
     expect(promptInput.placeholder).toContain("Tu es un producteur.");
 
-    const inputContract = screen.getByLabelText(/input contract/i) as HTMLTextAreaElement;
+    const inputContract = document.getElementById("tpl-input-contract") as HTMLTextAreaElement;
     expect(inputContract.value).toContain("\"brief\"");
   });
 
@@ -126,10 +140,13 @@ describe("/config/agents/$templateId", () => {
 
     renderRoute(`/config/agents/${TEMPLATE_ID}`);
 
-    const promptInput = await screen.findByLabelText(/system prompt/i);
+    // Wait page mounted then access the textarea by id (more specific than
+    // the label text which collides with the accordion trigger heading).
+    await screen.findByRole("heading", { name: /configuration de l'agent/i });
+    const promptInput = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
     fireEvent.change(promptInput, { target: { value: "v2 prompt" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /sauvegarder/i }));
+    fireEvent.click(screen.getByTestId("expert-save-button"));
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([, init]) => {
@@ -171,7 +188,7 @@ describe("/config/agents/$templateId", () => {
     renderRoute(`/config/agents/${TEMPLATE_ID}`);
 
     await screen.findByRole("heading", { name: /configuration de l'agent/i });
-    fireEvent.click(screen.getByRole("button", { name: /sauvegarder/i }));
+    fireEvent.click(screen.getByTestId("expert-save-button"));
 
     // Form remains rendered (we did not redirect away).
     await waitFor(() => {
@@ -197,6 +214,45 @@ describe("/config/agents/$templateId", () => {
     expect(templatesCalls).toHaveLength(0);
   });
 
+  it("AC4 — switching Wizard ↔ Expert preserves the in-flight FormState", async () => {
+    // Start in Wizard mode, advance to step 2 (Prompt), edit the textarea,
+    // then switch to Expert and verify the same value is visible there.
+    useModeStore.setState({ mode: "wizard", hasHydrated: true });
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith(`/api/v1/agents/templates/${TEMPLATE_ID}`)) {
+        return Promise.resolve(jsonResponse(TEMPLATE_FIXTURE));
+      }
+      return Promise.resolve(jsonResponse({}, { status: 404 }));
+    });
+
+    renderRoute(`/config/agents/${TEMPLATE_ID}`);
+
+    // Wait Wizard step 1 mounted, then click "Suivant" to reach step 2.
+    await screen.findByTestId("template-wizard-form");
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+
+    // Step 2 — textarea identifié par id (label "Prompt" peut collider avec
+    // le heading "System prompt" et le AccordionTrigger en mode Expert).
+    const wizardPromptInput = await screen.findByTestId("template-wizard-form");
+    expect(wizardPromptInput).toBeInTheDocument();
+    const promptTextareaWizard = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
+    expect(promptTextareaWizard).not.toBeNull();
+    fireEvent.change(promptTextareaWizard, {
+      target: { value: "preserved across switch" },
+    });
+
+    // Switch to Expert mode via the ConfigModeToggle.
+    fireEvent.click(screen.getByRole("radio", { name: /mode expert/i }));
+
+    // The expert form mounts ; the system_prompt textarea must reflect
+    // the edit made in the Wizard step.
+    await screen.findByTestId("template-expert-form");
+    const expertPromptInput = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
+    expect(expertPromptInput).not.toBeNull();
+    expect(expertPromptInput.value).toBe("preserved across switch");
+  });
+
   it("rejects malformed JSON in provider_chain with a toast", async () => {
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -208,10 +264,11 @@ describe("/config/agents/$templateId", () => {
 
     renderRoute(`/config/agents/${TEMPLATE_ID}`);
 
-    const providerInput = await screen.findByLabelText(/provider chain/i);
+    await screen.findByRole("heading", { name: /configuration de l'agent/i });
+    const providerInput = document.getElementById("tpl-provider-chain") as HTMLTextAreaElement;
     fireEvent.change(providerInput, { target: { value: "not json" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /sauvegarder/i }));
+    fireEvent.click(screen.getByTestId("expert-save-button"));
 
     // No PUT should have been issued.
     await waitFor(() => {

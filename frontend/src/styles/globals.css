@@ -54,6 +54,32 @@
   --color-status-pending: #71717a; /* neutral-500 */
   --color-status-warning: #f59e0b; /* amber-500 */
   --color-status-error: #ef4444;
+
+  /* ─── Animations (Story 2.3 T0.2) ─── */
+  /* Radix Accordion CSS animations consommées par `shared/components/ui/accordion.tsx`
+     via les utilités Tailwind `animate-accordion-up` / `animate-accordion-down`.
+     Tailwind v4 résout `--animate-*` en classes utilités (`animate-accordion-up`).
+     Reduced-motion : géré par le bloc `@media (prefers-reduced-motion: reduce)` ci-dessous. */
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
 }
 
 /* ─── Light theme override ─── */

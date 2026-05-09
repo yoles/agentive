@@ -1,6 +1,6 @@
 # Story 2.3 : Mode wizard guidé vs mode expert direct
 
-Status: ready-for-dev
+Status: Review
 
 > 🎯 **Troisième story Epic 2 — Agent Platform.** Cette story transforme la **page d'édition Story 2.2** (formulaire flat 12 champs en mode "Expert minimal") en **deux UX co-existantes** :
 >
@@ -210,29 +210,29 @@ Status: ready-for-dev
 
 ## Tasks / Subtasks
 
-- [ ] **T0 — Pré-requis dépendances + animations Accordion (AC1, AC3)**
+- [x] **T0 — Pré-requis dépendances + animations Accordion (AC1, AC3)**
   - [ ] T0.1 `cd frontend && npm install @hookform/resolvers` (peer dep officielle Zod ↔ react-hook-form). Commit `chore(frontend): add @hookform/resolvers Sprint 1`.
   - [ ] T0.2 Vérifier dans `frontend/src/styles/globals.css` la présence des keyframes `@keyframes accordion-up` / `@keyframes accordion-down` + leurs utilités Tailwind v4 (`@theme inline { --animate-accordion-up: accordion-up 0.2s ease-out; --animate-accordion-down: accordion-down 0.2s ease-out; }`). Si absentes → ajouter (référence shadcn docs). Smoke test : monter rapidement un Accordion vide dans un `App.test.tsx`-like et vérifier que les classes `data-[state=closed]:animate-accordion-up` produisent une transition.
   - [ ] T0.3 Vérifier `package.json` après install : `react-hook-form ^7.72.1` + `zod ^4.3.6` + `@hookform/resolvers ^3.x` présents.
 
-- [ ] **T1 — Extract templateForm helpers depuis Story 2.2 (AC5)**
+- [x] **T1 — Extract templateForm helpers depuis Story 2.2 (AC5)**
   - [ ] T1.1 Créer `frontend/src/features/agent_registry/templateForm.ts` ; déplacer `FormState` type + `buildInitialForm` + `buildPayload` + `parseProviderChain` + `parseContract` + `BuildPayloadResult` type depuis `$templateId.tsx`. Pure logic, aucun import React.
   - [ ] T1.2 Créer `frontend/src/features/agent_registry/focusFirstInvalidField.ts` ; déplacer la fonction depuis `$templateId.tsx`. Couple DOM (`document.getElementById`), donc séparé du module pur.
   - [ ] T1.3 Mettre à jour `frontend/src/features/agent_registry/index.ts` (barrel) avec exports : `buildInitialForm`, `buildPayload`, `parseProviderChain`, `parseContract`, `focusFirstInvalidField`, types `FormState`, `BuildPayloadResult`.
   - [ ] T1.4 Tests `templateForm.test.ts` ≥ 2 tests (AC7).
 
-- [ ] **T2 — Schemas Zod miroitant Pydantic (AC6, D-F closure)**
+- [x] **T2 — Schemas Zod miroitant Pydantic (AC6, D-F closure)**
   - [ ] T2.1 Créer `frontend/src/features/agent_registry/schemas.ts` avec les 6 Zod schemas (cf AC6 verbatim). Réutiliser le typage existant `types.ts` via `z.infer<typeof ...Schema>` quand pertinent.
   - [ ] T2.2 Exporter via `index.ts` : `LLMModelSchema`, `ProviderIdSchema`, `LLMParamsSchema`, `ContractDefinitionSchema`, `ErrorPolicySchema`, `UpdateTemplateRequestSchema`, `WizardStep1Schema..WizardStep5Schema` (sub-schemas pour gates Wizard).
   - [ ] T2.3 Tests `schemas.test.ts` ≥ 3 tests (AC7) — assertion notable : `UpdateTemplateRequestSchema.safeParse({ rogue: "x" }).success === false` + `UpdateTemplateRequestSchema.safeParse({ provider_chain: ["anthropic", "anthropic"] }).success === false` + `UpdateTemplateRequestSchema.safeParse({}).success === false` (refine non-empty).
 
-- [ ] **T3 — `useModeStore` Zustand persist + `ConfigModeToggle` (AC1)**
+- [x] **T3 — `useModeStore` Zustand persist + `ConfigModeToggle` (AC1)**
   - [ ] T3.1 Créer `frontend/src/features/agent_registry/modeStore.ts` ; reproduire 1:1 le pattern `sidebarStore.ts` (Story 1.8). Type : `{ mode: "wizard" | "expert", hasHydrated: boolean, setMode: (m) => void, setHasHydrated: (v) => void }`. Default `mode: "wizard"`. Key persist : `agentive.agent-config-mode`. Partialize : `{ mode }` uniquement.
   - [ ] T3.2 Créer `frontend/src/features/agent_registry/ConfigModeToggle.tsx` ; pattern miroir `features/theme/ModeToggle.tsx` (mounted flag, deux Boutons côte à côte). Variant icon+text (`Wand2` Wizard + `LayoutGrid` Expert). Accessibility : `role="radiogroup"`, `aria-checked`, focus visible. Suppress visual indicator si `!hasHydrated` (suppress flicker).
   - [ ] T3.3 Exporter via `index.ts` : `useModeStore`, `ConfigModeToggle`.
   - [ ] T3.4 Tests `modeStore.test.ts` ≥ 3 tests + `ConfigModeToggle.test.tsx` ≥ 2 tests (AC7).
 
-- [ ] **T4 — `TemplateWizardForm` (AC2)**
+- [x] **T4 — `TemplateWizardForm` (AC2)**
   - [ ] T4.1 Créer `frontend/src/features/agent_registry/TemplateWizardForm.tsx`. Props : `{ template: TemplateDetail, formState: FormState, onFormStateChange: (state: FormState) => void, onSubmit: () => Promise<void>, isPending: boolean }`. État interne : `currentStep` (1-5), `completedSteps` (Set).
   - [ ] T4.2 Composer 5 étapes (Identité / Prompt / Contrats / LLM / Validation+ErrorPolicy). Utiliser `react-hook-form` + `zodResolver(WizardStepNSchema)` par étape pour gates de validation locale. Bouton "Suivant" déclenche `await trigger()` (RHF) ; si `true`, advance ; sinon, focus first invalid (réutilise `focusFirstInvalidField` adapté ou usage natif RHF `setFocus`).
   - [ ] T4.3 Barre de progression en haut (composant inline ou nouveau `<WizardProgress steps={[...]} currentStep={N} completedSteps={...} onStepClick={...} />`). Cliquer une étape précédente = navigation OK ; cliquer une étape future = bloqué (déjà géré via `currentStep` + `completedSteps`).
@@ -240,14 +240,14 @@ Status: ready-for-dev
   - [ ] T4.5 Bouton secondaire "Annuler" visible à toutes les étapes ; clic = appel `onFormStateChange(buildInitialForm(template.config))` + reset `currentStep` à 1.
   - [ ] T4.6 Tests `TemplateWizardForm.test.tsx` ≥ 2 tests (AC7).
 
-- [ ] **T5 — `TemplateExpertForm` (AC3)**
+- [x] **T5 — `TemplateExpertForm` (AC3)**
   - [ ] T5.1 Créer `frontend/src/features/agent_registry/TemplateExpertForm.tsx`. Props : `{ template: TemplateDetail, formState: FormState, onFormStateChange: (state: FormState) => void, onSubmit: () => Promise<void>, isPending: boolean }`.
   - [ ] T5.2 Composer 5 `<AccordionItem>` (Identité / Prompt / Contrats / LLM / Politique d'erreur). Utiliser `<Accordion type="multiple" defaultValue={["identity", "prompt", "contracts", "llm", "error_policy"]}>` pour ouvrir toutes les sections au montage. Réutiliser les champs Story 2.2 (Input/Textarea/Select) tels quels.
   - [ ] T5.3 Validation Zod inline via `react-hook-form` + `zodResolver(UpdateTemplateRequestSchema)`. Erreurs sous chaque champ via `<FormMessage>` shadcn (à vérifier : si `Form` shadcn n'est pas dans le repo, utiliser `<p className="text-destructive text-xs">` direct, pattern Story 2.1).
   - [ ] T5.4 Bouton "Sauvegarder" en bas (sticky ou pied de section "Politique d'erreur") + bouton secondaire "Annuler" qui restore `formState = buildInitialForm(template.config)`.
   - [ ] T5.5 Tests `TemplateExpertForm.test.tsx` ≥ 2 tests (AC7).
 
-- [ ] **T6 — Réécriture page `$templateId.tsx` (AC4 — switch préserve state)**
+- [x] **T6 — Réécriture page `$templateId.tsx` (AC4 — switch préserve state)**
   - [ ] T6.1 **Réécrire** `frontend/src/app/routes/config/agents/$templateId.tsx`. Le contenu Story 2.2 (formulaire flat 12 fields inline) DISPARAÎT. Nouveau host minimal :
     ```tsx
     export function AgentTemplateDetail() {
@@ -293,7 +293,7 @@ Status: ready-for-dev
   - [ ] T6.4 Vérifier import-linter ESLint boundaries v6 : `$templateId.tsx` importe uniquement de `@/features/agent_registry`, `@/shared/...`. Pas de cross-feature.
   - [ ] T6.5 Smoke test manuel (non bloquant) : `make up` puis ouvrir `https://localhost:8443/config/agents/{templateId-existant}` ; tester switch Wizard ↔ Expert ; remplir Wizard étape par étape ; soumettre ; vérifier toast + log structlog backend (`m2.agent_template.updated`).
 
-- [ ] **T7 — Tests miroir Zod ↔ Pydantic + smoke + commit (AC7, AC8)**
+- [x] **T7 — Tests miroir Zod ↔ Pydantic + smoke + commit (AC7, AC8)**
   - [ ] T7.1 Compléter `schemas.test.ts` avec un **test de cohérence Zod ↔ Pydantic** : pour chaque cas testé dans `backend/tests/unit/m2_agent_registry/test_schemas_update.py` (extra forbid, llm_model invalid, provider_chain duplicates/empty/max_length, error_policy bounds, empty payload), reproduire le même cas côté Zod et asserter le même verdict (accept/reject). Maintient l'invariant Sprint 1 que Zod miroite Pydantic 1:1.
   - [ ] T7.2 `make test` local : assert 0 failed, 0 errors, ≥ 435 backend (inchangé) + ≥ 45 frontend (33 baseline + ≥ 12 nouveaux).
   - [ ] T7.3 `make lint-backend` + `make lint-frontend` verts (AC8).
@@ -407,16 +407,61 @@ Status: ready-for-dev
 
 ### Agent Model Used
 
-_(to be filled by dev agent)_
+claude-opus-4-7 (1M context) — bmad-dev-story single-pass execution.
 
 ### Debug Log References
 
-_(to be filled)_
+- Test `getByLabelText(/system prompt/i)` ambigu en Expert mode (collide avec `<h2>System prompt</h2>` du heading et le AccordionTrigger label "System prompt"). Fix : utiliser `document.getElementById("tpl-system-prompt")` directement dans les tests.
+- Test `getByLabelText(/provider chain/i)` collide aussi avec heading + label. Idem : `document.getElementById("tpl-provider-chain")`.
+- Test AC4 : `findByLabelText(/prompt/i)` retournait le bouton du WizardProgress (label "Prompt") au lieu du textarea. Fix : `document.getElementById("tpl-system-prompt")` après `findByTestId("template-wizard-form")`.
+- Test `submits PUT` : `getByRole("button", { name: /sauvegarder/i })` matche aussi le bouton Annuler dans certains rendus (sonner Toaster portal). Fix : `getByTestId("expert-save-button")` plus précis.
+- Test `TemplateExpertForm.test.tsx` : `getByLabelText(/system prompt/i, { selector: "label" })` mal interprété — le `selector` est pour le contrôle, pas le label. Fix : `getByLabelText(/^prompt$/i)` plus spécifique au label "Prompt" du textarea.
+- 1 itération sur le sed regex pour remplacer `<Label>` par `<label>` natif (pas de primitive `Label` dans le repo).
 
 ### Completion Notes List
 
-_(to be filled)_
+- ✅ AC1 ConfigModeToggle UX-DR16 + useModeStore Zustand persist (key `agentive.agent-config-mode`, default `wizard`, `hasHydrated` flag pour suppress flicker)
+- ✅ AC2 Wizard 5 étapes (Identité / Prompt / Contrats / LLM / ErrorPolicy+Validation), gates Zod par étape, progression cliquable backwards, bouton Annuler restore via `buildInitialForm`
+- ✅ AC3 Expert 5 accordéons empilés défaut open (`type="multiple" defaultValue=ALL_SECTIONS`), tous les 12 champs visibles
+- ✅ AC4 Switch Wizard ↔ Expert préserve `FormState` (vit dans le parent `$templateId.tsx`, props vers les deux modes) — test e2e `AC4 — switching Wizard ↔ Expert preserves the in-flight FormState`
+- ✅ AC5 Helpers extraits Story 2.2 dans `templateForm.ts` (pure logic) + `focusFirstInvalidField.ts` (DOM helper) — réutilisés par les deux modes ET par le host `$templateId.tsx`
+- ✅ AC6 Schemas Zod miroitant Pydantic backend (`schemas.ts`) — 6 schemas atomiques + 5 sub-schemas Wizard step gates + 1 schema racine `UpdateTemplateRequestSchema` strict + non-empty refine. **D-F fermé**.
+- ✅ AC7 Tests : **+48 frontend (33 baseline → 81)** et 435 backend inchangé. Largement au-delà des ≥ 12 demandés. Cohérence Zod ↔ Pydantic vérifiée par 9 tests miroir dans `schemas.test.ts`.
+- ✅ AC8 Lint backend (ruff + mypy) + frontend (eslint + tsc) verts. Pas d'`any` introduit. ConfigModeToggle accessible (`role="radiogroup"` + `aria-checked`).
+- ✅ T0.1 `@hookform/resolvers ^5.2.2` ajouté à `package.json`.
+- ✅ T0.2 Keyframes `accordion-up` / `accordion-down` ajoutées dans `src/styles/globals.css` (Tailwind v4 `@theme inline { --animate-* }` + `@keyframes`).
+- ✅ Smoke test runtime non re-vérifié (Story 2.3 = 100% frontend, le smoke Story 2.2 reste valide). Vérification visuelle manuelle suggérée pour confirmer que les Tailwind animations rendent correctement à l'ouverture/fermeture des accordéons (test JSDOM ne couvre pas l'aspect visuel).
+
+#### Décisions techniques d'implémentation
+
+- **Validation Wizard step gates** : implémentée en **validation manuelle Zod** (pas `react-hook-form`) — l'état est lifted au parent et chaque étape valide son sub-schema sur clic "Suivant". Plus simple, évite le coût de sync RHF ↔ formState parent. `react-hook-form` + `@hookform/resolvers` reste installé pour usage futur (Story 2.4+ avec contracts visual editor).
+- **`<label>` natif au lieu d'une primitive `Label`** : aucune primitive `Label` dans `shared/components/ui/`. Pattern Story 2.1/2.2 réutilisé (pas d'import de Radix Label, conservation de la cohérence).
+- **`buildPayload`/`parseProviderChain`/`parseContract` extraits tels quels** : pas de modification de la logique Story 2.2. Le contrat de retour (discriminated union `{ok: true, payload}` ou `{ok: false, field, message}`) est conservé.
+- **`focusFirstInvalidField` extrait dans son propre fichier** : couple DOM (`document.getElementById`), donc séparé de la pure logic `templateForm.ts`. Le mapping `field → input id` reste partagé.
+- **Pattern derived state during render** réutilisé pour hydrater `formState` depuis `templateQuery.data` (cohérent Story 2.2 P-14, évite ESLint `react-hooks/set-state-in-effect`).
 
 ### File List
 
-_(to be filled)_
+**Frontend NEW (12 + 1 globals.css edit)**
+- `frontend/src/features/agent_registry/templateForm.ts` (T1.1)
+- `frontend/src/features/agent_registry/templateForm.test.ts` (T1.4) — 16 tests
+- `frontend/src/features/agent_registry/focusFirstInvalidField.ts` (T1.2)
+- `frontend/src/features/agent_registry/schemas.ts` (T2.1) — 6 atomic + 5 wizard step + 1 root
+- `frontend/src/features/agent_registry/schemas.test.ts` (T2.3) — 19 tests (incl. 9 cohérence Zod ↔ Pydantic)
+- `frontend/src/features/agent_registry/modeStore.ts` (T3.1)
+- `frontend/src/features/agent_registry/modeStore.test.ts` (T3.4) — 4 tests
+- `frontend/src/features/agent_registry/ConfigModeToggle.tsx` (T3.2)
+- `frontend/src/features/agent_registry/ConfigModeToggle.test.tsx` (T3.4) — 3 tests
+- `frontend/src/features/agent_registry/TemplateWizardForm.tsx` (T4.1) — 5 steps + WizardProgress sub-component
+- `frontend/src/features/agent_registry/TemplateWizardForm.test.tsx` (T4.6) — 2 tests (gate blocked + complete flow)
+- `frontend/src/features/agent_registry/TemplateExpertForm.tsx` (T5.1) — 5 accordéons all-open
+- `frontend/src/features/agent_registry/TemplateExpertForm.test.tsx` (T5.5) — 3 tests (render + submit + cancel restore)
+
+**Frontend MODIFIED (3)**
+- `frontend/src/app/routes/config/agents/$templateId.tsx` (T6.1) — RÉÉCRITURE COMPLÈTE : 466 lignes → 175 lignes (host minimal). Le formulaire flat Story 2.2 disparaît au profit du toggle Wizard/Expert.
+- `frontend/src/app/routes/config/agents/$templateId.test.tsx` (T6.2) — adapté nouvelle structure (force mode `expert` au beforeEach pour tests existants Story 2.2 + nouveau test AC4 switch préserve state)
+- `frontend/src/features/agent_registry/index.ts` — exports étendus (templateForm, schemas, modeStore, ConfigModeToggle, TemplateWizardForm, TemplateExpertForm, focusFirstInvalidField)
+- `frontend/src/styles/globals.css` (T0.2) — ajout `--animate-accordion-up` / `--animate-accordion-down` + `@keyframes` Radix-compatible
+- `frontend/package.json` + `package-lock.json` (T0.1) — `+@hookform/resolvers ^5.2.2`
+
+**Backend & autres : aucun changement** — Story 2.3 = 100% frontend.
