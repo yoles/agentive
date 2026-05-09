@@ -1,6 +1,6 @@
 # Story 2.2 : Configurer l'identité, le prompt, les contrats élastiques, le LLM et la politique d'erreur
 
-Status: Review
+Status: Done
 
 > 🎯 **Deuxième story Epic 2 — Agent Platform.** Cette story pose le **endpoint de configuration profonde** d'un agent-template (`PUT /api/v1/agents/templates/{id}`), active le **versioning prompts** (table `prompts` insertion à chaque édition), introduit le **wrapping anti-prompt-injection** AR44 (`<user_input>...</user_input>` / `<tool_output>...</tool_output>`), et ajoute la **politique d'erreur** déclarative (retry exponential backoff NFR14). Côté UI, livre une **page d'édition expert minimale** (`/config/agents/{templateId}`) — formulaire flat sans wizard, sans accordéons stylés (Story 2.3 ajoutera la dichotomie Wizard/Expert).
 >
