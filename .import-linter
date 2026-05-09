@@ -94,10 +94,21 @@ ignore_imports =
 # No feature module may import sqlalchemy / psycopg directly.
 # All DB access goes through `agentive_backend.shared.repositories`, which is
 # the ONLY shared module permitted to talk to SQLAlchemy.
+#
+# `allow_indirect_imports = True` — only DIRECT edges from features/* into
+# sqlalchemy/psycopg are violations. The legitimate public path
+# (features → shared.repositories → repositories.<X>_repo → sqlalchemy,
+#  features → shared.event_bus → event_bus.publisher → psycopg)
+# would otherwise be flagged because the wrapper packages re-export their
+# submodules in __init__.py, and import-linter follows package-level imports
+# transitively. The contract's intent — and its English description — is
+# "directly", so we restrict checking to direct edges. A feature that types
+# `from sqlalchemy import select` is still caught (direct edge).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:no-direct-db-access-from-features]
 name = Feature modules must not import sqlalchemy / psycopg directly
 type = forbidden
+allow_indirect_imports = True
 source_modules =
     agentive_backend.features
 forbidden_modules =
@@ -114,10 +125,19 @@ forbidden_modules =
 # are forbidden so we can refactor internals without breaking callers
 # (e.g. the planned Redis Streams migration — see
 # `docs/decisions/event-bus-migration-trigger.md`).
+#
+# `allow_indirect_imports = True` for the same reason as Contract 3:
+# `shared/event_bus/__init__.py` re-exports symbols from .publisher /
+# .outbox / .subscriber / .naming, so features that legitimately use the
+# public API (`from agentive_backend.shared.event_bus import publish`)
+# would otherwise show a transitive chain into the private submodules.
+# A direct `from agentive_backend.shared.event_bus.publisher import publish`
+# is still a violation (direct edge from features → publisher).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:event-bus-only-public-api]
 name = Features must import only the public event_bus API (publish, subscribe)
 type = forbidden
+allow_indirect_imports = True
 source_modules =
     agentive_backend.features
 forbidden_modules =
