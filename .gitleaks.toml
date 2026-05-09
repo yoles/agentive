@@ -90,6 +90,24 @@ paths = [
 ]
 
 [[allowlists]]
+description = "Allowlist synthetic LLM keys in test fixtures + redaction runbook"
+# Scoped to the 4 custom LLM-provider rules only — default rules (AWS, GCP,
+# Slack, Stripe, generic OpenAI…) still apply in tests, so a real cloud key
+# accidentally pasted in a fixture would still fail CI. The fixtures here use
+# obvious markers (`fake`, `leak`, `test`, `do-not-trust`) to exercise the
+# redaction logic itself; flagging them as leaks is what we test against.
+targetRules = [
+    "anthropic-api-key",
+    "openai-project-key",
+    "voyage-api-key",
+    "agentive-api-token",
+]
+paths = [
+    '''^backend/tests/''',
+    '''^docs/runbooks/llm-usage\.md$''',
+]
+
+[[allowlists]]
 description = "Allowlist tool-produced artifacts outside application code (ALL rules, default + custom)"
 # No `targetRules` → applies to every gitleaks rule (default + custom).
 # Intentional : planning docs / BMAD framework / Claude tooling are not
