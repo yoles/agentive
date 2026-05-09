@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-09  # Story 2.2 ready-for-dev (PUT templates + versioning prompts + UI expert minimale)
+last_updated: 2026-05-09  # Story 2.2 review (PUT templates + versioning prompts + UI expert minimale — implémentée single-pass)
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -65,6 +65,7 @@ last_updated: 2026-05-09  # Story 2.2 ready-for-dev (PUT templates + versioning 
 # 2026-05-09 — Préalable au bump done : `make test` rouge localement (7 failed + 55 errors) — root cause `Makefile:test-backend` divergeait du job CI (manque `--network host` + mount `/var/run/docker.sock` + mount `.import-linter`). Fix appliqué (commit 1db1a54) : bascule `compose run` → `docker run` direct, mirror CI 1:1, tag image stable `agentive-backend:dev`. Re-run `make test` → **390 backend / 26 frontend tests verts, 0 failure, 0 error**. Bug environnemental, aucune régression code Story 2.1.
 # 2026-05-09 — Story 2.1 done — `make test` vert end-to-end (390 backend, dont 26 tests m2 attendus, + 26 frontend), 0 régression, fix Makefile tooling appliqué en amont. Epic 2 reste `in-progress` (7 stories backlog : 2.2 → 2.8). Prochaine action SM : `bmad-create-story` pour Story 2.2 (Configurer agent complet).
 # 2026-05-09 — Story 2.2 créée (ready-for-dev) via bmad-create-story : PUT /api/v1/agents/templates/{id} + GET détail + versioning prompts (insertion table `prompts` à chaque édition + bump agent_templates.version) + helper `wrap_external_input` AR44 (shared/llm/security.py) + ErrorPolicy schema NFR14 (validation only — dispatcher défer Story 4.6) + page `/config/agents/{templateId}` formulaire expert minimal flat (ModeToggle/accordéons/Wizard = 2.3). AC1-AC8, T1-T7, ≥ 25 nouveaux tests prévus (≥ 18 backend + ≥ 7 frontend), 0 régression baseline 390+26. Décisions intégrées : audit-event bypass `event_bus.publish_and_commit('m2.agent_template.updated', ...)` avec TODO Story 9.1 (cleanup), atomicité single-transaction P-02 (template+prompt+event), smoke test runtime AC8. Tech-debt 2.1 D4 (UUID validation $templateId) fermé via FastAPI Path UUID + frontend regex guard ; D6 (queryKey ["agent-templates"]) partiellement fermé via conventions queryKey posées ; 5 nouveaux defer D11-D15 (rollback UI, provider chain runtime, error policy dispatcher, contracts visuels, listing paginé). Anti-scope strict : pas de Wizard/Expert toggle, pas d'accordéons stylés, pas de validation Zod, pas de liste templates, pas de rollback, pas de dispatcher runtime error_policy/provider_chain.
+# 2026-05-09 — Story 2.2 implémentée single-pass via bmad-dev-story (Status: Review). 46 nouveaux tests verts (14 schemas + 6 security + 4 service + 6 routes + 7 e2e + 5 frontend + 4 repos) — 0 régression sur baseline (390 backend / 26 frontend). Total : 431 backend / 31 frontend. Smoke runtime AC8 OK : POST + PUT happy 200 (v1→v2) + PUT UUID invalide 422 RFC 7807 + log structlog `event_type=m2.agent_template.updated` avec `correlation_id`/`old_version`/`new_version`/`bump_version` propagés. `git grep "audit-event bypass cleanup"` → 2 hits 2 lignes distinctes (service.py:152 created + service.py:319 updated). Lint backend (ruff+mypy) + frontend (eslint+tsc) verts. Tech-debt 2.1 D4 fermé (FastAPI Path UUID + frontend regex guard). Décisions exécution : (a) schema `prompts` Sprint 1 conservé minimal — H2 architecture (parent_version, is_active, metadata) défer 2.4/2.7 ; (b) PATCH-like sémantique sur PUT (champs absents = inchangés) ; (c) `payload.system_prompt is not None` = trigger unique du bump version + insert prompt ; (d) `updated_at` retourné = `datetime.now(UTC)` Sprint 1 (pas de colonne dédiée). Frontend tests à +5 vs +7 spec : 5 tests `$templateId.test.tsx` couvrent les flows critiques, hooks exercés indirectement. Story 2.2 Status: Review — second-pass code-review recommended via different LLM avant bump done.
 project: Agentive
 project_key: NOKEY
 tracking_system: file-system
@@ -91,7 +92,7 @@ development_status:
   # Epic 2: Agent Platform (Sprint 1)
   epic-2: in-progress
   2-1-creer-agent-template-depuis-archetype: done
-  2-2-configurer-agent-complet: ready-for-dev
+  2-2-configurer-agent-complet: review
   2-3-mode-wizard-vs-expert: backlog
   2-4-distinction-template-vs-instance: backlog
   2-5-tool-hub-mcp-assignation: backlog

@@ -15,7 +15,10 @@ Module-specific event modules are filled by their owning epics.
 
 from __future__ import annotations
 
-from agentive_backend.shared.contracts.events.agent_events import AgentTemplateCreatedEvent
+from agentive_backend.shared.contracts.events.agent_events import (
+    AgentTemplateCreatedEvent,
+    AgentTemplateUpdatedEvent,
+)
 from agentive_backend.shared.contracts.events.health_events import HealthCheckEvent
 from agentive_backend.shared.contracts.events.system_events import (
     SystemShutdownEvent,
@@ -24,6 +27,7 @@ from agentive_backend.shared.contracts.events.system_events import (
 
 __all__ = [
     "AgentTemplateCreatedEvent",
+    "AgentTemplateUpdatedEvent",
     "HealthCheckEvent",
     "SystemShutdownEvent",
     "SystemStartedEvent",

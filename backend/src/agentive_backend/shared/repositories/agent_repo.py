@@ -113,6 +113,69 @@ class AgentTemplateRepo(BaseRepo):
         await session.refresh(template)
         return template
 
+    async def get_by_id_in_session(
+        self,
+        session: AsyncSession,
+        template_id: UUID,
+    ) -> AgentTemplate | None:
+        """SELECT by id inside the caller's transaction (Story 2.2).
+
+        Same atomicity rationale as :meth:`create_in_session` — the service
+        layer composes get + update + outbox publish in a single transaction.
+        """
+        return await session.get(AgentTemplate, template_id)
+
+    async def update_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        template: AgentTemplate,
+        config: dict[str, Any],
+        new_version: int,
+    ) -> AgentTemplate:
+        """UPDATE config + version inside the caller's transaction (Story 2.2).
+
+        ``template`` is the row already loaded via :meth:`get_by_id_in_session`
+        in the same session — we mutate its attributes and let the unit-of-work
+        flush them. SQLAlchemy auto-increments ``updated_at`` if such a column
+        existed; Sprint 1 schema does not have one, so the modification time
+        is derivable from the matching ``prompts.created_at`` row.
+
+        Raises:
+            ConflictError: If the new ``(name, version, tenant_id)`` already
+                exists (extremely unlikely Sprint 1 — single-tenant + no
+                rename, but defensive against future race conditions).
+        """
+        template.config = config
+        template.version = new_version
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise ConflictError(
+                detail=f"Template '{template.name}' (version {new_version}) already exists",
+                context={"name": template.name, "version": new_version},
+            ) from exc
+        await session.refresh(template)
+        return template
+
+    async def update_config_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        template: AgentTemplate,
+        config: dict[str, Any],
+    ) -> AgentTemplate:
+        """UPDATE config only (no version bump, no prompt insert) — Story 2.2.
+
+        Used when the PUT payload changes only ancillary fields (e.g.
+        ``llm_params``) and does not include ``system_prompt``. Versioning
+        is anchored to prompt edits, so non-prompt edits are silent (no bump).
+        """
+        template.config = config
+        await session.flush()
+        await session.refresh(template)
+        return template
+
 
 class AgentInstanceRepo(BaseRepo):
     """Public API surface for AgentInstance. ALL DB access must go through this class."""

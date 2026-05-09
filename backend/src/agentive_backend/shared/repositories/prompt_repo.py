@@ -10,8 +10,11 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentive_backend.infra.db.models import Prompt
+from agentive_backend.shared.exceptions import ConflictError
 from agentive_backend.shared.repositories.base import BaseRepo
 
 
@@ -46,13 +49,50 @@ class PromptRepo(BaseRepo):
         tenant_id: UUID | None = None,
     ) -> Prompt:
         async with self.with_tenant(tenant_id) as session:
-            prompt = Prompt(
+            return await self.create_in_session(
+                session,
                 agent_template_id=agent_template_id,
                 version=version,
                 content=content,
                 tenant_id=tenant_id,
             )
-            session.add(prompt)
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        agent_template_id: UUID,
+        version: int,
+        content: str,
+        tenant_id: UUID | None = None,
+    ) -> Prompt:
+        """INSERT inside the caller's transaction — Story 2.2 atomicity (P-02 pattern).
+
+        Used by ``AgentRegistryService.update_template`` to compose the
+        prompt bump with the template UPDATE and the outbox event publish in
+        a single transaction.
+
+        Raises:
+            ConflictError: If ``(agent_template_id, version)`` already exists.
+                The repo translates :class:`IntegrityError` into a domain
+                error so feature code stays free of ``sqlalchemy`` imports
+                (``import-linter`` Contract 3).
+        """
+        prompt = Prompt(
+            agent_template_id=agent_template_id,
+            version=version,
+            content=content,
+            tenant_id=tenant_id,
+        )
+        session.add(prompt)
+        try:
             await session.flush()
-            await session.refresh(prompt)
-            return prompt
+        except IntegrityError as exc:
+            raise ConflictError(
+                detail=(
+                    f"Prompt for template '{agent_template_id}' (version {version}) already exists"
+                ),
+                context={"agent_template_id": str(agent_template_id), "version": version},
+            ) from exc
+        await session.refresh(prompt)
+        return prompt
