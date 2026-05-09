@@ -70,6 +70,38 @@ def test_update_request_provider_chain_max_length() -> None:
         )
 
 
+def test_update_request_provider_chain_no_duplicates_p13() -> None:
+    """P-13 fix Story 2.2 review — duplicates rejetés (le runtime fallback
+    Story 4.6 retry-erait sur le même provider, défaisant la chain)."""
+    with pytest.raises(PydanticValidationError, match="duplicate"):
+        UpdateTemplateRequest.model_validate(
+            {"provider_chain": ["anthropic", "openai", "anthropic"]}
+        )
+
+
+def test_update_request_empty_payload_rejected_p03() -> None:
+    """P-03 fix Story 2.2 review — un payload `{}` produit un audit event
+    spurious sur un UPDATE no-op : on refuse en amont via model_validator."""
+    with pytest.raises(PydanticValidationError, match="at least one field"):
+        UpdateTemplateRequest.model_validate({})
+
+
+def test_update_request_all_none_rejected_p03() -> None:
+    """P-03 fix — un payload avec UNIQUEMENT des champs `null` est aussi rejeté."""
+    with pytest.raises(PydanticValidationError, match="at least one field"):
+        UpdateTemplateRequest.model_validate(
+            {
+                "system_prompt": None,
+                "input_contract": None,
+                "output_contract": None,
+                "llm_model": None,
+                "llm_params": None,
+                "provider_chain": None,
+                "error_policy": None,
+            }
+        )
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ContractDefinition (AC2)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

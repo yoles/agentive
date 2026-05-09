@@ -93,8 +93,12 @@ describe("/config/agents/$templateId", () => {
     // Header reveals after fetch resolves.
     await screen.findByRole("heading", { name: /configuration de l'agent/i });
 
+    // P-01/P-02 fix (Story 2.2 review 2026-05-09) — `system_prompt` n'est plus
+    // hydraté depuis `config.prompt_base` ; le textarea reste vide et le
+    // placeholder affiche le prompt archétype à titre indicatif.
     const promptInput = screen.getByLabelText(/system prompt/i) as HTMLTextAreaElement;
-    expect(promptInput.value).toBe("Tu es un producteur.");
+    expect(promptInput.value).toBe("");
+    expect(promptInput.placeholder).toContain("Tu es un producteur.");
 
     const inputContract = screen.getByLabelText(/input contract/i) as HTMLTextAreaElement;
     expect(inputContract.value).toContain("\"brief\"");

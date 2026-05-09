@@ -265,6 +265,16 @@ class AgentRegistryService:
             old_version = existing.version
             merged_config = dict(existing.config or {})
 
+            # P-01 fix — bump version + insert prompts row UNIQUEMENT si le
+            # `system_prompt` change réellement (vs identique à l'existant).
+            # Sans ce check, la default UX path (Save sans modification du
+            # prompt) duplique des rows `prompts` byte-identiques et inflate
+            # `agent_templates.version` à chaque clic.
+            current_system_prompt = merged_config.get("system_prompt")
+            system_prompt_changed = (
+                payload.system_prompt is not None and payload.system_prompt != current_system_prompt
+            )
+
             if payload.system_prompt is not None:
                 merged_config["system_prompt"] = payload.system_prompt
             if payload.input_contract is not None:
@@ -280,7 +290,7 @@ class AgentRegistryService:
             if payload.error_policy is not None:
                 merged_config["error_policy"] = payload.error_policy.model_dump()
 
-            bump_version = payload.system_prompt is not None
+            bump_version = system_prompt_changed
             if bump_version:
                 new_version = old_version + 1
                 updated = await self._template_repo.update_in_session(
@@ -289,14 +299,13 @@ class AgentRegistryService:
                     config=merged_config,
                     new_version=new_version,
                 )
-                # `payload.system_prompt` is non-None — guarded above. Asserting
-                # for the type-checker, not the runtime (no logical change).
-                assert payload.system_prompt is not None
+                # `payload.system_prompt` is non-None — guarded by `system_prompt_changed`
+                # which short-circuits if `payload.system_prompt is None`.
                 await self._prompt_repo.create_in_session(
                     session,
                     agent_template_id=template_id,
                     version=new_version,
-                    content=payload.system_prompt,
+                    content=payload.system_prompt,  # type: ignore[arg-type]  # guarded
                     tenant_id=tenant_id,
                 )
             else:
@@ -318,6 +327,13 @@ class AgentRegistryService:
             )
             # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
             event_id = await publish(event_type, event, session=session)
+
+            # P-05 fix — `updated_at` capturé À L'INTÉRIEUR du with_tenant block,
+            # juste avant le commit (qui s'exécute à `__aexit__`). Sans ça, la
+            # valeur retournée incluait la latence de `emit_notify` post-commit
+            # (jusqu'à plusieurs centaines de ms sous charge) — incohérent pour
+            # un timestamp qui prétend refléter l'écriture DB.
+            updated_at = datetime.now(tz=UTC)
             # commit happens at __aexit__ if no exception is raised.
 
         # ─── Post-commit: best-effort NOTIFY ───
@@ -340,17 +356,17 @@ class AgentRegistryService:
             bump_version=bump_version,
         )
 
-        # `updated_at` Sprint 1 — la table n'a pas de colonne dédiée. La
-        # valeur retournée correspond à l'instant de fin de transaction côté
-        # service (≈ commit DB à la milliseconde près). Au besoin, l'état
-        # exact est retrouvable via ``MAX(prompts.created_at) WHERE agent_template_id = ?``.
+        # `updated_at` Sprint 1 — la table n'a pas de colonne dédiée. La valeur
+        # retournée est capturée juste avant le commit (P-05) ; au besoin l'état
+        # historique est retrouvable via ``MAX(prompts.created_at) WHERE agent_template_id = ?``
+        # pour les rows qui ont déclenché un bump version.
         return UpdateTemplateResponse(
             template_id=updated.id,
             name=updated.name,
             archetype=updated.archetype,
             version=updated.version,
             config=updated.config,
-            updated_at=datetime.now(tz=UTC),
+            updated_at=updated_at,
         )
 
 

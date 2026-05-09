@@ -191,3 +191,37 @@ async def test_update_template_merges_contracts_via_model_dump(
         "extras": {"meta": "ok"},
     }
     assert response.config["output_contract"] == {"core": {"a": "string"}, "extras": {}}
+
+
+@pytest.mark.asyncio
+async def test_update_template_skip_bump_when_system_prompt_unchanged_p01(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """P-01 fix Story 2.2 review — system_prompt identique à l'existant ⇒
+    pas de bump version, pas d'insert prompts row. L'event reste publié
+    pour tracer l'intention (config peut quand même avoir changé via d'autres
+    champs comme llm_params)."""
+    template = SimpleNamespace(
+        id=uuid4(),
+        name="x",
+        archetype="producteur",
+        version=3,
+        config={"system_prompt": "same prompt", "prompt_base": "skel"},
+    )
+    service, trepo, prepo, _session = _make_service(template=template)
+
+    payload = UpdateTemplateRequest(
+        system_prompt="same prompt",  # IDENTIQUE à l'existant
+        llm_params=LLMParams(temperature=0.9, max_tokens=1024),
+    )
+    response = await service.update_template(template.id, payload)
+
+    assert response.version == 3  # no bump
+    prepo.create_in_session.assert_not_awaited()  # no prompts row
+    trepo.update_in_session.assert_not_awaited()
+    trepo.update_config_in_session.assert_awaited_once()
+    # l'event est tout de même publié (l'opérateur a changé llm_params)
+    event_publish_mock.assert_awaited_once()
+    event_arg = event_publish_mock.await_args.args[1]
+    assert event_arg.old_version == 3
+    assert event_arg.new_version == 3

@@ -239,7 +239,14 @@ class AgentInstance(Base):
 
 
 class Prompt(Base):
-    """Versioned prompts — each edit creates a new row (audit trail)."""
+    """Versioned prompts — each edit creates a new row (audit trail).
+
+    .. note:: Sprint 1 schema is intentionally minimal (Story 1.5). Architecture
+       H2 describes the target schema with `parent_version`, `is_active`
+       (UNIQUE constraint) and `metadata` JSONB ; that evolution is deferred
+       to Story 2.4 / 2.7 when runtime instances + rollback semantics are
+       implemented (cf P-16 follow-up Story 2.2 code-review 2026-05-09).
+    """
 
     __tablename__ = "prompts"
 

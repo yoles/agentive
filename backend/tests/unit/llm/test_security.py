@@ -15,14 +15,13 @@ def test_wrap_user_input_happy_path() -> None:
 
 
 def test_wrap_tool_output_happy_path() -> None:
-    """AC3 — tool_output utilise le tag dédié."""
-    assert (
-        wrap_external_input('{"result": 42}', "tool_output")
-        == "<tool_output>{&quot;result&quot;: 42}</tool_output>"
-        or wrap_external_input('{"result": 42}', "tool_output")
-        == '<tool_output>{"result": 42}</tool_output>'
-    )
-    # html.escape(quote=False) ne touche pas aux ", donc :
+    """AC3 — tool_output utilise le tag dédié.
+
+    P-06 fix Story 2.2 review (2026-05-09) — l'ancienne version contenait
+    un `or` tautologique qui passait quel que soit le résultat ; on garde
+    UNE assertion deterministic. `html.escape(quote=False)` ne touche pas
+    aux `"`, donc le contenu JSON est préservé verbatim.
+    """
     assert (
         wrap_external_input('{"result": 42}', "tool_output")
         == '<tool_output>{"result": 42}</tool_output>'

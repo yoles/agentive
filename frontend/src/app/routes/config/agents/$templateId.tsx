@@ -92,10 +92,13 @@ function buildInitialForm(config: Record<string, unknown>): FormState {
   const inputContract = (config.input_contract ?? EMPTY_CONTRACT) as ContractDefinition;
   const outputContract = (config.output_contract ?? EMPTY_CONTRACT) as ContractDefinition;
 
+  // P-01/P-02 fix — NE PAS copier `prompt_base` (skeleton archétype) dans le
+  // form state du `system_prompt`. Sans ça, la default UX (Save sans toucher
+  // le textarea) persiste l'archétype skeleton comme prompt utilisateur ET
+  // bump la version. Le textarea reste vide ; un placeholder côté JSX
+  // affichera le `prompt_base` à titre indicatif.
   return {
-    system_prompt:
-      pickString(config, "system_prompt", "") ||
-      pickString(config, "prompt_base", ""), // fallback to archetype baseline
+    system_prompt: pickString(config, "system_prompt", ""),
     llm_model: (config.llm_model as LLMModel | undefined) ?? "claude-3-5-sonnet-20241022",
     temperature: pickNumber(llmParams as unknown as Record<string, unknown>, "temperature", 0.7),
     max_tokens: pickNumber(llmParams as unknown as Record<string, unknown>, "max_tokens", 4096),
@@ -108,14 +111,65 @@ function buildInitialForm(config: Record<string, unknown>): FormState {
   };
 }
 
-function buildPayload(form: FormState): UpdateTemplateRequest {
-  // JSON parsing throws if the operator typed garbage — caller catches.
-  const providerChain = JSON.parse(form.provider_chain_raw) as ProviderId[];
-  const inputContract = JSON.parse(form.input_contract_raw) as ContractDefinition;
-  const outputContract = JSON.parse(form.output_contract_raw) as ContractDefinition;
+type BuildPayloadResult =
+  | { ok: true; payload: UpdateTemplateRequest }
+  | { ok: false; field: "provider_chain" | "input_contract" | "output_contract"; message: string };
 
-  return {
-    system_prompt: form.system_prompt,
+/** P-09/P-10 fix — parse + valide chaque champ JSON séparément avec un
+ * message dédié au champ (au lieu d'un blob générique). Valide aussi la
+ * SHAPE post-parse (Array.isArray + every typeof === "string" pour
+ * provider_chain ; objet avec `core` + `extras` pour les contrats).
+ */
+function parseProviderChain(raw: string): ProviderId[] | string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return `JSON invalide : ${(e as Error).message}`;
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    !parsed.every((x): x is string => typeof x === "string")
+  ) {
+    return "doit être un tableau JSON non vide de strings (ex : [\"anthropic\", \"openai\"])";
+  }
+  return parsed as ProviderId[];
+}
+
+function parseContract(raw: string): ContractDefinition | string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return `JSON invalide : ${(e as Error).message}`;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return "doit être un objet JSON avec les clés `core` et `extras`";
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj.core !== "object" || obj.core === null || Array.isArray(obj.core)) {
+    return "le champ `core` doit être un objet";
+  }
+  // `extras` est optionnel côté backend (default {}) — on accepte l'absence.
+  return parsed as ContractDefinition;
+}
+
+function buildPayload(form: FormState): BuildPayloadResult {
+  const providerChain = parseProviderChain(form.provider_chain_raw);
+  if (typeof providerChain === "string") {
+    return { ok: false, field: "provider_chain", message: providerChain };
+  }
+  const inputContract = parseContract(form.input_contract_raw);
+  if (typeof inputContract === "string") {
+    return { ok: false, field: "input_contract", message: inputContract };
+  }
+  const outputContract = parseContract(form.output_contract_raw);
+  if (typeof outputContract === "string") {
+    return { ok: false, field: "output_contract", message: outputContract };
+  }
+
+  const payload: UpdateTemplateRequest = {
     llm_model: form.llm_model,
     llm_params: {
       temperature: form.temperature,
@@ -130,6 +184,46 @@ function buildPayload(form: FormState): UpdateTemplateRequest {
       backoff_strategy: form.backoff_strategy,
     },
   };
+  // P-01 fix — N'inclure `system_prompt` QUE s'il a un contenu non-blanc.
+  // Backend `min_length=1` rejette `""` en 422 ; et le service skippe le
+  // bump version si la valeur est identique à l'existante (P-01 backend).
+  if (form.system_prompt.trim().length > 0) {
+    payload.system_prompt = form.system_prompt;
+  }
+  return { ok: true, payload };
+}
+
+/** P-11 fix — extrait `errors[].loc[1]` du body RFC 7807 et focus l'input
+ * correspondant. Mapping `loc[1]` → input id ; fallback sur le textarea
+ * `system_prompt` si le champ ne matche aucun input connu.
+ */
+function focusFirstInvalidField(apiError: { errors?: Array<{ loc?: unknown }> }): void {
+  const fieldToInputId: Record<string, string> = {
+    system_prompt: "tpl-system-prompt",
+    llm_model: "tpl-llm-model",
+    llm_params: "tpl-temperature", // sub-field non distinct ici — temperature en premier
+    provider_chain: "tpl-provider-chain",
+    input_contract: "tpl-input-contract",
+    output_contract: "tpl-output-contract",
+    error_policy: "tpl-on-timeout",
+  };
+  const errors = apiError.errors ?? [];
+  for (const err of errors) {
+    const loc = Array.isArray(err.loc) ? err.loc : [];
+    const field = typeof loc[1] === "string" ? loc[1] : null;
+    if (field && fieldToInputId[field]) {
+      const el = document.getElementById(fieldToInputId[field]);
+      if (el instanceof HTMLElement) {
+        el.focus();
+        return;
+      }
+    }
+  }
+  // Fallback : focus le textarea du prompt (le champ le plus souvent édité).
+  const fallback = document.getElementById("tpl-system-prompt");
+  if (fallback instanceof HTMLTextAreaElement) {
+    fallback.focus();
+  }
 }
 
 export function AgentTemplateDetail() {
@@ -186,7 +280,13 @@ export function AgentTemplateDetail() {
     );
   }
 
-  const template = templateQuery.data!;
+  // P-14 fix — destructure narrow au lieu de `templateQuery.data!`.
+  // Si `data` est unexpectedly null après les guards précédents, on
+  // tombe sur un loading state plutôt qu'un crash runtime.
+  const template = templateQuery.data;
+  if (!template) {
+    return <p className="text-sm text-muted-foreground">Chargement du template…</p>;
+  }
 
   function patch(partial: Partial<FormState>) {
     setForm((prev) => (prev ? { ...prev, ...partial } : prev));
@@ -195,34 +295,45 @@ export function AgentTemplateDetail() {
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (form === null) return;
+    // P-12 fix — guard synchrone contre le double-submit (Enter rapide,
+    // double-click). `disabled={isPending}` sur le bouton ne s'applique
+    // qu'au render suivant, donc une fenêtre de race existe sans ce check.
+    if (updateMutation.isPending) return;
 
-    let payload: UpdateTemplateRequest;
-    try {
-      payload = buildPayload(form);
-    } catch (jsonErr) {
-      toast.error(
-        `JSON invalide dans contrats / provider chain — corrige et réessaie. (${
-          (jsonErr as Error).message
-        })`,
-      );
+    const result = buildPayload(form);
+    if (!result.ok) {
+      const fieldLabel: Record<typeof result.field, string> = {
+        provider_chain: "Provider chain",
+        input_contract: "Input contract",
+        output_contract: "Output contract",
+      };
+      toast.error(`${fieldLabel[result.field]} : ${result.message}`);
+      const inputId = {
+        provider_chain: "tpl-provider-chain",
+        input_contract: "tpl-input-contract",
+        output_contract: "tpl-output-contract",
+      }[result.field];
+      const el = document.getElementById(inputId);
+      if (el instanceof HTMLTextAreaElement) {
+        el.focus();
+      }
       return;
     }
 
     try {
-      const response = await updateMutation.mutateAsync(payload);
+      const response = await updateMutation.mutateAsync(result.payload);
       toast.success(`Template mis à jour (v${response.version})`);
     } catch (err) {
-      const apiError = err as Partial<ApiError>;
+      const apiError = err as Partial<ApiError> & { errors?: Array<{ loc?: unknown }> };
       const message =
         apiError.detail ??
         apiError.title ??
         "Mise à jour impossible — vérifiez les valeurs saisies.";
       toast.error(message);
-      // Best-effort focus on the most likely culprit (system_prompt).
-      const systemPromptInput = document.getElementById("tpl-system-prompt");
-      if (systemPromptInput instanceof HTMLTextAreaElement) {
-        systemPromptInput.focus();
-      }
+      // P-11 fix — focus le PREMIER champ invalide depuis errors[].loc[1]
+      // (RFC 7807 detailed errors), au lieu d'un focus systématique sur
+      // `system_prompt` (UX-trompeur quand l'erreur est ailleurs).
+      focusFirstInvalidField(apiError);
     }
   }
 
@@ -263,7 +374,9 @@ export function AgentTemplateDetail() {
           </p>
         </div>
 
-        {/* System prompt */}
+        {/* System prompt — P-01/P-02 fix : placeholder montre `prompt_base`
+            archetype, mais la valeur n'est PAS pré-remplie ; un champ vide
+            au save n'envoie pas `system_prompt` au backend. */}
         <div className="flex flex-col gap-2">
           <label htmlFor="tpl-system-prompt" className="text-sm font-medium">
             System prompt
@@ -273,11 +386,17 @@ export function AgentTemplateDetail() {
             rows={12}
             value={form.system_prompt}
             onChange={(e) => patch({ system_prompt: e.target.value })}
+            placeholder={
+              typeof template.config.prompt_base === "string"
+                ? `Laisser vide pour utiliser le prompt de l'archétype :\n\n${template.config.prompt_base}`
+                : "Saisir un system prompt personnalisé"
+            }
             className="font-mono text-sm"
             maxLength={50_000}
           />
           <p className="text-xs text-muted-foreground">
-            Modifier ce champ crée une nouvelle version (versioning prompts).
+            Modifier ce champ crée une nouvelle version (versioning prompts). Laisser vide
+            pour conserver le prompt de l'archétype.
           </p>
         </div>
 
@@ -316,7 +435,14 @@ export function AgentTemplateDetail() {
               min={0}
               max={2}
               value={form.temperature}
-              onChange={(e) => patch({ temperature: Number(e.target.value) })}
+              onChange={(e) => {
+                // P-04 fix — `valueAsNumber` retourne NaN pour "" / "abc" /
+                // formats invalides ; `Number(e.target.value)` coerce "" en 0
+                // silencieusement et "1,5" (locale fr) en NaN. On n'écrit
+                // l'état QUE si la valeur parse en number fini.
+                const v = e.target.valueAsNumber;
+                if (Number.isFinite(v)) patch({ temperature: v });
+              }}
             />
           </div>
           <div className="flex flex-col gap-2">
@@ -329,7 +455,10 @@ export function AgentTemplateDetail() {
               min={1}
               max={200_000}
               value={form.max_tokens}
-              onChange={(e) => patch({ max_tokens: Number(e.target.value) })}
+              onChange={(e) => {
+                const v = e.target.valueAsNumber;
+                if (Number.isFinite(v)) patch({ max_tokens: v });
+              }}
             />
           </div>
         </div>
@@ -416,7 +545,10 @@ export function AgentTemplateDetail() {
                 min={0}
                 max={10}
                 value={form.max_retries}
-                onChange={(e) => patch({ max_retries: Number(e.target.value) })}
+                onChange={(e) => {
+                  const v = e.target.valueAsNumber;
+                  if (Number.isFinite(v)) patch({ max_retries: v });
+                }}
               />
             </div>
             <div className="flex flex-col gap-2">
