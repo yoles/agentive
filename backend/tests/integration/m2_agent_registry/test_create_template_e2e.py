@@ -69,6 +69,13 @@ def _make_app(
     async def _handle_req_validation(  # pragma: no cover — verbatim of app.main handler
         _request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        # Strip `input` (P-06 — credentials/PII echo) AND `ctx` (Pydantic
+        # places the original ValueError instance under ctx.error, which is
+        # not JSON-serializable for `value_error`-typed errors raised by
+        # custom validators). Mirrors `app.main.handle_validation_error`.
+        sanitized_errors = [
+            {k: v for k, v in err.items() if k not in {"input", "ctx"}} for err in exc.errors()
+        ]
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
@@ -77,7 +84,7 @@ def _make_app(
                 "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "correlation_id": get_correlation_id(),
                 "detail": "Request body validation failed",
-                "errors": exc.errors(),
+                "errors": sanitized_errors,
             },
             media_type="application/problem+json",
         )
@@ -239,6 +246,78 @@ async def test_create_template_unknown_archetype_returns_422_rfc7807(
         # picking up unrelated rows from earlier tests in the same session.
         count = await _count_outbox(seed_session_factory, "m2.agent_template.created", name="Test")
         assert count == 0
+
+
+@pytest.mark.integration
+async def test_create_template_empty_name_returns_422_rfc7807(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 + AC7 (T4.1 ≥12) — Empty `name` → 422 RFC 7807 + no row + no event."""
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/agents/templates",
+            headers=_auth_headers(),
+            json={"archetype": "producteur", "name": ""},
+        )
+        assert resp.status_code == 422
+        assert resp.headers["content-type"] == "application/problem+json"
+        body = resp.json()
+        assert body["type"] == "/errors/validation"
+        assert body["status"] == 422
+
+    # No row inserted, no audit event published.
+    async with seed_session_factory() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM agent_templates WHERE name = ''")
+        )
+        assert int(result.scalar_one()) == 0
+    count = await _count_outbox(seed_session_factory, "m2.agent_template.created", name="")
+    assert count == 0
+
+
+@pytest.mark.integration
+async def test_create_template_whitespace_only_name_returns_422_rfc7807(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 + P-05 + AC7 (T4.1 ≥12) — Whitespace-only `name` → 422 (post-trim).
+
+    The schema's `_strip_and_revalidate_name` validator rejects `"   "` after
+    trimming so it is NOT persisted as three spaces (Story 2.1 P-05).
+    """
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/agents/templates",
+            headers=_auth_headers(),
+            json={"archetype": "producteur", "name": "   "},
+        )
+        assert resp.status_code == 422
+        assert resp.headers["content-type"] == "application/problem+json"
+        body = resp.json()
+        assert body["type"] == "/errors/validation"
+        # Custom validator surfaces a `value_error` mentioning the rule.
+        errors_blob = str(body.get("errors", []))
+        assert "blank" in errors_blob or "whitespace" in errors_blob
+
+    # No row inserted (neither raw "   " nor stripped ""), no audit event.
+    async with seed_session_factory() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM agent_templates WHERE name IN ('   ', '')")
+        )
+        assert int(result.scalar_one()) == 0
+    count_blank = await _count_outbox(seed_session_factory, "m2.agent_template.created", name="")
+    count_spaces = await _count_outbox(
+        seed_session_factory, "m2.agent_template.created", name="   "
+    )
+    assert count_blank == 0
+    assert count_spaces == 0
 
 
 @pytest.mark.integration
