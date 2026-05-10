@@ -232,12 +232,14 @@ describe("/config/agents/$templateId", () => {
     await screen.findByTestId("template-wizard-form");
     fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
 
-    // Step 2 — textarea identifié par id (label "Prompt" peut collider avec
-    // le heading "System prompt" et le AccordionTrigger en mode Expert).
-    const wizardPromptInput = await screen.findByTestId("template-wizard-form");
-    expect(wizardPromptInput).toBeInTheDocument();
-    const promptTextareaWizard = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
-    expect(promptTextareaWizard).not.toBeNull();
+    // Step 2 — Story 2.3 P-04 (CR 2026-05-10) : data-testid scopés par mode
+    // évitent l'ambigüité transitoire pendant le switch Wizard ↔ Expert
+    // (les deux formulaires partagent l'`id` HTML "tpl-system-prompt" pour
+    // l'accessibilité `htmlFor`, mais les tests passent par data-testid).
+    await screen.findByTestId("template-wizard-form");
+    const promptTextareaWizard = screen.getByTestId(
+      "wizard-tpl-system-prompt",
+    ) as HTMLTextAreaElement;
     fireEvent.change(promptTextareaWizard, {
       target: { value: "preserved across switch" },
     });
@@ -248,9 +250,24 @@ describe("/config/agents/$templateId", () => {
     // The expert form mounts ; the system_prompt textarea must reflect
     // the edit made in the Wizard step.
     await screen.findByTestId("template-expert-form");
-    const expertPromptInput = document.getElementById("tpl-system-prompt") as HTMLTextAreaElement;
-    expect(expertPromptInput).not.toBeNull();
+    const expertPromptInput = screen.getByTestId(
+      "expert-tpl-system-prompt",
+    ) as HTMLTextAreaElement;
     expect(expertPromptInput.value).toBe("preserved across switch");
+
+    // Symétrie AC4 — on reste en Expert, on édite à nouveau, on revient
+    // en Wizard, l'édition Expert doit être visible côté Wizard step 2.
+    fireEvent.change(expertPromptInput, {
+      target: { value: "edited in expert then back" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: /mode wizard/i }));
+    await screen.findByTestId("template-wizard-form");
+    // Naviguer step 1 → step 2 pour voir le textarea prompt.
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    const wizardPromptAgain = screen.getByTestId(
+      "wizard-tpl-system-prompt",
+    ) as HTMLTextAreaElement;
+    expect(wizardPromptAgain.value).toBe("edited in expert then back");
   });
 
   it("rejects malformed JSON in provider_chain with a toast", async () => {

@@ -16,6 +16,7 @@ export type { ConfigMode } from "./modeStore";
 // Story 2.3 — Wizard + Expert presentation modes for the template editor.
 export { TemplateExpertForm } from "./TemplateExpertForm";
 export { TemplateWizardForm } from "./TemplateWizardForm";
+export type { WizardHandle } from "./TemplateWizardForm";
 // Story 2.3 — Zod schemas miroir Pydantic backend.
 export {
   ContractDefinitionSchema,

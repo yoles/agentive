@@ -19,7 +19,7 @@
  */
 
 import { CheckIcon, ChevronLeft, ChevronRight, Save, X } from "lucide-react";
-import { useState } from "react";
+import { forwardRef, useImperativeHandle, useState } from "react";
 import type { ZodType } from "zod";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
@@ -70,16 +70,90 @@ type Props = {
 
 type StepError = { message: string; field?: string } | null;
 
-export function TemplateWizardForm({
-  template,
-  formState,
-  onFormStateChange,
-  onSubmit,
-  isPending,
-}: Props) {
+export type WizardHandle = {
+  /**
+   * Navigate to the wizard step that contains the given backend field.
+   * Used by the parent host when an API error (RFC 7807 or buildPayload
+   * pre-flight) targets a field that is NOT visible on the current step.
+   * P-05 (CR 2026-05-10).
+   */
+  goToStepForField: (field: string) => void;
+  /**
+   * Reset wizard state to step 1 with no completed steps and no error.
+   * Used by the parent host after a successful PUT (P-06 CR 2026-05-10).
+   */
+  reset: () => void;
+};
+
+// Map backend field names → wizard step. Used by both `goToStepForField`
+// (parent → child) and `focusStepField` (child → DOM after a gate failure).
+const FIELD_TO_STEP: Record<string, number> = {
+  system_prompt: 2,
+  input_contract: 3,
+  output_contract: 3,
+  llm_model: 4,
+  llm_params: 4,
+  temperature: 4,
+  max_tokens: 4,
+  provider_chain: 4,
+  error_policy: 5,
+  on_timeout: 5,
+  max_retries: 5,
+  backoff_strategy: 5,
+};
+
+const FIELD_TO_INPUT_ID: Record<string, string> = {
+  system_prompt: "tpl-system-prompt",
+  input_contract: "tpl-input-contract",
+  output_contract: "tpl-output-contract",
+  llm_model: "tpl-llm-model",
+  llm_params: "tpl-temperature",
+  temperature: "tpl-temperature",
+  max_tokens: "tpl-max-tokens",
+  provider_chain: "tpl-provider-chain",
+  error_policy: "tpl-on-timeout",
+  on_timeout: "tpl-on-timeout",
+  max_retries: "tpl-max-retries",
+  backoff_strategy: "tpl-backoff",
+};
+
+function focusStepField(field: string | undefined) {
+  if (!field) return;
+  const id = FIELD_TO_INPUT_ID[field];
+  if (!id) return;
+  // Defer to next frame so the DOM has settled if a navigation just happened.
+  requestAnimationFrame(() => {
+    const el = document.getElementById(id);
+    if (el instanceof HTMLElement) el.focus();
+  });
+}
+
+export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function TemplateWizardForm(
+  { template, formState, onFormStateChange, onSubmit, isPending },
+  ref,
+) {
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [completedSteps, setCompletedSteps] = useState<Set<number>>(new Set());
   const [stepError, setStepError] = useState<StepError>(null);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      goToStepForField(field: string) {
+        const target = FIELD_TO_STEP[field];
+        if (target) {
+          setCurrentStep(target);
+          setStepError(null);
+        }
+      },
+      reset() {
+        setCurrentStep(1);
+        setCompletedSteps(new Set());
+        setStepError(null);
+      },
+    }),
+    [],
+  );
 
   function patch(partial: Partial<FormState>) {
     onFormStateChange({ ...formState, ...partial });
@@ -137,6 +211,9 @@ export function TemplateWizardForm({
     const err = validateStep(currentStep);
     if (err !== null) {
       setStepError(err);
+      // P-03 (CR 2026-05-10) — focus the first invalid field so the user
+      // does not have to scroll/hunt. AC2 explicitly requires this behavior.
+      focusStepField(err.field);
       return;
     }
     setStepError(null);
@@ -166,11 +243,19 @@ export function TemplateWizardForm({
   }
 
   async function handleSave() {
-    // Final-step gate: validate step 5 before triggering the mutation.
-    const err = validateStep(5);
-    if (err !== null) {
-      setStepError(err);
-      return;
+    // P-02 (CR 2026-05-10) — re-validate ALL editable steps (2..5) before
+    // triggering the mutation. Guards against bypass scenarios where the
+    // user goes back to an earlier step, breaks a value, then jumps forward
+    // via handleStepClick (which trusts completedSteps but does NOT
+    // re-validate). On failure, navigate to the failing step + focus.
+    for (let s = 2; s <= 5; s++) {
+      const err = validateStep(s);
+      if (err !== null) {
+        setStepError(err);
+        setCurrentStep(s);
+        focusStepField(err.field);
+        return;
+      }
     }
     setStepError(null);
     await onSubmit();
@@ -264,7 +349,7 @@ export function TemplateWizardForm({
       </div>
     </div>
   );
-}
+});
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Sub-components — one per wizard step
@@ -352,11 +437,12 @@ function Step2Prompt({
   return (
     <div className="flex flex-col gap-3">
       <h2 className="text-lg font-semibold">System prompt</h2>
-      <label htmlFor="tpl-system-prompt" className="text-sm font-medium" className={LABEL_CLASS}>
+      <label htmlFor="tpl-system-prompt" className={LABEL_CLASS}>
         Prompt
       </label>
       <Textarea
         id="tpl-system-prompt"
+        data-testid="wizard-tpl-system-prompt"
         rows={12}
         value={value}
         onChange={(e) => onChange(e.target.value)}

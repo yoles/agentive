@@ -2,6 +2,13 @@
 
 Status: Review
 
+> 📝 **Code Review Amendments — 2026-05-10** (post `bmad-code-review` adversarial 3 layers, John tranche 4 bad-spec) :
+>
+> - **B-01 — Expert sans Zod inline** : ferme P-07. AC3 + Décision #6 + T5.3 amendés ci-dessous → validation client Zod inline défer Story future (probable Story 2.7 quand form builder contracts arrive). `@hookform/resolvers ^5.2.2` reste installé pour usage futur. Sprint 1 = Expert sans validation client (backend RFC 7807 + `focusFirstInvalidField` reste l'autorité). D-F closure officielle = côté Wizard step gates uniquement (suffit pour mirroir Pydantic ↔ Zod).
+> - **B-02 — Divergence WizardStepXSchema vs UpdateTemplateRequestSchema** : intentionnelle. AC6 amendé ci-dessous → Wizard step gates imposent completion (UX guidée single-pass) ; `UpdateTemplateRequestSchema` reste permissif (PATCH-like sémantique Story 2.2). Le Zod miroir Pydantic concerne `UpdateTemplateRequestSchema`, pas les `WizardStep*Schema` (couche UX au-dessus).
+> - **B-03 — `max-w-3xl` au lieu de `max-w-2xl`** : intentionnel. AC3 + T6.1 amendés ci-dessous → 720-768px requis pour `WizardProgress` 5 étapes horizontal lisibles. Aucun rollback code.
+> - **B-04 — `templateForm.ts` module pur (pas hook `useTemplateFormLogic`)** : intentionnel. Décision #2 amendée ci-dessous → helpers stateless = pas de hook custom.
+
 > 🎯 **Troisième story Epic 2 — Agent Platform.** Cette story transforme la **page d'édition Story 2.2** (formulaire flat 12 champs en mode "Expert minimal") en **deux UX co-existantes** :
 >
 > 1. **Mode Wizard guidé** — 5 étapes séquentielles (Identité → Prompt → Contrats → LLM → Politique d'erreur), 1 étape visible à la fois, gates de validation à chaque transition, progression visible en haut. Cible : John "charge cognitive faible" / découverte d'un nouveau template.
@@ -46,11 +53,11 @@ Status: Review
 > **Décisions intégrées (Epic 1 retro + Story 2.1 + 2.2 + code-review 2026-05-09) :**
 >
 > 1. **Pas de changement backend** — la cible Sprint 1 est : 0 ligne de Python touchée. Toute la validation Zod côté front mirroir Pydantic 1:1 ; un mismatch Zod/Pydantic = bug à fixer côté Zod (le backend reste l'autorité).
-> 2. **`useTemplateFormLogic` partagé** — extraction Story 2.2 helpers (`buildInitialForm`, `buildPayload`, `parseProviderChain`, `parseContract`, `focusFirstInvalidField`) dans un module pur `features/agent_registry/templateForm.ts`. Wizard et Expert le consomment. Garantit que les deux modes produisent un payload identique pour le PUT.
+> 2. **`templateForm.ts` module pur partagé** *(amendement CR 2026-05-10 — B-04 : ex "useTemplateFormLogic" hook → corrigé en module pur car helpers stateless)* — extraction Story 2.2 helpers (`buildInitialForm`, `buildPayload`, `parseProviderChain`, `parseContract`) dans un **module pur** `features/agent_registry/templateForm.ts` (pas de hook custom car stateless). `focusFirstInvalidField` extrait à part (`focusFirstInvalidField.ts`, couple DOM). Wizard et Expert importent directement les helpers via le barrel `@/features/agent_registry`. Garantit que les deux modes produisent un payload identique pour le PUT.
 > 3. **Zustand persist pattern Story 1.8** — `useModeStore` reproduit `sidebarStore` 1:1 (`name: "agentive.agent-config-mode"`, `partialize: { mode }`, `hasHydrated` flag, `onRehydrateStorage`). Pas de variations.
 > 4. **Switch mid-edit préserve l'état** — quand l'utilisateur toggle Wizard ↔ Expert pendant l'édition, le `FormState` (10 champs string/number) est CONSERVÉ. Ni reset ni perte. Solution : le `FormState` vit dans le composant parent (`$templateId.tsx`) ou dans un hook custom partagé (`useTemplateForm()`). Wizard et Expert reçoivent le state + setter en props.
 > 5. **Animations Accordion shadcn — keyframes Tailwind v4 OBLIGATOIRES** — le composant `accordion.tsx:56` utilise `data-[state=closed]:animate-accordion-up data-[state=open]:animate-accordion-down` ; ces utilités requièrent que les keyframes `accordion-up` / `accordion-down` soient définies dans `src/styles/globals.css` (Tailwind v4 syntax `@keyframes` + `@theme inline { --animate-accordion-up: ... }`). **À vérifier en T0**, ajouter si manquantes (référence : [shadcn accordion docs](https://ui.shadcn.com/docs/components/accordion)). Sans, l'accordéon s'ouvrira/fermera instantanément (UX dégradée mais pas cassante).
-> 6. **`@hookform/resolvers` ajouté en deps** — `npm install @hookform/resolvers` requis Sprint 1 pour brancher Zod sur react-hook-form via `zodResolver`. Pas de variation alternative.
+> 6. **`@hookform/resolvers` ajouté en deps (usage défer)** — `npm install @hookform/resolvers` reste requis Sprint 1 (peer dep officielle). **Amendement CR 2026-05-10 (B-01)** : Sprint 1 ne branche PAS RHF côté Expert (validation backend-only post-PUT, pattern Story 2.2 — RFC 7807 toast + `focusFirstInvalidField`). Wizard step gates utilisent Zod en validation manuelle (pas RHF). La dépendance est conservée pour usage Story future (probable Story 2.7 quand le form builder visuel contracts arrive — D14 closure complète).
 > 7. **Pattern `mounted` flag pour ModeToggle** — miroir `ModeToggle` theme Story 1.8 : utiliser `useModeStore.hasHydrated` pour suppress visual flicker au premier render (avant que `localStorage.getItem("agentive.agent-config-mode")` ne soit lu). Sans, premier render = `wizard` (default) puis flash vers `expert` si l'utilisateur avait persisté.
 > 8. **Default mode = `wizard`** — premier accès UX guidé pour un nouvel utilisateur. Décision UX cohérente avec UX-DR16 ("guidance par défaut, expert sur opt-in").
 > 9. **Wizard step gates strict — pas de skip** — chaque "Suivant" valide les champs de l'étape courante via Zod. Si invalid, l'étape reste visible avec messages d'erreur inline (`FormMessage` shadcn). Pas de "skip optional", pas de "save & continue later". L'utilisateur doit corriger pour avancer.
@@ -127,9 +134,9 @@ Status: Review
 **And** l'`<Accordion type="multiple" defaultValue={["identity", "prompt", "contracts", "llm", "error_policy"]}>` ouvre TOUTES les sections au premier render (mode Expert = "tout visible") ; l'utilisateur peut replier ce qu'il veut ensuite (état NON persisté Sprint 1).
 
 **And** chaque section affiche les mêmes champs que le formulaire Story 2.2, avec :
-  - Validation Zod inline via `react-hook-form` + `zodResolver` (les erreurs apparaissent sous chaque champ via `<FormMessage>`)
+  - **Amendement CR 2026-05-10 (B-01) — Validation Zod inline DÉFER** : Sprint 1 = validation backend-only post-PUT (pattern Story 2.2 conservé : RFC 7807 toast + `focusFirstInvalidField`). Le branchage `react-hook-form` + `zodResolver` + `<FormMessage>` per field est **défer Story future** (probable Story 2.7 avec form builder visuel). `@hookform/resolvers` reste installé pour ce futur. **D-F closure officielle = côté Wizard step gates uniquement** (suffit pour mirroir Pydantic ↔ Zod et tests T7).
   - Focus visible UX-DR37 sur tous les inputs
-  - Layout `max-w-2xl` (640px max-width Sprint 2.2 conservé) — accordéons full width à l'intérieur du container
+  - **Amendement CR 2026-05-10 (B-03)** : Layout `max-w-3xl` (768px) — augmenté depuis `max-w-2xl` (640px Story 2.2) pour permettre au `WizardProgress` 5 étapes horizontal d'être lisible (titres step + pastilles) sans wrap. Accordéons full width à l'intérieur du container.
 
 **And** un bouton **"Sauvegarder"** (sticky en bas, ou en pied de page de la section "Politique d'erreur") déclenche `useUpdateTemplate.mutateAsync(payload)`. Le pattern Story 2.2 (toast succès / erreur RFC 7807 + focus extraction) reste identique.
 
@@ -181,6 +188,11 @@ Status: Review
 **And** chaque sub-step Wizard utilise un **subset** du schema pour son gate de validation : étape 2 valide `{ system_prompt }`, étape 3 valide `{ input_contract, output_contract }`, etc. (via `z.object({}).pick({ ... })` ou sub-schemas dédiés).
 
 **And** un **test de cohérence** (T7) vérifie que pour chaque cas valide/invalide testé côté backend (`test_schemas_update.py`), le résultat Zod est identique (accept/reject). Voir T7 pour la liste exhaustive.
+
+**Amendement CR 2026-05-10 (B-02) — Divergence intentionnelle WizardStepXSchema vs UpdateTemplateRequestSchema** :
+- Le **mirroir Zod ↔ Pydantic concerne `UpdateTemplateRequestSchema`** : tous les champs y sont `.optional()` (PATCH-like sémantique livrée Story 2.2 — un PUT peut modifier 1 seul champ sans toucher aux autres).
+- Les **`WizardStep1Schema..WizardStep5Schema`** sont une **couche UX au-dessus** : elles imposent la **completion** de chaque étape (ex : `WizardStep4Schema` exige `provider_chain.min(1)`, `llm_model`, `llm_params` complets). C'est cohérent avec l'esprit "Wizard guidé single-pass" (Décision #9 — pas de skip optional). Si un user veut un PUT partiel, il bascule en mode Expert (Décision #1 future quand Expert Zod inline arrive — voir B-01) ou utilise directement l'API.
+- **Aucun bug à fixer** : c'est un design choice. Tests cohérence (T7) couvrent uniquement `UpdateTemplateRequestSchema` ↔ Pydantic, pas `WizardStep*Schema` (qui sont par nature plus stricts).
 
 ### AC7 — Tests : ≥ 12 nouveaux tests, 0 régression baseline
 
@@ -243,7 +255,7 @@ Status: Review
 - [x] **T5 — `TemplateExpertForm` (AC3)**
   - [ ] T5.1 Créer `frontend/src/features/agent_registry/TemplateExpertForm.tsx`. Props : `{ template: TemplateDetail, formState: FormState, onFormStateChange: (state: FormState) => void, onSubmit: () => Promise<void>, isPending: boolean }`.
   - [ ] T5.2 Composer 5 `<AccordionItem>` (Identité / Prompt / Contrats / LLM / Politique d'erreur). Utiliser `<Accordion type="multiple" defaultValue={["identity", "prompt", "contracts", "llm", "error_policy"]}>` pour ouvrir toutes les sections au montage. Réutiliser les champs Story 2.2 (Input/Textarea/Select) tels quels.
-  - [ ] T5.3 Validation Zod inline via `react-hook-form` + `zodResolver(UpdateTemplateRequestSchema)`. Erreurs sous chaque champ via `<FormMessage>` shadcn (à vérifier : si `Form` shadcn n'est pas dans le repo, utiliser `<p className="text-destructive text-xs">` direct, pattern Story 2.1).
+  - [ ] ~~T5.3 Validation Zod inline via `react-hook-form` + `zodResolver(UpdateTemplateRequestSchema)`. Erreurs sous chaque champ via `<FormMessage>` shadcn (à vérifier : si `Form` shadcn n'est pas dans le repo, utiliser `<p className="text-destructive text-xs">` direct, pattern Story 2.1).~~ **Amendement CR 2026-05-10 (B-01) — DÉFER Story future** (probable Story 2.7). Sprint 1 = validation backend-only post-PUT (pattern Story 2.2). Voir AC3 amendé.
   - [ ] T5.4 Bouton "Sauvegarder" en bas (sticky ou pied de section "Politique d'erreur") + bouton secondaire "Annuler" qui restore `formState = buildInitialForm(template.config)`.
   - [ ] T5.5 Tests `TemplateExpertForm.test.tsx` ≥ 2 tests (AC7).
 
@@ -273,7 +285,7 @@ Status: Review
       };
 
       return (
-        <section className="container mx-auto flex max-w-2xl flex-col gap-6 py-6">
+        <section className="container mx-auto flex max-w-3xl flex-col gap-6 py-6"> {/* Amend CR 2026-05-10 (B-03) : 2xl→3xl pour WizardProgress 5 étapes */}
           <header className="flex items-center justify-between">
             <h1>Configuration de l'agent</h1>
             <ConfigModeToggle />
