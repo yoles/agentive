@@ -88,6 +88,10 @@ export function TemplateExpertForm({
   return (
     <form
       onSubmit={handleSave}
+      // P-31 (CR 2026-05-10) — noValidate désactive la validation HTML5
+      // native (popup browser sur min/max/required) qui bloque submit avant
+      // notre handleSave. On préfère le flow RFC 7807 backend + toast.
+      noValidate
       className="flex flex-col gap-5"
       data-testid="template-expert-form"
     >
@@ -100,7 +104,18 @@ export function TemplateExpertForm({
               <label htmlFor="tpl-name" className={LABEL_CLASS}>
                 Nom du template
               </label>
-              <Input id="tpl-name" type="text" value={template.name} readOnly />
+              {/* P-30 (CR 2026-05-10) — aria-readonly + tabindex=-1 :
+                  l'input est read-only (rename arrive Story 2.4) ; sortir
+                  du tab order évite la confusion pour les utilisateurs
+                  clavier (sinon focus sur input non-éditable). */}
+              <Input
+                id="tpl-name"
+                type="text"
+                value={template.name}
+                readOnly
+                aria-readonly="true"
+                tabIndex={-1}
+              />
               <p className="text-xs text-muted-foreground">
                 Renommer un template arrive avec la Story 2.4 (distinction template/instance).
               </p>
@@ -238,7 +253,15 @@ export function TemplateExpertForm({
                     }
                     onChange={(e) => {
                       const v = e.target.valueAsNumber;
-                      if (Number.isFinite(v)) patch({ max_tokens: v });
+                      // P-33 (CR 2026-05-10) — client bounds guard pour
+                      // éviter le round-trip 422 backend (Pydantic int >=1
+                      // <=200_000). On accepte les valeurs hors borne pour
+                      // ne pas perdre la saisie en cours, on bloque juste à
+                      // l'édition extrême : valeur acceptée si finite ET ≤
+                      // borne backend.
+                      if (Number.isFinite(v) && v >= 1 && v <= 200_000) {
+                        patch({ max_tokens: v });
+                      }
                     }}
                   />
                 </div>

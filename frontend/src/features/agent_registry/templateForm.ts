@@ -71,12 +71,25 @@ function pickNumber(record: Record<string, unknown>, key: string, fallback: numb
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+// P-32 (CR 2026-05-10) — defensive shape guards : un template legacy peut
+// stocker `input_contract = null` (en plus de `undefined`) ou même un type
+// inattendu. On retombe sur EMPTY_CONTRACT plutôt que de propager `null`
+// dans `JSON.stringify(null) = "null"` qui crashe `parseContract`.
+function pickObject<T>(value: unknown, fallback: T): T {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as T)
+    : fallback;
+}
+function pickArray<T>(value: unknown, fallback: T[]): T[] {
+  return Array.isArray(value) ? (value as T[]) : fallback;
+}
+
 export function buildInitialForm(config: Record<string, unknown>): FormState {
-  const llmParams = (config.llm_params ?? DEFAULT_LLM_PARAMS) as LLMParams;
-  const errorPolicy = (config.error_policy ?? DEFAULT_ERROR_POLICY) as ErrorPolicy;
-  const providerChain = (config.provider_chain ?? DEFAULT_PROVIDER_CHAIN) as ProviderId[];
-  const inputContract = (config.input_contract ?? EMPTY_CONTRACT) as ContractDefinition;
-  const outputContract = (config.output_contract ?? EMPTY_CONTRACT) as ContractDefinition;
+  const llmParams = pickObject<LLMParams>(config.llm_params, DEFAULT_LLM_PARAMS);
+  const errorPolicy = pickObject<ErrorPolicy>(config.error_policy, DEFAULT_ERROR_POLICY);
+  const providerChain = pickArray<ProviderId>(config.provider_chain, DEFAULT_PROVIDER_CHAIN);
+  const inputContract = pickObject<ContractDefinition>(config.input_contract, EMPTY_CONTRACT);
+  const outputContract = pickObject<ContractDefinition>(config.output_contract, EMPTY_CONTRACT);
 
   // P-01/P-02 Story 2.2 — system_prompt is NOT pre-filled from the
   // archetype prompt_base ; the placeholder displays the archetype

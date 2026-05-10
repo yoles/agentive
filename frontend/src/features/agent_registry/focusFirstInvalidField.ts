@@ -49,7 +49,7 @@ export function focusFirstInvalidField(apiError: {
     if (inputId) {
       const el = document.getElementById(inputId);
       if (el instanceof HTMLElement) {
-        el.focus();
+        focusElement(el);
         return;
       }
     }
@@ -58,5 +58,17 @@ export function focusFirstInvalidField(apiError: {
   const fallback = document.getElementById("tpl-system-prompt");
   if (fallback instanceof HTMLTextAreaElement) {
     fallback.focus();
+  }
+}
+
+// P-34 (CR 2026-05-10) — Radix `<SelectTrigger>` est un `<button>` avec
+// `data-slot="select-trigger"`. Un simple `.focus()` highlight le bouton
+// mais n'ouvre pas le menu : l'utilisateur doit Espace/Entrée pour voir
+// les options. On déclenche un `.click()` après focus pour les triggers
+// (les autres types restent juste `.focus()`).
+function focusElement(el: HTMLElement) {
+  el.focus();
+  if (el.tagName === "BUTTON" && el.dataset.slot === "select-trigger") {
+    el.click();
   }
 }

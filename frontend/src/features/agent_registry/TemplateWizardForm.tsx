@@ -167,6 +167,11 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
   }
 
   function validateStep(step: number): StepError {
+    // P-29 (CR 2026-05-10) — defensive : if STEPS is extended without
+    // updating this dispatcher, a step outside [1..5] would index past
+    // the schema array → safeParse on undefined → runtime crash. Better
+    // to fail loud (return null = pass = no gate) than crash silently.
+    if (step < 1 || step > 5) return null;
     const schema: ZodType<unknown> = (
       [WizardStep1Schema, WizardStep2Schema, WizardStep3Schema, WizardStep4Schema, WizardStep5Schema] as ZodType<unknown>[]
     )[step - 1];
@@ -404,9 +409,20 @@ function WizardProgress({
           <li key={step.id} className="flex flex-1 items-center gap-2">
             <button
               type="button"
-              onClick={() => onStepClick(step.id)}
-              disabled={!reachable}
+              // P-35 (CR 2026-05-10) — `aria-disabled` au lieu de `disabled`
+              // pour garder le bouton focusable au clavier (sinon Tab passe
+              // par-dessus les étapes futures sans signal a11y), avec un
+              // onClick guard + title explicite pour le screen reader.
+              onClick={() => {
+                if (reachable) onStepClick(step.id);
+              }}
+              aria-disabled={!reachable || undefined}
               aria-current={isActive ? "step" : undefined}
+              title={
+                !reachable
+                  ? "Complétez les étapes précédentes pour débloquer"
+                  : undefined
+              }
               className={cn(
                 "flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs font-medium transition-colors",
                 isActive && "border-primary bg-primary text-primary-foreground",
@@ -622,7 +638,11 @@ function Step4LLM({
             value={maxTokDisplay}
             onChange={(e) => {
               const v = e.target.valueAsNumber;
-              if (Number.isFinite(v)) patch({ max_tokens: v });
+              // P-33 (CR 2026-05-10) — client bounds guard (Pydantic int
+              // >=1 <=200_000). Évite le round-trip 422 backend.
+              if (Number.isFinite(v) && v >= 1 && v <= 200_000) {
+                patch({ max_tokens: v });
+              }
             }}
             aria-invalid={stepError?.field === "max_tokens" || undefined}
           />
@@ -745,9 +765,12 @@ function Step5ErrorPolicyAndValidation({
         <Field label="Temperature">{formState.temperature}</Field>
         <Field label="Max tokens">{formState.max_tokens}</Field>
         <Field label="System prompt (taille)">
-          {formState.system_prompt.length === 0
+          {/* P-36 (CR 2026-05-10) — defensive ?? '' au cas où un FormState
+              corrompu se glisse (TS garantit string mais runtime peut
+              recevoir undefined depuis hydration partielle). */}
+          {(formState.system_prompt ?? "").length === 0
             ? "vide (utilise l'archétype)"
-            : `${formState.system_prompt.length} caractères`}
+            : `${(formState.system_prompt ?? "").length} caractères`}
         </Field>
         <Field label="Provider chain">{formState.provider_chain_raw}</Field>
         <Field label="On timeout">{formState.on_timeout}</Field>
