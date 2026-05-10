@@ -489,6 +489,12 @@ class AgentRegistryService:
             template_id=str(template.id),
             template_version=template.version,
             workflow_run_id=str(workflow_run_id) if workflow_run_id else None,
+            # P-10 (CR 2026-05-10) — log shape aligned with event payload
+            # (AC1 spec). `actor`/`tenant_id` reflect Sprint 1 hardcoded
+            # values ; will surface real values once Story 9.1 wires the
+            # auth context resolution and Story 12 enables multi-tenant.
+            actor="system",
+            tenant_id=None,
         )
 
         return InstantiateTemplateResponse(

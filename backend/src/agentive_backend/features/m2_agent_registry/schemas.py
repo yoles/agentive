@@ -261,16 +261,21 @@ class InstantiateTemplateRequest(BaseModel):
 
 
 class AgentInstanceDetailResponse(BaseModel):
-    """Response for ``GET /api/v1/agents/instances/{instance_id}`` and shared
-    by ``POST /agents/templates/{id}/instances`` (Story 2.4).
+    """Response for ``GET /api/v1/agents/instances/{instance_id}`` (Story 2.4).
 
     The ``snapshot`` is a free-shape JSONB blob — see
     :class:`AgentRegistryService.instantiate_from_template` for the
     canonical Sprint 1 keys (``template_id``, ``template_version``,
     ``name``, ``archetype``, ``config``).
+
+    P-05 (CR 2026-05-10) — Pas de ``extra="forbid"`` ici : pour un response
+    model, c'est défensivement contre-productif. Si une évolution ORM ajoute
+    un champ que le serveur sérialise par erreur, on préfère propager
+    silencieusement (champ ignoré) plutôt que crash 500. ``extra="forbid"``
+    reste sur les request models (anti prompt-injection).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     instance_id: UUID
     template_id: UUID
@@ -280,8 +285,17 @@ class AgentInstanceDetailResponse(BaseModel):
     created_at: datetime
 
 
-# Alias — POST and GET return the same shape Sprint 1.
-InstantiateTemplateResponse = AgentInstanceDetailResponse
+class InstantiateTemplateResponse(AgentInstanceDetailResponse):
+    """Response for ``POST /api/v1/agents/templates/{id}/instances`` (201).
+
+    P-08 (CR 2026-05-10) — Wrapper class plutôt qu'alias plain. FastAPI
+    génère le composant OpenAPI à partir du ``__name__`` Python : avec un
+    alias ``InstantiateTemplateResponse = AgentInstanceDetailResponse``,
+    les SDK generators perdaient le nom ``InstantiateTemplateResponse``
+    (les 2 routes pointaient vers le même schema component). La classe
+    wrapper préserve les 2 noms distincts dans ``components/schemas`` sans
+    dupliquer le shape.
+    """
 
 
 __all__ = [

@@ -19,79 +19,13 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMiddleware
-from agentive_backend.features.m2_agent_registry import load_registry
-from agentive_backend.features.m2_agent_registry import router as agents_router
-from agentive_backend.shared.correlation import get_correlation_id
-from agentive_backend.shared.exceptions import AgentiveError
 from agentive_backend.shared.repositories import WorkflowRepo, WorkflowRunRepo
 
-
-def _make_app(
-    *,
-    session_factory: async_sessionmaker[AsyncSession],
-    token: str = "integration-test-token",
-) -> FastAPI:
-    app = FastAPI()
-    app.state.auth_token_hash = token
-    app.state.session_factory = session_factory
-    app.state.archetype_registry = load_registry()
-
-    app.add_middleware(AuthTokenMiddleware)
-    app.add_middleware(CorrelationIdMiddleware)
-    app.include_router(agents_router, prefix="/api/v1")
-
-    @app.exception_handler(AgentiveError)
-    async def _handle_agentive_error(  # pragma: no cover
-        _request: Request, exc: AgentiveError
-    ) -> JSONResponse:
-        body: dict[str, Any] = {
-            "type": exc.type,
-            "title": exc.title,
-            "status": exc.status,
-            "correlation_id": get_correlation_id(),
-        }
-        if exc.detail:
-            body["detail"] = exc.detail
-        if exc.context:
-            reserved = {"type", "title", "status", "correlation_id", "detail"}
-            for k, v in exc.context.items():
-                if k not in reserved:
-                    body[k] = v
-        return JSONResponse(
-            status_code=exc.status, content=body, media_type="application/problem+json"
-        )
-
-    @app.exception_handler(RequestValidationError)
-    async def _handle_req_validation(  # pragma: no cover
-        _request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        sanitized_errors = [
-            {k: v for k, v in err.items() if k not in {"input", "ctx"}} for err in exc.errors()
-        ]
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "type": "/errors/validation",
-                "title": "Validation failed",
-                "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "correlation_id": get_correlation_id(),
-                "detail": "Request body validation failed",
-                "errors": sanitized_errors,
-            },
-            media_type="application/problem+json",
-        )
-
-    return app
-
-
-def _auth_headers() -> dict[str, str]:
-    return {"Authorization": "Bearer integration-test-token"}
+# P-09 (CR 2026-05-10) — _make_app + _auth_headers factor dans conftest.py partagé.
+from .conftest import e2e_auth_headers as _auth_headers
+from .conftest import make_e2e_app as _make_app
 
 
 async def _create_workflow_run(

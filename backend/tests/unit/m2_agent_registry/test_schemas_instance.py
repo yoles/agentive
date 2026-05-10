@@ -71,6 +71,17 @@ def test_instance_detail_response_round_trip() -> None:
     assert resp.snapshot["config"]["system_prompt"] == "z"
 
 
-def test_instantiate_response_alias_is_same_shape() -> None:
-    """`InstantiateTemplateResponse` is an alias for `AgentInstanceDetailResponse`."""
-    assert InstantiateTemplateResponse is AgentInstanceDetailResponse
+def test_instantiate_response_subclass_preserves_shape() -> None:
+    """P-08 (CR 2026-05-10) — `InstantiateTemplateResponse` est désormais une
+    SUBCLASS (vs alias plain) pour préserver son nom dans le composant OpenAPI.
+    Le shape reste identique car la subclass n'ajoute aucun champ.
+    """
+    assert issubclass(InstantiateTemplateResponse, AgentInstanceDetailResponse)
+    # Same fields exactly — subclass adds nothing.
+    assert (
+        set(InstantiateTemplateResponse.model_fields.keys())
+        == set(AgentInstanceDetailResponse.model_fields.keys())
+    )
+    # Distinct __name__ for OpenAPI schema components.
+    assert InstantiateTemplateResponse.__name__ == "InstantiateTemplateResponse"
+    assert AgentInstanceDetailResponse.__name__ == "AgentInstanceDetailResponse"
