@@ -6,15 +6,21 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createTemplate,
   getArchetypeDetail,
+  getInstance,
   getTemplate,
+  instantiateTemplate,
   listArchetypes,
+  listInstancesByRun,
   updateTemplate,
 } from "./api";
 import type {
+  AgentInstance,
   ArchetypeDetail,
   ArchetypeSummary,
   CreateTemplateRequest,
   CreateTemplateResponse,
+  InstantiateTemplateRequest,
+  InstantiateTemplateResponse,
   TemplateDetail,
   UpdateTemplateRequest,
   UpdateTemplateResponse,
@@ -92,5 +98,46 @@ export function useUpdateTemplate(id: string) {
       void queryClient.invalidateQueries({ queryKey: ["agent-template", id] });
       void queryClient.invalidateQueries({ queryKey: ["agent-templates"] });
     },
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Story 2.4 — Agent instance hooks (no UI consumer Sprint 1, ready for Story 8.x)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** `useInstantiateTemplate` — Story 2.4 POST mutation.
+ *
+ * Invalidates the per-template instances queryKey so the consumer
+ * (Story 8.x trace explorer) re-fetches fresh data after a new run starts.
+ */
+export function useInstantiateTemplate(templateId: string) {
+  const queryClient = useQueryClient();
+  return useMutation<InstantiateTemplateResponse, unknown, InstantiateTemplateRequest>({
+    mutationFn: (body) => instantiateTemplate(templateId, body ?? {}),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["agent-template", templateId, "instances"],
+      });
+    },
+  });
+}
+
+/** `useInstance` — Story 2.4 detail fetch. */
+export function useInstance(instanceId: string | null | undefined) {
+  return useQuery<AgentInstance>({
+    queryKey: ["agent-instance", instanceId],
+    queryFn: () => getInstance(instanceId as string),
+    enabled: instanceId != null && instanceId !== "" && UUID_RE.test(instanceId),
+    staleTime: 30_000,
+  });
+}
+
+/** `useInstancesByRun` — Story 2.4 list fetch (per workflow_run). */
+export function useInstancesByRun(runId: string | null | undefined) {
+  return useQuery<AgentInstance[]>({
+    queryKey: ["workflow-run", runId, "instances"],
+    queryFn: () => listInstancesByRun(runId as string),
+    enabled: runId != null && runId !== "" && UUID_RE.test(runId),
+    staleTime: 30_000,
   });
 }

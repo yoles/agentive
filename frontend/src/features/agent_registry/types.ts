@@ -95,3 +95,25 @@ export type UpdateTemplateResponse = {
   config: Record<string, unknown>;
   updated_at: string;
 };
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Story 2.4 — Agent instance (frozen snapshot of a template)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** AgentInstance — Story 2.4. Snapshot is a free-shape JSONB blob ; canonical
+ * Sprint 1 keys are `{template_id, template_version, name, archetype, config}`
+ * (cf backend `AgentRegistryService.instantiate_from_template`). */
+export type AgentInstance = {
+  instance_id: string;
+  template_id: string;
+  template_version: number;
+  workflow_run_id: string | null;
+  snapshot: Record<string, unknown>;
+  created_at: string;
+};
+
+export type InstantiateTemplateRequest = {
+  workflow_run_id?: string | null;
+};
+
+export type InstantiateTemplateResponse = AgentInstance;

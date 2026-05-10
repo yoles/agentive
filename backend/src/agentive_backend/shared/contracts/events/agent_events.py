@@ -1,17 +1,24 @@
 """Agent lifecycle events — Epic M2 Agent Registry (Story 2.1+).
 
 Naming convention follows Story 1.7 pattern ``{module}.{object}.{verb}``.
-Initial events shipped Story 2.1 :
+Events shipped to date :
 
-* ``m2.agent_template.created`` — emitted after a new ``agent_templates``
-  row is committed via ``AgentRegistryService.create_template``.
+* ``m2.agent_template.created`` (Story 2.1) — emitted after a new
+  ``agent_templates`` row is committed via
+  ``AgentRegistryService.create_template``.
+* ``m2.agent_template.updated`` (Story 2.2) — emitted after a config
+  edit / version bump via ``AgentRegistryService.update_template``.
+* ``m2.agent_instance.created`` (Story 2.4) — emitted after a new
+  ``agent_instances`` row is committed via
+  ``AgentRegistryService.instantiate_from_template``.
 
-Story 2.2 will add ``m2.agent_template.updated`` (config edit, prompt
-versioning) and Story 2.4 will add ``m2.agent_instance.created`` /
-``m2.agent_instance.completed``.
+Defer Story 4.x : ``m2.agent_instance.completed`` (workflow_engine
+signals the run end with the final status — needs the workflow_engine
+runtime to exist first).
 
-⚠️ Story 2.1 §"Pièges connus" #5 — the object is ``agent_template``, not
-``agent``. Template ↔ instance distinction lands Story 2.4.
+Story 2.1 §"Pièges connus" #5 — the object on the *template* events
+is ``agent_template`` (not ``agent``). Template ↔ instance distinction
+landed Story 2.4 — the new events use ``agent_instance``.
 """
 
 from __future__ import annotations
@@ -62,4 +69,32 @@ class AgentTemplateUpdatedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
-__all__ = ["AgentTemplateCreatedEvent", "AgentTemplateUpdatedEvent"]
+class AgentInstanceCreatedEvent(BaseModel):
+    """Published after a new ``agent_instances`` row is durably committed (Story 2.4).
+
+    Same audit-bypass story as the template events — lives in
+    ``outbox_events`` until Story 9.1 wires :class:`AuditEventRepo`.
+    The handler chain (Story 9.1+) will eventually persist this in
+    ``audit_events`` via ``AuditEventRepo.record()``.
+
+    The instance carries its own immutable ``snapshot`` of the template
+    config at instantiation time — modifications to the template AFTER
+    this event do not propagate to the running instance (FR12, AC2 of
+    Story 2.4).
+    """
+
+    event_type: ClassVar[str] = "m2.agent_instance.created"
+
+    instance_id: UUID
+    template_id: UUID
+    template_version: int = Field(ge=1)
+    workflow_run_id: UUID | None = None
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+__all__ = [
+    "AgentInstanceCreatedEvent",
+    "AgentTemplateCreatedEvent",
+    "AgentTemplateUpdatedEvent",
+]

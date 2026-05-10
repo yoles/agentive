@@ -237,7 +237,55 @@ class UpdateTemplateResponse(BaseModel):
     updated_at: datetime
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Agent instance — instantiate from template (Story 2.4)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class InstantiateTemplateRequest(BaseModel):
+    """Body of ``POST /api/v1/agents/templates/{template_id}/instances`` (Story 2.4).
+
+    Empty body (``{}``) or ``{"workflow_run_id": null}`` both create an
+    instance that is **not** rattached to any workflow_run (Playground
+    Story 2.7 + tests d'isolation use this).
+
+    ``extra="forbid"`` rejects any unknown field — the snapshot capture
+    is server-driven (the caller cannot inject ``snapshot``/``template_id``
+    /``template_version`` ; those are derived from the URL ``template_id``
+    + the current ``agent_templates`` row).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_run_id: UUID | None = None
+
+
+class AgentInstanceDetailResponse(BaseModel):
+    """Response for ``GET /api/v1/agents/instances/{instance_id}`` and shared
+    by ``POST /agents/templates/{id}/instances`` (Story 2.4).
+
+    The ``snapshot`` is a free-shape JSONB blob — see
+    :class:`AgentRegistryService.instantiate_from_template` for the
+    canonical Sprint 1 keys (``template_id``, ``template_version``,
+    ``name``, ``archetype``, ``config``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: UUID
+    template_id: UUID
+    template_version: int
+    workflow_run_id: UUID | None
+    snapshot: dict[str, Any]
+    created_at: datetime
+
+
+# Alias — POST and GET return the same shape Sprint 1.
+InstantiateTemplateResponse = AgentInstanceDetailResponse
+
+
 __all__ = [
+    "AgentInstanceDetailResponse",
     "ArchetypeDetail",
     "ArchetypeSummary",
     "ContractDefinition",
@@ -245,6 +293,8 @@ __all__ = [
     "CreateTemplateRequest",
     "CreateTemplateResponse",
     "ErrorPolicy",
+    "InstantiateTemplateRequest",
+    "InstantiateTemplateResponse",
     "LLMModel",
     "LLMParams",
     "ProviderId",

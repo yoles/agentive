@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import asc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -201,15 +201,87 @@ class AgentInstanceRepo(BaseRepo):
         workflow_run_id: UUID | None = None,
         tenant_id: UUID | None = None,
     ) -> AgentInstance:
+        """Self-managed transaction wrapper.
+
+        Use :meth:`create_in_session` from inside an existing transaction
+        when you need to compose the INSERT with another write (Story 2.4
+        — instantiate_from_template publishes the audit event in the same
+        transaction).
+        """
         async with self.with_tenant(tenant_id) as session:
-            instance = AgentInstance(
+            return await self.create_in_session(
+                session,
                 template_id=template_id,
                 template_version=template_version,
-                workflow_run_id=workflow_run_id,
                 snapshot=snapshot,
+                workflow_run_id=workflow_run_id,
                 tenant_id=tenant_id,
             )
-            session.add(instance)
-            await session.flush()
-            await session.refresh(instance)
-            return instance
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        template_id: UUID,
+        template_version: int,
+        snapshot: dict[str, Any],
+        workflow_run_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+    ) -> AgentInstance:
+        """INSERT inside the caller's transaction — caller owns commit (Story 2.4).
+
+        Same atomicity rationale as
+        :meth:`AgentTemplateRepo.create_in_session` — the service layer
+        composes template SELECT + instance INSERT + outbox publish in a
+        single transaction.
+
+        No ``IntegrityError`` translation here : ``agent_instances`` has no
+        UNIQUE constraint (``id`` is server-generated UUID), so collisions
+        are not expected. If a future schema change adds one, this method
+        should mirror :meth:`AgentTemplateRepo.create_in_session` and
+        translate via :class:`ConflictError`.
+        """
+        instance = AgentInstance(
+            template_id=template_id,
+            template_version=template_version,
+            workflow_run_id=workflow_run_id,
+            snapshot=snapshot,
+            tenant_id=tenant_id,
+        )
+        session.add(instance)
+        await session.flush()
+        await session.refresh(instance)
+        return instance
+
+    async def get_by_id_in_session(
+        self,
+        session: AsyncSession,
+        instance_id: UUID,
+    ) -> AgentInstance | None:
+        """SELECT by id inside the caller's transaction (Story 2.4).
+
+        Symmetric with :meth:`AgentTemplateRepo.get_by_id_in_session`.
+        Currently unused by Story 2.4 (the service uses the standalone
+        :meth:`get_by_id` for the GET endpoint), but kept for consistency
+        and future composability (e.g. Story 2.7 Playground may need it).
+        """
+        return await session.get(AgentInstance, instance_id)
+
+    async def list_by_workflow_run_in_session(
+        self,
+        session: AsyncSession,
+        workflow_run_id: UUID,
+    ) -> list[AgentInstance]:
+        """List all instances rattached to a given workflow_run (Story 2.4).
+
+        Order ``created_at ASC`` for deterministic test assertions and a
+        natural chronological UX (the consumer Story 8.x trace explorer
+        renders runs left-to-right by start time).
+        """
+        stmt = (
+            select(AgentInstance)
+            .where(AgentInstance.workflow_run_id == workflow_run_id)
+            .order_by(asc(AgentInstance.created_at))
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())

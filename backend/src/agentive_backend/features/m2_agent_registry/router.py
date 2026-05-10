@@ -23,17 +23,25 @@ from fastapi import APIRouter, Request, status
 
 from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
 from agentive_backend.features.m2_agent_registry.schemas import (
+    AgentInstanceDetailResponse,
     ArchetypeDetail,
     ArchetypeSummary,
     CreateTemplateRequest,
     CreateTemplateResponse,
+    InstantiateTemplateRequest,
+    InstantiateTemplateResponse,
     TemplateDetailResponse,
     UpdateTemplateRequest,
     UpdateTemplateResponse,
 )
 from agentive_backend.features.m2_agent_registry.service import AgentRegistryService
 from agentive_backend.shared.exceptions import DependencyError
-from agentive_backend.shared.repositories import AgentTemplateRepo, PromptRepo
+from agentive_backend.shared.repositories import (
+    AgentInstanceRepo,
+    AgentTemplateRepo,
+    PromptRepo,
+    WorkflowRunRepo,
+)
 
 router = APIRouter(tags=["agents"])
 
@@ -69,10 +77,14 @@ def _build_service(request: Request) -> AgentRegistryService:
 
     template_repo = AgentTemplateRepo(session_factory=session_factory)
     prompt_repo = PromptRepo(session_factory=session_factory)
+    instance_repo = AgentInstanceRepo(session_factory=session_factory)
+    workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
     return AgentRegistryService(
         registry=registry,
         template_repo=template_repo,
         prompt_repo=prompt_repo,
+        instance_repo=instance_repo,
+        workflow_run_repo=workflow_run_repo,
     )
 
 
@@ -172,6 +184,87 @@ async def update_template(
     """
     service = _build_service(request)
     return await service.update_template(template_id, body, tenant_id=None)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Agent instance endpoints (Story 2.4 — distinction template vs instance)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@router.post(
+    "/agents/templates/{template_id}/instances",
+    response_model=InstantiateTemplateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Instantiate an agent from a template (Story 2.4 — frozen snapshot)",
+)
+async def instantiate_template(
+    request: Request,
+    template_id: UUID,
+    body: InstantiateTemplateRequest,
+) -> InstantiateTemplateResponse:
+    """201 on success.
+
+    Creates a new ``agent_instances`` row with a frozen snapshot of the
+    template config at this exact moment. Modifications to the template
+    AFTER this call do NOT propagate to the instance (FR12, AC2).
+
+    Errors :
+    * 404 — template_id not found OR workflow_run_id (if provided) not found.
+    * 422 — template_id not a UUID, or body Pydantic validation.
+    * 503 — lifespan state missing.
+    """
+    service = _build_service(request)
+    return await service.instantiate_from_template(
+        template_id=template_id,
+        workflow_run_id=body.workflow_run_id,
+        tenant_id=None,  # Story 2.4 anti-scope — single-tenant MVP.
+    )
+
+
+@router.get(
+    "/agents/instances/{instance_id}",
+    response_model=AgentInstanceDetailResponse,
+    summary="Get one agent-instance with its frozen snapshot (Story 2.4)",
+)
+async def get_instance(
+    request: Request,
+    instance_id: UUID,
+) -> AgentInstanceDetailResponse:
+    """200 on success.
+
+    Errors :
+    * 404 — instance not found.
+    * 422 — instance_id not a UUID.
+    * 503 — lifespan state missing.
+    """
+    service = _build_service(request)
+    return await service.get_instance_by_id(instance_id, tenant_id=None)
+
+
+@router.get(
+    "/workflows/runs/{run_id}/instances",
+    response_model=list[AgentInstanceDetailResponse],
+    summary="List all agent-instances rattached to a workflow run (Story 2.4)",
+)
+async def list_instances_by_run(
+    request: Request,
+    run_id: UUID,
+) -> list[AgentInstanceDetailResponse]:
+    """200 on success — empty list ``[]`` if the run has no instances yet.
+
+    Sprint 1 hosting — this endpoint lives in ``m2_agent_registry/router.py``
+    as it owns the ``agent_instances`` table. Story 4.1 may move it to
+    ``m3_workflow_engine/router.py`` when the workflow_engine becomes the
+    owner of the ``workflow_run`` lifecycle (cf Story 2.4 §"Décisions
+    intégrées" #14).
+
+    Errors :
+    * 404 — workflow_run not found (strict — NOT an empty list).
+    * 422 — run_id not a UUID.
+    * 503 — lifespan state missing.
+    """
+    service = _build_service(request)
+    return await service.list_instances_by_workflow_run(run_id, tenant_id=None)
 
 
 __all__ = ["router"]
