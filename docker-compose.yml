@@ -56,6 +56,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:?required}
       AGENTIVE_ENCRYPTION_KEY: ${AGENTIVE_ENCRYPTION_KEY:?required}
+      # Story 2.5 P-23 admin-gate (default false in prod for RCE/SSRF safety
+      # until Story 2.6 sandbox lands). Override per-environment via .env.
+      AGENTIVE_ALLOW_MCP_REGISTRATION: ${AGENTIVE_ALLOW_MCP_REGISTRATION:-false}
       # URLs construites via Pydantic Settings côté app (url-encoded) — ici on
       # passe uniquement les composants et le password sera URL-encodé par la lib.
       POSTGRES_HOST: db

@@ -102,7 +102,7 @@ async def discover_tools(
             _discover_inner(transport=transport, connection_config=connection_config),
             timeout=timeout,
         )
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise MCPDiscoveryTimeoutError(timeout=timeout) from exc
 
 
@@ -142,7 +142,7 @@ async def _discover_inner(
         raise ValueError(f"Unknown transport: {transport!r}")
 
 
-async def _list_tools_via_session(read: Any, write: Any) -> list[ToolInfo]:  # noqa: ANN401
+async def _list_tools_via_session(read: Any, write: Any) -> list[ToolInfo]:
     """Open a ClientSession on the (read, write) streams, initialize, list
     tools, and map them to :class:`ToolInfo` instances."""
     async with ClientSession(read, write) as session:

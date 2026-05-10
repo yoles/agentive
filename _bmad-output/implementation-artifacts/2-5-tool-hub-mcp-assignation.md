@@ -404,7 +404,7 @@ docker logs agentive-backend-1 | grep -E "m5.tool_server.connected|m2.agent_temp
 7. **MCP transport `connection_config` shape libre** — Pas de validation Pydantic stricte du contenu (le serveur MCP est l'autorité). Sprint 1 = juste `dict[str, Any]`. Le user qui POST avec un mauvais shape (ex stdio sans `command`) verra l'erreur via le `MCPDiscoveryTimeoutError` ou via l'exception MCP SDK propagée en `DependencyError`. Acceptable Sprint 1 ; validation strict défer Sprint 4+.
 8. **Frontend `Checkbox` shadcn primitive** (T0.5) — vérifier sa présence avant T9. Si absent, `pnpm dlx shadcn@latest add checkbox` ajoute `frontend/src/shared/components/ui/checkbox.tsx` + dépendance `@radix-ui/react-checkbox`.
 9. **`tools.tools_count` agrégat dans GET /tools/servers** (AC4) — utiliser `LEFT JOIN tools GROUP BY tool_servers.id` dans la query SQLAlchemy (pas N+1). Test e2e doit valider qu'avec 3 servers, on a bien 3 SQL queries (1 SELECT JOIN agrégé), pas 3+N.
-10. **Pattern `_make_app` factor** (P-09 Story 2.4 CR) — `tests/integration/m5_tool_hub/conftest.py` doit IMPORTER `make_e2e_app` depuis `tests/integration/m2_agent_registry/conftest.py` (réutilisation cross-feature) OU le re-définir si le wiring diffère (m5 router en plus). Décision exécution : RE-DÉFINIR localement avec une variante `make_e2e_app_with_tool_hub` qui inclut les 2 routers — évite le coupling cross-feature des conftests.
+10. **Pattern `_make_app` factor** (P-09 Story 2.4 CR) — `tests/integration/m5_tool_hub/conftest.py` doit IMPORTER `make_e2e_app` depuis `tests/integration/m2_agent_registry/conftest.py` (réutilisation cross-feature) OU le re-définir si le wiring diffère (m5 router en plus). ~~Décision exécution : RE-DÉFINIR localement avec une variante `make_e2e_app_with_tool_hub` qui inclut les 2 routers — évite le coupling cross-feature des conftests.~~ **Amendement CR 2026-05-10** : décision exécution révisée → ÉTENDRE `make_e2e_app` dans `tests/integration/m2_agent_registry/conftest.py` pour inclure le m5 router, et faire que `tests/integration/m5_tool_hub/conftest.py` re-exporte juste depuis m2. Justification : (a) DRY — pas de duplication de wiring app/middleware/lifespan, (b) le coupling cross-feature est test-only (zéro impact runtime, zéro impact import-linter sur `src/`), (c) cohérent avec le pattern P-09 Story 2.4 CR qui mutualise `_make_app` + `_auth_headers` dans un conftest partagé. Trade-off accepté : `m2_agent_registry/conftest.py` importe `from agentive_backend.features.m5_tool_hub import router as tools_router` — acceptable car les conftests d'intégration cross-features sont par nature des points de composition.
 11. **`actor="system"` hardcoded** (D1 défer Story 9.1) — cohérent Stories 2.1-2.4. À résoudre depuis auth context Story 9.1.
 12. **`tenant_id=None` partout Sprint 1** — multi-tenant Story 12.
 13. **`outbox_events.tenant_id` non rempli** (D44 Story 2.4 CR) — la dette traverse Story 2.5. À fermer Story 9.1+12.
@@ -464,6 +464,116 @@ claude-opus-4-7 (1M context) — bmad-dev-story single-pass execution.
 - ✅ **AC6** — Frontend `<AgentToolsPanel templateId={templateId} />` rendu en bas de `/config/agents/{templateId}` (Story 2.3 host inchangé — anti-scope respecté). Empty state si 0 serveur MCP enregistré + CTA. Checkboxes pré-cochées si déjà assignés. Bouton "Sauvegarder les assignments" disabled tant que la sélection == saved set. 2 tests composant : empty state + render+toggle+save.
 - ✅ **AC7** — Page `/config/tools` (CRUD minimal serveurs) : header + bouton "Ajouter un serveur" + tableau des serveurs (nom, transport badge, status, count, date) + empty state CTA + dialog modal `AddToolServerDialog` avec form (nom + transport Select + connection_config JSONB textarea avec template auto-rempli selon transport choisi). Toast handling pour 409/503/422. Pas de DELETE/EDIT serveur (anti-scope).
 - ✅ **AC8** — Tests : **491 backend (+21 vs baseline 470 post-2.4) + 99 frontend (+8 vs baseline 91)** = **29 nouveaux** (spec demandait ≥ 25). 0 régression. Lint (ruff + mypy + eslint + tsc) vert. Sidebar config étendue avec entrée "Outils MCP" link vers `/config/tools`.
+- ✅ **AC8 Smoke runtime (P-04 CR 2026-05-10)** — exécuté contre stack Docker dev (commit 741c6db + Cluster A patches via uvicorn `--reload`). Capture exhaustive ci-dessous.
+
+#### Smoke runtime — Capture 2026-05-10 21:02 UTC
+
+**Pré-requis** : `docker compose up -d` + `docker compose exec backend uv run alembic upgrade head` (migration `20260510000000_tool_hub_tables` appliquée) + `AGENTIVE_ALLOW_MCP_REGISTRATION=true` dans `.env` (P-23 gate).
+
+**Step 1 — POST /agents/templates** (baseline m2 pour avoir un template_id) :
+
+```
+{
+    "template_id": "050c5a9d-210f-4e24-937f-fba7b55837a7",
+    "name": "smoke-25-prod-459481",
+    "archetype": "producteur",
+    "version": 1,
+    "created_at": "2026-05-10T21:02:32.695596Z"
+}
+```
+
+**Step 2 — AC1 POST /tools/servers stdio** (mock MCP, body inclut `env.SECRET_TOKEN=hunter2-must-not-leak` pour vérifier P-03) :
+
+```
+{
+    "server_id": "eb20254f-b043-4691-8533-258e6390067e",
+    "name": "smoke-25-mcp-459481",
+    "transport": "stdio",
+    "status": "active",
+    "connection_config": {
+        "env": {"_redacted_keys": ["SECRET_TOKEN"]},
+        "args": ["-m", "tests.fixtures.mcp_mock_server"],
+        "command": "python"
+    },
+    "discovered_at": "2026-05-10T21:02:38.455073Z",
+    "tools": [
+        {"tool_id": "f18e481a-…", "name": "echo", "description": "Echo the input string back", "input_schema": {…}, "output_schema": null},
+        {"tool_id": "06f7b9d4-…", "name": "add",  "description": "Add two integers and return the sum", "input_schema": {…}, "output_schema": null}
+    ]
+}
+```
+
+P-03 redaction check (count of "hunter2-must-not-leak" dans la réponse) : **0** ✅. Le secret n'a jamais quitté la DB.
+
+**Step 3 — AC4 GET /tools/servers** (list lean view + tools_count) :
+
+```
+[{"server_id": "eb20254f-…", "name": "smoke-25-mcp-459481", "transport": "stdio", "status": "active", "tools_count": 2, "discovered_at": "…"}]
+```
+
+**Step 4 — AC4 GET /tools/servers/{id}** : same body as step 2, redaction sticks identiquement (idempotent).
+
+**Step 5 — AC2 POST /agents/templates/{id}/tools** (REPLACE atomic avec les 2 tool_ids) — réponse P-01 enrichie (`assigned_at` + `input_schema` + `output_schema` ajoutés au contrat) :
+
+```
+{
+    "template_id": "050c5a9d-…",
+    "assigned_tools": [
+        {
+            "tool_id": "06f7b9d4-…", "name": "add", "description": "…",
+            "server_id": "eb20254f-…",
+            "input_schema": {"type": "object", "required": ["a","b"], "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}},
+            "output_schema": null,
+            "assigned_at": "2026-05-10T21:02:58.721627Z"
+        },
+        {
+            "tool_id": "f18e481a-…", "name": "echo", "description": "…",
+            "server_id": "eb20254f-…",
+            "input_schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
+            "output_schema": null,
+            "assigned_at": "2026-05-10T21:02:58.721627Z"
+        }
+    ]
+}
+```
+
+P-01 contract check (per tool keys) : `['assigned_at', 'description', 'input_schema', 'name', 'output_schema', 'server_id', 'tool_id']` ✅ (7 fields, vs 4 avant fix).
+
+**Step 6 — AC4 GET /agents/templates/{id}/tools** : retourne la même shape que step 5, reflet exact post-REPLACE.
+
+**Step 7 — AC3 DELETE /agents/templates/{id}/tools/{tool_id}** (idempotency stricte) :
+
+- 1ère DELETE : `204 No Content`
+- 2ème DELETE : `404 Not Found` + RFC 7807 :
+  ```
+  {"type": "/errors/not-found", "status": 404, "detail": "Assignment (template=…, tool=…) not found", ...}
+  ```
+
+**Step 8 — docker logs grep audit events** (récents 2 minutes, sur 2 smokes consécutifs car le 1er a échoué pré-migration — cumul) :
+
+```
+$ docker compose logs backend --since 2m | grep -oE 'm5\.tool_server\.connected|m5\.tool\.discovered|m2\.agent_template\.tool_assigned|m2\.agent_template\.tool_unassigned' | sort | uniq -c
+      4 m2.agent_template.tool_assigned
+      2 m2.agent_template.tool_unassigned
+      4 m5.tool.discovered
+      2 m5.tool_server.connected
+```
+
+**Step 9 — DB outbox_events** (uniquement pour le smoke réussi : 1 server + 2 tools + 2 assignments + 1 unassign) :
+
+```
+$ docker compose exec db psql -U agentive_owner -d agentive -c "SELECT event_type, count(*) FROM outbox_events WHERE event_type LIKE 'm5.tool%' OR event_type LIKE 'm2.agent_template.tool_%' GROUP BY event_type ORDER BY event_type;"
+
+            event_type             | count
+-----------------------------------+-------
+ m2.agent_template.tool_assigned   |     2
+ m2.agent_template.tool_unassigned |     1
+ m5.tool.discovered                |     2
+ m5.tool_server.connected          |     1
+(4 rows)
+```
+
+**Verdict AC8** : ✅ 8 ACs end-to-end validés contre le stack runtime. Cluster A des patches CR 2026-05-10 appliqués et exercés (P-23 gate, P-03 redaction, P-01 contract enrichi, P-05 emit_notify event_type correct vérifié indirectement par les 4 events distincts dans logs+DB).
 - ✅ T0 — Pré-requis vérifiés : `mcp>=1.27.0` ✅, `infra/mcp/__init__.py` placeholder ✅, `features/m5_tool_hub/__init__.py` placeholder ✅, baseline grep = 3 hits Stories 2.1+2.2+2.4 ✅, `Checkbox` shadcn primitive **AJOUTÉE** (était absente — `frontend/src/shared/components/ui/checkbox.tsx` créé avec radix-ui pattern + lucide CheckIcon).
 - ✅ T1 — Migration Alembic `20260510_000000_tool_hub_tables.py` : 3 tables (tool_servers + tools + agent_template_tools) avec FK CASCADE, UNIQUE NULLS NOT DISTINCT (cohérent Story 2.1 P-07), CHECK constraints, RLS tenant_isolation policy + GRANTS agentive_app.
 - ✅ T2 — `infra/mcp/client.py` (~150 LOC) : `discover_tools(transport, connection_config, timeout=10s)` + `MCPDiscoveryTimeoutError` + `ToolInfo` dataclass.
@@ -553,3 +663,22 @@ claude-opus-4-7 (1M context) — bmad-dev-story single-pass execution.
 **Story spec**
 - `_bmad-output/implementation-artifacts/2-5-tool-hub-mcp-assignation.md` (T11) — Status: review + Tasks/Subtasks tous cochés [x] + Dev Agent Record rempli.
 - `_bmad-output/implementation-artifacts/sprint-status.yaml` (T11) — bump 2-5-tool-hub-mcp-assignation: in-progress → review + ligne récap.
+
+---
+
+### Amendement CR 2026-05-10 — D-01 admin-gate Sprint 1 (promu defer → patch P-23)
+
+**Décision tranchée par John** : `POST /tools/servers` accepte du code arbitraire (subprocess.Popen sur `command` user-fourni) + URL non-filtrée pour SSE (`sse_client(url=...)`). Sans sandbox bwrap (Story 2.6 D59) ni allowlist runtime (Story 4.x D60), tout utilisateur authentifié peut déclencher RCE sur le backend ou probe les services internes (SSRF, ex. metadata cloud `169.254.169.254`).
+
+**Sprint 1 = single-user MVP** (Story 1.7 auth token statique, pas de rôles), donc "admin-gate" se traduit en :
+
+- **Feature flag env `AGENTIVE_ALLOW_MCP_REGISTRATION`** (default `false`) à ajouter dans `shared/config.py` `Settings`.
+- **Gate `POST /tools/servers`** : si flag désactivé → 403 RFC 7807 avec `title="MCP server registration disabled"` + `detail` qui pointe Story 2.6 sandbox.
+- **GET endpoints non gatés** (read-only, surface 0 RCE/SSRF) — `GET /tools/servers`, `GET /tools/servers/{id}`, `GET /agents/templates/{id}/tools`, `POST/DELETE /agents/templates/{id}/tools/{tool_id}` (assignment ne touche pas au subprocess/réseau).
+- **`.env.example`** : ajouter la ligne commentée `# AGENTIVE_ALLOW_MCP_REGISTRATION=false  # RCE/SSRF risk — flip à true uniquement en dev/test ou après Story 2.6 sandbox.`
+- **Smoke runtime AC8** (P-04) : exécuter avec `AGENTIVE_ALLOW_MCP_REGISTRATION=true` ; ajouter aussi un test e2e du chemin 403 (flag false → POST refusé).
+- **Test e2e existant** (`test_create_tool_server_stdio_happy_path`) : doit forcer le flag à `true` dans la fixture (`monkeypatch.setenv` ou override Settings).
+
+**Justification** : opt-in explicite vs default-secure. Quiconque déploie en prod sans avoir lu la doc ne s'expose pas par défaut.
+
+**À fermer définitivement Story 2.6** : sandbox bwrap + allowlist URL → le flag peut redevenir `true` par défaut (ou disparaître si la sandbox couvre tout).

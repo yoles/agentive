@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from tests.integration.m2_agent_registry.conftest import (  # noqa: F401
     E2E_AUTH_TOKEN,
+    _enable_mcp_registration,
     app_session_factory,
     audit_admin_session_factory,
     e2e_auth_headers,

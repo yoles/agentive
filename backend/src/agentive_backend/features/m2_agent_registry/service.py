@@ -32,7 +32,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
@@ -447,9 +447,7 @@ class AgentRegistryService:
 
             # 2. Validate workflow_run FK if provided (404 sinon — strict).
             if workflow_run_id is not None:
-                run = await self._workflow_run_repo.get_by_id_in_session(
-                    session, workflow_run_id
-                )
+                run = await self._workflow_run_repo.get_by_id_in_session(session, workflow_run_id)
                 if run is None:
                     raise NotFoundError(
                         detail=f"Workflow run '{workflow_run_id}' not found",
@@ -595,7 +593,6 @@ class AgentRegistryService:
             for instance in instances
         ]
 
-
     # ─── Tool assignment (Story 2.5 — junction agent_template_tools) ──
 
     async def replace_template_tools(
@@ -651,8 +648,11 @@ class AgentRegistryService:
                 tenant_id=tenant_id,
             )
 
-            # 5. Publish events (1 per added, 1 per removed).
-            event_ids: list[UUID] = []
+            # 5. Publish events (1 per added, 1 per removed). Track each
+            # event_id alongside its real event_type so the post-commit
+            # NOTIFY (P-05) can fire with the correct channel — listeners
+            # filtering by event_type would miss a fabricated label.
+            events_emitted: list[tuple[UUID, str]] = []
             # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
             for tid in added:
                 tool = tools_by_id[tid]
@@ -666,7 +666,7 @@ class AgentRegistryService:
                 eid = await publish(
                     AgentTemplateToolAssignedEvent.event_type, event, session=session
                 )
-                event_ids.append(eid)
+                events_emitted.append((eid, AgentTemplateToolAssignedEvent.event_type))
             # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
             for tid in removed:
                 event_unassign = AgentTemplateToolUnassignedEvent(
@@ -680,7 +680,7 @@ class AgentRegistryService:
                     event_unassign,
                     session=session,
                 )
-                event_ids.append(eid)
+                events_emitted.append((eid, AgentTemplateToolUnassignedEvent.event_type))
 
             # 6. Re-fetch current assignments to return (after the DML).
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
@@ -688,14 +688,15 @@ class AgentRegistryService:
             )
             # commit at __aexit__.
 
-        # Post-commit best-effort NOTIFY (1 per event).
-        for eid in event_ids:
+        # Post-commit best-effort NOTIFY (1 per event with its real event_type).
+        for eid, event_type in events_emitted:
             try:
-                await emit_notify(eid, "m2.agent_template.tool_assigned_or_unassigned")
+                await emit_notify(eid, event_type)
             except Exception:
                 _log.warning(
                     "event_bus_notify_failed_will_be_polled",
                     event_id=str(eid),
+                    event_type=event_type,
                 )
 
         _log.info(
@@ -715,8 +716,11 @@ class AgentRegistryService:
                     name=tool.name,
                     description=tool.description,
                     server_id=tool.server_id,
+                    input_schema=dict(tool.input_schema or {}),
+                    output_schema=tool.output_schema,
+                    assigned_at=assigned_at,
                 )
-                for tool in assigned_tools
+                for tool, assigned_at in assigned_tools
             ],
         )
 
@@ -752,8 +756,11 @@ class AgentRegistryService:
                     name=tool.name,
                     description=tool.description,
                     server_id=tool.server_id,
+                    input_schema=dict(tool.input_schema or {}),
+                    output_schema=tool.output_schema,
+                    assigned_at=assigned_at,
                 )
-                for tool in assigned_tools
+                for tool, assigned_at in assigned_tools
             ],
         )
 
@@ -780,9 +787,7 @@ class AgentRegistryService:
             )
             if not deleted:
                 raise NotFoundError(
-                    detail=(
-                        f"Assignment (template={template_id}, tool={tool_id}) not found"
-                    ),
+                    detail=(f"Assignment (template={template_id}, tool={tool_id}) not found"),
                     context={
                         "template_id": str(template_id),
                         "tool_id": str(tool_id),

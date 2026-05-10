@@ -9,6 +9,7 @@ forbids ``sqlalchemy`` imports from ``agentive_backend.features``).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -113,9 +114,7 @@ class ToolServerRepo(BaseRepo):
 class ToolRepo(BaseRepo):
     """Public API surface for Tool (Story 2.5)."""
 
-    async def get_by_id(
-        self, tool_id: UUID, *, tenant_id: UUID | None = None
-    ) -> Tool | None:
+    async def get_by_id(self, tool_id: UUID, *, tenant_id: UUID | None = None) -> Tool | None:
         async with self.with_tenant(tenant_id) as session:
             return await session.get(Tool, tool_id)
 
@@ -167,11 +166,7 @@ class ToolRepo(BaseRepo):
         session: AsyncSession,
         server_id: UUID,
     ) -> list[Tool]:
-        stmt = (
-            select(Tool)
-            .where(Tool.server_id == server_id)
-            .order_by(asc(Tool.name))
-        )
+        stmt = select(Tool).where(Tool.server_id == server_id).order_by(asc(Tool.name))
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
@@ -184,17 +179,19 @@ class AgentTemplateToolRepo(BaseRepo):
         self,
         session: AsyncSession,
         template_id: UUID,
-    ) -> list[Tool]:
-        """Return the Tools currently assigned to ``template_id``, ordered
-        by ``Tool.name`` for deterministic UX."""
+    ) -> list[tuple[Tool, datetime]]:
+        """Return the Tools currently assigned to ``template_id`` paired with
+        their ``assigned_at`` timestamp from the junction row, ordered by
+        ``Tool.name`` then ``Tool.id`` for deterministic UX (P-01 + P-15).
+        """
         stmt = (
-            select(Tool)
+            select(Tool, AgentTemplateTool.assigned_at)
             .join(AgentTemplateTool, AgentTemplateTool.tool_id == Tool.id)
             .where(AgentTemplateTool.agent_template_id == template_id)
-            .order_by(asc(Tool.name))
+            .order_by(asc(Tool.name), asc(Tool.id))
         )
         result = await session.execute(stmt)
-        return list(result.scalars().all())
+        return [(tool, assigned_at) for tool, assigned_at in result.all()]
 
     async def replace_in_session(
         self,

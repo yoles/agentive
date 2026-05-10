@@ -323,7 +323,13 @@ class ReplaceAgentToolsRequest(BaseModel):
 
 class AssignedToolView(BaseModel):
     """A single tool currently assigned to a template, with its server
-    metadata for UX grouping."""
+    metadata for UX grouping and its assignment timestamp.
+
+    P-01 (CR 2026-05-10) — fields aligned with AC2 contract: includes
+    ``input_schema``/``output_schema`` (denormalized from ``ToolView`` to
+    avoid a cross-feature m5 schema import) and ``assigned_at`` (joined
+    from the junction row by ``AgentTemplateToolRepo.list_by_template_in_session``).
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -331,6 +337,9 @@ class AssignedToolView(BaseModel):
     name: str
     description: str
     server_id: UUID
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+    assigned_at: datetime
 
 
 class AgentToolsResponse(BaseModel):

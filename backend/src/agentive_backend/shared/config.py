@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = Field(default=None, alias="OPENAI_API_KEY")
     voyage_api_key: SecretStr | None = Field(default=None, alias="VOYAGE_API_KEY")
 
+    # ─── MCP Tool Hub (Story 2.5 — P-23 admin-gate) ───
+    # Opt-in flag: `POST /tools/servers` accepts user-supplied `command` (stdio
+    # subprocess) or `url` (SSE) without sandbox or URL filtering. This is RCE
+    # and SSRF surface by design — sandbox bwrap arrives Story 2.6 (D59), URL
+    # allowlist Story 4.x (D60). Flip to `true` only in dev/test or after
+    # Story 2.6. Default `false` = the endpoint returns 403.
+    mcp_allow_registration: bool = Field(default=False, alias="AGENTIVE_ALLOW_MCP_REGISTRATION")
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

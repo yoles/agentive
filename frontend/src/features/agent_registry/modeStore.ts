@@ -43,14 +43,12 @@ export const useModeStore = create<ModeState>()(
       // casserait le routing Wizard/Expert silencieusement.
       onRehydrateStorage: () => (state, error) => {
         if (error) {
-          // eslint-disable-next-line no-console
           console.warn(
             "[useModeStore] hydration error — falling back to default 'wizard'",
             error,
           );
         }
         if (state && !VALID_MODES.has(state.mode)) {
-          // eslint-disable-next-line no-console
           console.warn(
             `[useModeStore] invalid persisted mode '${state.mode}' — reset to 'wizard'`,
           );

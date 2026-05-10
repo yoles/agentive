@@ -403,9 +403,7 @@ class Tool(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    input_schema: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default="{}"
-    )
+    input_schema: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
     output_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     discovered_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
@@ -438,9 +436,7 @@ class AgentTemplateTool(Base):
     assigned_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
-    assigned_by_actor: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default="system"
-    )
+    assigned_by_actor: Mapped[str] = mapped_column(Text, nullable=False, server_default="system")
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     __table_args__ = (
