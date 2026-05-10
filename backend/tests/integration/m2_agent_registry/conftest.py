@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -29,6 +30,7 @@ from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMi
 from agentive_backend.features.m2_agent_registry import load_registry
 from agentive_backend.features.m2_agent_registry import router as agents_router
 from agentive_backend.features.m5_tool_hub import router as tools_router
+from agentive_backend.shared.config import settings as _runtime_settings
 from agentive_backend.shared.correlation import get_correlation_id
 from agentive_backend.shared.exceptions import AgentiveError
 
@@ -41,7 +43,6 @@ from tests.integration.repositories.conftest import (  # noqa: F401
     roles_provisioned,
     seed_session_factory,
 )
-
 
 E2E_AUTH_TOKEN = "integration-test-token"
 
@@ -123,3 +124,19 @@ def make_e2e_app(
 def e2e_auth_headers() -> dict[str, str]:
     """Standard `Authorization: Bearer …` headers for e2e tests."""
     return {"Authorization": f"Bearer {E2E_AUTH_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _enable_mcp_registration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Story 2.5 P-23 admin-gate — flip ``AGENTIVE_ALLOW_MCP_REGISTRATION``
+    to True for the duration of m2/m5 e2e tests.
+
+    Default is False (production-safe — RCE/SSRF until Story 2.6 sandbox).
+    Tests need it True to exercise the POST /tools/servers happy/409/503
+    paths. The 403 path test flips it back to False inline.
+
+    ``monkeypatch.setattr`` on a Pydantic v2 BaseSettings instance is safe
+    because BaseSettings is mutable by default and ``monkeypatch`` restores
+    the original value at teardown.
+    """
+    monkeypatch.setattr(_runtime_settings, "mcp_allow_registration", True)

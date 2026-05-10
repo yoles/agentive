@@ -94,6 +94,7 @@ export function ConfigModeToggle({ disabled = false }: ConfigModeToggleProps = {
   return (
     <div
       role="radiogroup"
+      tabIndex={-1}
       aria-label="Mode de configuration"
       aria-keyshortcuts="ArrowLeft ArrowRight Home End"
       onKeyDown={handleKeyDown}

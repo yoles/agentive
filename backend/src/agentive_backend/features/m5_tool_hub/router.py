@@ -24,7 +24,8 @@ from agentive_backend.features.m5_tool_hub.schemas import (
     ToolServerView,
 )
 from agentive_backend.features.m5_tool_hub.service import ToolHubService
-from agentive_backend.shared.exceptions import DependencyError
+from agentive_backend.shared.config import settings
+from agentive_backend.shared.exceptions import DependencyError, ForbiddenError
 from agentive_backend.shared.repositories import ToolRepo, ToolServerRepo
 
 router = APIRouter(tags=["tools"])
@@ -45,10 +46,9 @@ def _build_service(request: Request) -> ToolHubService:
         )
     server_repo = ToolServerRepo(session_factory=session_factory)
     tool_repo = ToolRepo(session_factory=session_factory)
-    assert (
-        server_repo._session_factory  # noqa: SLF001
-        is tool_repo._session_factory  # noqa: SLF001
-    ), "ToolHubService wiring violation : repos must share session_factory."
+    assert server_repo._session_factory is tool_repo._session_factory, (
+        "ToolHubService wiring violation : repos must share session_factory."
+    )
     return ToolHubService(server_repo=server_repo, tool_repo=tool_repo)
 
 
@@ -65,10 +65,22 @@ async def create_tool_server(
     """201 on success.
 
     Errors :
+    * 403 — registration disabled by ``AGENTIVE_ALLOW_MCP_REGISTRATION=false``
+            (default — P-23 admin-gate, RCE/SSRF surface until Story 2.6 sandbox).
     * 409 — a server with this ``name`` already exists.
     * 422 — Pydantic body validation (transport not in {stdio,sse}, etc.).
     * 503 — MCP discovery timeout (10s) OR connection_config invalid.
     """
+    if not settings.mcp_allow_registration:
+        raise ForbiddenError(
+            detail=(
+                "MCP server registration is disabled. Set "
+                "AGENTIVE_ALLOW_MCP_REGISTRATION=true to enable. "
+                "Note: this endpoint accepts arbitrary subprocess commands and SSE URLs "
+                "without sandboxing — sandbox arrives in Story 2.6."
+            ),
+            context={"flag": "AGENTIVE_ALLOW_MCP_REGISTRATION"},
+        )
     service = _build_service(request)
     return await service.connect_server(
         name=body.name,

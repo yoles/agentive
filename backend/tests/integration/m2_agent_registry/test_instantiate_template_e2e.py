@@ -292,10 +292,7 @@ async def test_instantiate_template_404_when_template_missing(
         # No row + no event.
         async with seed_session_factory() as session:
             count = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_instances "
-                    "WHERE template_id = :tid"
-                ),
+                text("SELECT COUNT(*) FROM agent_instances WHERE template_id = :tid"),
                 {"tid": str(nonexistent)},
             )
             assert int(count.scalar_one()) == 0
@@ -373,7 +370,7 @@ async def test_instantiate_template_atomicity_publish_failure_rolls_back_insert(
 
     real_publish = svc_module.publish
 
-    async def _selective_explode(event_type: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+    async def _selective_explode(event_type: str, *args: Any, **kwargs: Any) -> Any:
         if event_type == "m2.agent_instance.created":
             raise RuntimeError("simulated bus failure")
         return await real_publish(event_type, *args, **kwargs)

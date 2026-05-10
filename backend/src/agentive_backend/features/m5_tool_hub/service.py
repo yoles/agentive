@@ -49,6 +49,44 @@ if TYPE_CHECKING:
 
 _log = get_logger(__name__)
 
+# P-03 (CR 2026-05-10) — secret redaction for API responses.
+#
+# ``connection_config`` is stored verbatim (Sprint 1 = clear text on disk,
+# Fernet defer Story 9.2 / D55) but the API response MUST NOT echo
+# credentials back to the caller, since access middleware logs response
+# bodies. Strategy: only the structural fields (``command``, ``args``,
+# ``url``) are exposed ; values that hold secrets (``env``, ``headers``)
+# are replaced by their key list (``["KEY1", "KEY2"]``) so the caller can
+# see the SHAPE without reading the secret values.
+_REDACTED_VALUE_KEY_LIST = "<redacted-keys>"
+
+
+def _redact_connection_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``config`` with secret-bearing values masked.
+
+    Secret-bearing keys (env, headers, Authorization, token, password,
+    api_key, secret) are replaced by the SHAPE of their value (list of
+    sub-keys for dicts ; ``"<redacted>"`` for strings) so consumers can
+    inspect the wiring without leaking credentials.
+    """
+    if not isinstance(config, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key, value in config.items():
+        lkey = key.lower()
+        # Whole-dict redaction for env-like / headers-like containers.
+        if lkey in {"env", "headers"}:
+            if isinstance(value, dict):
+                safe[key] = {"_redacted_keys": sorted(str(k) for k in value)}
+            else:
+                safe[key] = _REDACTED_VALUE_KEY_LIST
+        # Direct secret-name match — mask the value.
+        elif lkey in {"authorization", "token", "password", "api_key", "secret", "auth"}:
+            safe[key] = "<redacted>"
+        else:
+            safe[key] = value
+    return safe
+
 
 class ToolHubService:
     """Orchestrate MCP server registration + tool discovery (Story 2.5)."""
@@ -196,9 +234,9 @@ class ToolHubService:
         return ToolServerDetailView(
             server_id=server.id,
             name=server.name,
-            transport=server.transport,  # type: ignore[arg-type]  # Pydantic Literal narrows
-            status=server.status,  # type: ignore[arg-type]
-            connection_config=server.connection_config,
+            transport=server.transport,
+            status=server.status,
+            connection_config=_redact_connection_config(server.connection_config),
             discovered_at=server.discovered_at,
             tools=[
                 ToolView(
@@ -223,8 +261,8 @@ class ToolHubService:
             ToolServerView(
                 server_id=server.id,
                 name=server.name,
-                transport=server.transport,  # type: ignore[arg-type]
-                status=server.status,  # type: ignore[arg-type]
+                transport=server.transport,
+                status=server.status,
                 tools_count=count,
                 discovered_at=server.discovered_at,
             )
@@ -256,9 +294,9 @@ class ToolHubService:
         return ToolServerDetailView(
             server_id=server.id,
             name=server.name,
-            transport=server.transport,  # type: ignore[arg-type]
-            status=server.status,  # type: ignore[arg-type]
-            connection_config=server.connection_config,
+            transport=server.transport,
+            status=server.status,
+            connection_config=_redact_connection_config(server.connection_config),
             discovered_at=server.discovered_at,
             tools=[
                 ToolView(

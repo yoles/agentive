@@ -16,7 +16,7 @@
  */
 
 import { Link } from "@tanstack/react-router";
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { Button } from "@/shared/components/ui/button";
 import { Checkbox } from "@/shared/components/ui/checkbox";
@@ -25,8 +25,8 @@ import {
   useReplaceAgentTools,
   useToolServers,
 } from "./hooks";
-import { listAgentTools, listToolServers, getToolServer } from "./api";
-import type { AssignedTool, ToolInfo, ToolServer } from "./types";
+import { getToolServer } from "./api";
+import type { ToolInfo, ToolServer } from "./types";
 import { useQueries } from "@tanstack/react-query";
 
 type Props = {
@@ -55,14 +55,21 @@ export function AgentToolsPanel({ templateId }: Props) {
   // Local UI state — the `selectedToolIds` set is the staged selection.
   const [selectedToolIds, setSelectedToolIds] = useState<Set<string>>(new Set());
 
-  // When the assignedQuery resolves (or refreshes), seed the local set.
+  // P-02 (CR 2026-05-10) — only seed the local selection ONCE from the server
+  // (initial load OR after a successful save). Background refetches (window
+  // focus, staleTime expiry, sibling mutation invalidation) MUST NOT clobber
+  // the user's in-progress checkbox edits.
   const assignedIds = useMemo(
     () => new Set((assignedQuery.data?.assigned_tools ?? []).map((t) => t.tool_id)),
     [assignedQuery.data],
   );
+  const seededRef = useRef(false);
   useEffect(() => {
-    setSelectedToolIds(new Set(assignedIds));
-  }, [assignedIds]);
+    if (assignedQuery.isSuccess && !seededRef.current) {
+      setSelectedToolIds(new Set(assignedIds));
+      seededRef.current = true;
+    }
+  }, [assignedQuery.isSuccess, assignedIds]);
 
   if (serversQuery.isLoading || assignedQuery.isLoading) {
     return (
@@ -108,6 +115,9 @@ export function AgentToolsPanel({ templateId }: Props) {
   async function handleSave() {
     try {
       await replaceMutation.mutateAsync({ tool_ids: [...selectedToolIds] });
+      // After a successful save, allow the next assignedQuery refresh to
+      // re-seed the local set (so external changes / multi-tab edits land).
+      seededRef.current = false;
       toast.success("Outils mis à jour");
     } catch (err) {
       const apiError = err as { detail?: string; title?: string };

@@ -128,9 +128,7 @@ async def test_instantiate_template_with_missing_workflow_run_raises_404(
     )
     service, irepo, _trepo, _wrepo = _make_service(template=template, workflow_run=None)
     with pytest.raises(NotFoundError, match="Workflow run"):
-        await service.instantiate_from_template(
-            template_id=template.id, workflow_run_id=uuid4()
-        )
+        await service.instantiate_from_template(template_id=template.id, workflow_run_id=uuid4())
     irepo.create_in_session.assert_not_awaited()
     event_publish_mock.assert_not_awaited()
 

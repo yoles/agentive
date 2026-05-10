@@ -48,9 +48,7 @@ def test_instantiate_request_accepts_valid_uuid() -> None:
         ("created_at", "2026-05-10T00:00:00Z"),
     ],
 )
-def test_instantiate_request_rejects_all_server_owned_fields(
-    field: str, value: object
-) -> None:
+def test_instantiate_request_rejects_all_server_owned_fields(field: str, value: object) -> None:
     """P-12 (CR 2026-05-10) — extra="forbid" doit rejeter TOUS les champs que
     le serveur dérive lui-même (snapshot depuis template + version, ids
     server-generated, timestamps). Sans paramétrisation, une régression qui
@@ -58,9 +56,7 @@ def test_instantiate_request_rejects_all_server_owned_fields(
     test legacy sur "snapshot".
     """
     with pytest.raises(ValidationError, match="extra"):
-        InstantiateTemplateRequest.model_validate(
-            {"workflow_run_id": None, field: value}
-        )
+        InstantiateTemplateRequest.model_validate({"workflow_run_id": None, field: value})
 
 
 def test_instance_detail_response_round_trip() -> None:
@@ -96,9 +92,8 @@ def test_instantiate_response_subclass_preserves_shape() -> None:
     """
     assert issubclass(InstantiateTemplateResponse, AgentInstanceDetailResponse)
     # Same fields exactly — subclass adds nothing.
-    assert (
-        set(InstantiateTemplateResponse.model_fields.keys())
-        == set(AgentInstanceDetailResponse.model_fields.keys())
+    assert set(InstantiateTemplateResponse.model_fields.keys()) == set(
+        AgentInstanceDetailResponse.model_fields.keys()
     )
     # Distinct __name__ for OpenAPI schema components.
     assert InstantiateTemplateResponse.__name__ == "InstantiateTemplateResponse"

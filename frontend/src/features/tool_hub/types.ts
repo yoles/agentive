@@ -52,6 +52,9 @@ export type AssignedTool = {
   name: string;
   description: string;
   server_id: string;
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown> | null;
+  assigned_at: string; // ISO 8601
 };
 
 export type AgentToolsResponse = {

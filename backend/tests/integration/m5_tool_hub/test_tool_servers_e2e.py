@@ -105,6 +105,74 @@ async def test_create_tool_server_stdio_happy_path(
 
 
 @pytest.mark.integration
+async def test_create_tool_server_disabled_by_flag_returns_403(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-23 admin-gate — when ``AGENTIVE_ALLOW_MCP_REGISTRATION=false`` the
+    POST endpoint returns 403 RFC 7807 with a hint pointing to the env var.
+
+    The conftest autouse fixture flips the flag to True ; we override it
+    back to False here to exercise the gate.
+    """
+    from agentive_backend.shared.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "mcp_allow_registration", False)
+
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "gated-srv",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        assert resp.status_code == 403, resp.text
+        body = resp.json()
+        assert body["status"] == 403
+        assert "AGENTIVE_ALLOW_MCP_REGISTRATION" in body.get("detail", "")
+        assert body.get("flag") == "AGENTIVE_ALLOW_MCP_REGISTRATION"
+
+
+@pytest.mark.integration
+async def test_get_endpoints_unaffected_by_registration_flag(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-23 — only POST /tools/servers is gated. GET endpoints stay open
+    (no RCE/SSRF surface — read-only).
+    """
+    from agentive_backend.shared.config import settings as _settings
+
+    # First seed with the flag enabled (default in conftest).
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        seed = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "list-gated-test",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        assert seed.status_code == 201
+
+        # Now disable the flag and verify GETs still work.
+        monkeypatch.setattr(_settings, "mcp_allow_registration", False)
+
+        listed = await client.get("/api/v1/tools/servers", headers=_auth_headers())
+        assert listed.status_code == 200
+        names = [s["name"] for s in listed.json()]
+        assert "list-gated-test" in names
+
+
+@pytest.mark.integration
 async def test_create_tool_server_invalid_transport_returns_422(
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -243,13 +311,59 @@ async def test_get_tool_server_detail_happy(
         )
         server_id = post.json()["server_id"]
 
-        get = await client.get(
-            f"/api/v1/tools/servers/{server_id}", headers=_auth_headers()
-        )
+        get = await client.get(f"/api/v1/tools/servers/{server_id}", headers=_auth_headers())
         assert get.status_code == 200, get.text
         body = get.json()
         assert body["server_id"] == server_id
         assert len(body["tools"]) == 2
+
+
+@pytest.mark.integration
+async def test_create_tool_server_redacts_secrets_in_response(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """P-03 (CR 2026-05-10) — POST 201 + GET detail responses must NOT echo
+    secret-bearing values (``env`` content for stdio, ``headers`` content
+    for sse, top-level secret keys). Only the structural shape (key names)
+    is exposed.
+    """
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    config = {
+        "command": "python",
+        "args": ["-m", "tests.fixtures.mcp_mock_server"],
+        "env": {"SECRET_API_KEY": "hunter2", "OTHER_VAR": "visible_value"},
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        post = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "redact-test",
+                "transport": "stdio",
+                "connection_config": config,
+            },
+        )
+        assert post.status_code == 201, post.text
+        post_body = post.json()
+        post_cfg = post_body["connection_config"]
+        # Structural fields preserved.
+        assert post_cfg["command"] == "python"
+        assert post_cfg["args"] == ["-m", "tests.fixtures.mcp_mock_server"]
+        # env values masked, env key NAMES exposed.
+        assert post_cfg["env"] == {"_redacted_keys": ["OTHER_VAR", "SECRET_API_KEY"]}
+        # The actual secret value MUST NOT appear anywhere in the response body.
+        assert "hunter2" not in post.text
+        assert "visible_value" not in post.text
+
+        # Same redaction on GET detail.
+        get = await client.get(
+            f"/api/v1/tools/servers/{post_body['server_id']}", headers=_auth_headers()
+        )
+        assert get.status_code == 200
+        get_cfg = get.json()["connection_config"]
+        assert get_cfg["env"] == {"_redacted_keys": ["OTHER_VAR", "SECRET_API_KEY"]}
+        assert "hunter2" not in get.text
 
 
 @pytest.mark.integration
@@ -259,9 +373,7 @@ async def test_get_tool_server_detail_not_found_returns_404(
     app = _make_app(session_factory=app_session_factory)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(
-            f"/api/v1/tools/servers/{uuid4()}", headers=_auth_headers()
-        )
+        resp = await client.get(f"/api/v1/tools/servers/{uuid4()}", headers=_auth_headers())
         assert resp.status_code == 404
         body = resp.json()
         assert "not found" in body.get("detail", "").lower()

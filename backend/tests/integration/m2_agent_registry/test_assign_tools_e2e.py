@@ -39,9 +39,7 @@ async def _create_template(client: httpx.AsyncClient, *, name: str) -> str:
     return resp.json()["template_id"]
 
 
-async def _create_server(
-    client: httpx.AsyncClient, *, name: str
-) -> tuple[str, list[str]]:
+async def _create_server(client: httpx.AsyncClient, *, name: str) -> tuple[str, list[str]]:
     """Returns (server_id, [tool_id, tool_id])."""
     resp = await client.post(
         "/api/v1/tools/servers",
@@ -83,10 +81,7 @@ async def test_replace_assign_happy_path(
         # Junction row created.
         async with seed_session_factory() as session:
             count = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_template_tools "
-                    "WHERE agent_template_id = :tid"
-                ),
+                text("SELECT COUNT(*) FROM agent_template_tools WHERE agent_template_id = :tid"),
                 {"tid": template_id},
             )
             assert int(count.scalar_one()) == 1
@@ -136,10 +131,7 @@ async def test_replace_assign_diff_emits_added_and_removed_events(
         # Final junction state : exactly 1 row (t2).
         async with seed_session_factory() as session:
             rows = await session.execute(
-                text(
-                    "SELECT tool_id FROM agent_template_tools "
-                    "WHERE agent_template_id = :tid"
-                ),
+                text("SELECT tool_id FROM agent_template_tools WHERE agent_template_id = :tid"),
                 {"tid": template_id},
             )
             tids = {str(r[0]) for r in rows.all()}
@@ -196,10 +188,7 @@ async def test_replace_assign_clear_all_emits_unassign_per_tool(
 
         async with seed_session_factory() as session:
             count = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_template_tools "
-                    "WHERE agent_template_id = :tid"
-                ),
+                text("SELECT COUNT(*) FROM agent_template_tools WHERE agent_template_id = :tid"),
                 {"tid": template_id},
             )
             assert int(count.scalar_one()) == 0
@@ -230,10 +219,7 @@ async def test_replace_assign_404_if_any_tool_missing(
         # AND no assignment was created (atomicity).
         async with seed_session_factory() as session:
             count = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_template_tools "
-                    "WHERE agent_template_id = :tid"
-                ),
+                text("SELECT COUNT(*) FROM agent_template_tools WHERE agent_template_id = :tid"),
                 {"tid": template_id},
             )
             assert int(count.scalar_one()) == 0
@@ -351,9 +337,7 @@ async def test_replace_assign_atomicity_publish_failure_rolls_back(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         template_id = await _create_template(client, name="ac5-replace-atomicity")
-        _server_id, tool_ids = await _create_server(
-            client, name="ac5-replace-atomicity-srv"
-        )
+        _server_id, tool_ids = await _create_server(client, name="ac5-replace-atomicity-srv")
 
         # NOW patch publish — only the m2 tool_assigned event will fail.
         import agentive_backend.features.m2_agent_registry.service as svc_module
@@ -377,10 +361,7 @@ async def test_replace_assign_atomicity_publish_failure_rolls_back(
         # Junction empty (rollback).
         async with seed_session_factory() as session:
             count = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_template_tools "
-                    "WHERE agent_template_id = :tid"
-                ),
+                text("SELECT COUNT(*) FROM agent_template_tools WHERE agent_template_id = :tid"),
                 {"tid": template_id},
             )
             assert int(count.scalar_one()) == 0

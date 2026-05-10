@@ -94,12 +94,12 @@ def _build_service(request: Request) -> AgentRegistryService:
     # P-16 Story 2.4 CR — atomicity invariant : the 6 repos must share the
     # same session_factory so service-level transactions stay consistent.
     assert (
-        template_repo._session_factory  # noqa: SLF001
-        is prompt_repo._session_factory  # noqa: SLF001
-        is instance_repo._session_factory  # noqa: SLF001
-        is workflow_run_repo._session_factory  # noqa: SLF001
-        is tool_repo._session_factory  # noqa: SLF001
-        is assignment_repo._session_factory  # noqa: SLF001
+        template_repo._session_factory
+        is prompt_repo._session_factory
+        is instance_repo._session_factory
+        is workflow_run_repo._session_factory
+        is tool_repo._session_factory
+        is assignment_repo._session_factory
     ), (
         "AgentRegistryService wiring violation : repos must share session_factory "
         "for atomicity P-02 (Story 2.1)."
@@ -321,9 +321,7 @@ async def replace_template_tools(
     * 422 — Pydantic body validation OR template_id not a UUID.
     """
     service = _build_service(request)
-    return await service.replace_template_tools(
-        template_id, body.tool_ids, tenant_id=None
-    )
+    return await service.replace_template_tools(template_id, body.tool_ids, tenant_id=None)
 
 
 @router.get(
