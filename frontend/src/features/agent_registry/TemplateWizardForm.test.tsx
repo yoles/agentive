@@ -103,4 +103,46 @@ describe("TemplateWizardForm", () => {
       expect(onSubmit).toHaveBeenCalledTimes(1);
     });
   });
+
+  it("P-14 — Précédent navigates back one step and clears stepError", () => {
+    renderWizard();
+    // Advance to step 3 (Contrats).
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    expect(screen.getByRole("heading", { name: /contrats élastiques/i })).toBeInTheDocument();
+    // Click Précédent → step 2.
+    fireEvent.click(screen.getByRole("button", { name: /précédent/i }));
+    expect(screen.getByRole("heading", { name: /system prompt/i })).toBeInTheDocument();
+    // Click Précédent again → step 1.
+    fireEvent.click(screen.getByRole("button", { name: /précédent/i }));
+    expect(screen.getByRole("heading", { name: /identité de l'agent/i })).toBeInTheDocument();
+  });
+
+  it("P-14 — clicking a completed step in the progress bar jumps directly to it", () => {
+    renderWizard();
+    // Reach step 3 (validates steps 1 + 2 along the way → both completed).
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    expect(screen.getByRole("heading", { name: /contrats élastiques/i })).toBeInTheDocument();
+    // The WizardProgress renders one button per step with the step label
+    // ("Identité", "Prompt", …) as a sibling <span> inside the <li>. We find
+    // the <li> containing "Identité" then click its button.
+    const identityLabel = screen.getByText("Identité");
+    const identityBtn = identityLabel.closest("li")?.querySelector("button");
+    expect(identityBtn).not.toBeNull();
+    fireEvent.click(identityBtn!);
+    expect(screen.getByRole("heading", { name: /identité de l'agent/i })).toBeInTheDocument();
+  });
+
+  it("P-14 — Annuler resets currentStep to 1 + clears completedSteps", () => {
+    renderWizard();
+    // Reach step 4 (LLM).
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    fireEvent.click(screen.getByRole("button", { name: /suivant/i }));
+    expect(screen.getByRole("heading", { name: /modèle llm/i })).toBeInTheDocument();
+    // Click Annuler → step 1.
+    fireEvent.click(screen.getByRole("button", { name: /annuler/i }));
+    expect(screen.getByRole("heading", { name: /identité de l'agent/i })).toBeInTheDocument();
+  });
 });

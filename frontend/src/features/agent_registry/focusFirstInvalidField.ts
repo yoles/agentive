@@ -10,15 +10,28 @@
 const FIELD_TO_INPUT_ID: Record<string, string> = {
   system_prompt: "tpl-system-prompt",
   llm_model: "tpl-llm-model",
-  llm_params: "tpl-temperature", // sub-field non distinct ici — temperature en premier
+  llm_params: "tpl-temperature", // fallback générique si loc[2] absent
   provider_chain: "tpl-provider-chain",
   input_contract: "tpl-input-contract",
   output_contract: "tpl-output-contract",
   error_policy: "tpl-on-timeout",
 };
 
-/** Extracts `errors[].loc[1]` from the RFC 7807 body and focuses the
- * matching input. Falls back on the system_prompt textarea if no match.
+// P-22 (CR 2026-05-10) — disambiguation pour les schemas nested (llm_params,
+// error_policy). Quand le backend renvoie `loc: ["body", "llm_params",
+// "max_tokens"]`, on focus l'input `tpl-max-tokens` au lieu de retomber
+// génériquement sur `tpl-temperature`.
+const SUBFIELD_TO_INPUT_ID: Record<string, string> = {
+  temperature: "tpl-temperature",
+  max_tokens: "tpl-max-tokens",
+  on_timeout: "tpl-on-timeout",
+  max_retries: "tpl-max-retries",
+  backoff_strategy: "tpl-backoff",
+};
+
+/** Extracts `errors[].loc[1]` (and `loc[2]` for nested schemas) from the
+ * RFC 7807 body and focuses the matching input. Falls back on the
+ * system_prompt textarea if no match.
  */
 export function focusFirstInvalidField(apiError: {
   errors?: Array<{ loc?: unknown }>;
@@ -27,8 +40,14 @@ export function focusFirstInvalidField(apiError: {
   for (const err of errors) {
     const loc = Array.isArray(err.loc) ? err.loc : [];
     const field = typeof loc[1] === "string" ? loc[1] : null;
-    if (field && FIELD_TO_INPUT_ID[field]) {
-      const el = document.getElementById(FIELD_TO_INPUT_ID[field]);
+    const subField = typeof loc[2] === "string" ? loc[2] : null;
+    // P-22 (CR 2026-05-10) — prefer subfield resolution for nested errors.
+    const inputId =
+      (subField && SUBFIELD_TO_INPUT_ID[subField]) ||
+      (field && FIELD_TO_INPUT_ID[field]) ||
+      null;
+    if (inputId) {
+      const el = document.getElementById(inputId);
       if (el instanceof HTMLElement) {
         el.focus();
         return;

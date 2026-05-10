@@ -87,7 +87,9 @@ describe("/config/agents/$templateId", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
-    localStorage.removeItem("agentive.agent-config-mode");
+    // P-11 (CR 2026-05-10) — chemin officiel Zustand, plus robust qu'un
+    // removeItem direct (invalide aussi le cache rehydrate-once interne).
+    useModeStore.persist.clearStorage();
   });
 
   it("hydrates the form from GET /agents/templates/{id}", async () => {

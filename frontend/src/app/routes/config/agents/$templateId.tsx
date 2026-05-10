@@ -61,6 +61,14 @@ export function AgentTemplateDetail() {
   // `react-hooks/set-state-in-effect`).
   const [hydratedFromId, setHydratedFromId] = useState<string | null>(null);
   const [formState, setFormState] = useState<FormState | null>(null);
+
+  // P-21 (CR 2026-05-10) — wrap setFormState pour matcher la prop
+  // `(updater: (prev: FormState) => FormState) => void` exposée par
+  // Wizard/Expert. Wizard/Expert ne mountent QUE quand `formState !== null`,
+  // donc le guard prev !== null est défensif (TS exhaustivity).
+  function applyFormStatePatch(updater: (prev: FormState) => FormState) {
+    setFormState((prev) => (prev === null ? null : updater(prev)));
+  }
   if (
     templateQuery.data &&
     (hydratedFromId !== templateQuery.data.template_id || formState === null)
@@ -181,7 +189,9 @@ export function AgentTemplateDetail() {
             {template.version}
           </p>
         </div>
-        <ConfigModeToggle />
+        {/* P-10 (CR 2026-05-10) — disabled pendant mutation pour bloquer le
+            switch mid-save (race : focus ciblerait un input inexistant). */}
+        <ConfigModeToggle disabled={updateMutation.isPending} />
       </header>
 
       {hasHydrated && mode === "wizard" && (
@@ -189,7 +199,7 @@ export function AgentTemplateDetail() {
           ref={wizardRef}
           template={template}
           formState={formState}
-          onFormStateChange={setFormState}
+          onFormStateChange={applyFormStatePatch}
           onSubmit={handleSubmit}
           isPending={updateMutation.isPending}
         />
@@ -198,7 +208,7 @@ export function AgentTemplateDetail() {
         <TemplateExpertForm
           template={template}
           formState={formState}
-          onFormStateChange={setFormState}
+          onFormStateChange={applyFormStatePatch}
           onSubmit={handleSubmit}
           isPending={updateMutation.isPending}
         />

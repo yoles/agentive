@@ -96,10 +96,12 @@ export function buildInitialForm(config: Record<string, unknown>): FormState {
   };
 }
 
-/** P-09/P-10 Story 2.2 — parse + validate each JSON field separately
- * with a field-specific error message. Validates SHAPE post-parse
- * (Array.isArray + every typeof === "string" for provider_chain ;
- * object with `core` for contracts).
+const ALLOWED_PROVIDERS = new Set<string>(["anthropic", "openai"]);
+
+/** P-09/P-10 Story 2.2 + P-09 Story 2.3 (CR 2026-05-10) — parse + validate
+ * each JSON field separately with a field-specific error message. Validates
+ * SHAPE post-parse AND value-domain (whitelist providers, dedup, length 1..4)
+ * pour mirroir Pydantic 1:1 et éviter le round-trip 422 backend.
  */
 export function parseProviderChain(raw: string): ProviderId[] | string {
   let parsed: unknown;
@@ -114,6 +116,16 @@ export function parseProviderChain(raw: string): ProviderId[] | string {
     !parsed.every((x): x is string => typeof x === "string")
   ) {
     return 'doit être un tableau JSON non vide de strings (ex : ["anthropic", "openai"])';
+  }
+  if (parsed.length > 4) {
+    return "max 4 providers dans la chaîne";
+  }
+  const unknown = parsed.find((p) => !ALLOWED_PROVIDERS.has(p));
+  if (unknown !== undefined) {
+    return `provider inconnu : "${unknown}" (autorisés : anthropic, openai)`;
+  }
+  if (new Set(parsed).size !== parsed.length) {
+    return "doublons interdits dans provider_chain";
   }
   return parsed as ProviderId[];
 }

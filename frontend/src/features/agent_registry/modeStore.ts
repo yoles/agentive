@@ -23,6 +23,8 @@ type ModeState = {
   setHasHydrated: (value: boolean) => void;
 };
 
+const VALID_MODES = new Set<ConfigMode>(["wizard", "expert"]);
+
 export const useModeStore = create<ModeState>()(
   persist(
     (set) => ({
@@ -34,7 +36,26 @@ export const useModeStore = create<ModeState>()(
     {
       name: "agentive.agent-config-mode",
       partialize: (state) => ({ mode: state.mode }),
-      onRehydrateStorage: () => (state) => {
+      // P-12 (CR 2026-05-10) — error branch + P-27 runtime guard sur la
+      // valeur hydratée. Si localStorage est corrompu (manipulation manuelle
+      // via DevTools, conflit cross-tab, etc.), on log et on retombe sur le
+      // default `wizard` plutôt que de propager une valeur invalide qui
+      // casserait le routing Wizard/Expert silencieusement.
+      onRehydrateStorage: () => (state, error) => {
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[useModeStore] hydration error — falling back to default 'wizard'",
+            error,
+          );
+        }
+        if (state && !VALID_MODES.has(state.mode)) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[useModeStore] invalid persisted mode '${state.mode}' — reset to 'wizard'`,
+          );
+          state.mode = "wizard";
+        }
         state?.setHasHydrated(true);
       },
     },

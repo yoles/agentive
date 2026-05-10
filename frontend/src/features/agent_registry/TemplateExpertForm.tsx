@@ -47,7 +47,14 @@ const LABEL_CLASS = "text-sm font-medium";
 type Props = {
   template: TemplateDetail;
   formState: FormState;
-  onFormStateChange: (next: FormState) => void;
+  /**
+   * P-21 (CR 2026-05-10) — functional updater pour éviter le race où deux
+   * `patch()` synchrones (autocomplete, IME composition, paste multi-champ)
+   * snapshot le `formState` du même render et le second écrase le premier.
+   * Pour un reset complet (Annuler), passer
+   * `(_prev) => buildInitialForm(template.config)`.
+   */
+  onFormStateChange: (updater: (prev: FormState) => FormState) => void;
   onSubmit: () => Promise<void>;
   isPending: boolean;
 };
@@ -60,11 +67,11 @@ export function TemplateExpertForm({
   isPending,
 }: Props) {
   function patch(partial: Partial<FormState>) {
-    onFormStateChange({ ...formState, ...partial });
+    onFormStateChange((prev) => ({ ...prev, ...partial }));
   }
 
   function handleCancel() {
-    onFormStateChange(buildInitialForm(template.config));
+    onFormStateChange(() => buildInitialForm(template.config));
   }
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
@@ -202,7 +209,13 @@ export function TemplateExpertForm({
                     step="0.1"
                     min={0}
                     max={2}
-                    value={formState.temperature}
+                    // P-20 (CR 2026-05-10) — empty display when state is NaN
+                    // pour éviter le mismatch UI ↔ state quand l'user clear.
+                    value={
+                      Number.isFinite(formState.temperature)
+                        ? formState.temperature
+                        : ""
+                    }
                     onChange={(e) => {
                       const v = e.target.valueAsNumber;
                       if (Number.isFinite(v)) patch({ temperature: v });
@@ -218,7 +231,11 @@ export function TemplateExpertForm({
                     type="number"
                     min={1}
                     max={200_000}
-                    value={formState.max_tokens}
+                    value={
+                      Number.isFinite(formState.max_tokens)
+                        ? formState.max_tokens
+                        : ""
+                    }
                     onChange={(e) => {
                       const v = e.target.valueAsNumber;
                       if (Number.isFinite(v)) patch({ max_tokens: v });
@@ -282,10 +299,17 @@ export function TemplateExpertForm({
                   type="number"
                   min={0}
                   max={10}
-                  value={formState.max_retries}
+                  step={1}
+                  value={
+                    Number.isFinite(formState.max_retries)
+                      ? formState.max_retries
+                      : ""
+                  }
                   onChange={(e) => {
                     const v = e.target.valueAsNumber;
-                    if (Number.isFinite(v)) patch({ max_retries: v });
+                    // P-28 (CR 2026-05-10) — reject non-int (type=number
+                    // accepts 0.5 ; Pydantic int validation rejects 422).
+                    if (Number.isInteger(v)) patch({ max_retries: v });
                   }}
                 />
               </div>
