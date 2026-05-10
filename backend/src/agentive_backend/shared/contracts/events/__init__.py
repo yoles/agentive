@@ -18,6 +18,8 @@ from __future__ import annotations
 from agentive_backend.shared.contracts.events.agent_events import (
     AgentInstanceCreatedEvent,
     AgentTemplateCreatedEvent,
+    AgentTemplateToolAssignedEvent,
+    AgentTemplateToolUnassignedEvent,
     AgentTemplateUpdatedEvent,
 )
 from agentive_backend.shared.contracts.events.health_events import HealthCheckEvent
@@ -25,12 +27,20 @@ from agentive_backend.shared.contracts.events.system_events import (
     SystemShutdownEvent,
     SystemStartedEvent,
 )
+from agentive_backend.shared.contracts.events.tool_events import (
+    ToolDiscoveredEvent,
+    ToolServerConnectedEvent,
+)
 
 __all__ = [
     "AgentInstanceCreatedEvent",
     "AgentTemplateCreatedEvent",
+    "AgentTemplateToolAssignedEvent",
+    "AgentTemplateToolUnassignedEvent",
     "AgentTemplateUpdatedEvent",
     "HealthCheckEvent",
     "SystemShutdownEvent",
     "SystemStartedEvent",
+    "ToolDiscoveredEvent",
+    "ToolServerConnectedEvent",
 ]

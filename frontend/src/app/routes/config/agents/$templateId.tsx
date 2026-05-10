@@ -19,6 +19,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
+import { AgentToolsPanel } from "@/features/tool_hub";
 import {
   buildInitialForm,
   buildPayload,
@@ -216,6 +217,10 @@ export function AgentTemplateDetail() {
       {!hasHydrated && (
         <p className="text-sm text-muted-foreground">Chargement de l'interface…</p>
       )}
+
+      {/* Story 2.5 décision #11 — outils MCP en panneau séparé sous le
+          formulaire (pas dans Wizard/Expert). */}
+      <AgentToolsPanel templateId={templateId} />
     </section>
   );
 }

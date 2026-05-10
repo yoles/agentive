@@ -208,8 +208,10 @@ def create_app() -> FastAPI:
 
     # ─── API versioned router — Story 2.1+ ────────────────────────────────
     from agentive_backend.features.m2_agent_registry import router as agents_router
+    from agentive_backend.features.m5_tool_hub import router as tools_router
 
     app.include_router(agents_router, prefix="/api/v1")
+    app.include_router(tools_router, prefix="/api/v1")
 
     return app
 

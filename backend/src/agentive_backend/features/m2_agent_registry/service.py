@@ -38,8 +38,10 @@ from uuid import UUID
 from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
 from agentive_backend.features.m2_agent_registry.schemas import (
     AgentInstanceDetailResponse,
+    AgentToolsResponse,
     ArchetypeDetail,
     ArchetypeSummary,
+    AssignedToolView,
     ContractSkeletonView,
     CreateTemplateResponse,
     InstantiateTemplateResponse,
@@ -50,6 +52,8 @@ from agentive_backend.features.m2_agent_registry.schemas import (
 from agentive_backend.shared.contracts.events import (
     AgentInstanceCreatedEvent,
     AgentTemplateCreatedEvent,
+    AgentTemplateToolAssignedEvent,
+    AgentTemplateToolUnassignedEvent,
     AgentTemplateUpdatedEvent,
 )
 from agentive_backend.shared.event_bus import emit_notify, publish
@@ -60,7 +64,9 @@ if TYPE_CHECKING:
     from agentive_backend.shared.repositories import (
         AgentInstanceRepo,
         AgentTemplateRepo,
+        AgentTemplateToolRepo,
         PromptRepo,
+        ToolRepo,
         WorkflowRunRepo,
     )
 
@@ -78,6 +84,8 @@ class AgentRegistryService:
         prompt_repo: PromptRepo,
         instance_repo: AgentInstanceRepo,
         workflow_run_repo: WorkflowRunRepo,
+        tool_repo: ToolRepo,
+        assignment_repo: AgentTemplateToolRepo,
     ) -> None:
         # P-16 (CR 2026-05-10) — invariant : pour que l'atomicité P-02
         # Story 2.1 (with_tenant + same session pour template SELECT +
@@ -91,6 +99,8 @@ class AgentRegistryService:
         self._prompt_repo = prompt_repo
         self._instance_repo = instance_repo
         self._workflow_run_repo = workflow_run_repo
+        self._tool_repo = tool_repo
+        self._assignment_repo = assignment_repo
 
     # ─── Archetypes ───────────────────────────────────────────────
 
@@ -584,6 +594,229 @@ class AgentRegistryService:
             )
             for instance in instances
         ]
+
+
+    # ─── Tool assignment (Story 2.5 — junction agent_template_tools) ──
+
+    async def replace_template_tools(
+        self,
+        template_id: UUID,
+        tool_ids: list[UUID],
+        *,
+        tenant_id: UUID | None = None,
+    ) -> AgentToolsResponse:
+        """REPLACE the list of tools assigned to a template — Story 2.5 AC2.
+
+        Atomic single-transaction (P-02 Story 2.1) :
+        1. Validate template exists.
+        2. Validate ALL tool_ids exist (404 if any single one missing — no
+           partial success, cf décision #8).
+        3. Compute (added, removed) diffs vs current assignments.
+        4. DELETE removed + INSERT added in junction.
+        5. Publish 1 event per added (tool_assigned) + 1 event per removed
+           (tool_unassigned) — all in the same transaction.
+        6. Return the current assignments list.
+
+        Raises
+        ------
+        NotFoundError
+            ``template_id`` does not exist, OR any ``tool_id`` does not exist.
+        """
+        async with self._template_repo.with_tenant(tenant_id) as session:
+            # 1. Validate template exists.
+            template = await self._template_repo.get_by_id_in_session(session, template_id)
+            if template is None:
+                raise NotFoundError(
+                    detail=f"Agent template '{template_id}' not found",
+                    context={"template_id": str(template_id)},
+                )
+
+            # 2. Validate ALL tools exist (decision #8 — strict 404, no partial).
+            tools_by_id: dict[UUID, Any] = {}
+            for tid in tool_ids:
+                tool = await self._tool_repo.get_by_id_in_session(session, tid)
+                if tool is None:
+                    raise NotFoundError(
+                        detail=f"Tool '{tid}' not found",
+                        context={"tool_id": str(tid)},
+                    )
+                tools_by_id[tool.id] = tool
+
+            # 3 + 4. Compute diff + DML inside the same session.
+            added, removed = await self._assignment_repo.replace_in_session(
+                session,
+                template_id=template_id,
+                new_tool_ids=tool_ids,
+                actor="system",
+                tenant_id=tenant_id,
+            )
+
+            # 5. Publish events (1 per added, 1 per removed).
+            event_ids: list[UUID] = []
+            # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
+            for tid in added:
+                tool = tools_by_id[tid]
+                event = AgentTemplateToolAssignedEvent(
+                    template_id=template_id,
+                    tool_id=tid,
+                    tool_name=tool.name,
+                    actor="system",
+                    tenant_id=tenant_id,
+                )
+                eid = await publish(
+                    AgentTemplateToolAssignedEvent.event_type, event, session=session
+                )
+                event_ids.append(eid)
+            # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
+            for tid in removed:
+                event_unassign = AgentTemplateToolUnassignedEvent(
+                    template_id=template_id,
+                    tool_id=tid,
+                    actor="system",
+                    tenant_id=tenant_id,
+                )
+                eid = await publish(
+                    AgentTemplateToolUnassignedEvent.event_type,
+                    event_unassign,
+                    session=session,
+                )
+                event_ids.append(eid)
+
+            # 6. Re-fetch current assignments to return (after the DML).
+            assigned_tools = await self._assignment_repo.list_by_template_in_session(
+                session, template_id
+            )
+            # commit at __aexit__.
+
+        # Post-commit best-effort NOTIFY (1 per event).
+        for eid in event_ids:
+            try:
+                await emit_notify(eid, "m2.agent_template.tool_assigned_or_unassigned")
+            except Exception:
+                _log.warning(
+                    "event_bus_notify_failed_will_be_polled",
+                    event_id=str(eid),
+                )
+
+        _log.info(
+            "agent_template_tools_replaced",
+            template_id=str(template_id),
+            added_count=len(added),
+            removed_count=len(removed),
+            actor="system",
+            tenant_id=None,
+        )
+
+        return AgentToolsResponse(
+            template_id=template_id,
+            assigned_tools=[
+                AssignedToolView(
+                    tool_id=tool.id,
+                    name=tool.name,
+                    description=tool.description,
+                    server_id=tool.server_id,
+                )
+                for tool in assigned_tools
+            ],
+        )
+
+    async def list_template_tools(
+        self,
+        template_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> AgentToolsResponse:
+        """List the tools currently assigned to a template — Story 2.5 AC4.
+
+        Raises
+        ------
+        NotFoundError
+            ``template_id`` does not exist.
+        """
+        async with self._template_repo.with_tenant(tenant_id) as session:
+            template = await self._template_repo.get_by_id_in_session(session, template_id)
+            if template is None:
+                raise NotFoundError(
+                    detail=f"Agent template '{template_id}' not found",
+                    context={"template_id": str(template_id)},
+                )
+            assigned_tools = await self._assignment_repo.list_by_template_in_session(
+                session, template_id
+            )
+
+        return AgentToolsResponse(
+            template_id=template_id,
+            assigned_tools=[
+                AssignedToolView(
+                    tool_id=tool.id,
+                    name=tool.name,
+                    description=tool.description,
+                    server_id=tool.server_id,
+                )
+                for tool in assigned_tools
+            ],
+        )
+
+    async def unassign_tool(
+        self,
+        template_id: UUID,
+        tool_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> None:
+        """Remove a single tool from a template's assignments — Story 2.5 AC3.
+
+        Strict idempotency : if the assignment does NOT exist, raises 404
+        (re-DELETE returns 404, not 204 — décision #10).
+
+        Raises
+        ------
+        NotFoundError
+            The assignment ``(template_id, tool_id)`` does not exist.
+        """
+        async with self._assignment_repo.with_tenant(tenant_id) as session:
+            deleted = await self._assignment_repo.unassign_in_session(
+                session, template_id=template_id, tool_id=tool_id
+            )
+            if not deleted:
+                raise NotFoundError(
+                    detail=(
+                        f"Assignment (template={template_id}, tool={tool_id}) not found"
+                    ),
+                    context={
+                        "template_id": str(template_id),
+                        "tool_id": str(tool_id),
+                    },
+                )
+
+            event = AgentTemplateToolUnassignedEvent(
+                template_id=template_id,
+                tool_id=tool_id,
+                actor="system",
+                tenant_id=tenant_id,
+            )
+            # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
+            event_id = await publish(
+                AgentTemplateToolUnassignedEvent.event_type, event, session=session
+            )
+            # commit at __aexit__.
+
+        try:
+            await emit_notify(event_id, AgentTemplateToolUnassignedEvent.event_type)
+        except Exception:
+            _log.warning(
+                "event_bus_notify_failed_will_be_polled",
+                event_id=str(event_id),
+                event_type=AgentTemplateToolUnassignedEvent.event_type,
+            )
+
+        _log.info(
+            "agent_template_tool_unassigned",
+            template_id=str(template_id),
+            tool_id=str(tool_id),
+            actor="system",
+            tenant_id=None,
+        )
 
 
 __all__ = ["AgentRegistryService"]

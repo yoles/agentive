@@ -35,6 +35,11 @@ from agentive_backend.shared.repositories.memory_chunk_repo import MemoryChunkRe
 from agentive_backend.shared.repositories.namespace_repo import NamespaceRepo
 from agentive_backend.shared.repositories.outbox_repo import OutboxRepo
 from agentive_backend.shared.repositories.prompt_repo import PromptRepo
+from agentive_backend.shared.repositories.tool_hub_repo import (
+    AgentTemplateToolRepo,
+    ToolRepo,
+    ToolServerRepo,
+)
 from agentive_backend.shared.repositories.user_repo import UserRepo
 from agentive_backend.shared.repositories.workflow_repo import (
     WorkflowRepo,
@@ -44,6 +49,7 @@ from agentive_backend.shared.repositories.workflow_repo import (
 __all__ = [
     "AgentInstanceRepo",
     "AgentTemplateRepo",
+    "AgentTemplateToolRepo",
     "AuditEventRepo",
     "BaseRepo",
     "ChunkEmbeddingRepo",
@@ -52,6 +58,8 @@ __all__ = [
     "NamespaceRepo",
     "OutboxRepo",
     "PromptRepo",
+    "ToolRepo",
+    "ToolServerRepo",
     "UserRepo",
     "WorkflowRepo",
     "WorkflowRunRepo",

@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMiddleware
 from agentive_backend.features.m2_agent_registry import load_registry
 from agentive_backend.features.m2_agent_registry import router as agents_router
+from agentive_backend.features.m5_tool_hub import router as tools_router
 from agentive_backend.shared.correlation import get_correlation_id
 from agentive_backend.shared.exceptions import AgentiveError
 
@@ -71,6 +72,9 @@ def make_e2e_app(
     app.add_middleware(AuthTokenMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
     app.include_router(agents_router, prefix="/api/v1")
+    # Story 2.5 — m5 tool_hub router included as well so e2e tests can
+    # cross-feature exercise tool registration → tool assignment → list.
+    app.include_router(tools_router, prefix="/api/v1")
 
     @app.exception_handler(AgentiveError)
     async def _handle_agentive_error(  # pragma: no cover — verbatim of app.main handler

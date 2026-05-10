@@ -23,9 +23,11 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     TIMESTAMP,
     Boolean,
+    CheckConstraint,
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -327,3 +329,124 @@ class AuditEvent(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), primary_key=True, nullable=False
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.5 — Tool Hub MCP (registry + assignment, runtime exec defer 2.6)
+# Migration : 20260510_000000_tool_hub_tables.py
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class ToolServer(Base):
+    """A registered MCP server (stdio or sse). 1 row per `POST /tools/servers`.
+
+    The ``connection_config`` JSONB shape depends on ``transport`` :
+    - stdio : ``{"command": str, "args": list[str], "env"?: dict}``
+    - sse   : ``{"url": str, "headers"?: dict[str, str]}``
+
+    Sprint 1 stores ``connection_config`` in clear (single-user dev). Story
+    9.2 will add Fernet encryption for credentials (D54).
+    """
+
+    __tablename__ = "tool_servers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    transport: Mapped[str] = mapped_column(Text, nullable=False)  # 'stdio' | 'sse'
+    connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    discovered_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    __table_args__ = (
+        # UNIQUE constraint with NULLS NOT DISTINCT is created via raw SQL in
+        # the Alembic migration (SQLAlchemy DSL doesn't expose the keyword).
+        # Declaring it here as a regular UniqueConstraint would diverge from
+        # the actual DB shape ; we list it as a docstring instead.
+        CheckConstraint(
+            "transport IN ('stdio', 'sse')",
+            name="ck_tool_server_transport",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'inactive')",
+            name="ck_tool_server_status",
+        ),
+    )
+
+
+class Tool(Base):
+    """A discovered tool exposed by a ToolServer. 1 row per tool from MCP
+    `list_tools()`. UNIQUE (server_id, name) so a server cannot expose 2
+    tools with the same name (re-discovery would 409).
+
+    ``input_schema`` is the JSON Schema (typically draft-07) returned by the
+    MCP server's tool definition. Sprint 1 stores it as-is (no Pydantic
+    validation — the MCP server is the authority on its tools' schemas).
+    """
+
+    __tablename__ = "tools"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tool_servers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    input_schema: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    output_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    __table_args__ = (UniqueConstraint("server_id", "name", name="uq_tool_per_server"),)
+
+
+class AgentTemplateTool(Base):
+    """Junction (PK composite) between agent_templates and tools.
+
+    Both FKs are ``ON DELETE CASCADE`` — removing a template OR a tool
+    cleans the assignment automatically. ``assigned_by_actor`` defaults to
+    ``"system"`` Sprint 1 (D1 defer Story 9.1 — auth context resolution).
+    """
+
+    __tablename__ = "agent_template_tools"
+
+    agent_template_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_templates.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tool_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tools.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    assigned_by_actor: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="system"
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_template_id",
+            "tool_id",
+            name="pk_agent_template_tools",
+        ),
+    )

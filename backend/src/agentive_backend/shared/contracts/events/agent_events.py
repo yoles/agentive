@@ -93,8 +93,44 @@ class AgentInstanceCreatedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
+class AgentTemplateToolAssignedEvent(BaseModel):
+    """Published when a tool is newly assigned to an agent_template (Story 2.5 AC2).
+
+    Emitted by ``AgentRegistryService.replace_template_tools`` for each
+    tool in the diff ``added`` set. Same audit-bypass pattern (TODO Story
+    9.1 cleanup).
+    """
+
+    event_type: ClassVar[str] = "m2.agent_template.tool_assigned"
+
+    template_id: UUID
+    tool_id: UUID
+    tool_name: str = Field(min_length=1)
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+class AgentTemplateToolUnassignedEvent(BaseModel):
+    """Published when a tool is removed from an agent_template (Story 2.5 AC2 + AC3).
+
+    Emitted (a) by ``AgentRegistryService.replace_template_tools`` for each
+    tool in the diff ``removed`` set, OR (b) by
+    ``AgentRegistryService.unassign_tool`` for the granular DELETE
+    endpoint.
+    """
+
+    event_type: ClassVar[str] = "m2.agent_template.tool_unassigned"
+
+    template_id: UUID
+    tool_id: UUID
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
 __all__ = [
     "AgentInstanceCreatedEvent",
     "AgentTemplateCreatedEvent",
+    "AgentTemplateToolAssignedEvent",
+    "AgentTemplateToolUnassignedEvent",
     "AgentTemplateUpdatedEvent",
 ]

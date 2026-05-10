@@ -36,6 +36,21 @@ export function ConfigPage() {
           </Button>
         </div>
       </div>
+
+      <div className="rounded-lg border border-border bg-card p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">Outils MCP</h2>
+            <p className="text-sm text-muted-foreground">
+              Serveurs MCP enregistrés et outils découverts. Assignation aux agents.{" "}
+              <span className="font-mono text-xs">[Story 2.5]</span>
+            </p>
+          </div>
+          <Button asChild variant="outline">
+            <Link to="/config/tools">Gérer</Link>
+          </Button>
+        </div>
+      </div>
     </section>
   );
 }
