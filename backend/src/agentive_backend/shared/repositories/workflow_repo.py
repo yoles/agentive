@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentive_backend.infra.db.models import Workflow, WorkflowRun
 from agentive_backend.shared.repositories.base import BaseRepo
@@ -62,6 +63,21 @@ class WorkflowRunRepo(BaseRepo):
     async def get_by_id(self, run_id: UUID, *, tenant_id: UUID | None = None) -> WorkflowRun | None:
         async with self.with_tenant(tenant_id) as session:
             return await session.get(WorkflowRun, run_id)
+
+    async def get_by_id_in_session(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> WorkflowRun | None:
+        """SELECT by id inside the caller's transaction (Story 2.4).
+
+        Used by ``AgentRegistryService.instantiate_from_template`` to
+        validate the optional ``workflow_run_id`` FK *inside* the same
+        transaction as the instance INSERT — without this method, a
+        race could let an attacker delete the workflow_run between
+        validation and INSERT.
+        """
+        return await session.get(WorkflowRun, run_id)
 
     async def list_by_workflow(
         self,

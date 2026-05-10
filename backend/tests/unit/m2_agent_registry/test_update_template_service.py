@@ -79,10 +79,17 @@ def _make_service(
     prompt_repo = AsyncMock()
     prompt_repo.create_in_session = AsyncMock()
 
+    # Story 2.4 — service constructor expanded ; these aren't exercised by
+    # update_template, so plain AsyncMocks are sufficient.
+    instance_repo = AsyncMock()
+    workflow_run_repo = AsyncMock()
+
     service = AgentRegistryService(
         registry={},  # not used in update_template paths
         template_repo=template_repo,
         prompt_repo=prompt_repo,
+        instance_repo=instance_repo,
+        workflow_run_repo=workflow_run_repo,
     )
     return service, template_repo, prompt_repo, session_mock
 

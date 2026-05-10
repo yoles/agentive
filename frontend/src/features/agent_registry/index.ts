@@ -35,9 +35,14 @@ export {
   useArchetypeDetail,
   useArchetypes,
   useCreateTemplate,
+  useInstance,
+  useInstancesByRun,
+  useInstantiateTemplate,
   useTemplate,
   useUpdateTemplate,
 } from "./hooks";
+// Story 2.4 — instance API surface (no UI consumer Sprint 1, ready for Story 8.x).
+export { getInstance, instantiateTemplate, listInstancesByRun } from "./api";
 // Story 2.3 — extracted helpers + form constants shared between Wizard and Expert.
 export {
   BACKOFF_OPTIONS,
@@ -54,12 +59,15 @@ export {
 } from "./templateForm";
 export type { BuildPayloadResult, FormState } from "./templateForm";
 export type {
+  AgentInstance,
   ArchetypeDetail,
   ArchetypeSummary,
   ContractDefinition,
   CreateTemplateRequest,
   CreateTemplateResponse,
   ErrorPolicy,
+  InstantiateTemplateRequest,
+  InstantiateTemplateResponse,
   LLMModel,
   LLMParams,
   ProviderId,

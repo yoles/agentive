@@ -36,15 +36,18 @@ from uuid import UUID
 
 from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
 from agentive_backend.features.m2_agent_registry.schemas import (
+    AgentInstanceDetailResponse,
     ArchetypeDetail,
     ArchetypeSummary,
     ContractSkeletonView,
     CreateTemplateResponse,
+    InstantiateTemplateResponse,
     TemplateDetailResponse,
     UpdateTemplateRequest,
     UpdateTemplateResponse,
 )
 from agentive_backend.shared.contracts.events import (
+    AgentInstanceCreatedEvent,
     AgentTemplateCreatedEvent,
     AgentTemplateUpdatedEvent,
 )
@@ -53,13 +56,18 @@ from agentive_backend.shared.exceptions import NotFoundError, ValidationError
 from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
-    from agentive_backend.shared.repositories import AgentTemplateRepo, PromptRepo
+    from agentive_backend.shared.repositories import (
+        AgentInstanceRepo,
+        AgentTemplateRepo,
+        PromptRepo,
+        WorkflowRunRepo,
+    )
 
 _log = get_logger(__name__)
 
 
 class AgentRegistryService:
-    """Orchestrate archetype lookup + template creation/update."""
+    """Orchestrate archetype lookup + template creation/update + instance lifecycle (Story 2.4)."""
 
     def __init__(
         self,
@@ -67,10 +75,14 @@ class AgentRegistryService:
         registry: Mapping[str, ArchetypeDefinition],
         template_repo: AgentTemplateRepo,
         prompt_repo: PromptRepo,
+        instance_repo: AgentInstanceRepo,
+        workflow_run_repo: WorkflowRunRepo,
     ) -> None:
         self._registry = registry
         self._template_repo = template_repo
         self._prompt_repo = prompt_repo
+        self._instance_repo = instance_repo
+        self._workflow_run_repo = workflow_run_repo
 
     # ─── Archetypes ───────────────────────────────────────────────
 
@@ -368,6 +380,187 @@ class AgentRegistryService:
             config=updated.config,
             updated_at=updated_at,
         )
+
+    # ─── Agent instances (Story 2.4 — distinction template vs instance) ─
+
+    async def instantiate_from_template(
+        self,
+        *,
+        template_id: UUID,
+        workflow_run_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+    ) -> InstantiateTemplateResponse:
+        """Create a new ``agent_instances`` row with a frozen snapshot of the
+        template config — Story 2.4 AC1 + AC2.
+
+        Atomicity (Story 2.1 P-02 pattern) — fetch template + (optional
+        validate workflow_run) + INSERT instance + outbox publish all share
+        a single transaction. ``with_tenant`` commits at ``__aexit__`` ;
+        any exception triggers a rollback so a partial state is impossible.
+
+        The snapshot shape is canonical Sprint 1 (cf Story 2.4 §"Décisions
+        intégrées" #11) :
+
+            {
+                "template_id": "<uuid str>",
+                "template_version": <int>,
+                "name": "<str>",
+                "archetype": "<str>",
+                "config": <full template.config dict copy>,
+            }
+
+        Modifying the template AFTER this call does NOT propagate to the
+        instance — the snapshot is immutable by design (FR12).
+
+        Raises:
+            NotFoundError: ``template_id`` does not exist, OR
+                ``workflow_run_id`` was provided and does not exist.
+        """
+        event_type = AgentInstanceCreatedEvent.event_type
+
+        async with self._instance_repo.with_tenant(tenant_id) as session:
+            # 1. SELECT template — must exist (404 sinon).
+            template = await self._template_repo.get_by_id_in_session(session, template_id)
+            if template is None:
+                raise NotFoundError(
+                    detail=f"Agent template '{template_id}' not found",
+                    context={"template_id": str(template_id)},
+                )
+
+            # 2. Validate workflow_run FK if provided (404 sinon — strict).
+            if workflow_run_id is not None:
+                run = await self._workflow_run_repo.get_by_id_in_session(
+                    session, workflow_run_id
+                )
+                if run is None:
+                    raise NotFoundError(
+                        detail=f"Workflow run '{workflow_run_id}' not found",
+                        context={"workflow_run_id": str(workflow_run_id)},
+                    )
+
+            # 3. Build the immutable snapshot — copy config dict to dodge
+            #    any mutable-default surprise (the SQLAlchemy JSONB column
+            #    returns a fresh dict per fetch, but defensive copy keeps
+            #    the contract obvious in code review).
+            snapshot: dict[str, Any] = {
+                "template_id": str(template.id),
+                "template_version": template.version,
+                "name": template.name,
+                "archetype": template.archetype,
+                "config": dict(template.config or {}),
+            }
+
+            # 4. INSERT instance.
+            instance = await self._instance_repo.create_in_session(
+                session,
+                template_id=template.id,
+                template_version=template.version,
+                snapshot=snapshot,
+                workflow_run_id=workflow_run_id,
+                tenant_id=tenant_id,
+            )
+
+            # 5. Publish audit event in the SAME transaction (P-02 atomicity).
+            event = AgentInstanceCreatedEvent(
+                instance_id=instance.id,
+                template_id=template.id,
+                template_version=template.version,
+                workflow_run_id=workflow_run_id,
+                actor="system",  # D1 defer Story 9.1 — auth context resolution.
+                tenant_id=tenant_id,
+            )
+            # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
+            event_id = await publish(event_type, event, session=session)
+            # commit happens at __aexit__ if no exception.
+
+        # ─── Post-commit: best-effort NOTIFY (Story 1.4 outbox pattern).
+        try:
+            await emit_notify(event_id, event_type)
+        except Exception:
+            _log.warning(
+                "event_bus_notify_failed_will_be_polled",
+                event_id=str(event_id),
+                event_type=event_type,
+            )
+
+        _log.info(
+            "agent_instance_created",
+            instance_id=str(instance.id),
+            template_id=str(template.id),
+            template_version=template.version,
+            workflow_run_id=str(workflow_run_id) if workflow_run_id else None,
+        )
+
+        return InstantiateTemplateResponse(
+            instance_id=instance.id,
+            template_id=instance.template_id,
+            template_version=instance.template_version,
+            workflow_run_id=instance.workflow_run_id,
+            snapshot=instance.snapshot,
+            created_at=instance.created_at,
+        )
+
+    async def get_instance_by_id(
+        self,
+        instance_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> AgentInstanceDetailResponse:
+        """Read one instance — Story 2.4 AC4.
+
+        Raises:
+            NotFoundError: ``instance_id`` does not exist (or is filtered
+                out by RLS for the bound tenant).
+        """
+        instance = await self._instance_repo.get_by_id(instance_id, tenant_id=tenant_id)
+        if instance is None:
+            raise NotFoundError(
+                detail=f"Agent instance '{instance_id}' not found",
+                context={"instance_id": str(instance_id)},
+            )
+        return AgentInstanceDetailResponse(
+            instance_id=instance.id,
+            template_id=instance.template_id,
+            template_version=instance.template_version,
+            workflow_run_id=instance.workflow_run_id,
+            snapshot=instance.snapshot,
+            created_at=instance.created_at,
+        )
+
+    async def list_instances_by_workflow_run(
+        self,
+        workflow_run_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> list[AgentInstanceDetailResponse]:
+        """List instances rattachées à un workflow_run — Story 2.4 AC3.
+
+        Strict 404 if the workflow_run itself does not exist (not an empty
+        list — cf Story 2.4 §"Décisions intégrées" #7). 200 + ``[]`` when
+        the run exists but has no instances.
+        """
+        async with self._instance_repo.with_tenant(tenant_id) as session:
+            run = await self._workflow_run_repo.get_by_id_in_session(session, workflow_run_id)
+            if run is None:
+                raise NotFoundError(
+                    detail=f"Workflow run '{workflow_run_id}' not found",
+                    context={"workflow_run_id": str(workflow_run_id)},
+                )
+            instances = await self._instance_repo.list_by_workflow_run_in_session(
+                session, workflow_run_id
+            )
+
+        return [
+            AgentInstanceDetailResponse(
+                instance_id=instance.id,
+                template_id=instance.template_id,
+                template_version=instance.template_version,
+                workflow_run_id=instance.workflow_run_id,
+                snapshot=instance.snapshot,
+                created_at=instance.created_at,
+            )
+            for instance in instances
+        ]
 
 
 __all__ = ["AgentRegistryService"]

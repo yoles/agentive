@@ -6,10 +6,13 @@
 
 import { apiFetch } from "@/shared/api/client";
 import type {
+  AgentInstance,
   ArchetypeDetail,
   ArchetypeSummary,
   CreateTemplateRequest,
   CreateTemplateResponse,
+  InstantiateTemplateRequest,
+  InstantiateTemplateResponse,
   TemplateDetail,
   UpdateTemplateRequest,
   UpdateTemplateResponse,
@@ -51,5 +54,35 @@ export async function updateTemplate(
       method: "PUT",
       body: JSON.stringify(body),
     },
+  );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Story 2.4 — Agent instance endpoints
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** POST /api/v1/agents/templates/{id}/instances — 201 Created (Story 2.4). */
+export async function instantiateTemplate(
+  templateId: string,
+  body: InstantiateTemplateRequest = {},
+): Promise<InstantiateTemplateResponse> {
+  return apiFetch<InstantiateTemplateResponse>(
+    `/api/v1/agents/templates/${encodeURIComponent(templateId)}/instances`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** GET /api/v1/agents/instances/{id} — Story 2.4 detail. */
+export async function getInstance(instanceId: string): Promise<AgentInstance> {
+  return apiFetch<AgentInstance>(`/api/v1/agents/instances/${encodeURIComponent(instanceId)}`);
+}
+
+/** GET /api/v1/workflows/runs/{run_id}/instances — Story 2.4. */
+export async function listInstancesByRun(runId: string): Promise<AgentInstance[]> {
+  return apiFetch<AgentInstance[]>(
+    `/api/v1/workflows/runs/${encodeURIComponent(runId)}/instances`,
   );
 }
