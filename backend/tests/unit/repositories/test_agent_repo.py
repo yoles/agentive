@@ -109,6 +109,11 @@ async def test_agent_instance_create_in_session_adds_and_flushes() -> None:
     session.add.assert_called_once()
     session.flush.assert_awaited_once()
     session.refresh.assert_awaited_once()
+    # P-14 (CR 2026-05-10) — verrouille le contrat "caller owns commit"
+    # (pas de commit dans create_in_session). Un futur sneaky commit
+    # cassera ce test (et l'atomicité Story 2.1 P-02 partout).
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
     instance = session.add.call_args.args[0]
     assert instance.template_id == template_id
     assert instance.template_version == 2
@@ -136,4 +141,9 @@ async def test_agent_instance_list_by_workflow_run_executes_select_with_order() 
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "agent_instances" in sql_text
     assert "workflow_run_id" in sql_text
-    assert "order by" in sql_text and "created_at" in sql_text
+    # P-13 (CR 2026-05-10) — verrouille la direction ASC explicite (sinon un
+    # swap `desc()` futur ne casserait pas le test).
+    assert "order by" in sql_text and "asc" in sql_text and "created_at" in sql_text
+    # P-19 (CR 2026-05-10) — secondary sort sur id pour déterminisme tests
+    # (cas Story 4.x where 2 INSERT batchés dans même tx auraient created_at identique).
+    assert "agent_instances.id" in sql_text

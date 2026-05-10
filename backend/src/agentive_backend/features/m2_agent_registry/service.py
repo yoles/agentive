@@ -29,6 +29,7 @@ migrated to ``AuditEventRepo.record()`` in Story 9.1).
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -78,6 +79,13 @@ class AgentRegistryService:
         instance_repo: AgentInstanceRepo,
         workflow_run_repo: WorkflowRunRepo,
     ) -> None:
+        # P-16 (CR 2026-05-10) — invariant : pour que l'atomicité P-02
+        # Story 2.1 (with_tenant + same session pour template SELECT +
+        # instance INSERT + outbox publish) tienne, les 4 repos DOIVENT
+        # partager la même session_factory. L'assertion vit dans
+        # `_build_service` (router.py) qui produit le wiring production ;
+        # ici le constructeur accepte des repos hétérogènes pour préserver
+        # la testabilité (les unit tests mockent chaque repo séparément).
         self._registry = registry
         self._template_repo = template_repo
         self._prompt_repo = prompt_repo
@@ -438,16 +446,20 @@ class AgentRegistryService:
                         context={"workflow_run_id": str(workflow_run_id)},
                     )
 
-            # 3. Build the immutable snapshot — copy config dict to dodge
-            #    any mutable-default surprise (the SQLAlchemy JSONB column
-            #    returns a fresh dict per fetch, but defensive copy keeps
-            #    the contract obvious in code review).
+            # 3. Build the immutable snapshot. P-15 (CR 2026-05-10) — deep
+            #    copy via `copy.deepcopy` (was shallow `dict(...)`) car
+            #    `template.config` contient des nested dicts (`llm_params`,
+            #    `error_policy`, `input_contract`, `provider_chain` list)
+            #    qui restaient partagés par référence sous shallow. Sprint 1
+            #    SQLAlchemy JSONB renvoie un fresh dict à chaque fetch donc
+            #    OK en pratique ; deep copy = defense-in-depth contre des
+            #    futurs paths qui réutiliseraient l'objet en session.
             snapshot: dict[str, Any] = {
                 "template_id": str(template.id),
                 "template_version": template.version,
                 "name": template.name,
                 "archetype": template.archetype,
-                "config": dict(template.config or {}),
+                "config": copy.deepcopy(template.config or {}),
             }
 
             # 4. INSERT instance.
@@ -502,7 +514,12 @@ class AgentRegistryService:
             template_id=instance.template_id,
             template_version=instance.template_version,
             workflow_run_id=instance.workflow_run_id,
-            snapshot=instance.snapshot,
+            # P-17 (CR 2026-05-10) — output symmetric copy : cohérence avec
+            # le defensive copy en entrée (snapshot construit via deepcopy).
+            # Évite tout aliasing de l'objet ORM `instance.snapshot` post-
+            # session-close (paranoïa : middleware response peut techniquement
+            # muter l'objet).
+            snapshot=dict(instance.snapshot),
             created_at=instance.created_at,
         )
 
@@ -529,7 +546,7 @@ class AgentRegistryService:
             template_id=instance.template_id,
             template_version=instance.template_version,
             workflow_run_id=instance.workflow_run_id,
-            snapshot=instance.snapshot,
+            snapshot=dict(instance.snapshot),  # P-17 — output defensive copy.
             created_at=instance.created_at,
         )
 
@@ -562,7 +579,7 @@ class AgentRegistryService:
                 template_id=instance.template_id,
                 template_version=instance.template_version,
                 workflow_run_id=instance.workflow_run_id,
-                snapshot=instance.snapshot,
+                snapshot=dict(instance.snapshot),  # P-17 — output defensive copy.
                 created_at=instance.created_at,
             )
             for instance in instances
