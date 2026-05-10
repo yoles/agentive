@@ -17,7 +17,7 @@
  */
 
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   buildInitialForm,
@@ -30,6 +30,7 @@ import {
   useModeStore,
   useTemplate,
   useUpdateTemplate,
+  type WizardHandle,
 } from "@/features/agent_registry";
 import type { ApiError } from "@/shared/api/client";
 
@@ -48,6 +49,11 @@ export function AgentTemplateDetail() {
 
   const mode = useModeStore((s) => s.mode);
   const hasHydrated = useModeStore((s) => s.hasHydrated);
+
+  // P-05/P-06 (CR 2026-05-10) — imperative handle to navigate the Wizard
+  // (back-to-step on save error, reset on success). Null when mode=expert
+  // (Wizard is unmounted) — guard with optional chaining at call sites.
+  const wizardRef = useRef<WizardHandle>(null);
 
   // FormState shared between Wizard and Expert — switching modes preserves
   // edits (AC4). "Derived state during render" pattern (Story 2.2 P-14)
@@ -112,29 +118,51 @@ export function AgentTemplateDetail() {
         output_contract: "Output contract",
       };
       toast.error(`${fieldLabel[result.field]} : ${result.message}`);
+      // P-05 (CR 2026-05-10) — navigate the Wizard to the failing field
+      // BEFORE focusing, otherwise the input is not in the DOM (Wizard
+      // shows one step at a time). Defer focus to next frame so the
+      // navigation has rendered.
+      if (mode === "wizard") {
+        wizardRef.current?.goToStepForField(result.field);
+      }
       const inputId = {
         provider_chain: "tpl-provider-chain",
         input_contract: "tpl-input-contract",
         output_contract: "tpl-output-contract",
       }[result.field];
-      const el = document.getElementById(inputId);
-      if (el instanceof HTMLTextAreaElement) {
-        el.focus();
-      }
+      requestAnimationFrame(() => {
+        const el = document.getElementById(inputId);
+        if (el instanceof HTMLElement) el.focus();
+      });
       return;
     }
 
     try {
       const response = await updateMutation.mutateAsync(result.payload);
       toast.success(`Template mis à jour (v${response.version})`);
+      // P-06 (CR 2026-05-10) — reset FormState from the response config
+      // (server is authoritative — the new prompt version, version bump,
+      // etc.) and reset the Wizard to step 1 with no completed steps.
+      setFormState(buildInitialForm(response.config));
+      wizardRef.current?.reset();
     } catch (err) {
-      const apiError = err as Partial<ApiError> & { errors?: Array<{ loc?: unknown }> };
+      const apiError = err as Partial<ApiError> & {
+        errors?: Array<{ loc?: unknown }>;
+      };
       const message =
         apiError.detail ??
         apiError.title ??
         "Mise à jour impossible — vérifiez les valeurs saisies.";
       toast.error(message);
-      focusFirstInvalidField(apiError);
+      // P-05 (CR 2026-05-10) — navigate to the offending field's step BEFORE
+      // focusFirstInvalidField, so the focus target exists in the DOM.
+      if (mode === "wizard") {
+        const firstError = apiError.errors?.[0];
+        const loc = Array.isArray(firstError?.loc) ? firstError.loc : [];
+        const firstField = typeof loc[1] === "string" ? loc[1] : null;
+        if (firstField) wizardRef.current?.goToStepForField(firstField);
+      }
+      requestAnimationFrame(() => focusFirstInvalidField(apiError));
     }
   }
 
@@ -158,6 +186,7 @@ export function AgentTemplateDetail() {
 
       {hasHydrated && mode === "wizard" && (
         <TemplateWizardForm
+          ref={wizardRef}
           template={template}
           formState={formState}
           onFormStateChange={setFormState}

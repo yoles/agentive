@@ -115,6 +115,7 @@ export function TemplateExpertForm({
               </label>
               <Textarea
                 id="tpl-system-prompt"
+                data-testid="expert-tpl-system-prompt"
                 rows={12}
                 value={formState.system_prompt}
                 onChange={(e) => patch({ system_prompt: e.target.value })}
