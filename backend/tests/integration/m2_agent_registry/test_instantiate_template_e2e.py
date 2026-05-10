@@ -21,79 +21,12 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMiddleware
-from agentive_backend.features.m2_agent_registry import load_registry
-from agentive_backend.features.m2_agent_registry import router as agents_router
-from agentive_backend.shared.correlation import get_correlation_id
-from agentive_backend.shared.exceptions import AgentiveError
-
-
-def _make_app(
-    *,
-    session_factory: async_sessionmaker[AsyncSession],
-    token: str = "integration-test-token",
-) -> FastAPI:
-    app = FastAPI()
-    app.state.auth_token_hash = token
-    app.state.session_factory = session_factory
-    app.state.archetype_registry = load_registry()
-
-    app.add_middleware(AuthTokenMiddleware)
-    app.add_middleware(CorrelationIdMiddleware)
-    app.include_router(agents_router, prefix="/api/v1")
-
-    @app.exception_handler(AgentiveError)
-    async def _handle_agentive_error(  # pragma: no cover
-        _request: Request, exc: AgentiveError
-    ) -> JSONResponse:
-        body: dict[str, Any] = {
-            "type": exc.type,
-            "title": exc.title,
-            "status": exc.status,
-            "correlation_id": get_correlation_id(),
-        }
-        if exc.detail:
-            body["detail"] = exc.detail
-        if exc.context:
-            reserved = {"type", "title", "status", "correlation_id", "detail"}
-            for k, v in exc.context.items():
-                if k not in reserved:
-                    body[k] = v
-        return JSONResponse(
-            status_code=exc.status, content=body, media_type="application/problem+json"
-        )
-
-    @app.exception_handler(RequestValidationError)
-    async def _handle_req_validation(  # pragma: no cover
-        _request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        sanitized_errors = [
-            {k: v for k, v in err.items() if k not in {"input", "ctx"}} for err in exc.errors()
-        ]
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "type": "/errors/validation",
-                "title": "Validation failed",
-                "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "correlation_id": get_correlation_id(),
-                "detail": "Request body validation failed",
-                "errors": sanitized_errors,
-            },
-            media_type="application/problem+json",
-        )
-
-    return app
-
-
-def _auth_headers() -> dict[str, str]:
-    return {"Authorization": "Bearer integration-test-token"}
+# P-09 (CR 2026-05-10) — _make_app + _auth_headers factor dans conftest.py partagé.
+from .conftest import e2e_auth_headers as _auth_headers
+from .conftest import make_e2e_app as _make_app
 
 
 async def _create_template(
@@ -187,8 +120,19 @@ async def test_instantiate_template_happy_path_creates_instance_with_snapshot(
 @pytest.mark.integration
 async def test_instantiate_template_isolation_v2_v3_no_hot_swap(
     app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """AC2 — modifier le template entre 2 instantiations ne touche pas la première."""
+    """AC2 — modifier le template entre 2 instantiations ne touche pas la première.
+
+    P-06 + P-11 (CR 2026-05-10) — Renforce le test :
+    * P-11 : asserte explicitement que le PUT bump bien la version à 2 AVANT
+      de POSTer i2 (failsafe contre une régression archetype qui pré-remplirait
+      `config.system_prompt`, ce qui ferait `bump_version=False` et casserait
+      l'assertion `i2.template_version == 2` pour la mauvaise raison).
+    * P-06 : asserte que 2 events `m2.agent_instance.created` sont publiés
+      dans `outbox_events` (1 par instance créée). Sans cette assertion, une
+      régression qui skip l'event pour la 2nde instance passerait silencieusement.
+    """
     app = _make_app(session_factory=app_session_factory)
     transport = httpx.ASGITransport(app=app)
 
@@ -205,7 +149,17 @@ async def test_instantiate_template_isolation_v2_v3_no_hot_swap(
         assert i1["template_version"] == 1
 
         # Bump template (Story 2.2 PUT → version 2 because system_prompt set).
-        await _put_template(client, template_id, system_prompt="v2 prompt")
+        # P-11 — failsafe assertion : verrouille que le PUT a bien bumpé la
+        # version à 2. Si l'archetype change pour pré-remplir system_prompt
+        # à "v2 prompt" (improbable mais non-vérifié), bump_version=False et
+        # template.version reste à 1 — l'assertion ci-dessous catch cette
+        # régression frontalement.
+        put_resp = await _put_template(client, template_id, system_prompt="v2 prompt")
+        assert put_resp["version"] == 2, (
+            f"PUT did not bump version to 2 (got {put_resp['version']}). "
+            "Likely cause : archetype now pre-fills config.system_prompt with "
+            "the same value, making system_prompt_changed=False. Test rest is invalid."
+        )
 
         # Second instance (template version 2 now).
         i2_resp = await client.post(
@@ -225,6 +179,21 @@ async def test_instantiate_template_isolation_v2_v3_no_hot_swap(
         i1_again = i1_get.json()
         assert i1_again["template_version"] == 1
         assert "system_prompt" not in i1_again["snapshot"]["config"]
+
+        # P-06 — assert 2 outbox events (1 per instance).
+        async with seed_session_factory() as session:
+            count = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm2.agent_instance.created' "
+                    "AND payload->>'template_id' = :tid"
+                ),
+                {"tid": template_id},
+            )
+            assert int(count.scalar_one()) == 2, (
+                "AC1+AC2 violation : expected 2 audit events (1 per instance), "
+                "got fewer. The 2nd instance may have skipped the event."
+            )
 
 
 @pytest.mark.integration
@@ -323,6 +292,19 @@ async def test_instantiate_template_404_when_template_missing(
                 {"tid": str(nonexistent)},
             )
             assert int(count.scalar_one()) == 0
+
+            # P-07 (CR 2026-05-10) — assert 0 outbox event published. Without
+            # this, a regression that publishes a "instance_create_failed" or
+            # similar defensive event for the 404 path would pass silently.
+            event_count = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm2.agent_instance.created' "
+                    "AND payload->>'template_id' = :tid"
+                ),
+                {"tid": str(nonexistent)},
+            )
+            assert int(event_count.scalar_one()) == 0
 
 
 @pytest.mark.integration

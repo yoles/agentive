@@ -107,32 +107,54 @@ export function useUpdateTemplate(id: string) {
 
 /** `useInstantiateTemplate` — Story 2.4 POST mutation.
  *
- * Invalidates the per-template instances queryKey so the consumer
- * (Story 8.x trace explorer) re-fetches fresh data after a new run starts.
+ * Invalidates BOTH (a) the per-template instances queryKey AND (b) the
+ * per-workflow-run instances queryKey when the response carries a
+ * workflow_run_id. P-04 (CR 2026-05-10) — without (b), the Story 8.x trace
+ * explorer fetched via `useInstancesByRun` saw a stale cache after a new
+ * instance was created in the run.
  */
 export function useInstantiateTemplate(templateId: string) {
   const queryClient = useQueryClient();
   return useMutation<InstantiateTemplateResponse, unknown, InstantiateTemplateRequest>({
     mutationFn: (body) => instantiateTemplate(templateId, body ?? {}),
-    onSuccess: () => {
+    onSuccess: (response) => {
       void queryClient.invalidateQueries({
         queryKey: ["agent-template", templateId, "instances"],
       });
+      if (response.workflow_run_id != null) {
+        void queryClient.invalidateQueries({
+          queryKey: ["workflow-run", response.workflow_run_id, "instances"],
+        });
+      }
     },
   });
 }
 
-/** `useInstance` — Story 2.4 detail fetch. */
+/** `useInstance` — Story 2.4 detail fetch.
+ *
+ * P-04 (CR 2026-05-10) — `staleTime: Infinity` car le snapshot est
+ * immutable par design (FR12, AC2). Pas de PUT/PATCH JAMAIS sur
+ * `/agents/instances/{id}` (anti-scope spec). Refresh = invalidation
+ * manuelle uniquement (ex : after `useInstantiateTemplate` succès).
+ */
 export function useInstance(instanceId: string | null | undefined) {
   return useQuery<AgentInstance>({
     queryKey: ["agent-instance", instanceId],
     queryFn: () => getInstance(instanceId as string),
     enabled: instanceId != null && instanceId !== "" && UUID_RE.test(instanceId),
-    staleTime: 30_000,
+    staleTime: Number.POSITIVE_INFINITY,
   });
 }
 
-/** `useInstancesByRun` — Story 2.4 list fetch (per workflow_run). */
+/** `useInstancesByRun` — Story 2.4 list fetch (per workflow_run).
+ *
+ * `staleTime: 30_000` (pas Infinity) car la LISTE peut s'allonger pendant
+ * la durée de vie d'un run (workflow_engine Story 4.x ajoutera des
+ * instances au fur et à mesure). L'invalidation explicite via
+ * `useInstantiateTemplate.onSuccess` couvre les ajouts qu'on initie nous-
+ * mêmes ; le staleTime court couvre les ajouts initiés par d'autres
+ * onglets / le worker.
+ */
 export function useInstancesByRun(runId: string | null | undefined) {
   return useQuery<AgentInstance[]>({
     queryKey: ["workflow-run", runId, "instances"],
