@@ -1,6 +1,6 @@
 # Story 2.3 : Mode wizard guidé vs mode expert direct
 
-Status: Review
+Status: Done
 
 > 📝 **Code Review Amendments — 2026-05-10** (post `bmad-code-review` adversarial 3 layers, John tranche 4 bad-spec) :
 >
