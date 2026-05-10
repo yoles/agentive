@@ -298,10 +298,61 @@ class InstantiateTemplateResponse(AgentInstanceDetailResponse):
     """
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.5 — Tool assignment to agent_templates (junction table)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class ReplaceAgentToolsRequest(BaseModel):
+    """Body of ``POST /api/v1/agents/templates/{template_id}/tools`` (Story 2.5 AC2).
+
+    REPLACE semantics : the ``tool_ids`` list REPLACES the current
+    assignments for this template. Tools previously assigned but not
+    listed here are unassigned. Tools not previously assigned but listed
+    here are assigned. Both diffs happen atomically (single-tx).
+
+    Defensive ``max_length=100`` — Sprint 1 we don't expect more than a
+    handful of tools per template ; a 100-cap rejects pathological payloads
+    early. Empty list is valid (clear all assignments).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_ids: list[UUID] = Field(default_factory=list, max_length=100)
+
+
+class AssignedToolView(BaseModel):
+    """A single tool currently assigned to a template, with its server
+    metadata for UX grouping."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tool_id: UUID
+    name: str
+    description: str
+    server_id: UUID
+
+
+class AgentToolsResponse(BaseModel):
+    """Response for ``POST /api/v1/agents/templates/{id}/tools`` (200 OK)
+    and ``GET /api/v1/agents/templates/{id}/tools`` (Story 2.5 AC2 + AC4).
+
+    The ``assigned_tools`` list is flat ; the frontend groups by
+    ``server_id`` for the UX (UX-DR §"Tool grouping").
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    template_id: UUID
+    assigned_tools: list[AssignedToolView]
+
+
 __all__ = [
     "AgentInstanceDetailResponse",
+    "AgentToolsResponse",
     "ArchetypeDetail",
     "ArchetypeSummary",
+    "AssignedToolView",
     "ContractDefinition",
     "ContractSkeletonView",
     "CreateTemplateRequest",
@@ -312,6 +363,7 @@ __all__ = [
     "LLMModel",
     "LLMParams",
     "ProviderId",
+    "ReplaceAgentToolsRequest",
     "TemplateDetailResponse",
     "UpdateTemplateRequest",
     "UpdateTemplateResponse",

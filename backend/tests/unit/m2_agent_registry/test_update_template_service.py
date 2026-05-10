@@ -79,10 +79,12 @@ def _make_service(
     prompt_repo = AsyncMock()
     prompt_repo.create_in_session = AsyncMock()
 
-    # Story 2.4 — service constructor expanded ; these aren't exercised by
-    # update_template, so plain AsyncMocks are sufficient.
+    # Story 2.4 + 2.5 — service constructor expanded ; these aren't exercised
+    # by update_template, so plain AsyncMocks are sufficient.
     instance_repo = AsyncMock()
     workflow_run_repo = AsyncMock()
+    tool_repo = AsyncMock()
+    assignment_repo = AsyncMock()
 
     service = AgentRegistryService(
         registry={},  # not used in update_template paths
@@ -90,6 +92,8 @@ def _make_service(
         prompt_repo=prompt_repo,
         instance_repo=instance_repo,
         workflow_run_repo=workflow_run_repo,
+        tool_repo=tool_repo,
+        assignment_repo=assignment_repo,
     )
     return service, template_repo, prompt_repo, session_mock
 

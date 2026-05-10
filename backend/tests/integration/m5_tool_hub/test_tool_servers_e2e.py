@@ -1,0 +1,267 @@
+"""End-to-end integration tests — Tool Hub server CRUD (Story 2.5 T10.3 / AC8).
+
+Couvre :
+* AC1 — POST stdio happy path : 201 + body shape complet + 1+N outbox events.
+* AC1 — POST 503 on MCP discovery timeout.
+* POST 422 on invalid transport.
+* POST 409 on duplicate name.
+* GET /tools/servers list (200 + tools_count).
+* GET /tools/servers/{id} detail (200 + tools array).
+* GET 404 detail on inexistent.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from uuid import uuid4
+
+import httpx
+import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from agentive_backend.infra.mcp.client import MCPDiscoveryTimeoutError, ToolInfo
+
+from .conftest import e2e_auth_headers as _auth_headers
+from .conftest import make_e2e_app as _make_app
+
+
+def _stdio_config() -> dict[str, Any]:
+    """The connection_config that points to our local mock MCP server."""
+    return {"command": "python", "args": ["-m", "tests.fixtures.mcp_mock_server"]}
+
+
+@pytest.mark.integration
+async def test_create_tool_server_stdio_happy_path(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1 — POST stdio with mock subprocess returns 2 tools (echo + add).
+
+    Discovers via the real MCP SDK against the bundled mock server fixture
+    (no Node.js dependency in CI).
+    """
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "ac1-stdio",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["name"] == "ac1-stdio"
+        assert body["transport"] == "stdio"
+        assert body["status"] == "active"
+        assert "server_id" in body and len(body["server_id"]) == 36
+        assert "discovered_at" in body
+        # Mock server exposes 2 tools : echo + add.
+        tools = body["tools"]
+        assert len(tools) == 2
+        names = sorted(t["name"] for t in tools)
+        assert names == ["add", "echo"]
+        for tool in tools:
+            assert "tool_id" in tool
+            assert "input_schema" in tool
+
+        # DB rows : 1 server + 2 tools.
+        async with seed_session_factory() as session:
+            srv_row = await session.execute(
+                text("SELECT name, transport, status FROM tool_servers WHERE id = :sid"),
+                {"sid": body["server_id"]},
+            )
+            assert srv_row.one() == ("ac1-stdio", "stdio", "active")
+            tools_count = await session.execute(
+                text("SELECT COUNT(*) FROM tools WHERE server_id = :sid"),
+                {"sid": body["server_id"]},
+            )
+            assert int(tools_count.scalar_one()) == 2
+
+        # Outbox : 1 server.connected + 2 tool.discovered = 3 events.
+        async with seed_session_factory() as session:
+            connected = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm5.tool_server.connected' "
+                    "AND payload->>'server_id' = :sid"
+                ),
+                {"sid": body["server_id"]},
+            )
+            assert int(connected.scalar_one()) == 1
+            discovered = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm5.tool.discovered' "
+                    "AND payload->>'server_id' = :sid"
+                ),
+                {"sid": body["server_id"]},
+            )
+            assert int(discovered.scalar_one()) == 2
+
+
+@pytest.mark.integration
+async def test_create_tool_server_invalid_transport_returns_422(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "bad-transport",
+                "transport": "http",  # not in the Literal whitelist
+                "connection_config": {},
+            },
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert body["type"] == "/errors/validation"
+
+
+@pytest.mark.integration
+async def test_create_tool_server_duplicate_name_returns_409(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Décision #6 Story 2.5 — re-POST same name → 409 ConflictError."""
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "dup-name",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        assert first.status_code == 201, first.text
+
+        second = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "dup-name",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        assert second.status_code == 409
+        body = second.json()
+        assert "already registered" in body.get("detail", "").lower()
+
+
+@pytest.mark.integration
+async def test_create_tool_server_discovery_timeout_returns_503(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1 — discovery timeout → 503 DependencyError + 0 row created."""
+    import agentive_backend.features.m5_tool_hub.service as svc_module
+
+    async def _timeout(**_kwargs: Any) -> list[ToolInfo]:
+        raise MCPDiscoveryTimeoutError(timeout=10.0)
+
+    monkeypatch.setattr(svc_module, "discover_tools", _timeout)
+
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "timeout-srv",
+                "transport": "stdio",
+                "connection_config": {"command": "x"},
+            },
+        )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert "timeout" in body.get("detail", "").lower()
+
+        # No row INSERTed.
+        async with seed_session_factory() as session:
+            count = await session.execute(
+                text("SELECT COUNT(*) FROM tool_servers WHERE name = :n"),
+                {"n": "timeout-srv"},
+            )
+            assert int(count.scalar_one()) == 0
+
+
+@pytest.mark.integration
+async def test_list_tool_servers_returns_count(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Seed 1 server.
+        await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "list-test",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+
+        resp = await client.get("/api/v1/tools/servers", headers=_auth_headers())
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert isinstance(body, list)
+        # At least 1 server (others may exist from parallel tests — filter by name).
+        targets = [s for s in body if s["name"] == "list-test"]
+        assert len(targets) == 1
+        assert targets[0]["tools_count"] == 2  # mock server has 2 tools
+
+
+@pytest.mark.integration
+async def test_get_tool_server_detail_happy(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        post = await client.post(
+            "/api/v1/tools/servers",
+            headers=_auth_headers(),
+            json={
+                "name": "detail-test",
+                "transport": "stdio",
+                "connection_config": _stdio_config(),
+            },
+        )
+        server_id = post.json()["server_id"]
+
+        get = await client.get(
+            f"/api/v1/tools/servers/{server_id}", headers=_auth_headers()
+        )
+        assert get.status_code == 200, get.text
+        body = get.json()
+        assert body["server_id"] == server_id
+        assert len(body["tools"]) == 2
+
+
+@pytest.mark.integration
+async def test_get_tool_server_detail_not_found_returns_404(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            f"/api/v1/tools/servers/{uuid4()}", headers=_auth_headers()
+        )
+        assert resp.status_code == 404
+        body = resp.json()
+        assert "not found" in body.get("detail", "").lower()

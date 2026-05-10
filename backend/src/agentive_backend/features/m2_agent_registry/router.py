@@ -24,12 +24,14 @@ from fastapi import APIRouter, Request, status
 from agentive_backend.features.m2_agent_registry.archetypes import ArchetypeDefinition
 from agentive_backend.features.m2_agent_registry.schemas import (
     AgentInstanceDetailResponse,
+    AgentToolsResponse,
     ArchetypeDetail,
     ArchetypeSummary,
     CreateTemplateRequest,
     CreateTemplateResponse,
     InstantiateTemplateRequest,
     InstantiateTemplateResponse,
+    ReplaceAgentToolsRequest,
     TemplateDetailResponse,
     UpdateTemplateRequest,
     UpdateTemplateResponse,
@@ -39,7 +41,9 @@ from agentive_backend.shared.exceptions import DependencyError
 from agentive_backend.shared.repositories import (
     AgentInstanceRepo,
     AgentTemplateRepo,
+    AgentTemplateToolRepo,
     PromptRepo,
+    ToolRepo,
     WorkflowRunRepo,
 )
 
@@ -85,11 +89,17 @@ def _build_service(request: Request) -> AgentRegistryService:
     prompt_repo = PromptRepo(session_factory=session_factory)
     instance_repo = AgentInstanceRepo(session_factory=session_factory)
     workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
+    tool_repo = ToolRepo(session_factory=session_factory)
+    assignment_repo = AgentTemplateToolRepo(session_factory=session_factory)
+    # P-16 Story 2.4 CR — atomicity invariant : the 6 repos must share the
+    # same session_factory so service-level transactions stay consistent.
     assert (
         template_repo._session_factory  # noqa: SLF001
         is prompt_repo._session_factory  # noqa: SLF001
         is instance_repo._session_factory  # noqa: SLF001
         is workflow_run_repo._session_factory  # noqa: SLF001
+        is tool_repo._session_factory  # noqa: SLF001
+        is assignment_repo._session_factory  # noqa: SLF001
     ), (
         "AgentRegistryService wiring violation : repos must share session_factory "
         "for atomicity P-02 (Story 2.1)."
@@ -100,6 +110,8 @@ def _build_service(request: Request) -> AgentRegistryService:
         prompt_repo=prompt_repo,
         instance_repo=instance_repo,
         workflow_run_repo=workflow_run_repo,
+        tool_repo=tool_repo,
+        assignment_repo=assignment_repo,
     )
 
 
@@ -280,6 +292,80 @@ async def list_instances_by_run(
     """
     service = _build_service(request)
     return await service.list_instances_by_workflow_run(run_id, tenant_id=None)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Tool assignment endpoints (Story 2.5 — junction agent_template_tools)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@router.post(
+    "/agents/templates/{template_id}/tools",
+    response_model=AgentToolsResponse,
+    summary="REPLACE the tools assigned to an agent-template (Story 2.5)",
+)
+async def replace_template_tools(
+    request: Request,
+    template_id: UUID,
+    body: ReplaceAgentToolsRequest,
+) -> AgentToolsResponse:
+    """200 on success.
+
+    REPLACE semantics : the body's ``tool_ids`` list REPLACES the current
+    assignments. Tools previously assigned but absent from the new list
+    are unassigned ; tools added are assigned. All atomic single-tx.
+
+    Errors :
+    * 404 — template_id not found OR any tool_id in the list not found
+      (no partial success — décision #8 Story 2.5).
+    * 422 — Pydantic body validation OR template_id not a UUID.
+    """
+    service = _build_service(request)
+    return await service.replace_template_tools(
+        template_id, body.tool_ids, tenant_id=None
+    )
+
+
+@router.get(
+    "/agents/templates/{template_id}/tools",
+    response_model=AgentToolsResponse,
+    summary="List the tools currently assigned to an agent-template (Story 2.5)",
+)
+async def list_template_tools(
+    request: Request,
+    template_id: UUID,
+) -> AgentToolsResponse:
+    """200 on success — empty ``assigned_tools`` list if no tool assigned.
+
+    Errors :
+    * 404 — template_id not found.
+    * 422 — template_id not a UUID.
+    """
+    service = _build_service(request)
+    return await service.list_template_tools(template_id, tenant_id=None)
+
+
+@router.delete(
+    "/agents/templates/{template_id}/tools/{tool_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Unassign a single tool from an agent-template (Story 2.5)",
+)
+async def delete_template_tool(
+    request: Request,
+    template_id: UUID,
+    tool_id: UUID,
+) -> None:
+    """204 on success.
+
+    Strict idempotency : re-DELETE returns 404 (not 204) — décision #10
+    Story 2.5.
+
+    Errors :
+    * 404 — assignment ``(template_id, tool_id)`` does not exist.
+    * 422 — template_id or tool_id not a UUID.
+    """
+    service = _build_service(request)
+    await service.unassign_tool(template_id, tool_id, tenant_id=None)
 
 
 __all__ = ["router"]

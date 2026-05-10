@@ -86,6 +86,9 @@ def _make_service(
     workflow_run_repo.get_by_id_in_session = AsyncMock(return_value=workflow_run)
 
     prompt_repo = AsyncMock()
+    # Story 2.5 — added kwargs ; not exercised by instantiate paths.
+    tool_repo = AsyncMock()
+    assignment_repo = AsyncMock()
 
     service = AgentRegistryService(
         registry={},  # not used in instantiate paths
@@ -93,6 +96,8 @@ def _make_service(
         prompt_repo=prompt_repo,
         instance_repo=instance_repo,
         workflow_run_repo=workflow_run_repo,
+        tool_repo=tool_repo,
+        assignment_repo=assignment_repo,
     )
     return service, instance_repo, template_repo, workflow_run_repo
 
