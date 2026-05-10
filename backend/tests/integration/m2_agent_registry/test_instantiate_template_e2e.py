@@ -360,3 +360,80 @@ async def test_instantiate_template_invalid_uuid_returns_422(
             json={},
         )
         assert resp.status_code == 422
+
+
+@pytest.mark.integration
+async def test_instantiate_template_atomicity_publish_failure_rolls_back_insert(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5 (P-01 CR 2026-05-10) — atomicité E2E réelle.
+
+    Monkeypatch ``service.publish`` pour qu'il throw UNIQUEMENT pour
+    ``m2.agent_instance.created`` (le ``_create_template`` setup utilise
+    aussi ``service.publish`` pour ``m2.agent_template.created``, on ne
+    peut pas le casser globalement). Attend une 5xx côté HTTP, puis assert
+    que ``SELECT count(*) FROM agent_instances WHERE template_id = :tid``
+    reste à 0 (rollback complet). Le test unit dans
+    ``test_instantiate_template_service.py`` couvre la propagation de
+    l'erreur via mocks ; ce test verrouille l'invariant DB rollback côté
+    Postgres réel (testcontainer), qui ne peut pas être validé via mocks.
+    """
+    import agentive_backend.features.m2_agent_registry.service as svc_module
+
+    real_publish = svc_module.publish
+
+    async def _selective_explode(event_type: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        if event_type == "m2.agent_instance.created":
+            raise RuntimeError("simulated bus failure")
+        return await real_publish(event_type, *args, **kwargs)
+
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Setup : create the template BEFORE installing the failing publish ;
+        # `_create_template` exercises `service.publish` for
+        # `m2.agent_template.created` which must succeed so the template row
+        # exists and the atomicity test has a real target.
+        template_id = await _create_template(client, name="ac5-atomicity")
+
+        # NOW patch publish — only the instance-create event will fail.
+        monkeypatch.setattr(svc_module, "publish", _selective_explode)
+
+        # The POST must fail. Note : `_make_app` does not register a generic
+        # `Exception` handler (production `app.main` does, returning 500), so
+        # under `ASGITransport` the unhandled `RuntimeError` propagates back
+        # through the httpx client. We catch it here — the important
+        # invariant for AC5 is the DB rollback assertion below, not the
+        # specific HTTP status code.
+        with pytest.raises(RuntimeError, match="simulated bus failure"):
+            await client.post(
+                f"/api/v1/agents/templates/{template_id}/instances",
+                headers=_auth_headers(),
+                json={},
+            )
+
+        # Critical AC5 assertion : the INSERT was rolled back ; 0 instance row.
+        async with seed_session_factory() as session:
+            count = await session.execute(
+                text("SELECT COUNT(*) FROM agent_instances WHERE template_id = :tid"),
+                {"tid": template_id},
+            )
+            assert int(count.scalar_one()) == 0, (
+                "AC5 violation : agent_instances has rows for the template even though "
+                "publish() failed — the transaction did not rollback."
+            )
+
+        # And no outbox event was committed either (the publish was the failing step).
+        async with seed_session_factory() as session:
+            event_count = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm2.agent_instance.created' "
+                    "AND payload->>'template_id' = :tid"
+                ),
+                {"tid": template_id},
+            )
+            assert int(event_count.scalar_one()) == 0

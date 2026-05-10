@@ -16,7 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { useInstantiateTemplate, useUpdateTemplate } from "./hooks";
+import { useInstance, useInstantiateTemplate, useUpdateTemplate } from "./hooks";
+import { getInstance } from "./api";
 
 const TEMPLATE_ID = "11111111-2222-3333-4444-555555555555";
 
@@ -155,29 +156,66 @@ describe("useInstantiateTemplate (Story 2.4 T8.5)", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({});
   });
 
-  it("forwards the optional workflow_run_id in the body", async () => {
-    const RUN_ID = "33333333-3333-3333-3333-333333333333";
+  it("getInstance(instanceId) GETs /api/v1/agents/instances/{id} (P-03 CR — AC7 spec test 2)", async () => {
+    const INSTANCE_ID = "44444444-4444-4444-4444-444444444444";
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
-        instance_id: "44444444-4444-4444-4444-444444444444",
+        instance_id: INSTANCE_ID,
         template_id: TEMPLATE_ID,
         template_version: 2,
-        workflow_run_id: RUN_ID,
+        workflow_run_id: null,
+        snapshot: {
+          template_id: TEMPLATE_ID,
+          template_version: 2,
+          name: "x",
+          archetype: "producteur",
+          config: {},
+        },
+        created_at: new Date().toISOString(),
+      }),
+    );
+
+    const result = await getInstance(INSTANCE_ID);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(`/api/v1/agents/instances/${INSTANCE_ID}`);
+    // GET = no method override (default), or "GET". Either way no body.
+    expect((init as RequestInit | undefined)?.method ?? "GET").toBe("GET");
+    expect((init as RequestInit | undefined)?.body).toBeUndefined();
+    expect(result.instance_id).toBe(INSTANCE_ID);
+    expect(result.template_version).toBe(2);
+  });
+
+  it("useInstance gates fetch on a valid UUID (P-03 CR — guard against malformed param)", async () => {
+    const { wrapper } = makeWrapper();
+    // Render with non-UUID — `enabled` should be false, no fetch fired.
+    renderHook(() => useInstance("not-a-uuid"), { wrapper });
+    // Render with empty string — same.
+    renderHook(() => useInstance(""), { wrapper });
+    // Render with null — same.
+    renderHook(() => useInstance(null), { wrapper });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Now render with a valid UUID — fetch fires.
+    const VALID_ID = "55555555-5555-5555-5555-555555555555";
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        instance_id: VALID_ID,
+        template_id: TEMPLATE_ID,
+        template_version: 1,
+        workflow_run_id: null,
         snapshot: {},
         created_at: new Date().toISOString(),
       }),
     );
-    const { wrapper } = makeWrapper();
-    const { result } = renderHook(() => useInstantiateTemplate(TEMPLATE_ID), { wrapper });
-
-    await act(async () => {
-      await result.current.mutateAsync({ workflow_run_id: RUN_ID });
+    const { result } = renderHook(() => useInstance(VALID_ID), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
     });
-
-    const [, init] = fetchMock.mock.calls[0];
-    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-      workflow_run_id: RUN_ID,
-    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(`/api/v1/agents/instances/${VALID_ID}`);
   });
 
   it("invalidates ['agent-template', templateId, 'instances'] on success", async () => {

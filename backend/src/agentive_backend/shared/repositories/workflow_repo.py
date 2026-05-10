@@ -72,10 +72,22 @@ class WorkflowRunRepo(BaseRepo):
         """SELECT by id inside the caller's transaction (Story 2.4).
 
         Used by ``AgentRegistryService.instantiate_from_template`` to
-        validate the optional ``workflow_run_id`` FK *inside* the same
-        transaction as the instance INSERT — without this method, a
-        race could let an attacker delete the workflow_run between
-        validation and INSERT.
+        validate the optional ``workflow_run_id`` FK before the instance
+        INSERT.
+
+        Note (P-02 CR 2026-05-10) — This validation is NOT race-free under
+        concurrent DELETE. ``session.get()`` does not pose a SHARE lock
+        under the default ``READ COMMITTED`` isolation, so a concurrent
+        transaction can DELETE the workflow_run between this SELECT and
+        the instance INSERT. The actual safety net is the FK constraint
+        ``agent_instances.workflow_run_id REFERENCES workflow_runs(id)
+        ON DELETE SET NULL`` (Story 1.5) : if the run vanishes mid-flight
+        the INSERT either succeeds (if the DELETE has not commit yet —
+        we read the old snapshot) or the FK CASCADE applies SET NULL
+        post-commit. To close the window entirely, switch to
+        ``with_for_update(read=True)`` (deferred to Story 4.x when the
+        workflow_engine becomes the owner of the run lifecycle and the
+        contention pattern is known — D42).
         """
         return await session.get(WorkflowRun, run_id)
 
