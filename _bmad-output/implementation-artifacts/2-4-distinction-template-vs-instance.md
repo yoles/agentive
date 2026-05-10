@@ -1,6 +1,6 @@
 # Story 2.4 : Distinction agent-template vs agent-instance
 
-Status: review
+Status: done
 
 > 🎯 **Quatrième story Epic 2 — Agent Platform.** Cette story livre la **distinction sémantique formelle** entre :
 >

@@ -89,6 +89,13 @@ async def test_instantiate_template_happy_path_creates_instance_with_snapshot(
         assert snapshot["archetype"] == "producteur"
         assert "config" in snapshot
         assert "prompt_base" in snapshot["config"]
+        # P-18 (CR 2026-05-10) — created_at présent + format ISO 8601 timezone-aware
+        # (Pydantic v2 + FastAPI sérialise automatiquement, mais le test verrouille
+        # contre une régression future qui passerait la valeur en naive datetime).
+        assert "created_at" in body
+        assert body["created_at"].endswith("Z") or "+" in body["created_at"], (
+            f"created_at should be timezone-aware ISO 8601, got {body['created_at']!r}"
+        )
 
         # DB row exists.
         async with seed_session_factory() as session:

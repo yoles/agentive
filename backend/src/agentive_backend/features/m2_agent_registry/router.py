@@ -75,10 +75,25 @@ def _build_service(request: Request) -> AgentRegistryService:
             },
         )
 
+    # P-16 (CR 2026-05-10) — atomicité P-02 Story 2.1 exige que les 4 repos
+    # partagent la même session_factory (sinon `service.publish(session=…)`
+    # et `repo.create_in_session(session, …)` opéreraient sur des pools
+    # différents, cassant silencieusement l'invariant "même transaction").
+    # En production tous viennent de `app.state.session_factory` — le passage
+    # explicite ci-dessous + l'assertion défensive verrouillent l'invariant.
     template_repo = AgentTemplateRepo(session_factory=session_factory)
     prompt_repo = PromptRepo(session_factory=session_factory)
     instance_repo = AgentInstanceRepo(session_factory=session_factory)
     workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
+    assert (
+        template_repo._session_factory  # noqa: SLF001
+        is prompt_repo._session_factory  # noqa: SLF001
+        is instance_repo._session_factory  # noqa: SLF001
+        is workflow_run_repo._session_factory  # noqa: SLF001
+    ), (
+        "AgentRegistryService wiring violation : repos must share session_factory "
+        "for atomicity P-02 (Story 2.1)."
+    )
     return AgentRegistryService(
         registry=registry,
         template_repo=template_repo,
