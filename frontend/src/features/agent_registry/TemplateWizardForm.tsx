@@ -63,7 +63,14 @@ const STEPS: ReadonlyArray<{ id: number; label: string }> = [
 type Props = {
   template: TemplateDetail;
   formState: FormState;
-  onFormStateChange: (next: FormState) => void;
+  /**
+   * P-21 (CR 2026-05-10) — functional updater pour éviter le race où deux
+   * `patch()` synchrones (autocomplete, IME composition, paste multi-champ)
+   * snapshot le `formState` du même render et le second écrase le premier.
+   * Pour un reset complet (Annuler / post-PUT succès), passer
+   * `(_prev) => buildInitialForm(template.config)`.
+   */
+  onFormStateChange: (updater: (prev: FormState) => FormState) => void;
   onSubmit: () => Promise<void>;
   isPending: boolean;
 };
@@ -156,7 +163,7 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
   );
 
   function patch(partial: Partial<FormState>) {
-    onFormStateChange({ ...formState, ...partial });
+    onFormStateChange((prev) => ({ ...prev, ...partial }));
   }
 
   function validateStep(step: number): StepError {
@@ -236,7 +243,7 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
   }
 
   function handleCancel() {
-    onFormStateChange(buildInitialForm(template.config));
+    onFormStateChange(() => buildInitialForm(template.config));
     setCurrentStep(1);
     setCompletedSteps(new Set());
     setStepError(null);
@@ -257,8 +264,19 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
         return;
       }
     }
+    // P-23 (CR 2026-05-10) — clear stepError BEFORE calling onSubmit so the
+    // banner does not linger after a failed-then-fixed save. If onSubmit
+    // throws, the parent host handles the error toast + focus ; we just
+    // re-surface a generic banner so the user knows something went wrong
+    // even if the toast is dismissed.
     setStepError(null);
-    await onSubmit();
+    try {
+      await onSubmit();
+    } catch {
+      setStepError({
+        message: "La sauvegarde a échoué — voir la notification d'erreur.",
+      });
+    }
   }
 
   return (
@@ -276,6 +294,7 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
             template={template}
             value={formState.system_prompt}
             onChange={(v) => patch({ system_prompt: v })}
+            error={stepError?.field === "system_prompt" ? stepError.message : null}
           />
         )}
         {currentStep === 3 && (
@@ -284,18 +303,29 @@ export const TemplateWizardForm = forwardRef<WizardHandle, Props>(function Templ
             outputRaw={formState.output_contract_raw}
             onInputChange={(v) => patch({ input_contract_raw: v })}
             onOutputChange={(v) => patch({ output_contract_raw: v })}
+            inputError={
+              stepError?.field === "input_contract" ? stepError.message : null
+            }
+            outputError={
+              stepError?.field === "output_contract" ? stepError.message : null
+            }
           />
         )}
         {currentStep === 4 && (
-          <Step4LLM formState={formState} patch={patch} />
+          <Step4LLM formState={formState} patch={patch} stepError={stepError} />
         )}
         {currentStep === 5 && (
           <Step5ErrorPolicyAndValidation
             formState={formState}
             patch={patch}
+            stepError={stepError}
           />
         )}
 
+        {/* P-17 (CR 2026-05-10) — global banner kept for messages whose
+            `field` does not map to a known input id (defensive fallback) ;
+            per-step components render an inline `<FormMessage>` under the
+            relevant field when `stepError.field` matches. */}
         {stepError && (
           <p
             role="alert"
@@ -421,14 +451,25 @@ function Step1Identity({ template }: { template: TemplateDetail }) {
   );
 }
 
+function FormMessage({ children }: { children: React.ReactNode }) {
+  // P-17 (CR 2026-05-10) — inline error message under a field. Pattern
+  // shadcn `<FormMessage>` (non encore ajouté au repo) reproduit en `<p>`
+  // text-destructive (cohérent Story 2.1 archetype creation form).
+  // Pas de `role="alert"` ici : le banner global (live region) annonce
+  // déjà le message au screen reader. Le per-field reste un visual cue.
+  return <p className="text-xs text-destructive">{children}</p>;
+}
+
 function Step2Prompt({
   template,
   value,
   onChange,
+  error,
 }: {
   template: TemplateDetail;
   value: string;
   onChange: (v: string) => void;
+  error: string | null;
 }) {
   const placeholderBase =
     typeof template.config.prompt_base === "string"
@@ -449,7 +490,10 @@ function Step2Prompt({
         placeholder={placeholderBase}
         className="font-mono text-sm"
         maxLength={50_000}
+        aria-invalid={error !== null || undefined}
+        aria-describedby={error !== null ? "tpl-system-prompt-error" : undefined}
       />
+      {error && <span id="tpl-system-prompt-error"><FormMessage>{error}</FormMessage></span>}
       <p className="text-xs text-muted-foreground">
         Modifier ce champ crée une nouvelle version (versioning prompts). Laisser vide
         pour conserver le prompt de l'archétype.
@@ -463,11 +507,15 @@ function Step3Contracts({
   outputRaw,
   onInputChange,
   onOutputChange,
+  inputError,
+  outputError,
 }: {
   inputRaw: string;
   outputRaw: string;
   onInputChange: (v: string) => void;
   onOutputChange: (v: string) => void;
+  inputError: string | null;
+  outputError: string | null;
 }) {
   return (
     <div className="flex flex-col gap-5">
@@ -484,7 +532,9 @@ function Step3Contracts({
           value={inputRaw}
           onChange={(e) => onInputChange(e.target.value)}
           className="font-mono text-xs"
+          aria-invalid={inputError !== null || undefined}
         />
+        {inputError && <FormMessage>{inputError}</FormMessage>}
       </div>
       <div className="flex flex-col gap-2">
         <label htmlFor="tpl-output-contract" className={LABEL_CLASS}>Output contract (JSON)</label>
@@ -494,7 +544,9 @@ function Step3Contracts({
           value={outputRaw}
           onChange={(e) => onOutputChange(e.target.value)}
           className="font-mono text-xs"
+          aria-invalid={outputError !== null || undefined}
         />
+        {outputError && <FormMessage>{outputError}</FormMessage>}
       </div>
     </div>
   );
@@ -503,10 +555,21 @@ function Step3Contracts({
 function Step4LLM({
   formState,
   patch,
+  stepError,
 }: {
   formState: FormState;
   patch: (partial: Partial<FormState>) => void;
+  stepError: StepError;
 }) {
+  // P-20 (CR 2026-05-10) — `value` displays the empty string when state is
+  // NaN so the input visually mirrors the underlying state. Sans ce guard,
+  // l'utilisateur efface le champ → state garde l'ancienne valeur, mismatch UI.
+  const tempDisplay = Number.isFinite(formState.temperature)
+    ? formState.temperature
+    : "";
+  const maxTokDisplay = Number.isFinite(formState.max_tokens)
+    ? formState.max_tokens
+    : "";
   return (
     <div className="flex flex-col gap-5">
       <h2 className="text-lg font-semibold">Modèle LLM &amp; provider chain</h2>
@@ -527,6 +590,7 @@ function Step4LLM({
             ))}
           </SelectContent>
         </Select>
+        {stepError?.field === "llm_model" && <FormMessage>{stepError.message}</FormMessage>}
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div className="flex flex-col gap-2">
@@ -537,12 +601,16 @@ function Step4LLM({
             step="0.1"
             min={0}
             max={2}
-            value={formState.temperature}
+            value={tempDisplay}
             onChange={(e) => {
               const v = e.target.valueAsNumber;
               if (Number.isFinite(v)) patch({ temperature: v });
             }}
+            aria-invalid={stepError?.field === "temperature" || undefined}
           />
+          {stepError?.field === "temperature" && (
+            <FormMessage>{stepError.message}</FormMessage>
+          )}
         </div>
         <div className="flex flex-col gap-2">
           <label htmlFor="tpl-max-tokens" className={LABEL_CLASS}>Max tokens</label>
@@ -551,12 +619,16 @@ function Step4LLM({
             type="number"
             min={1}
             max={200_000}
-            value={formState.max_tokens}
+            value={maxTokDisplay}
             onChange={(e) => {
               const v = e.target.valueAsNumber;
               if (Number.isFinite(v)) patch({ max_tokens: v });
             }}
+            aria-invalid={stepError?.field === "max_tokens" || undefined}
           />
+          {stepError?.field === "max_tokens" && (
+            <FormMessage>{stepError.message}</FormMessage>
+          )}
         </div>
       </div>
       <div className="flex flex-col gap-2">
@@ -567,7 +639,11 @@ function Step4LLM({
           value={formState.provider_chain_raw}
           onChange={(e) => patch({ provider_chain_raw: e.target.value })}
           className="font-mono text-sm"
+          aria-invalid={stepError?.field === "provider_chain" || undefined}
         />
+        {stepError?.field === "provider_chain" && (
+          <FormMessage>{stepError.message}</FormMessage>
+        )}
         <p className="text-xs text-muted-foreground">
           Tableau JSON, ex : <code>["anthropic", "openai"]</code>. Fallback runtime arrive Story 4.6.
         </p>
@@ -579,10 +655,16 @@ function Step4LLM({
 function Step5ErrorPolicyAndValidation({
   formState,
   patch,
+  stepError,
 }: {
   formState: FormState;
   patch: (partial: Partial<FormState>) => void;
+  stepError: StepError;
 }) {
+  // P-20 (CR 2026-05-10) — display empty for non-finite max_retries.
+  const retriesDisplay = Number.isFinite(formState.max_retries)
+    ? formState.max_retries
+    : "";
   return (
     <div className="flex flex-col gap-5">
       <h2 className="text-lg font-semibold">Politique d'erreur &amp; validation finale</h2>
@@ -606,6 +688,7 @@ function Step5ErrorPolicyAndValidation({
               ))}
             </SelectContent>
           </Select>
+          {stepError?.field === "on_timeout" && <FormMessage>{stepError.message}</FormMessage>}
         </div>
         <div className="flex flex-col gap-2">
           <label htmlFor="tpl-max-retries" className={LABEL_CLASS}>Max retries</label>
@@ -614,12 +697,18 @@ function Step5ErrorPolicyAndValidation({
             type="number"
             min={0}
             max={10}
-            value={formState.max_retries}
+            step={1}
+            value={retriesDisplay}
             onChange={(e) => {
               const v = e.target.valueAsNumber;
-              if (Number.isFinite(v)) patch({ max_retries: v });
+              // P-28 (CR 2026-05-10) — type=number accepte 0.5 ; on rejette
+              // les non-entiers côté client (Pydantic int validation rejet
+              // sinon avec 422 silencieux).
+              if (Number.isInteger(v)) patch({ max_retries: v });
             }}
+            aria-invalid={stepError?.field === "max_retries" || undefined}
           />
+          {stepError?.field === "max_retries" && <FormMessage>{stepError.message}</FormMessage>}
         </div>
         <div className="flex flex-col gap-2">
           <label htmlFor="tpl-backoff" className={LABEL_CLASS}>Backoff</label>
@@ -640,12 +729,16 @@ function Step5ErrorPolicyAndValidation({
               ))}
             </SelectContent>
           </Select>
+          {stepError?.field === "backoff_strategy" && <FormMessage>{stepError.message}</FormMessage>}
         </div>
       </div>
       <p className="text-xs text-muted-foreground">
         Le dispatcher actif (qui APPLIQUE le retry au runtime) arrive avec la Story 4.6.
       </p>
       <hr className="border-border" />
+      {/* P-13 (CR 2026-05-10) — récap COMPLET (12 champs) en lecture seule
+          avant Sauvegarder. Décision intégrée #10 spec : "récap de tous les
+          champs en lecture seule + bouton Sauvegarder". */}
       <h3 className="text-sm font-semibold">Récapitulatif avant sauvegarde</h3>
       <dl className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
         <Field label="Modèle LLM">{formState.llm_model}</Field>
@@ -655,6 +748,16 @@ function Step5ErrorPolicyAndValidation({
           {formState.system_prompt.length === 0
             ? "vide (utilise l'archétype)"
             : `${formState.system_prompt.length} caractères`}
+        </Field>
+        <Field label="Provider chain">{formState.provider_chain_raw}</Field>
+        <Field label="On timeout">{formState.on_timeout}</Field>
+        <Field label="Max retries">{formState.max_retries}</Field>
+        <Field label="Backoff">{formState.backoff_strategy}</Field>
+        <Field label="Input contract (taille)">
+          {formState.input_contract_raw.length} caractères
+        </Field>
+        <Field label="Output contract (taille)">
+          {formState.output_contract_raw.length} caractères
         </Field>
       </dl>
     </div>

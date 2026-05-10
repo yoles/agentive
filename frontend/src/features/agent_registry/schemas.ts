@@ -26,25 +26,37 @@ export const LLMModelSchema = z.enum([
 
 export const ProviderIdSchema = z.enum(["anthropic", "openai"]);
 
-export const LLMParamsSchema = z.object({
-  temperature: z.number().min(0).max(2),
-  max_tokens: z.number().int().min(1).max(200_000),
-});
+// P-18 (CR 2026-05-10) — `.strict()` ajoutée pour mirroir Pydantic
+// `model_config = ConfigDict(extra="forbid")`. Sinon Zod accepte des champs
+// inconnus (`malicious: "x"`) que Pydantic rejetterait → divergence client
+// /serveur silencieuse.
+export const LLMParamsSchema = z
+  .object({
+    temperature: z.number().min(0).max(2),
+    max_tokens: z.number().int().min(1).max(200_000),
+  })
+  .strict();
 
 // B1 amend Story 2.2 — `core` permissive (default {} accepted), only
 // validates dict shape. Runtime value validation defers to Story 4.x.
-export const ContractDefinitionSchema = z.object({
-  core: z.record(z.string(), z.unknown()).optional().default({}),
-  extras: z.record(z.string(), z.unknown()).optional().default({}),
-});
+// P-18 (CR 2026-05-10) — `.strict()` ajoutée (cf LLMParamsSchema).
+export const ContractDefinitionSchema = z
+  .object({
+    core: z.record(z.string(), z.unknown()).optional().default({}),
+    extras: z.record(z.string(), z.unknown()).optional().default({}),
+  })
+  .strict();
 
-export const ErrorPolicySchema = z.object({
-  on_timeout: z
-    .enum(["retry_with_backoff", "fail_fast", "fallback_provider"])
-    .default("retry_with_backoff"),
-  max_retries: z.number().int().min(0).max(10).default(3),
-  backoff_strategy: z.enum(["exponential", "linear", "constant"]).default("exponential"),
-});
+// P-18 (CR 2026-05-10) — `.strict()` ajoutée (cf LLMParamsSchema).
+export const ErrorPolicySchema = z
+  .object({
+    on_timeout: z
+      .enum(["retry_with_backoff", "fail_fast", "fallback_provider"])
+      .default("retry_with_backoff"),
+    max_retries: z.number().int().min(0).max(10).default(3),
+    backoff_strategy: z.enum(["exponential", "linear", "constant"]).default("exponential"),
+  })
+  .strict();
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Top-level UpdateTemplateRequest mirror — strict + non-empty refine
@@ -81,7 +93,13 @@ export const UpdateTemplateRequestSchema = z
 /** Step 1 — Identité (read-only Sprint 1 ; gate trivially passes). */
 export const WizardStep1Schema = z.object({}).strict();
 
-/** Step 2 — Prompt. `system_prompt` peut être vide (= conserver l'archétype baseline). */
+/** Step 2 — Prompt. `system_prompt` peut être vide (= conserver l'archétype
+ * baseline) — c'est intentionnel (P-19 CR 2026-05-10) : `buildPayload` omet
+ * complètement le champ si `trim().length === 0`, donc le backend reçoit un
+ * payload sans `system_prompt` (PATCH-like Story 2.2 sémantique) au lieu de
+ * `{system_prompt: ""}` qui violerait Pydantic `min_length=1`. La divergence
+ * apparente avec `UpdateTemplateRequestSchema.system_prompt.min(1)` est gérée
+ * en amont par `buildPayload`. */
 export const WizardStep2Schema = z.object({
   system_prompt: z.string().max(50_000).optional(),
 });

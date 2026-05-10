@@ -76,7 +76,14 @@ describe("TemplateExpertForm", () => {
     const { onFormStateChange } = renderExpert();
     fireEvent.click(screen.getByRole("button", { name: /annuler/i }));
     expect(onFormStateChange).toHaveBeenCalled();
-    const restored = onFormStateChange.mock.calls[0][0];
+    // P-21 (CR 2026-05-10) — onFormStateChange est désormais un updater
+    // functional. handleCancel passe `() => buildInitialForm(template.config)`
+    // qui ignore prev. On invoque l'updater avec un état arbitraire pour
+    // récupérer le résultat.
+    const updater = onFormStateChange.mock.calls[0][0] as (
+      prev: ReturnType<typeof buildInitialForm>,
+    ) => ReturnType<typeof buildInitialForm>;
+    const restored = updater(buildInitialForm(TEMPLATE.config));
     // Initial form should have system_prompt empty (P-01 fix preserved).
     expect(restored.system_prompt).toBe("");
   });

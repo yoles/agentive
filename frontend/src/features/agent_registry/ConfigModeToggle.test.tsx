@@ -17,7 +17,9 @@ describe("ConfigModeToggle", () => {
 
   afterEach(() => {
     cleanup();
-    localStorage.removeItem("agentive.agent-config-mode");
+    // P-11 (CR 2026-05-10) — chemin officiel Zustand, plus robust qu'un
+    // removeItem direct.
+    useModeStore.persist.clearStorage();
   });
 
   it("renders both options with role=radio + role=radiogroup", () => {
@@ -39,15 +41,20 @@ describe("ConfigModeToggle", () => {
     ).toHaveAttribute("aria-checked", "true");
   });
 
-  it("hides active state until hydration completes (suppress flicker)", () => {
+  it("renders a skeleton (no radios) until hydration completes (P-24)", () => {
+    // P-24 (CR 2026-05-10) — pre-hydration : the component renders a busy
+    // skeleton ; aucun `role="radio"` n'est présent (sinon le radiogroup
+    // serait invalide WAI-ARIA — au moins un radio doit être checked).
     useModeStore.setState({ mode: "wizard", hasHydrated: false });
     render(<ConfigModeToggle />);
-    // Both options inactive when not hydrated.
-    expect(
-      screen.getByRole("radio", { name: /mode wizard/i }),
-    ).toHaveAttribute("aria-checked", "false");
-    expect(
-      screen.getByRole("radio", { name: /mode expert/i }),
-    ).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("config-mode-toggle-skeleton")).toBeInTheDocument();
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+  });
+
+  it("disabled prop blocks setMode (P-10 race-mid-save guard)", () => {
+    useModeStore.setState({ mode: "wizard", hasHydrated: true });
+    render(<ConfigModeToggle disabled />);
+    fireEvent.click(screen.getByRole("radio", { name: /mode expert/i }));
+    expect(useModeStore.getState().mode).toBe("wizard");
   });
 });
