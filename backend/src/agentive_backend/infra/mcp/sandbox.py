@@ -70,14 +70,20 @@ class SandboxProfile:
 
     Per-tool profile customization (column ``tools.sandbox_profile JSONB``)
     is deferred to Sprint 2 (D62 Story 2.6).
+
+    P-04 / P-16 (CR 2026-05-11) — the resource caps below are applied
+    ONLY in the setrlimit fallback path (`_build_setrlimit_bootstrap`).
+    In bwrap mode, isolation is provided by PID/user namespaces +
+    capability drops ; CPU/memory/process caps are NOT enforced by bwrap
+    itself. Wrapping bwrap with `prlimit` to apply these caps in bwrap
+    mode is deferred to Sprint 2 (new defer D74).
     """
 
     unshare_net: bool = True
     ro_binds: tuple[str, ...] = _DEFAULT_RO_BINDS
     tmpfs_paths: tuple[str, ...] = _DEFAULT_TMPFS_PATHS
     env_passthrough: tuple[str, ...] = _DEFAULT_ENV_PASSTHROUGH
-    # Resource caps for setrlimit fallback (also enforced when bwrap is
-    # used — defense in depth).
+    # Resource caps for setrlimit fallback ONLY (cf class docstring).
     max_processes: int = 16
     cpu_seconds: int = 30
     memory_mb: int = 512
@@ -209,12 +215,21 @@ def _build_bwrap_argv(
     args: list[str],
     *,
     profile: SandboxProfile,
+    parent_env: dict[str, str] | None = None,
 ) -> list[str]:
     """Construct the ``bwrap`` argv that wraps ``command`` + ``args``.
 
     Order matters : ``bwrap`` consumes its own flags first, then a literal
     ``--`` separator is implicit (the first non-flag arg is the command).
+
+    P-01 (CR 2026-05-11) — for each ``env_key`` in ``profile.env_passthrough``,
+    we resolve the value from ``parent_env`` (caller-supplied) OR fall back
+    to the current process environment. bwrap's ``--setenv KEY VAL`` is a
+    LITERAL assignment ; if we pass an empty string the sandbox boots with
+    ``PATH=""`` and bare-name commands (e.g. ``python``) fail ENOENT.
     """
+    import os
+
     argv: list[str] = ["bwrap"]
 
     # Network isolation.
@@ -240,10 +255,12 @@ def _build_bwrap_argv(
 
     # Set hostname inside the sandbox (avoid leaking host hostname).
     argv.extend(["--hostname", "mcp-sandbox"])
-    # Clean environment — clear, then re-export whitelist.
+    # Clean environment — clear, then re-export whitelist with REAL values.
     argv.append("--clearenv")
+    env_source = parent_env if parent_env is not None else os.environ
     for env_key in profile.env_passthrough:
-        argv.extend(["--setenv", env_key, ""])  # value set by parent env propagation
+        value = env_source.get(env_key, "")
+        argv.extend(["--setenv", env_key, value])
     # Die with parent (no zombies on backend crash).
     argv.append("--die-with-parent")
 

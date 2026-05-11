@@ -96,6 +96,61 @@ def _redact_connection_config(config: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+# P-05 (CR 2026-05-11) — tool-arguments redaction.
+#
+# Distinct from ``_redact_connection_config`` (which understands the
+# known structural shape ``{env, headers, ...}`` of a connection_config
+# dict), ``_redact_arguments`` walks arbitrary user-supplied dicts/lists
+# recursively and masks values whose KEY matches a secret-name pattern
+# (case-insensitive substring). This is the helper Story 2.6 P-05 calls
+# out for the audit payload : tool callers can supply any shape, secret-
+# bearing keys can appear at any depth, under any of many synonyms.
+_SECRET_KEY_PATTERNS: tuple[str, ...] = (
+    "token",
+    "password",
+    "secret",
+    "api_key",
+    "apikey",
+    "_key",  # covers openai_key, private_key, access_key, signing_key, etc.
+    "key_",  # covers key_id, key_secret, etc.
+    "auth",  # matches authorization, auth_header, bearer_auth, etc.
+    "bearer",
+    "credential",  # credentials, aws_credential, etc.
+    "passphrase",
+    "client_secret",
+)
+
+
+def _key_is_secret(key: str) -> bool:
+    """True if ``key`` (case-insensitive) contains any secret-name pattern."""
+    lkey = key.lower()
+    return any(pat in lkey for pat in _SECRET_KEY_PATTERNS)
+
+
+def _redact_arguments(value: Any, *, depth: int = 0) -> Any:
+    """Recursively redact secret-bearing values in arbitrary tool arguments.
+
+    Walks dicts + lists ; masks values whose KEY (in a parent dict)
+    matches a secret-name pattern. Non-dict / non-list values are returned
+    as-is. Depth-bounded at 8 levels (defensive against pathological
+    nested input).
+    """
+    if depth > 8:
+        return "<redacted-deep>"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for k, v in value.items():
+            key_str = str(k)
+            if _key_is_secret(key_str):
+                result[key_str] = "<redacted>"
+            else:
+                result[key_str] = _redact_arguments(v, depth=depth + 1)
+        return result
+    if isinstance(value, list):
+        return [_redact_arguments(item, depth=depth + 1) for item in value]
+    return value
+
+
 class ToolHubService:
     """Orchestrate MCP server registration + tool discovery (Story 2.5)."""
 
@@ -414,8 +469,14 @@ class ToolHubService:
             transport = server.transport
             connection_config = dict(server.connection_config or {})
 
-        # 2. Execute the tool inside the sandbox + measure duration.
-        effective_backend: SandboxBackend = sandbox_backend or "bwrap"
+        # 2. Resolve the actual sandbox backend ONCE (P-03 CR 2026-05-11)
+        #    — never default to literal "bwrap" since detect_sandbox_backend
+        #    may pick "setrlimit" in containers where bwrap is non-functional.
+        #    The resolved value is forwarded to call_tool AND used in the
+        #    audit event + response, so all three see the same truth.
+        from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
+
+        effective_backend: SandboxBackend = sandbox_backend or detect_sandbox_backend()
         start = time.monotonic()
         status: Literal["success", "timeout", "error"] = "error"
         result: dict[str, Any] = {}
@@ -426,7 +487,7 @@ class ToolHubService:
                 tool_name=tool_name,
                 arguments=arguments,
                 timeout=timeout,
-                backend=sandbox_backend,
+                backend=effective_backend,
             )
             status = "success"
         except MCPExecutionTimeoutError as exc:
@@ -548,7 +609,13 @@ class ToolHubService:
         + ``duration_ms``. Best-effort post-commit ``emit_notify`` follows
         the Story 2.5 P-05 pattern (real event_type, not a fabricated label).
         """
-        args_redacted = _redact_connection_config(arguments)
+        # P-05 (CR 2026-05-11) — use the dedicated arguments helper, which
+        # walks dicts/lists recursively and masks by case-insensitive
+        # secret-name patterns (bearer, openai_key, private_key, nested, …).
+        # ``_redact_connection_config`` understood only the env/headers
+        # shape, missing the long tail of secret-key synonyms callers use
+        # in tool arguments.
+        args_redacted = _redact_arguments(arguments)
         async with session_factory_owner.with_tenant(tenant_id) as session:
             event = ToolInvokedEvent(
                 tool_id=tool_id,

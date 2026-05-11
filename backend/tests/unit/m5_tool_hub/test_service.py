@@ -28,12 +28,18 @@ import pytest
 from agentive_backend.features.m5_tool_hub import service as svc_module
 from agentive_backend.features.m5_tool_hub.service import (
     ToolHubService,
+    _redact_arguments,
     _redact_connection_config,
 )
 from agentive_backend.infra.mcp.client import MCPDiscoveryTimeoutError, ToolInfo
+from agentive_backend.infra.mcp.sandbox import (
+    MCPExecutionTimeoutError,
+    MCPToolError,
+)
 from agentive_backend.shared.exceptions import (
     ConflictError,
     DependencyError,
+    NotFoundError,
 )
 
 
@@ -212,3 +218,322 @@ def test_redact_connection_config_masks_top_level_secret_keys() -> None:
     import json as _json
 
     assert "ak_live_abcdef" not in _json.dumps(out)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.6 P-05 — _redact_arguments helper (recursive + pattern-based)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def test_redact_arguments_masks_secret_synonyms_case_insensitive() -> None:
+    """Patterns ``bearer``, ``openai_key``, ``private_key``, ``credential``
+    must all be masked — closes the P-05 gap where the connection-config
+    helper only knew ``api_key``/``token``/``password``/etc.
+    """
+    out = _redact_arguments(
+        {
+            "Authorization": "Bearer xyz",
+            "openai_key": "sk-abc",
+            "private_key": "-----BEGIN-----",
+            "credentials": "user:pass",
+            "Bearer_Token": "leak-me",
+            "harmless_field": "public",
+            "nested": {"api_key": "deep"},
+        }
+    )
+    import json as _json
+
+    payload = _json.dumps(out)
+    for leak in ("xyz", "sk-abc", "BEGIN", "user:pass", "leak-me", "deep"):
+        assert leak not in payload, f"secret leaked: {leak!r} in {payload}"
+    # The non-secret field stays intact.
+    assert out["harmless_field"] == "public"
+
+
+def test_redact_arguments_walks_lists_and_nested_dicts() -> None:
+    """Lists of dicts + deep nesting are walked recursively."""
+    out = _redact_arguments(
+        {
+            "items": [
+                {"name": "x", "api_key": "leak-1"},
+                {"deeply": {"nested": {"password": "leak-2"}}},
+            ]
+        }
+    )
+    import json as _json
+
+    payload = _json.dumps(out)
+    assert "leak-1" not in payload
+    assert "leak-2" not in payload
+    # Non-secret values survive.
+    assert out["items"][0]["name"] == "x"
+
+
+def test_redact_arguments_depth_bounded_against_pathological_nesting() -> None:
+    """Walks up to depth 8 ; beyond that returns ``"<redacted-deep>"`` to
+    avoid stack-overflow on adversarial cyclic-shaped input."""
+    deep: dict[str, Any] = {"k": "v"}
+    for _ in range(20):
+        deep = {"n": deep}
+    out = _redact_arguments(deep)
+    # Walk down and find the depth-cutoff marker.
+    cur: Any = out
+    while isinstance(cur, dict) and "n" in cur:
+        cur = cur["n"]
+    assert cur == "<redacted-deep>"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.6 T4.7 / P-06 — invoke_tool unit tests
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _make_invoke_service(*, server, tool) -> ToolHubService:
+    """Build a ToolHubService whose repos return preset ``server`` and
+    ``tool`` rows. The audit publish (`_publish_invoked`) opens its own
+    session via ``server_repo.with_tenant`` ; we mock that path too.
+    """
+    server_repo = MagicMock()
+    session_mock = MagicMock()
+    server_repo.with_tenant = MagicMock()
+    server_repo.with_tenant.return_value.__aenter__ = AsyncMock(return_value=session_mock)
+    server_repo.with_tenant.return_value.__aexit__ = AsyncMock(return_value=False)
+    server_repo.get_by_id_in_session = AsyncMock(return_value=server)
+
+    tool_repo = MagicMock()
+    tool_repo.get_by_id_in_session = AsyncMock(return_value=tool)
+
+    return ToolHubService(server_repo=server_repo, tool_repo=tool_repo)
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_happy_path_returns_call_tool_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.7 (1) — happy path : call_tool returns a content dict, the
+    service forwards it to the caller and publishes a ``success`` audit
+    event with ``duration_ms`` populated.
+    """
+    server_id = uuid4()
+    tool_id = uuid4()
+    server = MagicMock()
+    server.id = server_id
+    server.transport = "stdio"
+    server.connection_config = {"command": "x"}
+    tool = MagicMock()
+    tool.id = tool_id
+    tool.server_id = server_id
+    tool.name = "echo"
+    service = _make_invoke_service(server=server, tool=tool)
+
+    captured_event: dict[str, Any] = {}
+
+    async def _fake_publish(event_type: str, event: Any, **_kw: Any) -> Any:
+        captured_event["event_type"] = event_type
+        captured_event["event"] = event
+        return uuid4()  # event_id
+
+    async def _fake_call_tool(**_: Any) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "hi"}], "isError": False}
+
+    monkeypatch.setattr(svc_module, "publish", _fake_publish)
+    monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
+    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+
+    result = await service.invoke_tool(
+        server_id=server_id,
+        tool_id=tool_id,
+        arguments={"text": "hi"},
+        timeout=5.0,
+        sandbox_backend="setrlimit",
+    )
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "hi"
+    assert captured_event["event_type"] == "m5.tool.invoked"
+    assert captured_event["event"].status == "success"
+    assert captured_event["event"].sandbox_backend == "setrlimit"
+    assert captured_event["event"].duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_translates_execution_timeout_to_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.7 (2) — MCPExecutionTimeoutError from infra translates to
+    DependencyError 503 ; audit event records status=timeout (cf P-08
+    Story 2.5 pattern).
+    """
+    server_id = uuid4()
+    tool_id = uuid4()
+    server = MagicMock()
+    server.id = server_id
+    server.transport = "stdio"
+    server.connection_config = {"command": "x"}
+    tool = MagicMock()
+    tool.id = tool_id
+    tool.server_id = server_id
+    tool.name = "sleep"
+    service = _make_invoke_service(server=server, tool=tool)
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_publish(event_type: str, event: Any, **_kw: Any) -> Any:
+        captured["event"] = event
+        return uuid4()
+
+    async def _fake_call_tool(**_: Any) -> dict[str, Any]:
+        raise MCPExecutionTimeoutError(timeout=0.5)
+
+    monkeypatch.setattr(svc_module, "publish", _fake_publish)
+    monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
+    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+
+    with pytest.raises(DependencyError) as exc_info:
+        await service.invoke_tool(
+            server_id=server_id,
+            tool_id=tool_id,
+            arguments={"seconds": 30},
+            timeout=0.5,
+            sandbox_backend="setrlimit",
+        )
+    assert "timeout" in str(exc_info.value.detail).lower()
+    assert captured["event"].status == "timeout"
+    assert captured["event"].sandbox_backend == "setrlimit"
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_translates_tool_error_to_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.7 (3) — MCPToolError (server returned isError=True) translates
+    to NotFoundError 404. Audit records status=error.
+    """
+    server_id = uuid4()
+    tool_id = uuid4()
+    server = MagicMock()
+    server.id = server_id
+    server.transport = "stdio"
+    server.connection_config = {"command": "x"}
+    tool = MagicMock()
+    tool.id = tool_id
+    tool.server_id = server_id
+    tool.name = "broken"
+    service = _make_invoke_service(server=server, tool=tool)
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_publish(event_type: str, event: Any, **_kw: Any) -> Any:
+        captured["event"] = event
+        return uuid4()
+
+    async def _fake_call_tool(**_: Any) -> dict[str, Any]:
+        raise MCPToolError(tool_name="broken", detail="bad input")
+
+    monkeypatch.setattr(svc_module, "publish", _fake_publish)
+    monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
+    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await service.invoke_tool(
+            server_id=server_id,
+            tool_id=tool_id,
+            arguments={},
+            timeout=5.0,
+            sandbox_backend="bwrap",
+        )
+    assert "bad input" in str(exc_info.value.detail).lower()
+    assert captured["event"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_args_redaction_masks_secrets_in_audit_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.7 (4) — argument with ``bearer_token`` key is masked in the
+    audit ``args_redacted`` field. Closes the P-05 redaction gap.
+    """
+    server_id = uuid4()
+    tool_id = uuid4()
+    server = MagicMock()
+    server.id = server_id
+    server.transport = "stdio"
+    server.connection_config = {"command": "x"}
+    tool = MagicMock()
+    tool.id = tool_id
+    tool.server_id = server_id
+    tool.name = "echo"
+    service = _make_invoke_service(server=server, tool=tool)
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_publish(event_type: str, event: Any, **_kw: Any) -> Any:
+        captured["event"] = event
+        return uuid4()
+
+    async def _fake_call_tool(**_: Any) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "ok"}], "isError": False}
+
+    monkeypatch.setattr(svc_module, "publish", _fake_publish)
+    monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
+    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+
+    await service.invoke_tool(
+        server_id=server_id,
+        tool_id=tool_id,
+        arguments={
+            "text": "public",
+            "bearer_token": "hunter2-bearer-secret",
+            "nested": {"openai_key": "sk-deep-secret"},
+        },
+        timeout=5.0,
+        sandbox_backend="setrlimit",
+    )
+    args_redacted = captured["event"].args_redacted
+    # Top-level secret masked.
+    assert args_redacted["bearer_token"] == "<redacted>"
+    # Nested secret masked too.
+    assert args_redacted["nested"]["openai_key"] == "<redacted>"
+    # Non-secret survives.
+    assert args_redacted["text"] == "public"
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_raises_not_found_when_tool_not_on_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.7 (5) — defense in depth : even if a tool row exists, if its
+    ``server_id`` differs from the requested ``server_id`` (e.g. crafted
+    URL), service returns 404 instead of invoking.
+    """
+    server_id = uuid4()
+    wrong_server_id = uuid4()
+    tool_id = uuid4()
+    server = MagicMock()
+    server.id = server_id
+    server.transport = "stdio"
+    server.connection_config = {"command": "x"}
+    # tool points to a DIFFERENT server.
+    tool = MagicMock()
+    tool.id = tool_id
+    tool.server_id = wrong_server_id
+    tool.name = "oops"
+    service = _make_invoke_service(server=server, tool=tool)
+
+    call_tool_called = False
+
+    async def _spy(**_: Any) -> dict[str, Any]:
+        nonlocal call_tool_called
+        call_tool_called = True
+        return {"content": [], "isError": False}
+
+    monkeypatch.setattr(svc_module, "call_tool", _spy)
+
+    with pytest.raises(NotFoundError):
+        await service.invoke_tool(
+            server_id=server_id,
+            tool_id=tool_id,
+            arguments={},
+            timeout=5.0,
+            sandbox_backend="bwrap",
+        )
+    assert call_tool_called is False, "service should refuse the call BEFORE reaching call_tool"

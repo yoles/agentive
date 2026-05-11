@@ -132,14 +132,22 @@ async def test_sandbox_caps_process_count() -> None:
     if not bwrap_available:
         pytest.skip("bwrap not functional in this environment (kernel/docker constraint)")
 
+    # P-04 (CR 2026-05-11) — STRICT assertion : the bypass test must FAIL
+    # if the sandbox does NOT block the fork-bomb. The previous accept-
+    # both-outcomes assertion (FORK_BLOCKED_AT OR FORK_OK_SPAWNED) was a
+    # no-op that passed even when the cap was bypassed. AC4 requires
+    # failure on bypass.
+    #
+    # Sandbox cap = 8 max processes. We attempt 64 forks. The script
+    # prints either ``FORK_BLOCKED_AT:N:<errno>`` (cap hit at N < 64) or
+    # ``FORK_OK_SPAWNED:64`` (no cap, security regression).
     payload = (
-        "import os, sys; "
+        "import os, sys\n"
         "spawned = 0\n"
         "for i in range(64):\n"
         "    try:\n"
         "        pid = os.fork()\n"
         "        if pid == 0:\n"
-        "            # child — sleep a bit then exit\n"
         "            import time; time.sleep(0.1)\n"
         "            sys.exit(0)\n"
         "        spawned += 1\n"
@@ -147,7 +155,7 @@ async def test_sandbox_caps_process_count() -> None:
         "        print(f'FORK_BLOCKED_AT:{spawned}:{e.errno}', flush=True)\n"
         "        sys.exit(0)\n"
         "print(f'FORK_OK_SPAWNED:{spawned}', flush=True)\n"
-        "sys.exit(0)"
+        "sys.exit(0)\n"
     )
     async with sandboxed_subprocess(
         "python",
@@ -158,15 +166,11 @@ async def test_sandbox_caps_process_count() -> None:
     ) as proc:
         stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
     output = stdout.decode("utf-8", errors="replace") if stdout else ""
-    # The script either gets blocked partway (FORK_BLOCKED_AT) OR completes
-    # all 64 forks (FORK_OK_SPAWNED:64). bwrap's PID namespace + max_processes=8
-    # rlimit should block before 64.
-    # We accept BOTH outcomes Sprint 1 — the goal is to ensure the SUBPROCESS
-    # does not crash the parent (which is the only invariant the bypass test
-    # truly checks). A regression that LET the parent crash would HALT the
-    # whole pytest run.
-    assert ("FORK_BLOCKED_AT" in output) or ("FORK_OK_SPAWNED" in output), (
-        f"Sandbox crashed the parent process — RESILIENCE regression.\nstdout={output}"
+    assert "FORK_BLOCKED_AT" in output, (
+        f"Fork-bomb cap NOT enforced — security regression in sandbox.\nstdout={output}"
+    )
+    assert "FORK_OK_SPAWNED" not in output, (
+        f"Fork-bomb fully ran past the cap — security regression.\nstdout={output}"
     )
 
 
