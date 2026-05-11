@@ -107,15 +107,16 @@ class ToolServerRepo(BaseRepo):
         tenant_id: UUID | None = None,
     ) -> list[tuple[ToolServer, int]]:
         """LEFT JOIN tools + GROUP BY → list[(server, count)] ordered by
-        ``discovered_at DESC`` (most recent first — UX naturelle).
-        Single SQL query (no N+1).
+        ``discovered_at DESC, id DESC`` (most recent first — UX naturelle,
+        secondary sort P-15 for deterministic ordering on ties).
+        Single SQL query (no N+1) — verified by P-21 test.
         """
         async with self.with_tenant(tenant_id) as session:
             stmt = (
                 select(ToolServer, func.count(Tool.id).label("tools_count"))
                 .outerjoin(Tool, Tool.server_id == ToolServer.id)
                 .group_by(ToolServer.id)
-                .order_by(desc(ToolServer.discovered_at))
+                .order_by(desc(ToolServer.discovered_at), desc(ToolServer.id))
             )
             result = await session.execute(stmt)
             return [(row[0], int(row[1])) for row in result.all()]

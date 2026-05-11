@@ -278,6 +278,22 @@ async def test_delete_template_tool_happy_path(
             )
             assert int(count.scalar_one()) == 0
 
+        # P-14 (CR 2026-05-10) — AC3 demands "1 audit event
+        # m2.agent_template.tool_unassigned émis". Verify the outbox row
+        # exists and is scoped to this (template, tool) pair (not just
+        # ANY unassigned event from prior tests).
+        async with seed_session_factory() as session:
+            audit = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type = 'm2.agent_template.tool_unassigned' "
+                    "AND payload->>'template_id' = :tid "
+                    "AND payload->>'tool_id' = :tlid"
+                ),
+                {"tid": template_id, "tlid": tool_ids[0]},
+            )
+            assert int(audit.scalar_one()) == 1
+
         # And re-DELETE returns 404 (strict idempotency décision #10).
         del2 = await client.delete(
             f"/api/v1/agents/templates/{template_id}/tools/{tool_ids[0]}",
@@ -365,3 +381,22 @@ async def test_replace_assign_atomicity_publish_failure_rolls_back(
                 {"tid": template_id},
             )
             assert int(count.scalar_one()) == 0
+
+        # P-12 (CR 2026-05-10) — the P-02 atomicity invariant has TWO sides :
+        # "no row INSERT without committed event" AND "no event without
+        # committed row". The original test only covered the first side ;
+        # this assertion closes the second : no spurious tool_assigned /
+        # tool_unassigned event landed in outbox for this template.
+        async with seed_session_factory() as session:
+            spurious = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE event_type IN ('m2.agent_template.tool_assigned', "
+                    "                      'm2.agent_template.tool_unassigned') "
+                    "AND payload->>'template_id' = :tid"
+                ),
+                {"tid": template_id},
+            )
+            assert int(spurious.scalar_one()) == 0, (
+                "Atomicity violation: outbox event(s) committed despite rollback"
+            )

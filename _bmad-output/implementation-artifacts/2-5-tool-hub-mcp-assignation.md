@@ -1,6 +1,6 @@
 # Story 2.5 : Tool Hub MCP + assignation outils à un agent
 
-Status: review
+Status: done
 
 > 🎯 **Cinquième story Epic 2 — Agent Platform.** Cette story livre la **plomberie M5 Tool Hub** : connexion de serveurs MCP (stdio + SSE), discovery + registry des outils exposés, et assignation d'outils à des agent-templates via une junction table. Couvre **FR22** (Tool Hub MCP) et **NFR19** (compatibilité stdio + SSE).
 >
@@ -593,7 +593,7 @@ $ docker compose exec db psql -U agentive_owner -d agentive -c "SELECT event_typ
 - **Duplicate check pre-discovery** : on SELECT par name AVANT la discovery (étape 1). Si conflit → 409 sans payer le coût d'un timeout MCP. Évite le gaspillage de 10s pour un nom déjà pris.
 - **`replace_in_session` retourne `(added, removed)`** : le service utilise les diffs pour émettre exactement N events `tool_assigned` + M events `tool_unassigned` (pas d'events spurious pour les tools inchangés). Pattern miroir Story 2.4 P-02 atomicité.
 - **`tools.input_schema` JSONB shape libre** : aucune validation Pydantic Sprint 1 (le serveur MCP est l'autorité). Stockage textuel via `dict(tool.inputSchema)` après mapping camelCase → snake_case.
-- **Mock MCP server stdio uniquement** : SSE testing défer Story 2.6 (D55). Le test transport routing implicite via les 2 fixtures du `infra/mcp/client.py` (stdio résolu par le subprocess mock + branche if-elif).
+- **Mock MCP server stdio uniquement** : SSE testing happy-path défer Story 2.6 (rolls into **D59** runtime execution — amendement P-19 CR 2026-05-10 : la mention initiale "D55" était une typo, D55 = Fernet encryption uniquement). Le test transport routing positif (P-09 CR Cluster B) couvre le dispatch SSE via fake `sse_client`.
 - **Frontend `AgentToolsPanel` panneau séparé** (décision #11 spec) : RENDU en bas de `/config/agents/{templateId}`, PAS intégré dans le Wizard/Expert form Story 2.3 (qui reste inchangé). UX cohérente avec UX-DR §"Tool grouping".
 - **`useQueries` TanStack** dans `AgentToolsPanel` pour fetcher en parallèle le détail (avec tools array) de chaque serveur listé. Cache scopé par `["tool-server", serverId]` queryKey (cohérent invalidation Story 2.4 D40 chains).
 - **`AddToolServerDialog` JSON config validation client** : `JSON.parse` + `Array.isArray(parsed) === false` côté client AVANT POST. Évite un round-trip 422 pour les erreurs JSON triviales.

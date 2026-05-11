@@ -35,7 +35,8 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-10  # Story 2.5 code-review adversarial via bmad-code-review (Blind + EdgeCase + Auditor) — 69 raw → 40 uniques (23 patches + 1 bad-spec + 16 defer + 10 rejected) ; B-01 amend tranché : Dev Note #10 révisée → DRY accepté ; D-01 tranché : admin-gate Sprint 1 (promu defer → P-23, feature flag AGENTIVE_ALLOW_MCP_REGISTRATION default false)
+last_updated: 2026-05-11  # Story 2.5 done — fix-batch CR adversarial complet : Cluster A (commit 97b85d4, P-01..P-06 + P-23 + B-01 amend) + Cluster B (commit 409b262, P-07..P-11) + Cluster C (P-12..P-22 + bump done). 514 backend (+23) + 100 frontend (+1) = 614 total, 0 régression, lint vert
+# 2026-05-11 — Story 2.5 done — fix-batch CR adversarial 3 clusters complet. Cluster A (commit 97b85d4) : 7 patches Critical/High + B-01 amend — P-01 AssignedToolView contract AC2 (assigned_at + input_schema + output_schema), P-02 useEffect clobber guard, P-03 connection_config redaction (env/headers values masked, smoke prove 0 leak), P-04 smoke runtime AC8 capturé exhaustivement (9 steps + docker logs + DB outbox count), P-05 emit_notify event_type per-row, P-06 unit tests T2.5+T6.2 (+12), P-23 admin-gate AGENTIVE_ALLOW_MCP_REGISTRATION default false (D-01 RCE/SSRF promu defer→patch). Cluster B (commit 409b262) : 5 Medium — P-07 AgentToolsPanel partial-failure rendering, P-08 MCP exception broadening (FileNotFound/Permission/OSError + catch-all → 503), P-09 SSE transport routing positive test, P-10 real subprocess sleep timeout (python -c "time.sleep(300)" + timeout=1s), P-11 tenant_id.is_() UUID-safe. Cluster C : 11 Low/Polish — P-12 atomicité outbox 0-event, P-13 model server_default text("'{}'::jsonb"), P-14 DELETE outbox audit-event assert, P-15 secondary sort by id (deux repos), P-16 getattr outputSchema défensif, P-17 args/env element-type str validation, P-18 reject empty tool name, P-19 spec D55 typo (→ D59), P-20 ToolServerDetailView.tools_count, P-21 N+1 query test (3 servers ≤ 5 SELECTs), P-22 verified clean. Tests : 514 backend (+23) + 100 frontend (+1) = 614 total. 0 régression, ruff+mypy+eslint+tsc verts. AC1-AC8 prouvés end-to-end (smoke + automatisé). 17 defer ouverts traçables Story 2.6+/12+/9.2 (D-01 fermé). Epic 2 reste in-progress (3 stories backlog post-2.5 : 2.6 Sandbox bwrap + 2.7 Playground + 2.8 Review conversationnelle). Prochaine action SM : `bmad-create-story` pour Story 2.6.
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -110,7 +111,7 @@ development_status:
   2-2-configurer-agent-complet: done
   2-3-mode-wizard-vs-expert: done
   2-4-distinction-template-vs-instance: done
-  2-5-tool-hub-mcp-assignation: review
+  2-5-tool-hub-mcp-assignation: done
   2-6-execution-outils-sandbox-bwrap: backlog
   2-7-agent-playground: backlog
   2-8-review-conversationnelle-controleur: backlog

@@ -268,6 +268,7 @@ class ToolHubService:
             status=server.status,
             connection_config=_redact_connection_config(server.connection_config),
             discovered_at=server.discovered_at,
+            tools_count=len(inserted_tools),
             tools=[
                 ToolView(
                     tool_id=tool.id,
@@ -328,6 +329,7 @@ class ToolHubService:
             status=server.status,
             connection_config=_redact_connection_config(server.connection_config),
             discovered_at=server.discovered_at,
+            tools_count=len(tools),
             tools=[
                 ToolView(
                     tool_id=tool.id,

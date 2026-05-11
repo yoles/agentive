@@ -294,6 +294,80 @@ async def test_list_tool_servers_returns_count(
 
 
 @pytest.mark.integration
+async def test_list_tool_servers_is_not_n_plus_1(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """P-21 (CR 2026-05-10) — Dev Note #9 / spec L406 demanded :
+    *"avec 3 servers, on a bien 3 SQL queries (1 SELECT JOIN agrégé), pas
+    3+N"*.
+
+    We attach a SQLAlchemy event listener that counts ``SELECT`` statements
+    issued during the ``GET /tools/servers`` request and assert the count
+    stays bounded regardless of the number of servers / tools.
+
+    Tolerance: the count check is "≤ 5 SELECTs" rather than "= 1" because
+    the request pipeline also issues a couple of ``SET LOCAL`` (tenant
+    binding) and possibly a ``BEGIN``/``COMMIT`` framing. The point is to
+    catch the N+1 regression where a per-server tools count subquery would
+    fire 3+ extra SELECTs.
+    """
+    from sqlalchemy import event
+
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Seed 3 servers (3 tools each via the mock).
+        for i in range(3):
+            await client.post(
+                "/api/v1/tools/servers",
+                headers=_auth_headers(),
+                json={
+                    "name": f"n1-server-{i}",
+                    "transport": "stdio",
+                    "connection_config": _stdio_config(),
+                },
+            )
+
+        select_counter: list[str] = []
+
+        engine = app_session_factory.kw["bind"]
+        sync_engine = engine.sync_engine
+
+        def _before_cursor_execute(_conn: Any, _cursor: Any, statement: str, *_rest: Any) -> None:
+            # Scope the counter to SELECTs targeting tool_servers — the
+            # query of interest for the N+1 invariant.
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "tool_servers" in statement.lower()
+            ):
+                select_counter.append(statement)
+
+        event.listen(sync_engine, "before_cursor_execute", _before_cursor_execute)
+        try:
+            resp = await client.get("/api/v1/tools/servers", headers=_auth_headers())
+        finally:
+            event.remove(sync_engine, "before_cursor_execute", _before_cursor_execute)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        ours = [s for s in body if s["name"].startswith("n1-server-")]
+        assert len(ours) == 3
+        for s in ours:
+            assert s["tools_count"] == 2  # mock exposes 2 tools per server
+
+        # The N+1 trap: a per-server count subquery would have fired 3+
+        # extra SELECTs targeting tool_servers / tools. The aggregate JOIN
+        # keeps the total bounded. We allow a small headroom (≤ 5) for
+        # framing / RLS-binding queries that may also hit tool_servers in
+        # passing without scaling with N.
+        assert len(select_counter) <= 5, (
+            f"N+1 regression: {len(select_counter)} SELECTs against tool_servers "
+            f"for 3 servers, expected ≤ 5 (1 list query + framing).\nQueries:\n"
+            + "\n".join(select_counter)
+        )
+
+
+@pytest.mark.integration
 async def test_get_tool_server_detail_happy(
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

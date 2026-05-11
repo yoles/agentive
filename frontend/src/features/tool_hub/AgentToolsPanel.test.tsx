@@ -113,6 +113,7 @@ describe("AgentToolsPanel", () => {
       status: "active" as const,
       connection_config: { command: "python" },
       discovered_at: new Date().toISOString(),
+      tools_count: 2,
       tools: [
         {
           tool_id: TOOL_ID_A,
@@ -267,6 +268,7 @@ describe("AgentToolsPanel", () => {
             status: "active",
             connection_config: { command: "python" },
             discovered_at: new Date().toISOString(),
+            tools_count: 1,
             tools: [
               {
                 tool_id: TOOL_OK,
