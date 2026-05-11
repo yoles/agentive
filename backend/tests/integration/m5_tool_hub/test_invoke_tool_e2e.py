@@ -187,6 +187,38 @@ async def test_invoke_tool_disabled_by_flag_returns_403(
 
 
 @pytest.mark.integration
+async def test_invoke_tool_unknown_agent_template_id_returns_404(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """P-11 (CR 2026-05-11) — when caller supplies an ``agent_template_id``
+    that does NOT exist in ``agent_templates``, return 404 rather than
+    polluting the audit trail with a fictitious attribution.
+    """
+    from uuid import uuid4
+
+    from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.mcp_sandbox_backend = detect_sandbox_backend()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        srv = await _seed_server(client, "p11-ghost-template")
+        echo_id = _tool_id(srv, "echo")
+
+        resp = await client.post(
+            f"/api/v1/tools/servers/{srv['server_id']}/tools/{echo_id}/invoke",
+            headers=_auth_headers(),
+            json={
+                "arguments": {"text": "hi"},
+                "agent_template_id": str(uuid4()),  # does NOT exist
+            },
+        )
+        assert resp.status_code == 404, resp.text
+        body = resp.json()
+        assert "agent template" in body.get("detail", "").lower()
+
+
+@pytest.mark.integration
 async def test_invoke_tool_audit_event_redacts_secret_arguments(
     app_session_factory: async_sessionmaker[AsyncSession],
     seed_session_factory: async_sessionmaker[AsyncSession],

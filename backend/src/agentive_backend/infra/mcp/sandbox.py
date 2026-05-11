@@ -35,13 +35,12 @@ de pool persistant (D61), pas d'allowlist URL SSE runtime (D63).
 from __future__ import annotations
 
 import asyncio
-import resource
 import shutil
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 from agentive_backend.shared.logging import get_logger
 
@@ -270,31 +269,6 @@ def _build_bwrap_argv(
     return argv
 
 
-def _setrlimit_preexec(profile: SandboxProfile) -> Any:
-    """Build a ``preexec_fn`` for ``subprocess.Popen`` that applies CPU,
-    memory, and process-count rlimits.
-
-    Best-effort fallback used when ``bwrap`` is unavailable. Does NOT
-    restrict network or filesystem (the bypass tests will skip in this
-    mode — see :mod:`tests.integration.mcp.test_sandbox_bypass`).
-    """
-
-    import contextlib
-
-    def _apply() -> None:  # pragma: no cover — runs in forked child
-        cpu = profile.cpu_seconds
-        mem = profile.memory_mb * 1024 * 1024
-        nproc = profile.max_processes
-        with contextlib.suppress(ValueError, OSError):
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        with contextlib.suppress(ValueError, OSError):
-            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-        with contextlib.suppress(ValueError, OSError):
-            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
-
-    return _apply
-
-
 @asynccontextmanager
 async def sandboxed_subprocess(
     command: str,
@@ -404,8 +378,19 @@ def _build_setrlimit_bootstrap(
     (D62 Sprint 2 per-tool profile, D65 metric Prometheus dashboard).
     """
     mem_bytes = profile.memory_mb * 1024 * 1024
+    # P-12 (CR 2026-05-11) — scrub dangerous env vars BEFORE execvp so the
+    # bootstrap doesn't propagate LD_PRELOAD / PYTHONPATH /
+    # LD_LIBRARY_PATH / PYTHONSTARTUP injected by a hypothetical adversary
+    # writing to ``/tmp`` (the only writable path). Without this, a tool
+    # call running in setrlimit fallback could be hijacked via env-based
+    # code injection — sandbox escape conceptuelle.
     bootstrap = (
         "import resource, os, sys, contextlib\n"
+        "for _dangerous in (\n"
+        "    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONSTARTUP',\n"
+        "    'PYTHONHOME', 'PYTHONINSPECT', 'LD_AUDIT',\n"
+        "):\n"
+        "    os.environ.pop(_dangerous, None)\n"
         f"with contextlib.suppress(ValueError, OSError):\n"
         f"    resource.setrlimit(resource.RLIMIT_CPU, ({profile.cpu_seconds}, {profile.cpu_seconds}))\n"
         f"with contextlib.suppress(ValueError, OSError):\n"
