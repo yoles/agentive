@@ -301,7 +301,22 @@ async def _call_tool_inner(
         # SDK to spawn ``bwrap`` and pass the original command as bwrap's
         # tail args. The SDK believes it's launching ``bwrap`` (which is
         # true) but bwrap then execs the real command inside the sandbox.
-        sandbox_argv_prefix = _sandbox_argv_prefix(profile=profile, backend=backend)
+        #
+        # P-02 (CR 2026-05-11) — filter ``env`` via
+        # ``profile.env_passthrough`` BEFORE forwarding to the SDK. In
+        # setrlimit fallback mode the SDK spawns the bootstrap subprocess
+        # which inherits this env wholesale ; without filtering, secret-
+        # bearing keys from ``connection_config["env"]`` would leak into
+        # the subprocess.
+        effective_profile = profile or SandboxProfile()
+        effective_env: dict[str, str] | None
+        if env is not None:
+            effective_env = {k: v for k, v in env.items() if k in effective_profile.env_passthrough}
+        else:
+            effective_env = None
+        sandbox_argv_prefix = _sandbox_argv_prefix(
+            profile=effective_profile, backend=backend, parent_env=effective_env
+        )
         if sandbox_argv_prefix:
             wrapped_command = sandbox_argv_prefix[0]
             wrapped_args = [*sandbox_argv_prefix[1:], command, *args]
@@ -309,7 +324,9 @@ async def _call_tool_inner(
             wrapped_command = command
             wrapped_args = list(args)
 
-        params = StdioServerParameters(command=wrapped_command, args=wrapped_args, env=env)
+        params = StdioServerParameters(
+            command=wrapped_command, args=wrapped_args, env=effective_env
+        )
         try:
             async with stdio_client(params) as (read, write):
                 return await _call_tool_via_session(read, write, tool_name, arguments)
@@ -341,13 +358,25 @@ def _reraise_domain_error_from_group(exc_group: BaseExceptionGroup) -> None:
     the caller sees the original domain class rather than the anyio
     ``BaseExceptionGroup`` wrapping it.
 
-    Returns silently if no domain error is found ; the caller then
+    P-07 (CR 2026-05-11) — also unwraps ``OSError`` and translates it to
+    :class:`MCPExecutionError`. anyio task groups wrap subprocess-spawn
+    errors (ENOENT on missing ``bwrap`` binary, EACCES on permission
+    denied, etc.) ; without this branch the OSError leaks as a
+    ``BaseExceptionGroup`` past ``service.invoke_tool``'s ``except
+    (MCPExecutionTimeoutError | MCPToolError | MCPExecutionError)`` and
+    surfaces as a generic 500 instead of the canonical 503.
+
+    Returns silently if no relevant exception is found ; the caller then
     re-raises the original group.
     """
     domain_types = (MCPToolError, MCPExecutionError, MCPExecutionTimeoutError)
     for exc in exc_group.exceptions:
         if isinstance(exc, domain_types):
             raise exc from exc_group
+        if isinstance(exc, OSError):
+            raise MCPExecutionError(
+                returncode=-1, stderr_tail=f"{type(exc).__name__}: {exc}"
+            ) from exc
         if isinstance(exc, BaseExceptionGroup):
             _reraise_domain_error_from_group(exc)
 
@@ -356,10 +385,13 @@ def _sandbox_argv_prefix(
     *,
     profile: SandboxProfile | None,
     backend: SandboxBackend | None,
+    parent_env: dict[str, str] | None = None,
 ) -> list[str]:
     """Compute the bwrap (or setrlimit bootstrap) argv prefix to wrap the
-    target command. Returns an empty list if no sandbox should be applied
-    (degenerate case kept for testability — production always sandboxes).
+    target command.
+
+    P-09 (CR 2026-05-11) — placeholder validation hardened against ``python -O``
+    (which strips ``assert``). Use explicit ``RuntimeError`` instead.
     """
     from agentive_backend.infra.mcp.sandbox import (
         _build_bwrap_argv,
@@ -373,16 +405,28 @@ def _sandbox_argv_prefix(
     if effective_backend == "bwrap":
         # Build a bwrap argv that ends with ``--`` and an empty trailing
         # command — we'll splice the real command in afterward.
-        argv = _build_bwrap_argv("__PLACEHOLDER__", [], profile=effective_profile)
+        argv = _build_bwrap_argv(
+            "__PLACEHOLDER__",
+            [],
+            profile=effective_profile,
+            parent_env=parent_env,
+        )
         # Drop the placeholder so callers can append the real command.
-        # The placeholder is the second-to-last element (followed by no args).
-        assert argv[-1] == "__PLACEHOLDER__", argv
+        if argv[-1] != "__PLACEHOLDER__":
+            raise RuntimeError(
+                f"_build_bwrap_argv layout drift: trailing element is {argv[-1]!r}, "
+                "not the expected placeholder. Refusing to strip."
+            )
         return argv[:-1]
     else:
         # setrlimit bootstrap is ``python -c "..." <command> <args...>`` — we
         # return the python bootstrap (sans command) and let the caller append.
         bootstrap = _build_setrlimit_bootstrap("__PLACEHOLDER__", [], profile=effective_profile)
-        assert bootstrap[-1] == "__PLACEHOLDER__", bootstrap
+        if bootstrap[-1] != "__PLACEHOLDER__":
+            raise RuntimeError(
+                f"_build_setrlimit_bootstrap layout drift: trailing element is "
+                f"{bootstrap[-1]!r}, not the expected placeholder. Refusing to strip."
+            )
         return bootstrap[:-1]
 
 

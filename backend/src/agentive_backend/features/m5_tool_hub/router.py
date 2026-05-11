@@ -14,6 +14,7 @@ All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). The global
 
 from __future__ import annotations
 
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, Request, status
@@ -160,8 +161,15 @@ async def invoke_tool(
             context={"flag": "AGENTIVE_ALLOW_MCP_REGISTRATION"},
         )
     service = _build_service(request)
+    # P-03 (CR 2026-05-11) — resolve sandbox_backend ONCE (caller's
+    # app.state cache or auto-detect) and pass the same value through
+    # service + response, so the HTTP response and the audit event agree
+    # on the active sandbox mode.
     backend = getattr(request.app.state, "mcp_sandbox_backend", None)
-    import time
+    if backend is None:
+        from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
+
+        backend = detect_sandbox_backend()
 
     start = time.monotonic()
     result = await service.invoke_tool(
@@ -177,7 +185,7 @@ async def invoke_tool(
     return InvokeToolResponse(
         result=result,
         duration_ms=duration_ms,
-        sandbox_backend=backend or "bwrap",
+        sandbox_backend=backend,
     )
 
 

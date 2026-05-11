@@ -25,7 +25,7 @@ So that les outils ne peuvent pas compromettre l'hôte ou exfiltrer des données
 **When** `infra.mcp.sandbox.call_tool(server, tool_name="echo", arguments={"text":"hi"}, timeout=30.0)` est appelé
 **Then** le subprocess MCP démarre dans un namespace réseau dédié (`--unshare-net` ou `--share-net` selon profil)
 **And** le filesystem hôte est monté read-only (`--ro-bind /usr /usr`, `--ro-bind /etc /etc`, etc.) sauf `/tmp` éphémère (`--tmpfs /tmp`)
-**And** seuls les binaires whitelistés sont accessibles (whitelist explicite `--ro-bind /usr/bin/python /usr/bin/python` par profil)
+**And** seuls les binaires whitelistés sont accessibles ~~(whitelist explicite `--ro-bind /usr/bin/python /usr/bin/python` par profil)~~ — **Amendement CR 2026-05-11 B-02** : bind par DOSSIER (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`) Sprint 1, per-binary whitelist défer Sprint 2+ (nouveau **D73** dans Completion Notes). Justification : per-binary whitelist exigerait soit un mount-point individuel par binaire (centaines pour Python+deps) soit un fakeroot tooling — coût démesuré Sprint 1 ; bind par dossier reste deny-all-by-default grâce à `--clearenv` + `--ro-bind` (lecture seule)
 **And** la réponse de l'outil est récupérée + retournée à l'appelant en `dict[str, Any]` (shape MCP `CallToolResult`)
 **And** le timeout de 30s est appliqué via `asyncio.wait_for` (kill si dépassé → `MCPExecutionTimeoutError` translaté en `DependencyError` 503 par les couches features/)
 
@@ -86,7 +86,7 @@ So that les outils ne peuvent pas compromettre l'hôte ou exfiltrer des données
 
 **Given** la baseline post-Story 2.5 = **514 backend + 100 frontend**
 **When** la Story 2.6 est implémentée
-**Then** ≥ 25 nouveaux tests : ≥ 18 backend (≥ 5 sandbox unit + ≥ 4 sandbox security/bypass + ≥ 4 client.call_tool integration + ≥ 3 schemas + ≥ 2 lifespan health-check bwrap) + ≥ 7 frontend (utility hook tests seulement — pas de UI dans cette story)
+**Then** ≥ 25 nouveaux tests : ≥ 18 backend (≥ 5 sandbox unit + ≥ 4 sandbox security/bypass + ≥ 4 client.call_tool integration + ≥ 3 schemas + ≥ 2 lifespan health-check bwrap) + ~~≥ 7 frontend (utility hook tests seulement — pas de UI dans cette story)~~ **0 frontend** — **Amendement CR 2026-05-11 B-01** : zéro tests frontend conformément à T9 *« 100% backend »* et décision #15 *« Frontend = ZÉRO changement »* (3/4 sources spec convergent ; "≥ 7 frontend" était un copy-paste artifact des templates Stories 2.4/2.5)
 **And** baseline 514 + 100 strictement préservée (0 régression)
 **And** `make lint` (ruff + mypy + eslint + tsc) vert
 **And** smoke runtime AC7 capturé en Completion Notes (decision Story 2.4 B-01 / Story 2.5 P-04 pattern)
@@ -282,7 +282,7 @@ So that les outils ne peuvent pas compromettre l'hôte ou exfiltrer des données
 
 13. **Mock MCP server étendu** : ajouter handler `@server.call_tool()` pour `echo` + `add` dans `tests/fixtures/mcp_mock_server.py`. Cohérent avec Story 2.5 fixture.
 
-14. **AGENTIVE_ALLOW_MCP_REGISTRATION flag** (Story 2.5 P-23) : peut rester `false` par défaut puisque l'admin-gate gardait POST /tools/servers, pas `call_tool`. Décision : Story 2.6 ne touche PAS ce flag. Si on veut un gate sur `call_tool` (ex : "registration enabled but execution disabled"), ce serait un nouveau flag → défer (D-67 nouveau si besoin).
+14. **AGENTIVE_ALLOW_MCP_REGISTRATION flag** (Story 2.5 P-23) : ~~peut rester `false` par défaut puisque l'admin-gate gardait POST /tools/servers, pas `call_tool`. Décision : Story 2.6 ne touche PAS ce flag.~~ **Amendement CR 2026-05-11 B-03** : décision révisée → le endpoint `POST .../invoke` est gaté par le MÊME flag `AGENTIVE_ALLOW_MCP_REGISTRATION`. Justification : tant que bwrap n'est pas production-validated (kernel constraint Docker dev = setrlimit fallback uniquement), la surface RCE/SSRF de l'exécution est strictement identique à celle de la registration — gater les deux derrière un flag unique respecte le principe defense-in-depth + opt-in explicite. Un flag séparé `AGENTIVE_ALLOW_MCP_EXECUTION` reste défer **D67** si un besoin opérationnel se présente (ex : "registration disabled in prod, execution enabled for trusted-pre-registered tools").
 
 15. **Frontend = ZÉRO changement** : la story est backend-only. Story 2.7 (Playground) consommera l'API. Reproduction du pattern Story 2.4 (backend-only) — la story file `## Frontend Changes` section sera vide ou marquée "N/A".
 
