@@ -228,4 +228,83 @@ describe("AgentToolsPanel", () => {
       expect(new Set(body.tool_ids)).toEqual(new Set([TOOL_ID_A, TOOL_ID_B]));
     });
   });
+
+  it("P-07: renders healthy servers even when one server detail fetch fails", async () => {
+    const SERVER_OK = "11111111-aaaa-bbbb-cccc-dddddddddddd";
+    const SERVER_KO = "22222222-aaaa-bbbb-cccc-dddddddddddd";
+    const TOOL_OK = "33333333-aaaa-bbbb-cccc-dddddddddddd";
+
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/tools/servers")) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              server_id: SERVER_OK,
+              name: "healthy-server",
+              transport: "stdio",
+              status: "active",
+              tools_count: 1,
+              discovered_at: new Date().toISOString(),
+            },
+            {
+              server_id: SERVER_KO,
+              name: "broken-server",
+              transport: "stdio",
+              status: "active",
+              tools_count: 1,
+              discovered_at: new Date().toISOString(),
+            },
+          ]),
+        );
+      }
+      if (url.endsWith(`/tools/servers/${SERVER_OK}`)) {
+        return Promise.resolve(
+          jsonResponse({
+            server_id: SERVER_OK,
+            name: "healthy-server",
+            transport: "stdio",
+            status: "active",
+            connection_config: { command: "python" },
+            discovered_at: new Date().toISOString(),
+            tools: [
+              {
+                tool_id: TOOL_OK,
+                name: "ping",
+                description: "Ping a host",
+                input_schema: {},
+                output_schema: null,
+              },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith(`/tools/servers/${SERVER_KO}`)) {
+        return Promise.resolve(jsonResponse({ detail: "boom" }, { status: 500 }));
+      }
+      if (url.endsWith(`/agents/templates/${TEMPLATE_ID}/tools`)) {
+        return Promise.resolve(
+          jsonResponse({ template_id: TEMPLATE_ID, assigned_tools: [] }),
+        );
+      }
+      return Promise.resolve(jsonResponse({}, { status: 404 }));
+    });
+
+    render(
+      <Providers>
+        <AgentToolsPanel templateId={TEMPLATE_ID} />
+      </Providers>,
+    );
+
+    // The healthy server's tool group must render despite the broken sibling.
+    await waitFor(() => {
+      expect(screen.getByTestId(`tool-group-${SERVER_OK}`)).toBeInTheDocument();
+    });
+    expect(screen.getByTestId(`tool-checkbox-${TOOL_OK}`)).toBeInTheDocument();
+
+    // The broken server gets a degraded banner instead of hiding the panel.
+    expect(
+      screen.getByTestId(`tool-group-error-${SERVER_KO}`),
+    ).toBeInTheDocument();
+  });
 });

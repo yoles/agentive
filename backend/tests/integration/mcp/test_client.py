@@ -16,6 +16,7 @@ These tests exercise the REAL MCP SDK + real asyncio cancellation paths
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
@@ -49,28 +50,21 @@ async def test_discover_tools_stdio_returns_two_mock_tools() -> None:
 
 
 @pytest.mark.integration
-async def test_discover_tools_timeout_raises_via_real_wait_for() -> None:
-    """T2.5 (2) + P-10 (CR 2026-05-10) — Real ``asyncio.wait_for`` path.
+async def test_discover_tools_timeout_raises_via_real_wait_for_inproc() -> None:
+    """T2.5 (2) — In-process verification of the wait_for → translate path.
 
-    Spec demanded a "mock subprocess that sleeps 30s" to exercise the
-    actual timeout machinery. We approximate by passing a coroutine that
-    awaits forever (cheaper than spawning a real sleeping subprocess) and
-    a tiny timeout — the same wait_for semantics fire.
-
-    The dev-batch also has a monkeypatched test in
-    ``tests/integration/m5_tool_hub/test_tool_servers_e2e.py`` that
-    short-circuits the discovery ; THIS test complements it by exercising
-    the real wait_for cancellation.
+    Verifies the exception-translation contract end-to-end without
+    spawning a subprocess: a hanging coroutine + the same ``asyncio.wait_for``
+    pattern as ``discover_tools``. Cheaper than the subprocess test below
+    and runs in every test cycle. The subprocess sibling test
+    (``test_discover_tools_timeout_with_real_subprocess_sleep``) covers the
+    full path including OS subprocess cancellation.
     """
 
     async def _hang() -> list[ToolInfo]:
         await asyncio.sleep(60)
         return []
 
-    # Substitute discover_tools' inner coroutine factory by overriding the
-    # Literal arg path: pass an unknown transport that would normally raise
-    # ValueError, but FIRST wrap it so wait_for gets to fire on a hanging
-    # task. We do this by replicating the wait_for shape directly here :
     with pytest.raises(MCPDiscoveryTimeoutError) as exc_info:
         try:
             await asyncio.wait_for(_hang(), timeout=0.05)
@@ -78,6 +72,113 @@ async def test_discover_tools_timeout_raises_via_real_wait_for() -> None:
             raise MCPDiscoveryTimeoutError(timeout=0.05) from exc
 
     assert exc_info.value.timeout == 0.05
+
+
+@pytest.mark.integration
+async def test_discover_tools_timeout_with_real_subprocess_sleep() -> None:
+    """P-10 (CR 2026-05-10) — REAL subprocess that hangs forever.
+
+    Spec T2.5 (2) demanded "utiliser un mock subprocess qui dort 30s" to
+    exercise the actual ``asyncio.wait_for`` cancellation path including
+    SIGTERM dispatch to the child process. We spawn ``python -c "import
+    time; time.sleep(300)"`` (no MCP protocol on stdin/stdout, so the MCP
+    SDK will hang on ``initialize()`` until our timeout fires).
+
+    Validates :
+    - ``discover_tools`` returns a real ``MCPDiscoveryTimeoutError`` (not
+      a raw ``asyncio.TimeoutError``).
+    - The configured timeout value is carried on the exception.
+    - The whole thing completes within ~3s (i.e., the timeout actually
+      stops the discovery rather than waiting on the 300s sleep).
+    """
+    import time
+
+    start = time.monotonic()
+    with pytest.raises(MCPDiscoveryTimeoutError) as exc_info:
+        await discover_tools(
+            transport="stdio",
+            connection_config={
+                "command": "python",
+                "args": ["-c", "import time; time.sleep(300)"],
+            },
+            timeout=1.0,
+        )
+    elapsed = time.monotonic() - start
+    assert exc_info.value.timeout == 1.0
+    assert elapsed < 5.0, (
+        f"discover_tools should bail within ~1s + cleanup grace, got {elapsed:.1f}s"
+    )
+
+
+@pytest.mark.integration
+async def test_discover_tools_dispatches_to_sse_client_for_sse_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-09 (CR 2026-05-10) — Positive routing test for SSE.
+
+    Spec decision #3 demanded "at least one transport-routing test
+    proving infra/mcp/client.py picks the right transport per
+    tool_servers.transport". A full SSE happy path needs a real SSE
+    server (deferred to Story 2.6 D59), so we mock ``sse_client`` and
+    ``ClientSession`` to assert the dispatch happened on the SSE branch
+    AND that headers + url are propagated correctly.
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, MagicMock
+
+    from mcp import types
+
+    captured: dict[str, Any] = {}
+
+    @asynccontextmanager
+    async def fake_sse_client(*, url: str, headers: dict[str, str] | None = None):
+        captured["url"] = url
+        captured["headers"] = headers
+        # ``sse_client`` yields (read, write) streams.
+        yield (MagicMock(), MagicMock())
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            result = MagicMock()
+            result.tools = [
+                types.Tool(
+                    name="ping",
+                    description="probe",
+                    inputSchema={"type": "object"},
+                ),
+            ]
+            return result
+
+    monkeypatch.setattr("agentive_backend.infra.mcp.client.sse_client", fake_sse_client)
+    monkeypatch.setattr(
+        "agentive_backend.infra.mcp.client.ClientSession",
+        lambda *a, **kw: FakeSession(),
+    )
+    # If a regression sends SSE traffic to stdio_client by accident, fail loud.
+    monkeypatch.setattr(
+        "agentive_backend.infra.mcp.client.stdio_client",
+        AsyncMock(side_effect=AssertionError("must not call stdio_client for sse")),
+    )
+
+    tools = await _discover_inner(
+        transport="sse",
+        connection_config={
+            "url": "https://mcp.example.com/sse",
+            "headers": {"Authorization": "Bearer token"},
+        },
+    )
+    assert captured["url"] == "https://mcp.example.com/sse"
+    assert captured["headers"] == {"Authorization": "Bearer token"}
+    assert [t.name for t in tools] == ["ping"]
 
 
 @pytest.mark.integration
