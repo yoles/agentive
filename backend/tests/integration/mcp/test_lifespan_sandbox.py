@@ -41,6 +41,10 @@ def test_lifespan_stores_bwrap_when_probe_succeeds(
 ) -> None:
     """T3.4 (1) — when the bwrap binary exists AND the kernel allows
     unprivileged user namespaces, lifespan stores backend='bwrap'."""
+    # P-18 (CR 2026-05-11) — clear the @functools.cache so the monkey-
+    # patched probe is actually consulted (previous test runs may have
+    # cached a different result).
+    sandbox_module._detect_sandbox_backend_uncached.cache_clear()
     monkeypatch.setattr(
         sandbox_module.shutil,
         "which",
@@ -63,6 +67,7 @@ def test_lifespan_falls_back_to_setrlimit_when_probe_fails(
     unprivileged user namespaces (Docker default seccomp), lifespan stores
     backend='setrlimit' AND a warning is logged.
     """
+    sandbox_module._detect_sandbox_backend_uncached.cache_clear()
     monkeypatch.setattr(
         sandbox_module.shutil,
         "which",

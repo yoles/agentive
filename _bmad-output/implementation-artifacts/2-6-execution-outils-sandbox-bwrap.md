@@ -1,6 +1,6 @@
 # Story 2.6 : Exécution des outils MCP dans sandbox bwrap + setrlimit
 
-Status: review
+Status: done
 
 > 🎯 **Sixième story Epic 2 — Agent Platform.** Cette story livre l'**exécution runtime sandboxée** des outils MCP enregistrés en Story 2.5 : appel d'un outil via `infra/mcp/sandbox.py` qui spawne le serveur MCP dans un sandbox `bubblewrap` (`bwrap`) avec namespace réseau dédié + filesystem read-only + `/tmp` éphémère + timeout strict. Fallback `setrlimit` si `bwrap` indisponible. Couvre **FR24** (exécution sandboxée) et **NFR10** (sandbox outils MCP).
 >
@@ -418,7 +418,7 @@ claude-opus-4-7 (1M context) — bmad-dev-story single-pass execution (suite à 
 - **bwrap inopérant en container Docker** (limitation kernel) : `bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces` → la fonction `detect_sandbox_backend()` a été renforcée d'un probe `_probe_bwrap_actually_works()` qui spawn un `bwrap true` minimal pour valider le namespace user, et retourne "setrlimit" si le probe échoue. Cette détection automatique permet à la story de fonctionner en dev/CI Docker (mode dégradé setrlimit) ET en prod (mode bwrap complet) sans changement de code.
 - **Bootstrap setrlimit** : `python -c "import resource, os, sys, contextlib; with contextlib.suppress(...): resource.setrlimit(...); os.execvp(sys.argv[1], sys.argv[1:])"` — pattern python-bootstrap qui applique les rlimits CPU + AS (memory) puis `execvp` remplace l'image du process. RLIMIT_NPROC intentionnellement omis (Linux compte par real UID, donc inutilisable en container où le user a déjà nombreux process).
 - **anyio.BaseExceptionGroup unwrap** : `ClientSession.__aexit__` et `stdio_client.__aexit__` enveloppent les exceptions dans `BaseExceptionGroup` (anyio task group). Helper `_reraise_domain_error_from_group()` ajouté dans `infra/mcp/client.py` pour re-raise `MCPToolError` / `MCPExecutionError` / `MCPExecutionTimeoutError` directement, permettant aux callers + tests `pytest.raises(MCPToolError)` de fonctionner.
-- `git grep "audit-event bypass cleanup" backend/src/` → **9 hits** post-Story 2.6 :
+- `git grep "audit-event bypass cleanup" backend/src/` → **8 hits** post-Story 2.6 (corrigé P-24 CR 2026-05-11 ; le "9" précédent comptait à tort le docstring de référence ligne 13 comme un TODO) :
   - 3 baseline Stories 2.1+2.2+2.4 : m2/service.py L182 (created), L358 (updated), L494 (instance.created).
   - 4 Story 2.5 : m2/service.py L656/670/798 (tool_assigned/unassigned ×3) + m5/service.py L129 (connect_server).
   - **1 nouveau Story 2.6** : m5/service.py L596 (invoke_tool publish).
@@ -474,10 +474,19 @@ $ docker compose exec db psql ... -c "SELECT event_type, payload->>'status', cou
  m5.tool.invoked | timeout |     1
 ```
 
+**Step 5 (AC7) — docker logs grep** (ajouté P-23 CR 2026-05-11, omis du smoke initial) :
+
+```
+$ docker compose logs backend --since 30s | grep -c "m5.tool.invoked"
+2
+```
+
+L'événement `m5.tool.invoked` apparaît à la fois dans les logs structlog (event_dispatch via outbox worker) et dans le payload de log de l'API call. Le compte 2 reflète 1 invoke + 1 outbox dispatch confirmation (cohérent avec event_bus pattern Story 1.4).
+
 **Verdict AC7** : ✅ 3 m5.tool.invoked events distincts (2 success + 1 timeout) ; `duration_ms` cohérent (4150ms = spawn overhead du bootstrap setrlimit + MCP handshake — élevé en mode dégradé Docker, sera ~50-200ms en bwrap natif) ; `sandbox_backend=setrlimit` propagé jusqu'à la réponse HTTP ; `result.content[0].text` correctement extrait pour echo + add.
 
 - ✅ **AC8** — Tests : **541 backend (+27 vs baseline 514 post-2.5) + 100 frontend (inchangé, anti-scope strict)** = **27 nouveaux** (spec ≥ 25). Breakdown :
-  - `tests/unit/mcp/test_sandbox.py` : 13 tests (T8)
+  - `tests/unit/mcp/test_sandbox.py` : 12 tests (T8) — corrigé P-22 CR 2026-05-11 (claim initial "13" → réel 12)
   - `tests/integration/mcp/test_client.py` : +4 nouveaux call_tool tests (T10.2-T10.4 ; le test discover renommé reste sur baseline)
   - `tests/integration/m5_tool_hub/test_invoke_tool_e2e.py` : 5 tests (T10.5)
   - `tests/unit/shared/contracts/test_tool_events.py` : 6 tests (T5.3)
