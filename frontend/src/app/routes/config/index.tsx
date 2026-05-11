@@ -51,6 +51,21 @@ export function ConfigPage() {
           </Button>
         </div>
       </div>
+
+      <div className="rounded-lg border border-border bg-card p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">Playground</h2>
+            <p className="text-sm text-muted-foreground">
+              Testez un agent en isolation (no events, no memory writes).{" "}
+              <span className="font-mono text-xs">[Story 2.7]</span>
+            </p>
+          </div>
+          <Button asChild variant="outline">
+            <Link to="/config/playground">Ouvrir</Link>
+          </Button>
+        </div>
+      </div>
     </section>
   );
 }

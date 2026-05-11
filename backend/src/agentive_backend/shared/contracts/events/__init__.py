@@ -23,6 +23,9 @@ from agentive_backend.shared.contracts.events.agent_events import (
     AgentTemplateUpdatedEvent,
 )
 from agentive_backend.shared.contracts.events.health_events import HealthCheckEvent
+from agentive_backend.shared.contracts.events.playground_events import (
+    PlaygroundRunCompletedEvent,
+)
 from agentive_backend.shared.contracts.events.system_events import (
     SystemShutdownEvent,
     SystemStartedEvent,
@@ -40,6 +43,7 @@ __all__ = [
     "AgentTemplateToolUnassignedEvent",
     "AgentTemplateUpdatedEvent",
     "HealthCheckEvent",
+    "PlaygroundRunCompletedEvent",
     "SystemShutdownEvent",
     "SystemStartedEvent",
     "ToolDiscoveredEvent",
