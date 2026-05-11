@@ -19,8 +19,18 @@ from agentive_backend.infra.mcp.sandbox import (
     SandboxProfile,
     _build_bwrap_argv,
     _build_setrlimit_bootstrap,
+    _detect_sandbox_backend_uncached,
     detect_sandbox_backend,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_sandbox_detect_cache() -> None:
+    """P-18 (CR 2026-05-11) — ``detect_sandbox_backend`` is now memoized
+    via ``@functools.cache``. Clear it before each test so monkeypatched
+    ``shutil.which`` / ``_probe_bwrap_actually_works`` are honored."""
+    _detect_sandbox_backend_uncached.cache_clear()
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SandboxProfile

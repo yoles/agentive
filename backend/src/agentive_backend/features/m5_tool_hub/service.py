@@ -468,8 +468,12 @@ class ToolHubService:
                 )
             tool = await self._tool_repo.get_by_id_in_session(session, tool_id)
             if tool is None or tool.server_id != server_id:
+                # P-20 (CR 2026-05-11) — uniform "Tool not found" message
+                # in both branches (missing OR wrong server). Avoids leaking
+                # cross-server tool_id existence to authenticated callers
+                # (relevant Story 12 multi-tenant).
                 raise NotFoundError(
-                    detail=f"Tool '{tool_id}' not found on server '{server_id}'",
+                    detail=f"Tool '{tool_id}' not found",
                     context={"server_id": str(server_id), "tool_id": str(tool_id)},
                 )
             tool_name = tool.name
@@ -505,6 +509,14 @@ class ToolHubService:
         start = time.monotonic()
         status: Literal["success", "timeout", "error"] = "error"
         result: dict[str, Any] = {}
+        # P-17 (CR 2026-05-11) — single audit-publish path. The 3 except
+        # branches used to duplicate ~12 lines each, and an audit failure
+        # in any branch shadowed the original domain exception. Now we
+        # capture (status, domain_exception_to_raise) inside try/except,
+        # publish ONCE in a try/except-wrapped block (P-08 alignment), and
+        # re-raise the captured domain error so the original cause is
+        # preserved.
+        domain_exception_to_raise: Exception | None = None
         try:
             result = await call_tool(
                 transport=transport,  # type: ignore[arg-type]  # Literal narrowed by DB CHECK
@@ -517,73 +529,67 @@ class ToolHubService:
             status = "success"
         except MCPExecutionTimeoutError as exc:
             status = "timeout"
-            duration_ms = int((time.monotonic() - start) * 1000)
-            await self._publish_invoked(
-                session_factory_owner=self._server_repo,
-                tool_id=tool_id,
-                server_id=server_id,
-                agent_template_id=agent_template_id,
-                tool_name=tool_name,
-                arguments=arguments,
-                duration_ms=duration_ms,
-                status=status,
-                sandbox_backend=effective_backend,
-                tenant_id=tenant_id,
-            )
-            raise DependencyError(
+            domain_exception_to_raise = DependencyError(
                 detail=f"MCP tool '{tool_name}' execution timeout",
                 context={
                     "server_id": str(server_id),
                     "tool_id": str(tool_id),
                     "timeout_seconds": exc.timeout,
                 },
-            ) from exc
+            )
+            domain_exception_to_raise.__cause__ = exc
         except MCPToolError as exc:
             status = "error"
-            duration_ms = int((time.monotonic() - start) * 1000)
-            await self._publish_invoked(
-                session_factory_owner=self._server_repo,
-                tool_id=tool_id,
-                server_id=server_id,
-                agent_template_id=agent_template_id,
-                tool_name=tool_name,
-                arguments=arguments,
-                duration_ms=duration_ms,
-                status=status,
-                sandbox_backend=effective_backend,
-                tenant_id=tenant_id,
-            )
-            raise NotFoundError(
+            domain_exception_to_raise = NotFoundError(
                 detail=f"MCP tool '{tool_name}' returned error: {exc.detail}",
                 context={
                     "server_id": str(server_id),
                     "tool_id": str(tool_id),
                     "tool_name": tool_name,
                 },
-            ) from exc
+            )
+            domain_exception_to_raise.__cause__ = exc
         except MCPExecutionError as exc:
             status = "error"
-            duration_ms = int((time.monotonic() - start) * 1000)
-            await self._publish_invoked(
-                session_factory_owner=self._server_repo,
-                tool_id=tool_id,
-                server_id=server_id,
-                agent_template_id=agent_template_id,
-                tool_name=tool_name,
-                arguments=arguments,
-                duration_ms=duration_ms,
-                status=status,
-                sandbox_backend=effective_backend,
-                tenant_id=tenant_id,
-            )
-            raise DependencyError(
+            domain_exception_to_raise = DependencyError(
                 detail=f"MCP tool '{tool_name}' subprocess error (rc={exc.returncode})",
                 context={
                     "server_id": str(server_id),
                     "tool_id": str(tool_id),
                     "returncode": exc.returncode,
                 },
-            ) from exc
+            )
+            domain_exception_to_raise.__cause__ = exc
+
+        # If a domain error was captured, publish the failure audit then
+        # re-raise. Audit-publish failures are logged at warning level but
+        # NEVER replace the original domain exception (P-08 contract).
+        if domain_exception_to_raise is not None:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            try:
+                await self._publish_invoked(
+                    session_factory_owner=self._server_repo,
+                    tool_id=tool_id,
+                    server_id=server_id,
+                    agent_template_id=agent_template_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    duration_ms=duration_ms,
+                    status=status,
+                    sandbox_backend=effective_backend,
+                    tenant_id=tenant_id,
+                )
+            except Exception as audit_exc:
+                _log.warning(
+                    "tool_invoked_audit_publish_failed_on_error_path",
+                    tool_id=str(tool_id),
+                    server_id=str(server_id),
+                    tool_name=tool_name,
+                    domain_status=status,
+                    error_type=type(audit_exc).__name__,
+                    error_message=str(audit_exc)[:200],
+                )
+            raise domain_exception_to_raise
 
         duration_ms = int((time.monotonic() - start) * 1000)
 

@@ -35,6 +35,7 @@ de pool persistant (D61), pas d'allowlist URL SSE runtime (D63).
 from __future__ import annotations
 
 import asyncio
+import functools
 import shutil
 import sys
 from collections.abc import AsyncIterator
@@ -133,16 +134,30 @@ class MCPToolError(Exception):
 def detect_sandbox_backend() -> SandboxBackend:
     """Detect the active sandbox backend.
 
-    Cached by callers at lifespan startup ; never re-detect per call
-    (avoid TOCTOU + cheap to memoize). The probe checks BOTH that the
-    ``bwrap`` binary exists AND that the kernel allows unprivileged user
-    namespaces (required for ``--unshare-user`` + capability drop).
+    Memoized at module level via :func:`_detect_sandbox_backend_uncached` —
+    callers should treat this as a cached helper (TOCTOU is acceptable
+    since kernel security profile rarely changes at runtime). The probe
+    checks BOTH that the ``bwrap`` binary exists AND that the kernel
+    allows unprivileged user namespaces (required for ``--unshare-user`` +
+    capability drop).
 
-    On Docker without ``CAP_SYS_ADMIN`` or with ``kernel.unprivileged_userns_clone=0``,
-    the binary exists but spawning fails — we fall back to setrlimit so
-    the application keeps working in degraded sandbox mode (CPU/MEM/NPROC
-    rlimits only ; no network or filesystem isolation).
+    On Docker without ``CAP_SYS_ADMIN`` or with
+    ``kernel.unprivileged_userns_clone=0``, the binary exists but spawning
+    fails — we fall back to setrlimit.
+
+    P-18 (CR 2026-05-11) — synchronous on purpose : the probe runs at
+    lifespan boot only (memoized result reused everywhere). Callers from
+    async code should call this exactly once at startup and propagate
+    the result, not re-probe per request.
     """
+    return _detect_sandbox_backend_uncached()
+
+
+@functools.cache
+def _detect_sandbox_backend_uncached() -> SandboxBackend:
+    """Underlying detection logic. ``@functools.cache`` means the probe
+    fires exactly once per process lifetime (no event-loop blocking past
+    the first call)."""
     if shutil.which("bwrap") is None:
         _log.warning(
             "mcp_sandbox.bwrap_unavailable_falling_back_to_setrlimit",
@@ -381,16 +396,24 @@ def _build_setrlimit_bootstrap(
     # P-12 (CR 2026-05-11) — scrub dangerous env vars BEFORE execvp so the
     # bootstrap doesn't propagate LD_PRELOAD / PYTHONPATH /
     # LD_LIBRARY_PATH / PYTHONSTARTUP injected by a hypothetical adversary
-    # writing to ``/tmp`` (the only writable path). Without this, a tool
-    # call running in setrlimit fallback could be hijacked via env-based
-    # code injection — sandbox escape conceptuelle.
+    # writing to ``/tmp`` (the only writable path).
+    #
+    # P-21 (CR 2026-05-11) — set ``PR_SET_PDEATHSIG=SIGKILL`` via ctypes
+    # so the spawned subprocess is killed when the backend dies. Linux
+    # equivalent of bwrap's ``--die-with-parent``. Best-effort : suppress
+    # any error (non-Linux kernel, ctypes loading failure) ; the subprocess
+    # will simply not have parent-death protection in that case.
     bootstrap = (
-        "import resource, os, sys, contextlib\n"
+        "import resource, os, sys, contextlib, ctypes, signal\n"
         "for _dangerous in (\n"
         "    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONSTARTUP',\n"
         "    'PYTHONHOME', 'PYTHONINSPECT', 'LD_AUDIT',\n"
         "):\n"
         "    os.environ.pop(_dangerous, None)\n"
+        "with contextlib.suppress(OSError, AttributeError):\n"
+        "    _libc = ctypes.CDLL('libc.so.6', use_errno=True)\n"
+        "    # PR_SET_PDEATHSIG = 1, SIGKILL = 9\n"
+        "    _libc.prctl(1, signal.SIGKILL, 0, 0, 0)\n"
         f"with contextlib.suppress(ValueError, OSError):\n"
         f"    resource.setrlimit(resource.RLIMIT_CPU, ({profile.cpu_seconds}, {profile.cpu_seconds}))\n"
         f"with contextlib.suppress(ValueError, OSError):\n"
