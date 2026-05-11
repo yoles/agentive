@@ -1,18 +1,19 @@
-"""MCP discovery client — thin wrapper sur le SDK Python ``mcp>=1.27.0``.
+"""MCP client — thin wrapper sur le SDK Python ``mcp>=1.27.0``.
 
-Story 2.5 — Sprint 1 livre uniquement la **discovery** (connexion éphémère
-+ ``list_tools()``) ; l'**exécution** runtime des outils (call MCP réel via
-sandbox bwrap) arrive Story 2.6.
+Story 2.5 — discovery (connexion éphémère + ``list_tools()``).
+Story 2.6 — runtime execution (``call_tool`` via sandbox bwrap + fallback
+setrlimit, voir :mod:`agentive_backend.infra.mcp.sandbox`).
 
-API publique : :func:`discover_tools` ouvre une connexion vers le serveur
-MCP via le transport demandé (stdio | sse), récupère la liste de ses outils,
-ferme la connexion. Tout est wrappé dans ``asyncio.wait_for(timeout=10s)``
-pour qu'un serveur hangulé ne bloque pas le request handler FastAPI.
+API publique :
+- :func:`discover_tools` (Story 2.5) — `list_tools()` only.
+- :func:`call_tool` (Story 2.6) — invoke one tool with arguments, returns
+  the result dict. Sandbox applied to stdio subprocess ; SSE bypass
+  réseau (le serveur est distant — voir Dev Notes Story 2.6 décision #3).
 
-Domain error :class:`MCPDiscoveryTimeoutError` est traduite en
-:class:`agentive_backend.shared.exceptions.DependencyError` par le service
-(features/ ne doit jamais connaître les exceptions infra/MCP — Story 2.1
-P-01 import-linter Contract 3 friendly).
+Toutes les erreurs infra-level (timeout, crash subprocess, tool error)
+sont traduites en domain ``DependencyError`` / ``NotFoundError`` par les
+features/ (P-08 Story 2.5 pattern, features/ ne connaît jamais les
+exceptions infra/MCP — Story 2.1 P-01 import-linter Contract 3 friendly).
 """
 
 from __future__ import annotations
@@ -24,6 +25,14 @@ from typing import Any, Literal
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
+
+from agentive_backend.infra.mcp.sandbox import (
+    MCPExecutionError,
+    MCPExecutionTimeoutError,
+    MCPToolError,
+    SandboxBackend,
+    SandboxProfile,
+)
 
 
 @dataclass(frozen=True)
@@ -183,4 +192,242 @@ async def _list_tools_via_session(read: Any, write: Any) -> list[ToolInfo]:
         return infos
 
 
-__all__ = ["MCPDiscoveryTimeoutError", "ToolInfo", "discover_tools"]
+async def call_tool(
+    *,
+    transport: Literal["stdio", "sse"],
+    connection_config: dict[str, Any],
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout: float = 30.0,
+    profile: SandboxProfile | None = None,
+    backend: SandboxBackend | None = None,
+) -> dict[str, Any]:
+    """Invoke ``tool_name`` on the MCP server pointed to by
+    ``connection_config`` and return its result (Story 2.6 AC1).
+
+    For ``transport="stdio"`` the server subprocess runs INSIDE a
+    :func:`agentive_backend.infra.mcp.sandbox.sandboxed_subprocess`
+    (bwrap or setrlimit fallback) — no network, read-only filesystem,
+    ``/tmp`` tmpfs, capabilities dropped, parent-death signal.
+
+    For ``transport="sse"`` the sandbox does NOT wrap the remote server
+    (it's not our process — see Dev Notes Story 2.6 décision #3). The
+    HTTP/SSE client traffic uses our backend process directly ;
+    setrlimits would apply to the backend itself, which we don't want
+    Sprint 1. URL allowlist defer to Story 4.x (D63).
+
+    Parameters
+    ----------
+    transport, connection_config
+        Same shape as :func:`discover_tools`.
+    tool_name
+        The tool to call. Must match a tool the server exposes.
+    arguments
+        Tool-specific input dict. MCP server validates against the tool's
+        ``inputSchema``.
+    timeout
+        Wall-clock cap on the entire call (connect + initialize + call +
+        close). Exceeding raises :class:`MCPExecutionTimeoutError`.
+    profile, backend
+        Override sandbox profile / backend. Both ``None`` = production
+        defaults.
+
+    Returns
+    -------
+    dict[str, Any]
+        The MCP ``CallToolResult`` shape : ``{"content": [...],
+        "isError": bool, ...}``. Caller (workflow_engine Story 4.x or
+        playground Story 2.7) decides how to unwrap.
+
+    Raises
+    ------
+    MCPExecutionTimeoutError
+        Call did not complete within ``timeout`` seconds.
+    MCPExecutionError
+        Subprocess crashed / non-zero exit / SDK protocol error.
+    MCPToolError
+        Server returned ``CallToolResult.isError=True`` (tool semantic
+        rejection — e.g. invalid arguments per the tool's schema).
+    ValueError
+        ``connection_config`` is malformed (missing required keys for
+        the requested transport).
+    """
+    try:
+        return await asyncio.wait_for(
+            _call_tool_inner(
+                transport=transport,
+                connection_config=connection_config,
+                tool_name=tool_name,
+                arguments=arguments,
+                profile=profile,
+                backend=backend,
+            ),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise MCPExecutionTimeoutError(timeout=timeout) from exc
+
+
+async def _call_tool_inner(
+    *,
+    transport: Literal["stdio", "sse"],
+    connection_config: dict[str, Any],
+    tool_name: str,
+    arguments: dict[str, Any],
+    profile: SandboxProfile | None,
+    backend: SandboxBackend | None,
+) -> dict[str, Any]:
+    """Inner call without the timeout wrapper.
+
+    Dispatches transport to stdio (sandboxed subprocess via
+    :func:`agentive_backend.infra.mcp.sandbox.sandboxed_subprocess` + MCP
+    SDK ``stdio_client`` on its pipes) or sse (no sandbox — direct
+    ``sse_client``).
+    """
+    if transport == "stdio":
+        command = connection_config.get("command")
+        if not isinstance(command, str) or not command:
+            raise ValueError("stdio connection_config requires non-empty 'command'")
+        args = connection_config.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise ValueError("stdio connection_config 'args' must be a list of strings")
+        env = connection_config.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise ValueError("stdio connection_config 'env' must be a dict if present")
+
+        # Sprint 1 — use the MCP SDK's ``stdio_client`` with
+        # :class:`StdioServerParameters` and a wrapped ``command``/``args``
+        # that re-routes the spawn through bwrap. Cheap trick : we ask the
+        # SDK to spawn ``bwrap`` and pass the original command as bwrap's
+        # tail args. The SDK believes it's launching ``bwrap`` (which is
+        # true) but bwrap then execs the real command inside the sandbox.
+        sandbox_argv_prefix = _sandbox_argv_prefix(profile=profile, backend=backend)
+        if sandbox_argv_prefix:
+            wrapped_command = sandbox_argv_prefix[0]
+            wrapped_args = [*sandbox_argv_prefix[1:], command, *args]
+        else:
+            wrapped_command = command
+            wrapped_args = list(args)
+
+        params = StdioServerParameters(command=wrapped_command, args=wrapped_args, env=env)
+        try:
+            async with stdio_client(params) as (read, write):
+                return await _call_tool_via_session(read, write, tool_name, arguments)
+        except BaseExceptionGroup as exc_group:
+            # anyio.create_task_group (used by ClientSession + stdio_client)
+            # wraps inner exceptions in BaseExceptionGroup. Unwrap so the
+            # caller can ``pytest.raises(MCPToolError, ...)`` as documented.
+            _reraise_domain_error_from_group(exc_group)
+            raise
+        except OSError as exc:
+            raise MCPExecutionError(returncode=-1, stderr_tail=str(exc)) from exc
+    elif transport == "sse":
+        url = connection_config.get("url")
+        if not isinstance(url, str) or not url:
+            raise ValueError("sse connection_config requires non-empty 'url'")
+        headers = connection_config.get("headers")
+        if headers is not None and not isinstance(headers, dict):
+            raise ValueError("sse connection_config 'headers' must be a dict if present")
+        async with sse_client(url=url, headers=headers) as (read, write):
+            return await _call_tool_via_session(read, write, tool_name, arguments)
+    else:
+        raise ValueError(f"Unknown transport: {transport!r}")
+
+
+def _reraise_domain_error_from_group(exc_group: BaseExceptionGroup) -> None:
+    """If ``exc_group`` (recursively) contains a domain error
+    (:class:`MCPToolError`, :class:`MCPExecutionError`,
+    :class:`MCPExecutionTimeoutError`), re-raise that inner exception so
+    the caller sees the original domain class rather than the anyio
+    ``BaseExceptionGroup`` wrapping it.
+
+    Returns silently if no domain error is found ; the caller then
+    re-raises the original group.
+    """
+    domain_types = (MCPToolError, MCPExecutionError, MCPExecutionTimeoutError)
+    for exc in exc_group.exceptions:
+        if isinstance(exc, domain_types):
+            raise exc from exc_group
+        if isinstance(exc, BaseExceptionGroup):
+            _reraise_domain_error_from_group(exc)
+
+
+def _sandbox_argv_prefix(
+    *,
+    profile: SandboxProfile | None,
+    backend: SandboxBackend | None,
+) -> list[str]:
+    """Compute the bwrap (or setrlimit bootstrap) argv prefix to wrap the
+    target command. Returns an empty list if no sandbox should be applied
+    (degenerate case kept for testability — production always sandboxes).
+    """
+    from agentive_backend.infra.mcp.sandbox import (
+        _build_bwrap_argv,
+        _build_setrlimit_bootstrap,
+        detect_sandbox_backend,
+    )
+
+    effective_backend = backend or detect_sandbox_backend()
+    effective_profile = profile or SandboxProfile()
+
+    if effective_backend == "bwrap":
+        # Build a bwrap argv that ends with ``--`` and an empty trailing
+        # command — we'll splice the real command in afterward.
+        argv = _build_bwrap_argv("__PLACEHOLDER__", [], profile=effective_profile)
+        # Drop the placeholder so callers can append the real command.
+        # The placeholder is the second-to-last element (followed by no args).
+        assert argv[-1] == "__PLACEHOLDER__", argv
+        return argv[:-1]
+    else:
+        # setrlimit bootstrap is ``python -c "..." <command> <args...>`` — we
+        # return the python bootstrap (sans command) and let the caller append.
+        bootstrap = _build_setrlimit_bootstrap("__PLACEHOLDER__", [], profile=effective_profile)
+        assert bootstrap[-1] == "__PLACEHOLDER__", bootstrap
+        return bootstrap[:-1]
+
+
+async def _call_tool_via_session(
+    read: Any,
+    write: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Open a ``ClientSession``, initialize, call ``tool_name``, map the
+    result to a plain dict.
+
+    Translates ``CallToolResult.isError=True`` into :class:`MCPToolError`.
+    """
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        result = await session.call_tool(tool_name, arguments=arguments)
+
+        # Convert content blocks to plain dicts for the audit/payload layer.
+        content_dicts: list[dict[str, Any]] = []
+        for block in result.content:
+            if hasattr(block, "model_dump"):
+                content_dicts.append(block.model_dump())
+            else:  # pragma: no cover — defensive for older SDK shapes
+                content_dicts.append(dict(block))
+
+        if result.isError:
+            # Extract a human-readable error message from the first text block.
+            detail = "tool returned error"
+            for block_dict in content_dicts:
+                text_value = block_dict.get("text")
+                if isinstance(text_value, str):
+                    detail = text_value
+                    break
+            raise MCPToolError(tool_name=tool_name, detail=detail)
+
+        return {"content": content_dicts, "isError": False}
+
+
+__all__ = [
+    "MCPDiscoveryTimeoutError",
+    "MCPExecutionError",
+    "MCPExecutionTimeoutError",
+    "MCPToolError",
+    "ToolInfo",
+    "call_tool",
+    "discover_tools",
+]

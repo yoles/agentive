@@ -20,6 +20,8 @@ from fastapi import APIRouter, Request, status
 
 from agentive_backend.features.m5_tool_hub.schemas import (
     CreateToolServerRequest,
+    InvokeToolRequest,
+    InvokeToolResponse,
     ToolServerDetailView,
     ToolServerView,
 )
@@ -118,6 +120,65 @@ async def get_tool_server(
     """
     service = _build_service(request)
     return await service.get_server_detail(server_id, tenant_id=None)
+
+
+@router.post(
+    "/tools/servers/{server_id}/tools/{tool_id}/invoke",
+    response_model=InvokeToolResponse,
+    summary="Invoke an MCP tool inside the sandbox (Story 2.6)",
+)
+async def invoke_tool(
+    request: Request,
+    server_id: UUID,
+    tool_id: UUID,
+    body: InvokeToolRequest,
+) -> InvokeToolResponse:
+    """200 on success.
+
+    Errors :
+    * 403 — registration/execution disabled by
+            ``AGENTIVE_ALLOW_MCP_REGISTRATION=false`` (P-23 Story 2.5 gate
+            extended to runtime — same RCE/SSRF risk surface as registration).
+    * 404 — server / tool not found, OR tool returned ``isError=True``.
+    * 422 — body validation (timeout out of range, etc.).
+    * 503 — sandbox subprocess crash OR ``timeout_seconds`` exceeded.
+
+    Note Sprint 1 : NO allowlist check "is tool in agent_template's
+    assigned_tools" — deferred to Story 4.x (workflow_engine, D60).
+    """
+    if not settings.mcp_allow_registration:
+        raise ForbiddenError(
+            detail=(
+                "MCP tool execution is disabled. Set "
+                "AGENTIVE_ALLOW_MCP_REGISTRATION=true to enable. "
+                "Note: this endpoint runs the MCP server inside a sandbox "
+                "(bwrap or setrlimit fallback) — the flag still gates execution "
+                "because the registration surface and the execution surface share "
+                "the same RCE/SSRF risk model until Story 2.6 sandbox is "
+                "production-validated."
+            ),
+            context={"flag": "AGENTIVE_ALLOW_MCP_REGISTRATION"},
+        )
+    service = _build_service(request)
+    backend = getattr(request.app.state, "mcp_sandbox_backend", None)
+    import time
+
+    start = time.monotonic()
+    result = await service.invoke_tool(
+        server_id=server_id,
+        tool_id=tool_id,
+        arguments=body.arguments,
+        agent_template_id=body.agent_template_id,
+        timeout=body.timeout_seconds,
+        sandbox_backend=backend,
+        tenant_id=None,
+    )
+    duration_ms = int((time.monotonic() - start) * 1000)
+    return InvokeToolResponse(
+        result=result,
+        duration_ms=duration_ms,
+        sandbox_backend=backend or "bwrap",
+    )
 
 
 __all__ = ["router"]

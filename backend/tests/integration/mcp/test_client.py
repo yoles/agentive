@@ -29,9 +29,12 @@ from agentive_backend.infra.mcp.client import (
 
 
 @pytest.mark.integration
-async def test_discover_tools_stdio_returns_two_mock_tools() -> None:
-    """T2.5 (1) — Real MCP SDK + real subprocess. The mock server (``echo``
-    + ``add``) must show up via ``discover_tools(transport="stdio")``.
+async def test_discover_tools_stdio_returns_mock_tools() -> None:
+    """T2.5 (1) — Real MCP SDK + real subprocess. The mock server (``echo``,
+    ``add``, ``sleep``) must show up via ``discover_tools(transport="stdio")``.
+
+    Story 2.6 added the ``sleep`` tool to the mock for the timeout-test
+    fixture. ``echo`` + ``add`` remain available for happy-path tests.
     """
     tools = await discover_tools(
         transport="stdio",
@@ -42,11 +45,11 @@ async def test_discover_tools_stdio_returns_two_mock_tools() -> None:
         timeout=10.0,
     )
     names = sorted(t.name for t in tools)
-    assert names == ["add", "echo"]
+    assert names == ["add", "echo", "sleep"]
     for tool in tools:
         assert isinstance(tool, ToolInfo)
         assert isinstance(tool.input_schema, dict)
-        assert tool.name in {"echo", "add"}
+        assert tool.name in {"echo", "add", "sleep"}
 
 
 @pytest.mark.integration
@@ -219,6 +222,111 @@ async def test_mcp_discovery_timeout_error_carries_timeout_value() -> None:
     err = MCPDiscoveryTimeoutError(timeout=7.5)
     assert err.timeout == 7.5
     assert "7.5" in str(err)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.6 — call_tool integration tests
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@pytest.mark.integration
+async def test_call_tool_stdio_echo_happy_path() -> None:
+    """T10.2 / AC1 — happy path via mock MCP server : ``echo("hi")``
+    returns ``{"content": [{"text": "hi", ...}], "isError": False}``."""
+    from agentive_backend.infra.mcp.client import call_tool
+
+    result = await call_tool(
+        transport="stdio",
+        connection_config={
+            "command": "python",
+            "args": ["-m", "tests.fixtures.mcp_mock_server"],
+        },
+        tool_name="echo",
+        arguments={"text": "hi"},
+        timeout=10.0,
+    )
+    assert result["isError"] is False
+    assert isinstance(result["content"], list)
+    assert len(result["content"]) == 1
+    assert result["content"][0]["text"] == "hi"
+
+
+@pytest.mark.integration
+async def test_call_tool_stdio_add_returns_sum() -> None:
+    """T10.2 — second tool name on the same server : ``add(2, 3)``."""
+    import json as _json
+
+    from agentive_backend.infra.mcp.client import call_tool
+
+    result = await call_tool(
+        transport="stdio",
+        connection_config={
+            "command": "python",
+            "args": ["-m", "tests.fixtures.mcp_mock_server"],
+        },
+        tool_name="add",
+        arguments={"a": 2, "b": 3},
+        timeout=10.0,
+    )
+    assert result["isError"] is False
+    payload = _json.loads(result["content"][0]["text"])
+    assert payload == {"sum": 5}
+
+
+@pytest.mark.integration
+async def test_call_tool_timeout_kills_subprocess() -> None:
+    """T10.3 / AC2 — timeout raises MCPExecutionTimeoutError; subprocess
+    is reaped (no zombie ; we verify via /proc/self/fd count tolerance)."""
+    import os
+    from pathlib import Path
+
+    from agentive_backend.infra.mcp.client import (
+        MCPExecutionTimeoutError,
+        call_tool,
+    )
+
+    fd_dir = Path(f"/proc/{os.getpid()}/fd")
+    fds_before = len(list(fd_dir.iterdir()))
+    with pytest.raises(MCPExecutionTimeoutError) as exc_info:
+        await call_tool(
+            transport="stdio",
+            connection_config={
+                "command": "python",
+                "args": ["-m", "tests.fixtures.mcp_mock_server"],
+            },
+            tool_name="sleep",
+            arguments={"seconds": 30.0},
+            timeout=0.5,
+        )
+    fds_after = len(list(fd_dir.iterdir()))
+    assert exc_info.value.timeout == 0.5
+    # Tolerance ±10 — the bwrap/SDK plumbing may keep a few fds for
+    # async cleanup ; the point is to detect dramatic leaks (50+ on
+    # repeated calls).
+    assert abs(fds_after - fds_before) <= 10, f"fd leak suspected: {fds_before} → {fds_after}"
+
+
+@pytest.mark.integration
+async def test_call_tool_unknown_tool_raises_mcp_tool_error() -> None:
+    """T10.4 / AC6 — server-side error (unknown tool) translates to
+    MCPToolError on the client side."""
+    from agentive_backend.infra.mcp.client import MCPToolError, call_tool
+
+    with pytest.raises(MCPToolError) as exc_info:
+        await call_tool(
+            transport="stdio",
+            connection_config={
+                "command": "python",
+                "args": ["-m", "tests.fixtures.mcp_mock_server"],
+            },
+            tool_name="nonexistent_tool",
+            arguments={},
+            timeout=10.0,
+        )
+    assert exc_info.value.tool_name == "nonexistent_tool"
+    assert (
+        "unknown" in exc_info.value.detail.lower() or "nonexistent" in exc_info.value.detail.lower()
+    )
 
 
 # Provide a `_anyio_backend` fixture so pytest-anyio runs these on asyncio.

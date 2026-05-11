@@ -202,6 +202,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.archetype_registry = load_registry()
     log.info("archetype_registry_loaded", count=len(app.state.archetype_registry))
 
+    # Story 2.6 — detect sandbox backend once at boot. Stored on app.state
+    # so the m5 service reads it without re-running ``shutil.which`` per call
+    # (avoid TOCTOU + cheap to memoize). Warning logged inside the helper
+    # when bwrap is unavailable.
+    from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
+
+    app.state.mcp_sandbox_backend = detect_sandbox_backend()
+    log.info(
+        "mcp_sandbox.backend_selected",
+        backend=app.state.mcp_sandbox_backend,
+    )
+
     # Build the session factory FIRST so the LLM fallback callback can
     # close over it. The callback is wired into the LLMRouter at
     # construction time (no post-construction private-attribute mutation).
