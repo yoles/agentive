@@ -29,7 +29,7 @@ from agentive_backend.features.m5_tool_hub.schemas import (
 from agentive_backend.features.m5_tool_hub.service import ToolHubService
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.exceptions import DependencyError, ForbiddenError
-from agentive_backend.shared.repositories import ToolRepo, ToolServerRepo
+from agentive_backend.shared.repositories import AgentTemplateRepo, ToolRepo, ToolServerRepo
 
 router = APIRouter(tags=["tools"])
 
@@ -49,10 +49,11 @@ def _build_service(request: Request) -> ToolHubService:
         )
     server_repo = ToolServerRepo(session_factory=session_factory)
     tool_repo = ToolRepo(session_factory=session_factory)
-    assert server_repo._session_factory is tool_repo._session_factory, (
-        "ToolHubService wiring violation : repos must share session_factory."
-    )
-    return ToolHubService(server_repo=server_repo, tool_repo=tool_repo)
+    template_repo = AgentTemplateRepo(session_factory=session_factory)
+    assert (
+        server_repo._session_factory is tool_repo._session_factory is template_repo._session_factory
+    ), "ToolHubService wiring violation : repos must share session_factory."
+    return ToolHubService(server_repo=server_repo, tool_repo=tool_repo, template_repo=template_repo)
 
 
 @router.post(
@@ -182,6 +183,12 @@ async def invoke_tool(
         tenant_id=None,
     )
     duration_ms = int((time.monotonic() - start) * 1000)
+    # P-14 (CR 2026-05-11) — increment AC3 counter post-success. (Error
+    # paths bail out before this line ; the audit event records failure
+    # status with sandbox_backend regardless.)
+    counters = getattr(request.app.state, "mcp_sandbox_invocations", None)
+    if isinstance(counters, dict):
+        counters[backend] = counters.get(backend, 0) + 1
     return InvokeToolResponse(
         result=result,
         duration_ms=duration_ms,

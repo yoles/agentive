@@ -213,6 +213,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "mcp_sandbox.backend_selected",
         backend=app.state.mcp_sandbox_backend,
     )
+    # P-14 (CR 2026-05-11) — AC3 demands a ``mcp_sandbox_backend{kind=...}``
+    # counter (per-backend invocation count). Stored on app.state as a
+    # plain dict ; Prometheus integration formalized Story 7.x (D65).
+    app.state.mcp_sandbox_invocations = {"bwrap": 0, "setrlimit": 0}
 
     # Build the session factory FIRST so the LLM fallback callback can
     # close over it. The callback is wired into the LLMRouter at

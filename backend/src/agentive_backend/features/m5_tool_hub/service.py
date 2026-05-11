@@ -51,6 +51,7 @@ from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
     from agentive_backend.shared.repositories import (
+        AgentTemplateRepo,
         ToolRepo,
         ToolServerRepo,
     )
@@ -159,9 +160,15 @@ class ToolHubService:
         *,
         server_repo: ToolServerRepo,
         tool_repo: ToolRepo,
+        template_repo: AgentTemplateRepo | None = None,
     ) -> None:
+        # ``template_repo`` is optional Sprint 1 — only ``invoke_tool``
+        # uses it (P-11 CR 2026-05-11 : verify ``agent_template_id`` FK
+        # before audit). Connect/list/get paths don't need it ; passing
+        # None at construction time keeps existing call-sites working.
         self._server_repo = server_repo
         self._tool_repo = tool_repo
+        self._template_repo = template_repo
 
     async def connect_server(
         self,
@@ -469,6 +476,24 @@ class ToolHubService:
             transport = server.transport
             connection_config = dict(server.connection_config or {})
 
+        # P-11 (CR 2026-05-11) — verify ``agent_template_id`` exists (when
+        # supplied) before consuming the audit attribution. Without this
+        # check, an authenticated caller could attribute invocations to
+        # any template UUID, polluting the audit trail. Allowlist runtime
+        # ("tool in agent_template's assigned_tools") remains Story 4.x.
+        if agent_template_id is not None and self._template_repo is not None:
+            async with self._template_repo.with_tenant(tenant_id) as session:
+                template = await self._template_repo.get_by_id_in_session(
+                    session, agent_template_id
+                )
+            if template is None:
+                raise NotFoundError(
+                    detail=f"Agent template '{agent_template_id}' not found",
+                    context={
+                        "agent_template_id": str(agent_template_id),
+                    },
+                )
+
         # 2. Resolve the actual sandbox backend ONCE (P-03 CR 2026-05-11)
         #    — never default to literal "bwrap" since detect_sandbox_backend
         #    may pick "setrlimit" in containers where bwrap is non-functional.
@@ -563,18 +588,36 @@ class ToolHubService:
         duration_ms = int((time.monotonic() - start) * 1000)
 
         # 3. Audit event m5.tool.invoked (success path).
-        await self._publish_invoked(
-            session_factory_owner=self._server_repo,
-            tool_id=tool_id,
-            server_id=server_id,
-            agent_template_id=agent_template_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            duration_ms=duration_ms,
-            status=status,
-            sandbox_backend=effective_backend,
-            tenant_id=tenant_id,
-        )
+        #
+        # P-08 (CR 2026-05-11) — wrap audit publish in try/except : the tool
+        # has ALREADY executed (with side effects), so an audit-publish DB
+        # failure must NOT shadow the successful result. Returning the tool
+        # result here is better than 500-ing the caller (which would retry
+        # and multiply side effects). The audit gap is documented in D68 ;
+        # background recovery jobs can replay missing audits.
+        try:
+            await self._publish_invoked(
+                session_factory_owner=self._server_repo,
+                tool_id=tool_id,
+                server_id=server_id,
+                agent_template_id=agent_template_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                status=status,
+                sandbox_backend=effective_backend,
+                tenant_id=tenant_id,
+            )
+        except Exception as audit_exc:
+            _log.warning(
+                "tool_invoked_audit_publish_failed",
+                tool_id=str(tool_id),
+                server_id=str(server_id),
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                error_type=type(audit_exc).__name__,
+                error_message=str(audit_exc)[:200],
+            )
 
         _log.info(
             "tool_invoked",
