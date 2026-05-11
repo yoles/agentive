@@ -19,6 +19,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
+import { Button } from "@/shared/components/ui/button";
 import { AgentToolsPanel } from "@/features/tool_hub";
 import {
   buildInitialForm,
@@ -190,9 +191,20 @@ export function AgentTemplateDetail() {
             {template.version}
           </p>
         </div>
-        {/* P-10 (CR 2026-05-10) — disabled pendant mutation pour bloquer le
-            switch mid-save (race : focus ciblerait un input inexistant). */}
-        <ConfigModeToggle disabled={updateMutation.isPending} />
+        <div className="flex items-center gap-2">
+          <Button asChild variant="outline" size="sm">
+            <Link
+              to="/config/playground/$templateId"
+              params={{ templateId }}
+              data-testid="template-open-playground"
+            >
+              Tester dans Playground
+            </Link>
+          </Button>
+          {/* P-10 (CR 2026-05-10) — disabled pendant mutation pour bloquer le
+              switch mid-save (race : focus ciblerait un input inexistant). */}
+          <ConfigModeToggle disabled={updateMutation.isPending} />
+        </div>
       </header>
 
       {hasHydrated && mode === "wizard" && (

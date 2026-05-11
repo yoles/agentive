@@ -30,6 +30,7 @@ from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMi
 from agentive_backend.features.m2_agent_registry import load_registry
 from agentive_backend.features.m2_agent_registry import router as agents_router
 from agentive_backend.features.m5_tool_hub import router as tools_router
+from agentive_backend.features.m7_playground import router as playground_router
 from agentive_backend.shared.config import settings as _runtime_settings
 from agentive_backend.shared.correlation import get_correlation_id
 from agentive_backend.shared.exceptions import AgentiveError
@@ -76,6 +77,9 @@ def make_e2e_app(
     # Story 2.5 — m5 tool_hub router included as well so e2e tests can
     # cross-feature exercise tool registration → tool assignment → list.
     app.include_router(tools_router, prefix="/api/v1")
+    # Story 2.7 — m7 playground router (cross-feature : Playground tests
+    # need template + tools + LLM router wired in app.state).
+    app.include_router(playground_router, prefix="/api/v1")
 
     @app.exception_handler(AgentiveError)
     async def _handle_agentive_error(  # pragma: no cover — verbatim of app.main handler
