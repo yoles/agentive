@@ -49,7 +49,10 @@ export function AgentToolsPanel({ templateId }: Props) {
     })),
   });
 
-  const allDetailsLoaded = detailQueries.every((q) => q.isSuccess);
+  // P-07 (CR 2026-05-10) — render per-server : a single server detail
+  // failure (RLS error, corrupted connection_config, 5xx) must NOT hide
+  // the tools of the other healthy servers. Each ServerToolsGroup renders
+  // independently and a degraded banner is shown for the failed ones.
   const anyDetailLoading = detailQueries.some((q) => q.isLoading);
 
   // Local UI state — the `selectedToolIds` set is the staged selection.
@@ -149,24 +152,43 @@ export function AgentToolsPanel({ templateId }: Props) {
         <p className="mt-3 text-sm text-muted-foreground">Chargement des serveurs…</p>
       )}
 
-      {allDetailsLoaded && (
-        <div className="mt-4 flex flex-col gap-4">
-          {detailQueries.map((q, idx) => {
-            const server = servers[idx];
-            const detail = q.data;
-            if (!detail) return null;
+      <div className="mt-4 flex flex-col gap-4">
+        {detailQueries.map((q, idx) => {
+          const server = servers[idx];
+          if (q.isLoading) return null; // covered by the global banner above
+          if (q.isError) {
             return (
-              <ServerToolsGroup
+              <div
                 key={server.server_id}
-                server={server}
-                tools={detail.tools}
-                selectedToolIds={selectedToolIds}
-                onToggle={toggleTool}
-              />
+                className="rounded-md border border-destructive/40 bg-destructive/5 p-4"
+                data-testid={`tool-group-error-${server.server_id}`}
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold">{server.name}</h3>
+                  <span className="rounded bg-destructive/10 px-2 py-0.5 text-xs text-destructive">
+                    Échec du chargement
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Impossible de récupérer les outils de ce serveur. Les serveurs sains
+                  ci-dessous restent assignables.
+                </p>
+              </div>
             );
-          })}
-        </div>
-      )}
+          }
+          const detail = q.data;
+          if (!detail) return null;
+          return (
+            <ServerToolsGroup
+              key={server.server_id}
+              server={server}
+              tools={detail.tools}
+              selectedToolIds={selectedToolIds}
+              onToggle={toggleTool}
+            />
+          );
+        })}
+      </div>
 
       <div className="mt-4 flex items-center gap-3">
         <Button

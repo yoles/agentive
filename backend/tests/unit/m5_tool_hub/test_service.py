@@ -97,6 +97,44 @@ async def test_connect_server_translates_valueerror_to_dependency_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_exception",
+    [
+        FileNotFoundError("/usr/bin/nonexistent-mcp"),
+        PermissionError("[Errno 13] Permission denied"),
+        OSError("[Errno 32] Broken pipe"),
+        RuntimeError("mcp client protocol error"),
+        ConnectionError("SSE handshake failed"),
+    ],
+    ids=["FileNotFound", "Permission", "OSError", "RuntimeError", "Connection"],
+)
+async def test_connect_server_broadens_mcp_errors_to_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_exception: Exception,
+) -> None:
+    """P-08 (CR 2026-05-10) — Any exception raised inside discover_tools
+    that ISN'T already a domain error MUST be translated to DependencyError
+    503. Otherwise the FastAPI global handler returns 500 with no useful
+    diagnostic about the MCP layer being the culprit.
+    """
+
+    async def _raise(**_: Any) -> list[ToolInfo]:
+        raise raised_exception
+
+    monkeypatch.setattr(svc_module, "discover_tools", _raise)
+    service = _make_service()
+
+    with pytest.raises(DependencyError) as exc_info:
+        await service.connect_server(
+            name="broken", transport="stdio", connection_config={"command": "x"}
+        )
+    # Error type is propagated in context for diagnostics.
+    assert exc_info.value.context.get("error_type") == type(raised_exception).__name__
+    # No secret data leaked into context (P-03 alignment).
+    assert "connection_config" not in exc_info.value.context
+
+
+@pytest.mark.asyncio
 async def test_connect_server_409_before_discovery_when_duplicate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

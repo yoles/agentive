@@ -51,10 +51,20 @@ class ToolServerRepo(BaseRepo):
     ) -> ToolServer | None:
         """SELECT by `(name, tenant_id)` — used for the duplicate check
         (décision #6 Story 2.5 : POST same name → 409 ConflictError, no
-        UPSERT silencieux)."""
-        stmt = select(ToolServer).where(
-            ToolServer.name == name, ToolServer.tenant_id.is_(tenant_id)
+        UPSERT silencieux).
+
+        P-11 (CR 2026-05-10) — Postgres ``IS`` predicate accepts only
+        ``NULL``/``TRUE``/``FALSE``/``UNKNOWN``, so ``tenant_id.is_(<uuid>)``
+        emits invalid SQL. Branch by None vs UUID so Story 12 multi-tenant
+        doesn't crash with a SyntaxError on the day a real tenant_id is
+        passed.
+        """
+        tenant_predicate = (
+            ToolServer.tenant_id.is_(None)
+            if tenant_id is None
+            else ToolServer.tenant_id == tenant_id
         )
+        stmt = select(ToolServer).where(ToolServer.name == name, tenant_predicate)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 

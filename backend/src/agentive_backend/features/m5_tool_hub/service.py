@@ -161,6 +161,36 @@ class ToolHubService:
                 detail=f"MCP connection_config invalid: {exc}",
                 context={"name": name, "transport": transport},
             ) from exc
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            # P-08 (CR 2026-05-10) — subprocess spawn failures (stdio
+            # ``command`` not on PATH, executable bit missing, broken pipe
+            # post-fork, ENOENT) bubble up as raw OS errors otherwise. Wrap
+            # them as DependencyError 503 with the exception type so
+            # callers see "MCP command not found / not executable" instead
+            # of a generic 500.
+            raise DependencyError(
+                detail=f"MCP transport error: {type(exc).__name__}: {exc}",
+                context={"name": name, "transport": transport, "error_type": type(exc).__name__},
+            ) from exc
+        except Exception as exc:  # P-08 defensive catch-all
+            # The MCP SDK can raise its own client errors (mcp.ClientError,
+            # JSONDecodeError, anyio.EndOfStream, httpx exceptions for SSE,
+            # etc.). Any of those bubbling to the FastAPI global handler
+            # becomes a 500 with no useful detail. Translate to 503 so the
+            # caller knows the failure is in the MCP plumbing, not our
+            # service. P-03 redaction note: do NOT include connection_config
+            # in the error context (may contain secrets).
+            _log.warning(
+                "mcp_discovery_unexpected_error",
+                name=name,
+                transport=transport,
+                error_type=type(exc).__name__,
+                error_message=str(exc)[:200],
+            )
+            raise DependencyError(
+                detail=f"MCP discovery failed: {type(exc).__name__}",
+                context={"name": name, "transport": transport, "error_type": type(exc).__name__},
+            ) from exc
 
         # Step 3 — INSERT server + N tools + N+1 audit events in ONE transaction.
         async with self._server_repo.with_tenant(tenant_id) as session:
