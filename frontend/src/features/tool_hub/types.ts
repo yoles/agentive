@@ -34,6 +34,7 @@ export type ToolServerDetail = {
   status: ToolServerStatus;
   connection_config: Record<string, unknown>;
   discovered_at: string;
+  tools_count: number;
   tools: ToolInfo[];
 };
 

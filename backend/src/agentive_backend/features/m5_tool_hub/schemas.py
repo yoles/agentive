@@ -69,8 +69,10 @@ class ToolServerDetailView(BaseModel):
     """Detail response for ``GET /tools/servers/{id}`` AND ``POST /tools/
     servers`` (after a successful discovery — same shape).
 
-    Includes ``connection_config`` (Sprint 1 = clear, defer Fernet to
-    Story 9.2) and the full ``tools`` array.
+    Includes ``connection_config`` (P-03 redacted by the service — env /
+    headers values masked) and the full ``tools`` array. ``tools_count``
+    (P-20 CR 2026-05-10) matches ``len(tools)`` ; surfaced as a separate
+    field for parity with ``ToolServerView`` (T4.1 subclass intent).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -81,6 +83,7 @@ class ToolServerDetailView(BaseModel):
     status: ToolServerStatus
     connection_config: dict[str, Any]
     discovered_at: datetime
+    tools_count: int = Field(ge=0)
     tools: list[ToolView]
 
 

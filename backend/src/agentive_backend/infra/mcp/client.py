@@ -120,9 +120,20 @@ async def _discover_inner(
         args = connection_config.get("args", [])
         if not isinstance(args, list):
             raise ValueError("stdio connection_config 'args' must be a list")
+        # P-17 (CR 2026-05-10) — element-type validation : subprocess.Popen
+        # crashes with TypeError on non-str args/env, which then bubbles up as
+        # an opaque 500 (or, post-P-08, as a generic DependencyError). Reject
+        # early with a clear ValueError so the user sees the actual field at
+        # fault.
+        if not all(isinstance(arg, str) for arg in args):
+            raise ValueError("stdio connection_config 'args' must contain only strings")
         env = connection_config.get("env")
         if env is not None and not isinstance(env, dict):
             raise ValueError("stdio connection_config 'env' must be a dict if present")
+        if env is not None and not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            raise ValueError("stdio connection_config 'env' keys and values must all be strings")
         params = StdioServerParameters(command=command, args=list(args), env=env)
         async with stdio_client(params) as (read, write):
             return await _list_tools_via_session(read, write)
@@ -148,17 +159,28 @@ async def _list_tools_via_session(read: Any, write: Any) -> list[ToolInfo]:
     async with ClientSession(read, write) as session:
         await session.initialize()
         result = await session.list_tools()
-        return [
-            ToolInfo(
-                name=tool.name,
-                description=tool.description or "",
-                # `inputSchema` is camelCase in the MCP wire format — we
-                # snake_case it for our DB layer (Story 2.5 décision #1).
-                input_schema=dict(tool.inputSchema or {}),
-                output_schema=(dict(tool.outputSchema) if tool.outputSchema else None),
+        infos: list[ToolInfo] = []
+        for tool in result.tools:
+            # P-18 (CR 2026-05-10) — reject empty/missing tool names early so
+            # a buggy MCP server cannot persist a row with name="" that the
+            # UI then renders as a blank checkbox label.
+            if not isinstance(tool.name, str) or not tool.name:
+                raise ValueError("MCP server returned a tool with empty or missing 'name'")
+            # P-16 (CR 2026-05-10) — defensive ``getattr`` : older MCP SDK
+            # payloads may omit ``outputSchema`` entirely (attribute missing
+            # vs set to None). Without this, AttributeError leaks as 500.
+            output_schema_raw = getattr(tool, "outputSchema", None)
+            infos.append(
+                ToolInfo(
+                    name=tool.name,
+                    description=tool.description or "",
+                    # `inputSchema` is camelCase in the MCP wire format — we
+                    # snake_case it for our DB layer (Story 2.5 décision #1).
+                    input_schema=dict(tool.inputSchema or {}),
+                    output_schema=(dict(output_schema_raw) if output_schema_raw else None),
+                )
             )
-            for tool in result.tools
-        ]
+        return infos
 
 
 __all__ = ["MCPDiscoveryTimeoutError", "ToolInfo", "discover_tools"]
