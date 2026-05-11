@@ -87,8 +87,44 @@ class ToolServerDetailView(BaseModel):
     tools: list[ToolView]
 
 
+class InvokeToolRequest(BaseModel):
+    """Body of ``POST /api/v1/tools/servers/{server_id}/tools/{tool_id}/invoke``
+    — Story 2.6 AC1.
+
+    ``arguments`` is the tool-specific input dict ; the MCP server validates
+    against the tool's ``inputSchema`` at call time. ``timeout_seconds`` is
+    a hard wall-clock cap (default 30s — workflow_engine Story 4.x will
+    tune per step).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    agent_template_id: UUID | None = None
+
+
+class InvokeToolResponse(BaseModel):
+    """Response of ``POST .../invoke`` — Story 2.6 AC1.
+
+    ``result`` is the MCP ``CallToolResult`` shape (``content`` blocks +
+    ``isError=False`` — error case raises ``MCPToolError`` translated to
+    404 by the service). ``duration_ms`` + ``sandbox_backend`` are
+    surfaced so the caller can attribute latency / observe the active
+    sandbox mode.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    result: dict[str, Any]
+    duration_ms: int = Field(ge=0)
+    sandbox_backend: Literal["bwrap", "setrlimit"]
+
+
 __all__ = [
     "CreateToolServerRequest",
+    "InvokeToolRequest",
+    "InvokeToolResponse",
     "ToolServerDetailView",
     "ToolServerStatus",
     "ToolServerView",

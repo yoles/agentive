@@ -29,6 +29,7 @@ from agentive_backend.shared.contracts.events.system_events import (
 )
 from agentive_backend.shared.contracts.events.tool_events import (
     ToolDiscoveredEvent,
+    ToolInvokedEvent,
     ToolServerConnectedEvent,
 )
 
@@ -42,5 +43,6 @@ __all__ = [
     "SystemShutdownEvent",
     "SystemStartedEvent",
     "ToolDiscoveredEvent",
+    "ToolInvokedEvent",
     "ToolServerConnectedEvent",
 ]

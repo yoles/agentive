@@ -1,27 +1,29 @@
-"""Service layer — Tool Hub MCP orchestration (Story 2.5).
+"""Service layer — Tool Hub MCP orchestration (Stories 2.5 + 2.6).
 
 The service sits between the FastAPI router and the repositories. It :
 
 1. Validates the requested transport via Pydantic ``Transport`` Literal
    (router-level).
-2. Calls :func:`agentive_backend.infra.mcp.client.discover_tools` with a
-   strict 10s timeout (Story 2.5 décision #4).
-3. Composes the row INSERTs (1 server + N tools) AND the audit-event
-   publishes (1 server.connected + N tool.discovered) in a SINGLE
-   transaction (Story 2.1 P-02 atomicity pattern). The audit events
-   bypass to ``AuditEventRepo.record()`` — TODO Story 9.1 cleanup on a
-   single line so ``git grep "audit-event bypass cleanup"`` finds it.
+2. **Story 2.5** — Calls :func:`...client.discover_tools` (10s timeout)
+   and composes the row INSERTs + audit events in a SINGLE transaction.
+3. **Story 2.6** — Calls :func:`...client.call_tool` (configurable
+   timeout) inside the sandbox (bwrap or setrlimit fallback) and audits
+   the invocation with ``m5.tool.invoked``.
 4. After the transaction commits, best-effort ``emit_notify`` to wake the
    outbox worker. NOTIFY failure is non-fatal (poll fallback Story 1.4).
 
 Domain errors raised :
 - :class:`ConflictError` — server with this name already exists (décision #6).
-- :class:`DependencyError` — MCP discovery timed out (décision #4).
+- :class:`DependencyError` — MCP discovery timed out, sandbox crash, or
+  tool execution timeout (P-08 Story 2.5 translation).
+- :class:`NotFoundError` — server / tool not found OR tool returned
+  ``isError=True`` (Story 2.6 AC6).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from agentive_backend.features.m5_tool_hub.schemas import (
@@ -31,10 +33,16 @@ from agentive_backend.features.m5_tool_hub.schemas import (
 )
 from agentive_backend.infra.mcp.client import (
     MCPDiscoveryTimeoutError,
+    MCPExecutionError,
+    MCPExecutionTimeoutError,
+    MCPToolError,
+    call_tool,
     discover_tools,
 )
+from agentive_backend.infra.mcp.sandbox import SandboxBackend
 from agentive_backend.shared.contracts.events import (
     ToolDiscoveredEvent,
+    ToolInvokedEvent,
     ToolServerConnectedEvent,
 )
 from agentive_backend.shared.event_bus import emit_notify, publish
@@ -341,6 +349,229 @@ class ToolHubService:
                 for tool in tools
             ],
         )
+
+    async def invoke_tool(
+        self,
+        *,
+        server_id: UUID,
+        tool_id: UUID,
+        arguments: dict[str, Any],
+        agent_template_id: UUID | None = None,
+        timeout: float = 30.0,
+        sandbox_backend: SandboxBackend | None = None,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a tool at runtime — Story 2.6 AC1+AC5.
+
+        Sprint 1 — ephemeral session per call (no MCP pool — D61 defer
+        Sprint 2). Audit event ``m5.tool.invoked`` is published in a
+        single transaction with the response timing (status ∈ success /
+        timeout / error). If the audit publish fails after a successful
+        call, the call result is still returned to the caller (the audit
+        gap window is documented in D68 defer Story 9.1).
+
+        Parameters
+        ----------
+        server_id, tool_id
+            Both must reference rows that exist in ``tool_servers`` /
+            ``tools`` (404 ``NotFoundError`` otherwise).
+        arguments
+            Tool-specific input dict. Persisted in the audit event as
+            ``args_redacted`` (P-03 redaction reuse).
+        agent_template_id
+            Optional FK to the agent that invoked the tool — used by
+            Trace Explorer (Story 8.x) and audit (Story 9.1).
+        timeout
+            Wall-clock cap. Default 30s — tunable per call (workflow
+            engine Story 4.x will tune per step).
+        sandbox_backend
+            Force a backend (test override). ``None`` = auto-detect.
+        tenant_id
+            Multi-tenant defer Story 12 — always ``None`` Sprint 1.
+
+        Raises
+        ------
+        NotFoundError
+            Server or tool does not exist, OR tool returned ``isError=True``.
+        DependencyError
+            Sandbox crash / timeout / SDK protocol error.
+        """
+        # 1. Resolve server + tool rows (NotFoundError if missing).
+        async with self._server_repo.with_tenant(tenant_id) as session:
+            server = await self._server_repo.get_by_id_in_session(session, server_id)
+            if server is None:
+                raise NotFoundError(
+                    detail=f"Tool server '{server_id}' not found",
+                    context={"server_id": str(server_id)},
+                )
+            tool = await self._tool_repo.get_by_id_in_session(session, tool_id)
+            if tool is None or tool.server_id != server_id:
+                raise NotFoundError(
+                    detail=f"Tool '{tool_id}' not found on server '{server_id}'",
+                    context={"server_id": str(server_id), "tool_id": str(tool_id)},
+                )
+            tool_name = tool.name
+            transport = server.transport
+            connection_config = dict(server.connection_config or {})
+
+        # 2. Execute the tool inside the sandbox + measure duration.
+        effective_backend: SandboxBackend = sandbox_backend or "bwrap"
+        start = time.monotonic()
+        status: Literal["success", "timeout", "error"] = "error"
+        result: dict[str, Any] = {}
+        try:
+            result = await call_tool(
+                transport=transport,  # type: ignore[arg-type]  # Literal narrowed by DB CHECK
+                connection_config=connection_config,
+                tool_name=tool_name,
+                arguments=arguments,
+                timeout=timeout,
+                backend=sandbox_backend,
+            )
+            status = "success"
+        except MCPExecutionTimeoutError as exc:
+            status = "timeout"
+            duration_ms = int((time.monotonic() - start) * 1000)
+            await self._publish_invoked(
+                session_factory_owner=self._server_repo,
+                tool_id=tool_id,
+                server_id=server_id,
+                agent_template_id=agent_template_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                status=status,
+                sandbox_backend=effective_backend,
+                tenant_id=tenant_id,
+            )
+            raise DependencyError(
+                detail=f"MCP tool '{tool_name}' execution timeout",
+                context={
+                    "server_id": str(server_id),
+                    "tool_id": str(tool_id),
+                    "timeout_seconds": exc.timeout,
+                },
+            ) from exc
+        except MCPToolError as exc:
+            status = "error"
+            duration_ms = int((time.monotonic() - start) * 1000)
+            await self._publish_invoked(
+                session_factory_owner=self._server_repo,
+                tool_id=tool_id,
+                server_id=server_id,
+                agent_template_id=agent_template_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                status=status,
+                sandbox_backend=effective_backend,
+                tenant_id=tenant_id,
+            )
+            raise NotFoundError(
+                detail=f"MCP tool '{tool_name}' returned error: {exc.detail}",
+                context={
+                    "server_id": str(server_id),
+                    "tool_id": str(tool_id),
+                    "tool_name": tool_name,
+                },
+            ) from exc
+        except MCPExecutionError as exc:
+            status = "error"
+            duration_ms = int((time.monotonic() - start) * 1000)
+            await self._publish_invoked(
+                session_factory_owner=self._server_repo,
+                tool_id=tool_id,
+                server_id=server_id,
+                agent_template_id=agent_template_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                duration_ms=duration_ms,
+                status=status,
+                sandbox_backend=effective_backend,
+                tenant_id=tenant_id,
+            )
+            raise DependencyError(
+                detail=f"MCP tool '{tool_name}' subprocess error (rc={exc.returncode})",
+                context={
+                    "server_id": str(server_id),
+                    "tool_id": str(tool_id),
+                    "returncode": exc.returncode,
+                },
+            ) from exc
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+
+        # 3. Audit event m5.tool.invoked (success path).
+        await self._publish_invoked(
+            session_factory_owner=self._server_repo,
+            tool_id=tool_id,
+            server_id=server_id,
+            agent_template_id=agent_template_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            duration_ms=duration_ms,
+            status=status,
+            sandbox_backend=effective_backend,
+            tenant_id=tenant_id,
+        )
+
+        _log.info(
+            "tool_invoked",
+            tool_id=str(tool_id),
+            server_id=str(server_id),
+            tool_name=tool_name,
+            duration_ms=duration_ms,
+            status=status,
+            sandbox_backend=effective_backend,
+        )
+
+        return result
+
+    async def _publish_invoked(
+        self,
+        *,
+        session_factory_owner: Any,
+        tool_id: UUID,
+        server_id: UUID,
+        agent_template_id: UUID | None,
+        tool_name: str,
+        arguments: dict[str, Any],
+        duration_ms: int,
+        status: Literal["success", "timeout", "error"],
+        sandbox_backend: SandboxBackend,
+        tenant_id: UUID | None,
+    ) -> None:
+        """Publish ``m5.tool.invoked`` in a fresh single-tx session.
+
+        Separated from ``invoke_tool`` so the success / timeout / error
+        branches all use the same publish path with their own ``status``
+        + ``duration_ms``. Best-effort post-commit ``emit_notify`` follows
+        the Story 2.5 P-05 pattern (real event_type, not a fabricated label).
+        """
+        args_redacted = _redact_connection_config(arguments)
+        async with session_factory_owner.with_tenant(tenant_id) as session:
+            event = ToolInvokedEvent(
+                tool_id=tool_id,
+                server_id=server_id,
+                agent_template_id=agent_template_id,
+                tool_name=tool_name,
+                args_redacted=args_redacted,
+                duration_ms=duration_ms,
+                status=status,
+                sandbox_backend=sandbox_backend,
+                actor="system",
+                tenant_id=tenant_id,
+            )
+            # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
+            event_id = await publish(ToolInvokedEvent.event_type, event, session=session)
+        try:
+            await emit_notify(event_id, ToolInvokedEvent.event_type)
+        except Exception:
+            _log.warning(
+                "event_bus_notify_failed_will_be_polled",
+                event_id=str(event_id),
+                event_type=ToolInvokedEvent.event_type,
+            )
 
 
 __all__ = ["ToolHubService"]

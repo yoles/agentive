@@ -1,20 +1,21 @@
-"""Tool Hub MCP lifecycle events — Epic M5 (Story 2.5).
+"""Tool Hub MCP lifecycle events — Epic M5 (Stories 2.5 + 2.6).
 
 Naming convention follows Story 1.7 pattern ``{module}.{object}.{verb}``.
-Events shipped Story 2.5 :
+Events shipped :
 
-* ``m5.tool_server.connected`` — emitted after a successful MCP discovery
-  (server registered + N tools discovered).
-* ``m5.tool.discovered`` — emitted per tool, one row per discovered tool
-  in the same transaction as the parent ``tool_server.connected``.
-
-Defer Story 2.6 : ``m5.tool.executed`` / ``m5.tool.failed`` (when runtime
-execution lands with the bwrap sandbox).
+* ``m5.tool_server.connected`` — Story 2.5, emitted after a successful
+  MCP discovery (server registered + N tools discovered).
+* ``m5.tool.discovered`` — Story 2.5, emitted per tool, one row per
+  discovered tool in the same transaction as the parent
+  ``tool_server.connected``.
+* ``m5.tool.invoked`` — Story 2.6, emitted after a runtime tool call
+  (success / timeout / error) with ``duration_ms`` + ``sandbox_backend``
+  + ``args_redacted`` (P-03 secret-safety).
 """
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -54,4 +55,36 @@ class ToolDiscoveredEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
-__all__ = ["ToolDiscoveredEvent", "ToolServerConnectedEvent"]
+class ToolInvokedEvent(BaseModel):
+    """Published after a runtime MCP tool call completes (Story 2.6 AC5).
+
+    Emitted in a SINGLE transaction with the response timing (success /
+    timeout / error) so we never log an invocation that never happened
+    AND never lose the trace of one that did.
+
+    ``args_redacted`` is the input arguments with secret-named keys
+    (Authorization, token, password, api_key, secret, env, headers) masked
+    via the P-03 redaction helper (Story 2.5). The RAW arguments are NEVER
+    persisted to the audit trail.
+
+    ``result`` is NOT included in the event payload — tool outputs may
+    contain secrets or PII, and storing them would violate NFR6 (at-rest
+    encryption deferred to Story 9.2). The caller (workflow_engine Story
+    4.x or playground Story 2.7) is responsible for handling the result.
+    """
+
+    event_type: ClassVar[str] = "m5.tool.invoked"
+
+    tool_id: UUID
+    server_id: UUID
+    agent_template_id: UUID | None = None
+    tool_name: str = Field(min_length=1)
+    args_redacted: dict[str, Any] = Field(default_factory=dict)
+    duration_ms: int = Field(ge=0)
+    status: Literal["success", "timeout", "error"]
+    sandbox_backend: Literal["bwrap", "setrlimit"]
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+__all__ = ["ToolDiscoveredEvent", "ToolInvokedEvent", "ToolServerConnectedEvent"]

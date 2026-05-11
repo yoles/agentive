@@ -60,16 +60,16 @@ async def test_create_tool_server_stdio_happy_path(
         assert body["status"] == "active"
         assert "server_id" in body and len(body["server_id"]) == 36
         assert "discovered_at" in body
-        # Mock server exposes 2 tools : echo + add.
+        # Mock server exposes 3 tools : echo + add + sleep (Story 2.6).
         tools = body["tools"]
-        assert len(tools) == 2
+        assert len(tools) == 3
         names = sorted(t["name"] for t in tools)
-        assert names == ["add", "echo"]
+        assert names == ["add", "echo", "sleep"]
         for tool in tools:
             assert "tool_id" in tool
             assert "input_schema" in tool
 
-        # DB rows : 1 server + 2 tools.
+        # DB rows : 1 server + 3 tools.
         async with seed_session_factory() as session:
             srv_row = await session.execute(
                 text("SELECT name, transport, status FROM tool_servers WHERE id = :sid"),
@@ -80,9 +80,9 @@ async def test_create_tool_server_stdio_happy_path(
                 text("SELECT COUNT(*) FROM tools WHERE server_id = :sid"),
                 {"sid": body["server_id"]},
             )
-            assert int(tools_count.scalar_one()) == 2
+            assert int(tools_count.scalar_one()) == 3
 
-        # Outbox : 1 server.connected + 2 tool.discovered = 3 events.
+        # Outbox : 1 server.connected + 3 tool.discovered = 4 events.
         async with seed_session_factory() as session:
             connected = await session.execute(
                 text(
@@ -101,7 +101,7 @@ async def test_create_tool_server_stdio_happy_path(
                 ),
                 {"sid": body["server_id"]},
             )
-            assert int(discovered.scalar_one()) == 2
+            assert int(discovered.scalar_one()) == 3
 
 
 @pytest.mark.integration
@@ -290,7 +290,7 @@ async def test_list_tool_servers_returns_count(
         # At least 1 server (others may exist from parallel tests — filter by name).
         targets = [s for s in body if s["name"] == "list-test"]
         assert len(targets) == 1
-        assert targets[0]["tools_count"] == 2  # mock server has 2 tools
+        assert targets[0]["tools_count"] == 3  # mock server has 3 tools (echo + add + sleep)
 
 
 @pytest.mark.integration
@@ -353,7 +353,7 @@ async def test_list_tool_servers_is_not_n_plus_1(
         ours = [s for s in body if s["name"].startswith("n1-server-")]
         assert len(ours) == 3
         for s in ours:
-            assert s["tools_count"] == 2  # mock exposes 2 tools per server
+            assert s["tools_count"] == 3  # mock exposes 3 tools per server
 
         # The N+1 trap: a per-server count subquery would have fired 3+
         # extra SELECTs targeting tool_servers / tools. The aggregate JOIN
@@ -389,7 +389,7 @@ async def test_get_tool_server_detail_happy(
         assert get.status_code == 200, get.text
         body = get.json()
         assert body["server_id"] == server_id
-        assert len(body["tools"]) == 2
+        assert len(body["tools"]) == 3
 
 
 @pytest.mark.integration
