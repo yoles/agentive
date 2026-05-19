@@ -207,7 +207,7 @@ class PlaygroundService:
             candidate = json.loads(raw_output)
             if isinstance(candidate, dict):
                 parsed_output = candidate
-        except json.JSONDecodeError, TypeError, ValueError:
+        except (json.JSONDecodeError, TypeError, ValueError):
             parsed_output = None
 
         duration_ms_total = int((time.monotonic() - start) * 1000)
