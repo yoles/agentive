@@ -32,6 +32,7 @@ modules =
     agentive_backend.features.m5_tool_hub
     agentive_backend.features.m6_dashboard
     agentive_backend.features.m7_chat
+    agentive_backend.features.m7_playground
     agentive_backend.features.m8_agent_configurator
     agentive_backend.features.m9_topology
     agentive_backend.features.m10_reporting
