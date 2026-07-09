@@ -2,14 +2,17 @@
 
 Examples
 --------
-Valid : ``system.app.started``, ``m3.workflow.started``, ``m4.chunk.indexed``
+Valid : ``system.app.started``, ``workflow_engine.workflow.started``, ``memory_manager.chunk.indexed``
 Invalid : ``System.Started`` (uppercase), ``a.b.c.d`` (4 segments),
-``m3.workflow`` (2 segments).
+``workflow_engine.workflow`` (2 segments).
+
+The module prefix IS the feature package name (``features/<module>/``) —
+one name per bounded context everywhere (ADR ``docs/decisions/module-naming.md``).
 
 Why three segments
 ------------------
 Two segments would conflate domain and operation; four would force naming
-contortions (``m3.workflow.run.started`` vs ``m3.workflow.started``). Three
+contortions (``workflow_engine.workflow.run.started`` vs ``workflow_engine.workflow.started``). Three
 matches the canonical CloudEvents ``source/type`` split.
 """
 
@@ -21,27 +24,32 @@ from agentive_backend.shared.event_bus.exceptions import InvalidEventTypeError
 from agentive_backend.shared.logging import get_logger
 
 # Module prefixes whitelisted for warn-on-typo. Permissive (does not raise).
+# Rule: prefix == feature package name under `features/` (+ "system" for
+# app-lifecycle events). Keep in sync when adding a feature module.
 KNOWN_MODULE_PREFIXES: frozenset[str] = frozenset(
     {
         "system",
-        "m1",
-        "m2",
-        "m3",
-        "m4",
-        "m5",
-        "m6",
-        "m7",
-        "m8",
-        "m9",
-        "m10",
-        "m11",
-        "m12",
+        "agent_configurator",
+        "agent_registry",
+        "chat",
+        "company_architect",
+        "dashboard",
+        "memory_manager",
+        "playground",
+        "reporting",
+        "scheduler",
+        "tool_hub",
+        "topology",
+        "trace",
+        "workflow_engine",
     }
 )
 
 # Lowercase, three dot-separated segments. Each segment starts with a letter,
 # may contain letters / digits / underscore. No leading underscore on segments.
-_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+# (The module segment allows underscores since the DDD rename — prefixes are
+# package names like `agent_registry`, no longer `m2`.)
+_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 
 # Hard cap to prevent pathological event_type names from approaching the
 # Postgres NOTIFY 8000-byte payload limit (P11). Our NOTIFY message format

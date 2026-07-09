@@ -229,7 +229,7 @@ class AgentTemplate(Base):
     __table_args__ = (
         UniqueConstraint("name", "version", "tenant_id", name="uq_agent_template"),
         # Audit M-05 (4.4b) — the 8 universal archetype IDs (source:
-        # features/m2_agent_registry/templates/archetype-schema.yaml).
+        # features/agent_registry/templates/archetype-schema.yaml).
         # Before this CHECK, `archetype = 'banana'` passed the DB — the
         # invariant only lived in the registry/service. Adding a 9th
         # archetype = YAML entry + migration extending this constraint

@@ -12,9 +12,9 @@ from agentive_backend.shared.contracts.events import PlaygroundRunCompletedEvent
 
 
 def test_event_type_constant() -> None:
-    """``event_type`` MUST be ``m7.playground.run_completed`` (consumer
+    """``event_type`` MUST be ``playground.run.completed`` (consumer
     routers match exact string ; typo would silently break audit dispatch)."""
-    assert PlaygroundRunCompletedEvent.event_type == "m7.playground.run_completed"
+    assert PlaygroundRunCompletedEvent.event_type == "playground.run.completed"
 
 
 def test_serializes_decimal_cost_as_string() -> None:

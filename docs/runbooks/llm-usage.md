@@ -148,7 +148,7 @@ catches the **well-known prefixes** (`sk-ant-`, `sk-proj-`, `sk-`,
 into:
 
 - `Completion.text` (returned to the caller and stored in event payloads)
-- `m3.llm.completion_received` event payloads (Story 4.6)
+- `workflow_engine.llm.completion_received` event payloads (Story 4.6)
 - The `attempts` context of `LLMAllProvidersFailedError` (RFC 7807 body
   served to the client)
 

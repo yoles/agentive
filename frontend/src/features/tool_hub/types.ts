@@ -2,8 +2,8 @@
  * Domain types for the Tool Hub feature — Story 2.5.
  *
  * Mirror the backend Pydantic schemas in
- * `backend/src/agentive_backend/features/m5_tool_hub/schemas.py` and
- * `backend/src/agentive_backend/features/m2_agent_registry/schemas.py`
+ * `backend/src/agentive_backend/features/tool_hub/schemas.py` and
+ * `backend/src/agentive_backend/features/agent_registry/schemas.py`
  * (assignment shapes).
  */
 

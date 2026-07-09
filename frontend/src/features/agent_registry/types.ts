@@ -2,7 +2,7 @@
  * Domain types for the Agent Registry — Story 2.1.
  *
  * Mirror the backend Pydantic schemas in
- * `backend/src/agentive_backend/features/m2_agent_registry/schemas.py`.
+ * `backend/src/agentive_backend/features/agent_registry/schemas.py`.
  * When backend OpenAPI typegen lands (Story 1.1 stub `make gen-api-types`),
  * we'll regenerate these.
  */

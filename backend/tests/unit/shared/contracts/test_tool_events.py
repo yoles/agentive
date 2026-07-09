@@ -20,9 +20,9 @@ from agentive_backend.shared.contracts.events import (
 
 
 def test_tool_invoked_event_type_constant() -> None:
-    """``event_type`` MUST be ``m5.tool.invoked`` (consumer routes match
+    """``event_type`` MUST be ``tool_hub.tool.invoked`` (consumer routes match
     this string exactly — typo would break audit dispatch)."""
-    assert ToolInvokedEvent.event_type == "m5.tool.invoked"
+    assert ToolInvokedEvent.event_type == "tool_hub.tool.invoked"
 
 
 def test_tool_invoked_serializes_with_required_fields() -> None:
@@ -87,6 +87,6 @@ def test_tool_invoked_duration_ms_must_be_non_negative() -> None:
 
 def test_tool_events_barrel_exports_all_three() -> None:
     """The barrel ``events/__init__.py`` exports the 3 m5 events."""
-    assert ToolServerConnectedEvent.event_type == "m5.tool_server.connected"
-    assert ToolDiscoveredEvent.event_type == "m5.tool.discovered"
-    assert ToolInvokedEvent.event_type == "m5.tool.invoked"
+    assert ToolServerConnectedEvent.event_type == "tool_hub.tool_server.connected"
+    assert ToolDiscoveredEvent.event_type == "tool_hub.tool.discovered"
+    assert ToolInvokedEvent.event_type == "tool_hub.tool.invoked"

@@ -32,19 +32,19 @@ async def test_pattern_routes_only_matching_events(
         if len(received) >= expected:
             received_count.set()
 
-    await subscribe(re.compile(r"^m3\..*$"), handler)
+    await subscribe(re.compile(r"^workflow_engine\..*$"), handler)
 
     cid = uuid4()
     async with session_factory() as session:
         await publish_and_commit(
             session,
-            "m3.workflow.started",
+            "workflow_engine.workflow.started",
             {},
             correlation_id=cid,
         )
         await publish_and_commit(
             session,
-            "m4.chunk.indexed",
+            "memory_manager.chunk.indexed",
             {},
             correlation_id=cid,
         )
@@ -54,4 +54,4 @@ async def test_pattern_routes_only_matching_events(
     await asyncio.sleep(0.6)
 
     assert len(received) == 1
-    assert received[0].event_type == "m3.workflow.started"
+    assert received[0].event_type == "workflow_engine.workflow.started"

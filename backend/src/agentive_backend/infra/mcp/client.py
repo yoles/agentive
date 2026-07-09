@@ -35,7 +35,7 @@ from agentive_backend.infra.mcp.sandbox import (
 )
 
 # Audit M-01 (1.4/3.1.5) — single source of truth for MCP timeout budgets.
-# Callers (m5_tool_hub service) import these instead of re-literalizing
+# Callers (tool_hub service) import these instead of re-literalizing
 # 10.0 / 30.0, so the values cannot silently diverge between layers.
 DEFAULT_DISCOVERY_TIMEOUT_S: Final = 10.0
 DEFAULT_INVOKE_TIMEOUT_S: Final = 30.0

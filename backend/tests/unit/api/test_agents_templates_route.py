@@ -3,7 +3,7 @@
 Covers AC3 422 paths *without* hitting the DB. The repo + service are
 mocked so we test only the request/response shape and the RFC 7807
 content-type. End-to-end happy path lives in
-``tests/integration/m2_agent_registry/test_create_template_e2e.py``.
+``tests/integration/agent_registry/test_create_template_e2e.py``.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agentive_backend.app.main import create_app
-from agentive_backend.features.m2_agent_registry.schemas import CreateTemplateResponse
-from agentive_backend.features.m2_agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.schemas import CreateTemplateResponse
+from agentive_backend.features.agent_registry.service import AgentRegistryService
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
 
 @pytest.fixture
 def client(app: FastAPI) -> TestClient:
-    from agentive_backend.features.m2_agent_registry import load_registry
+    from agentive_backend.features.agent_registry import load_registry
 
     app.state.archetype_registry = load_registry()
     # Story 2.1 P-08 — sentinel so `_build_service` doesn't 503. The unknown-
@@ -152,11 +152,11 @@ def test_post_template_happy_path_uses_service(
     # Patch the build helper so any caller (router) gets our mock.
     # NOTE: the package re-exports the APIRouter as `router` from
     # ``__init__.py``, so the dotted path
-    # ``agentive_backend.features.m2_agent_registry.router`` is ambiguous.
+    # ``agentive_backend.features.agent_registry.router`` is ambiguous.
     # We import the submodule via importlib to disambiguate.
     import importlib
 
-    router_module = importlib.import_module("agentive_backend.features.m2_agent_registry.router")
+    router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
     monkeypatch.setattr(router_module, "_build_service", lambda _request: fake_service_instance)
 
     resp = client.post(
@@ -181,7 +181,7 @@ def test_post_template_happy_path_uses_service(
 def _patch_service(monkeypatch: pytest.MonkeyPatch, mock_service: AsyncMock) -> None:
     import importlib
 
-    router_module = importlib.import_module("agentive_backend.features.m2_agent_registry.router")
+    router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
     monkeypatch.setattr(router_module, "_build_service", lambda _request: mock_service)
 
 
@@ -220,7 +220,7 @@ def test_put_template_happy_path_uses_service(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     """AC1 — Happy path 200 avec mock service."""
-    from agentive_backend.features.m2_agent_registry.schemas import UpdateTemplateResponse
+    from agentive_backend.features.agent_registry.schemas import UpdateTemplateResponse
 
     template_id = uuid4()
     fake_response = UpdateTemplateResponse(
@@ -263,7 +263,7 @@ def test_get_template_happy_path_uses_service(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
     """AC6 — Happy path 200 avec mock service."""
-    from agentive_backend.features.m2_agent_registry.schemas import TemplateDetailResponse
+    from agentive_backend.features.agent_registry.schemas import TemplateDetailResponse
 
     template_id = uuid4()
     fake_response = TemplateDetailResponse(

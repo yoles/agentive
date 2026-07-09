@@ -144,7 +144,7 @@ class AgentTemplateRepo(BaseRepo):
         ``prompts.created_at`` of the matching row inserted right after.
         For non-versioning updates (see :meth:`update_config_in_session`),
         no `prompts` row is created, so the modification time is captured
-        only via the audit event ``m2.agent_template.updated`` row in the
+        only via the audit event ``agent_registry.agent_template.updated`` row in the
         outbox (P-17 docstring correction Story 2.2 code-review 2026-05-09).
 
         Raises:

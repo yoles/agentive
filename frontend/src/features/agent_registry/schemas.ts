@@ -1,6 +1,6 @@
 /**
  * Zod schemas — frontend mirror of backend Pydantic v2 schemas
- * (`backend/src/agentive_backend/features/m2_agent_registry/schemas.py`).
+ * (`backend/src/agentive_backend/features/agent_registry/schemas.py`).
  *
  * Story 2.3 D-F closure : these schemas drive client-side validation
  * (Wizard step gates + Expert form `react-hook-form` + `zodResolver`).
