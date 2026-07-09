@@ -3,7 +3,7 @@
 Why this module exists
 ----------------------
 Before the 2026-07 audit, TWO key-based redaction implementations lived in
-``m5_tool_hub/service.py`` with DIVERGENT coverage: ``_redact_connection_config``
+``tool_hub/service.py`` with DIVERGENT coverage: ``_redact_connection_config``
 matched an exact closed set of 6 key names while ``_redact_arguments`` matched
 12 case-insensitive substring patterns. A ``connection_config`` holding a
 secret under ``bearer`` / ``credential`` / ``passphrase`` / ``client_secret`` /

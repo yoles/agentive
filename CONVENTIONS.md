@@ -13,7 +13,7 @@
 7. **Toute nouvelle feature** suit la structure type :
    - Frontend : `components/ + hooks/ + services/ + store/ + types/ + utils/ + index.ts` (barrel public API)
    - Backend : `service.py + schemas.py + events.py + tests/ + __init__.py` (barrel public API)
-8. **Imports via barrel** : `from features.m3_workflow_engine import WorkflowEngine` ✅, jamais d'imports profonds (`from features.m3_workflow_engine.engine.internal import ...` ❌).
+8. **Imports via barrel** : `from features.workflow_engine import WorkflowEngine` ✅, jamais d'imports profonds (`from features.workflow_engine.engine.internal import ...` ❌).
 9. **Tous les inputs externes** (user input, tool output) wrappés dans `<user_input>...</user_input>` ou `<tool_output>...</tool_output>` avant tout appel LLM (défense contre prompt injection).
 10. **Correlation ID** (UUID v7 / ULID) propagé dans tous les logs et events.
 11. **Tenant ID** présent dans tous les nouveaux endpoints, queries, logs, métriques (NULL acceptable MVP, prêt pour Growth multi-tenant).

@@ -1,6 +1,6 @@
 """Playground audit events — Epic M7 (Story 2.7).
 
-Story 2.7 AC5 — single minimal audit event ``m7.playground.run_completed``
+Story 2.7 AC5 — single minimal audit event ``playground.run.completed``
 published after each Playground run regardless of success/failure. The
 payload contains METRICS only (template_id, tools_activated count,
 duration, token usage, cost, model, status) — NO prompt_resolved, NO
@@ -9,7 +9,7 @@ bounded (one row per Playground run, payload < 500 bytes).
 
 This is the ONLY ``event_bus.publish`` call from the Playground feature
 — a discipline encoded in the import structure (cf
-``features/m7_playground/__init__.py`` docstring).
+``features/playground/__init__.py`` docstring).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class PlaygroundRunCompletedEvent(BaseModel):
     - ``cost_estimate_usd: Decimal | None`` serialized as string.
     """
 
-    event_type: ClassVar[str] = "m7.playground.run_completed"
+    event_type: ClassVar[str] = "playground.run.completed"
 
     template_id: UUID
     tools_activated: int = Field(ge=0)

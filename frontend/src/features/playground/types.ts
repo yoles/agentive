@@ -2,7 +2,7 @@
  * Domain types for the Playground feature — Story 2.7.
  *
  * Mirror the backend Pydantic schemas in
- * `backend/src/agentive_backend/features/m7_playground/schemas.py`.
+ * `backend/src/agentive_backend/features/playground/schemas.py`.
  */
 
 export type ToolInvocationStatus = "success" | "error" | "timeout";

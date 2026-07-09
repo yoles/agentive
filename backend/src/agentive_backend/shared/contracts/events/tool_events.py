@@ -3,12 +3,12 @@
 Naming convention follows Story 1.7 pattern ``{module}.{object}.{verb}``.
 Events shipped :
 
-* ``m5.tool_server.connected`` — Story 2.5, emitted after a successful
+* ``tool_hub.tool_server.connected`` — Story 2.5, emitted after a successful
   MCP discovery (server registered + N tools discovered).
-* ``m5.tool.discovered`` — Story 2.5, emitted per tool, one row per
+* ``tool_hub.tool.discovered`` — Story 2.5, emitted per tool, one row per
   discovered tool in the same transaction as the parent
   ``tool_server.connected``.
-* ``m5.tool.invoked`` — Story 2.6, emitted after a runtime tool call
+* ``tool_hub.tool.invoked`` — Story 2.6, emitted after a runtime tool call
   (success / timeout / error) with ``duration_ms`` + ``sandbox_backend``
   + ``args_redacted`` (P-03 secret-safety).
 """
@@ -29,7 +29,7 @@ class ToolServerConnectedEvent(BaseModel):
     ``outbox_events`` until Story 9.1 wires :class:`AuditEventRepo`.
     """
 
-    event_type: ClassVar[str] = "m5.tool_server.connected"
+    event_type: ClassVar[str] = "tool_hub.tool_server.connected"
 
     server_id: UUID
     name: str = Field(min_length=1, max_length=255)
@@ -46,7 +46,7 @@ class ToolDiscoveredEvent(BaseModel):
     :class:`ToolServerConnectedEvent` and the row INSERTs.
     """
 
-    event_type: ClassVar[str] = "m5.tool.discovered"
+    event_type: ClassVar[str] = "tool_hub.tool.discovered"
 
     tool_id: UUID
     server_id: UUID
@@ -73,7 +73,7 @@ class ToolInvokedEvent(BaseModel):
     4.x or playground Story 2.7) is responsible for handling the result.
     """
 
-    event_type: ClassVar[str] = "m5.tool.invoked"
+    event_type: ClassVar[str] = "tool_hub.tool.invoked"
 
     tool_id: UUID
     server_id: UUID

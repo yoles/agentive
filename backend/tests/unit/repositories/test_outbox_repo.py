@@ -19,12 +19,12 @@ async def test_insert_persists_event_with_provided_id() -> None:
     await repo.insert(
         event_id=event_id,
         correlation_id=uuid4(),
-        event_type="m1.thing.happened",
+        event_type="company_architect.thing.happened",
         payload={"k": "v"},
     )
     event = session.add.call_args.args[0]
     assert event.id == event_id
-    assert event.event_type == "m1.thing.happened"
+    assert event.event_type == "company_architect.thing.happened"
 
 
 @pytest.mark.asyncio

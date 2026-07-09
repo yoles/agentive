@@ -65,7 +65,7 @@ class Subscription:
         """Return True if this subscription matches the given event type.
 
         Uses :meth:`re.Pattern.fullmatch` (P9) — partial matches surprise
-        callers (``re.compile(r"m3")`` would otherwise match ``m3.x.malicious``).
+        callers (``re.compile(r"workflow_engine")`` would otherwise match ``workflow_engine_x.y.malicious``).
         """
         if isinstance(self.matcher, str):
             return self.matcher == event_type

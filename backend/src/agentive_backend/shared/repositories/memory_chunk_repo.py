@@ -15,7 +15,7 @@ class MemoryChunkRepo(BaseRepo):
     """Public API surface for MemoryChunk. ALL DB access must go through this class.
 
     Vector search and reranking will live in
-    ``features.m4_memory_manager.service`` and call this repo's CRUD
+    ``features.memory_manager.service`` and call this repo's CRUD
     primitives.
     """
 

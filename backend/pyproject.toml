@@ -41,7 +41,7 @@ dependencies = [
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
     "python-multipart>=0.0.26",
-    # Story 2.1 — used to load `features/m2_agent_registry/templates/archetype-schema.yaml`.
+    # Story 2.1 — used to load `features/agent_registry/templates/archetype-schema.yaml`.
     # Already a transitive dep (langgraph), now declared explicitly per direct usage.
     "pyyaml>=6.0",
     # slowapi retiré (audit A-04 2026-07) : déclaré depuis le scaffolding mais
@@ -131,7 +131,7 @@ strict = false
 disallow_untyped_defs = false
 
 # `spike/` contient du code de validation isolé (Story 1.2). Il sera réécrit
-# proprement dans `features/m3_workflow_engine/` à l'Epic 4 — jusque là, on
+# proprement dans `features/workflow_engine/` à l'Epic 4 — jusque là, on
 # relâche mypy sur les retours de LangGraph (`StateGraph.compile()` retourne un
 # type interne complexe qu'il n'est pas utile de propager dans les signatures
 # du spike). Les tests `tests/spike/` valident la correction d'exécution.

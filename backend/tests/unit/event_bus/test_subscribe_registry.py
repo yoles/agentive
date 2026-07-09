@@ -33,15 +33,15 @@ async def test_exact_match_only_matches_exact_string() -> None:
 
     assert _match_subscriptions("system.started") == [sub]
     assert _match_subscriptions("system.shutdown") == []
-    assert _match_subscriptions("m3.workflow.started") == []
+    assert _match_subscriptions("workflow_engine.workflow.started") == []
 
 
 async def test_pattern_match_uses_regex() -> None:
-    sub = await subscribe(re.compile(r"^m3\..*$"), _noop)
+    sub = await subscribe(re.compile(r"^workflow_engine\..*$"), _noop)
 
-    matched = _match_subscriptions("m3.workflow.started")
+    matched = _match_subscriptions("workflow_engine.workflow.started")
     assert matched == [sub]
-    assert _match_subscriptions("m4.chunk.indexed") == []
+    assert _match_subscriptions("memory_manager.chunk.indexed") == []
 
 
 async def test_unsubscribe_removes_from_registry() -> None:
@@ -66,15 +66,15 @@ async def test_subscription_matches_uses_event_type() -> None:
     """Subscription.matches is the canonical pattern — used by registry too."""
     event = Event(
         id=uuid4(),
-        event_type="m3.workflow.started",
+        event_type="workflow_engine.workflow.started",
         payload={},
         correlation_id=uuid4(),
         created_at=datetime.now(UTC),
         tenant_id=None,
     )
-    sub_str = await subscribe("m3.workflow.started", _noop)
-    sub_pattern = await subscribe(re.compile(r"^m3\..*$"), _noop)
-    sub_other = await subscribe("m4.chunk.indexed", _noop)
+    sub_str = await subscribe("workflow_engine.workflow.started", _noop)
+    sub_pattern = await subscribe(re.compile(r"^workflow_engine\..*$"), _noop)
+    sub_other = await subscribe("memory_manager.chunk.indexed", _noop)
 
     assert sub_str.matches(event.event_type) is True
     assert sub_pattern.matches(event.event_type) is True

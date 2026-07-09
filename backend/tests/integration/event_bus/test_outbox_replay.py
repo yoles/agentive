@@ -31,7 +31,7 @@ async def _seed_unprocessed(session: AsyncSession, n: int) -> list[str]:
             {
                 "id": row_id,
                 "cid": cid,
-                "etype": "m3.workflow.started",
+                "etype": "workflow_engine.workflow.started",
                 "payload": json.dumps({"seed": True}),
             },
         )
@@ -47,7 +47,7 @@ async def test_replay_drains_unprocessed_rows_on_start(
     async def handler(event: Event) -> None:
         received.append(event)
 
-    await subscribe("m3.workflow.started", handler)
+    await subscribe("workflow_engine.workflow.started", handler)
 
     async with session_factory() as session:
         ids = await _seed_unprocessed(session, n=3)
@@ -106,7 +106,7 @@ async def test_replay_resumes_after_worker_crash(
     async def handler(event: Event) -> None:
         received_after_crash.append(event)
 
-    await subscribe("m3.workflow.started", handler)
+    await subscribe("workflow_engine.workflow.started", handler)
 
     worker2 = OutboxWorker(session_factory=session_factory, poll_interval_s=0.5)
     await worker2.start()

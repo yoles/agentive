@@ -3,16 +3,16 @@
 Naming convention follows Story 1.7 pattern ``{module}.{object}.{verb}``.
 Events shipped to date :
 
-* ``m2.agent_template.created`` (Story 2.1) — emitted after a new
+* ``agent_registry.agent_template.created`` (Story 2.1) — emitted after a new
   ``agent_templates`` row is committed via
   ``AgentRegistryService.create_template``.
-* ``m2.agent_template.updated`` (Story 2.2) — emitted after a config
+* ``agent_registry.agent_template.updated`` (Story 2.2) — emitted after a config
   edit / version bump via ``AgentRegistryService.update_template``.
-* ``m2.agent_instance.created`` (Story 2.4) — emitted after a new
+* ``agent_registry.agent_instance.created`` (Story 2.4) — emitted after a new
   ``agent_instances`` row is committed via
   ``AgentRegistryService.instantiate_from_template``.
 
-Defer Story 4.x : ``m2.agent_instance.completed`` (workflow_engine
+Defer Story 4.x : ``agent_registry.agent_instance.completed`` (workflow_engine
 signals the run end with the final status — needs the workflow_engine
 runtime to exist first).
 
@@ -38,7 +38,7 @@ class AgentTemplateCreatedEvent(BaseModel):
     Epic 1 retrospective 2026-05-08).
     """
 
-    event_type: ClassVar[str] = "m2.agent_template.created"
+    event_type: ClassVar[str] = "agent_registry.agent_template.created"
 
     template_id: UUID
     name: str = Field(min_length=1, max_length=255)
@@ -58,7 +58,7 @@ class AgentTemplateUpdatedEvent(BaseModel):
     did not include ``system_prompt`` (no prompt insert ⇒ no version bump).
     """
 
-    event_type: ClassVar[str] = "m2.agent_template.updated"
+    event_type: ClassVar[str] = "agent_registry.agent_template.updated"
 
     template_id: UUID
     name: str = Field(min_length=1, max_length=255)
@@ -83,7 +83,7 @@ class AgentInstanceCreatedEvent(BaseModel):
     Story 2.4).
     """
 
-    event_type: ClassVar[str] = "m2.agent_instance.created"
+    event_type: ClassVar[str] = "agent_registry.agent_instance.created"
 
     instance_id: UUID
     template_id: UUID
@@ -101,7 +101,7 @@ class AgentTemplateToolAssignedEvent(BaseModel):
     9.1 cleanup).
     """
 
-    event_type: ClassVar[str] = "m2.agent_template.tool_assigned"
+    event_type: ClassVar[str] = "agent_registry.agent_template.tool_assigned"
 
     template_id: UUID
     tool_id: UUID
@@ -119,7 +119,7 @@ class AgentTemplateToolUnassignedEvent(BaseModel):
     endpoint.
     """
 
-    event_type: ClassVar[str] = "m2.agent_template.tool_unassigned"
+    event_type: ClassVar[str] = "agent_registry.agent_template.tool_unassigned"
 
     template_id: UUID
     tool_id: UUID

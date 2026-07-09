@@ -64,7 +64,7 @@ Clés ad-hoc bound via `logger.bind(...)` ou `structlog.contextvars.bind_context
   "detail": "field 'name' must not be empty",
   "correlation_id": "01923a8e-1234-7000-8000-abcdef012345",
   "agent_id": "code-producer-v1",
-  "module": "m2_agent_registry",
+  "module": "agent_registry",
   "tenant_id": null
 }
 ```

@@ -2,7 +2,7 @@
  * Tests Zod — `schemas.ts` (Story 2.3 T2.3 + T7.1 cohérence Zod ↔ Pydantic).
  *
  * Pour chaque cas testé côté backend dans
- * `backend/tests/unit/m2_agent_registry/test_schemas_update.py`, on
+ * `backend/tests/unit/agent_registry/test_schemas_update.py`, on
  * reproduit le même cas en Zod et on asserte le même verdict (accept/reject).
  * Maintient l'invariant Sprint 1 : Zod miroite Pydantic 1:1.
  */

@@ -25,19 +25,19 @@ include_external_packages = True
 name = Feature modules must not import from each other
 type = independence
 modules =
-    agentive_backend.features.m1_company_architect
-    agentive_backend.features.m2_agent_registry
-    agentive_backend.features.m3_workflow_engine
-    agentive_backend.features.m4_memory_manager
-    agentive_backend.features.m5_tool_hub
-    agentive_backend.features.m6_dashboard
-    agentive_backend.features.m7_chat
-    agentive_backend.features.m7_playground
-    agentive_backend.features.m8_agent_configurator
-    agentive_backend.features.m9_topology
-    agentive_backend.features.m10_reporting
-    agentive_backend.features.m11_scheduler
-    agentive_backend.features.m12_trace
+    agentive_backend.features.company_architect
+    agentive_backend.features.agent_registry
+    agentive_backend.features.workflow_engine
+    agentive_backend.features.memory_manager
+    agentive_backend.features.tool_hub
+    agentive_backend.features.dashboard
+    agentive_backend.features.chat
+    agentive_backend.features.playground
+    agentive_backend.features.agent_configurator
+    agentive_backend.features.topology
+    agentive_backend.features.reporting
+    agentive_backend.features.scheduler
+    agentive_backend.features.trace
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 2 — Layered architecture : app → features → infra → shared

@@ -10,7 +10,7 @@ selection in ``_discover_inner`` rejects unknown transports cleanly.
 
 These tests exercise the REAL MCP SDK + real asyncio cancellation paths
 — complementary to the e2e integration tests in
-``tests/integration/m5_tool_hub/`` which go through the FastAPI router.
+``tests/integration/tool_hub/`` which go through the FastAPI router.
 """
 
 from __future__ import annotations

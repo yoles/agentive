@@ -19,3 +19,7 @@ Structure attendue : `NNN-short-slug.md` (ex: `001-starter-template.md`, `002-ev
 - [`repository-pattern.md`](./repository-pattern.md) — **Story 1.5** : Repository Pattern + RLS tenant binding via `BaseRepo.with_tenant()` (`set_config('app.tenant_id', :tid, true)`) ; rationale vs Active Record / DAO ; defense-in-depth avec `FORCE ROW LEVEL SECURITY` + `import-linter` Contract 3.
 - [`llm-abstraction.md`](./llm-abstraction.md) — **Story 1.6** : `LLMProvider` Protocol + `LLMRouter` multi-provider avec fallback (NFR12, NFR20) wrappant `langchain-anthropic` + `langchain-openai` ; rationale vs LiteLLM / SDK direct ; escape hatch `raw_provider_call()` ; redaction NFR9 + `import-linter` Contract 5.
 - [`llm-fallback-policy.md`](./llm-fallback-policy.md) — **Story 1.6** : table de classification des erreurs (retriable_with_fallback / fatal), chaîne canonique Sprint 0 `["anthropic", "openai"]`, `MODEL_FALLBACK_MAP`, policy de mise à jour pricing.
+
+### Sprint 1 — refactoring
+
+- [`module-naming.md`](./module-naming.md) — **Revue DDD 2026-07** : suppression des préfixes de planning `mN` des feature modules et du namespace d'events (préfixe event = nom du package) ; table de correspondance PRD ↔ code ; backfill `outbox_events` ; vigilance frontière `agent_configurator`/`agent_registry`.

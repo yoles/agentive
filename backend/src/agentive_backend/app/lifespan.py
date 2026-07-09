@@ -14,7 +14,7 @@ from typing import Any
 import bcrypt
 from fastapi import FastAPI
 
-from agentive_backend.features.m2_agent_registry import load_registry
+from agentive_backend.features.agent_registry import load_registry
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
 from agentive_backend.shared.config import settings
@@ -274,7 +274,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = session_factory
 
     async def _publish_fallback(ctx: FallbackContext) -> None:
-        """Publish ``m3.llm.fallback_triggered`` on the event bus.
+        """Publish ``workflow_engine.llm.fallback_triggered`` on the event bus.
 
         Captures the per-call ``correlation_id`` from the FallbackContext
         (router populates it from the structlog ContextVar at fallback
@@ -303,7 +303,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 async with session_factory() as session:
                     await publish_and_commit(
                         session,
-                        "m3.llm.fallback_triggered",
+                        "workflow_engine.llm.fallback_triggered",
                         {
                             "failed_provider": ctx.failed_provider,
                             "next_provider": ctx.next_provider,

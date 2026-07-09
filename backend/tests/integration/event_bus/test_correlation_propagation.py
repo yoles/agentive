@@ -32,13 +32,13 @@ async def test_handler_receives_correlation_id_in_contextvar(
         captured["from_contextvar"] = get_correlation_id()
         seen.set()
 
-    await subscribe("m3.workflow.started", handler)
+    await subscribe("workflow_engine.workflow.started", handler)
 
     expected_cid = uuid4()
     async with session_factory() as session:
         await publish_and_commit(
             session,
-            "m3.workflow.started",
+            "workflow_engine.workflow.started",
             {"workflow_id": str(uuid4())},
             correlation_id=expected_cid,
         )
@@ -72,14 +72,14 @@ async def test_handler_log_records_carry_correlation_id(
         handler_log.info("handler_smoke", correlation_id=get_correlation_id())
         seen.set()
 
-    await subscribe("m3.workflow.started", handler)
+    await subscribe("workflow_engine.workflow.started", handler)
 
     expected_cid = uuid4()
     with structlog.testing.capture_logs() as captured_logs:
         async with session_factory() as session:
             await publish_and_commit(
                 session,
-                "m3.workflow.started",
+                "workflow_engine.workflow.started",
                 {"workflow_id": str(uuid4())},
                 correlation_id=expected_cid,
             )

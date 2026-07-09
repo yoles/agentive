@@ -6,7 +6,7 @@ minimal and immutable so callers cannot mutate state shared across
 provider invocations.
 
 ``Completion`` is JSON-serializable so it can travel inside event bus
-payloads (e.g. ``m3.llm.completion_received`` — Story 4.6).
+payloads (e.g. ``workflow_engine.llm.completion_received`` — Story 4.6).
 """
 
 from __future__ import annotations

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from agentive_backend.features.m5_tool_hub.service import (
+from agentive_backend.features.tool_hub.service import (
     _redact_arguments,
     _redact_connection_config,
 )

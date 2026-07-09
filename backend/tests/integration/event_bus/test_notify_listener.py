@@ -34,18 +34,18 @@ async def test_notify_round_trip_under_one_second(
         received.append(event)
         seen.set()
 
-    await subscribe("m3.workflow.completed", handler)
+    await subscribe("workflow_engine.workflow.completed", handler)
 
     cid = uuid4()
     async with session_factory() as session:
         await publish_and_commit(
             session,
-            "m3.workflow.completed",
+            "workflow_engine.workflow.completed",
             {"workflow_id": str(uuid4())},
             correlation_id=cid,
         )
 
     await asyncio.wait_for(seen.wait(), timeout=2.0)
     assert len(received) == 1
-    assert received[0].event_type == "m3.workflow.completed"
+    assert received[0].event_type == "workflow_engine.workflow.completed"
     assert received[0].correlation_id == cid

@@ -15,16 +15,16 @@ from agentive_backend.shared.contracts.events import (
 
 
 def test_agent_template_created_event_type_constant() -> None:
-    assert AgentTemplateCreatedEvent.event_type == "m2.agent_template.created"
+    assert AgentTemplateCreatedEvent.event_type == "agent_registry.agent_template.created"
 
 
 def test_agent_template_updated_event_type_constant() -> None:
-    assert AgentTemplateUpdatedEvent.event_type == "m2.agent_template.updated"
+    assert AgentTemplateUpdatedEvent.event_type == "agent_registry.agent_template.updated"
 
 
 def test_agent_instance_created_event_type_constant() -> None:
     """Story 2.4 — new audit event for instance creation."""
-    assert AgentInstanceCreatedEvent.event_type == "m2.agent_instance.created"
+    assert AgentInstanceCreatedEvent.event_type == "agent_registry.agent_instance.created"
 
 
 def test_agent_instance_created_event_validates_minimal_payload() -> None:

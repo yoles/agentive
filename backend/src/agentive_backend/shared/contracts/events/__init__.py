@@ -3,10 +3,10 @@
 Naming convention : ``module.object.verb`` (Story 1.7 pattern, e.g.
 ``system.token.used``).
     - ``system.app.started``, ``system.app.shutdown``, ``system.health.checked``
-    - ``m2.agent_template.created`` (Story 2.1) — Story 2.4 will add
-      ``m2.agent_instance.*``.
-    - ``m3.workflow.started``, ``m3.workflow.completed`` (Epic 4)
-    - ``m4.chunk.indexed``, ``m4.chunk.archived`` (Epic 3)
+    - ``agent_registry.agent_template.created`` (Story 2.1) — Story 2.4 will add
+      ``agent_registry.agent_instance.*``.
+    - ``workflow_engine.workflow.started``, ``workflow_engine.workflow.completed`` (Epic 4)
+    - ``memory_manager.chunk.indexed``, ``memory_manager.chunk.archived`` (Epic 3)
 
 System events are published by :mod:`app.lifespan` at boot/shutdown and by
 :func:`app.main.create_app`'s ``/ready`` endpoint after each readiness probe.
