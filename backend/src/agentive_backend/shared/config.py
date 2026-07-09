@@ -60,9 +60,9 @@ class Settings(BaseSettings):
         default=SecretStr("change_me"), alias="AGENTIVE_ENCRYPTION_KEY"
     )
 
-    # ─── PostgreSQL (composants — la DSN est construite côté app via `computed_field`) ───
-    # On stocke les composants plutôt qu'une DSN complète pour pouvoir
-    # URL-encoder le password si nécessaire (supports `@`, `/`, `:`, `%`, etc.).
+    # ─── PostgreSQL (components — the DSN is built app-side via `computed_field`) ───
+    # We store the components rather than a full DSN so the password can be
+    # URL-encoded when needed (supports `@`, `/`, `:`, `%`, etc.).
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
     postgres_db: str = Field(default="agentive", alias="POSTGRES_DB")

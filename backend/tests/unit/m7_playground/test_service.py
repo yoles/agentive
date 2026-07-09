@@ -100,7 +100,7 @@ async def test_run_happy_path_returns_full_response(
         return uuid4()
 
     monkeypatch.setattr(svc_module, "publish", _spy_publish)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     result = await service.run(
         template_id=template_id,
@@ -166,7 +166,7 @@ async def test_run_llm_error_translates_to_dependency_error_and_audits_llm_error
         return uuid4()
 
     monkeypatch.setattr(svc_module, "publish", _spy_publish)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     with pytest.raises(DependencyError):
         await service.run(
@@ -210,6 +210,74 @@ async def test_run_missing_variable_raises_422_validation_error(
     assert "missing_var" in str(exc_info.value.detail)
     assert publish_calls == []
     llm_router.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hostile_prompt",
+    [
+        "{0}",  # positional field → IndexError with empty args
+        "{}",  # auto-numbered field → IndexError with empty args
+        "{x.__class__}",  # attribute traversal → info-disclosure vector
+        "{x[0]}",  # index traversal
+        "{x:!r}",  # malformed format spec → ValueError
+    ],
+)
+async def test_run_hostile_template_raises_422_not_500(
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_prompt: str,
+) -> None:
+    """Audit A-01 (5.5 / CR P-02) — a template with positional fields,
+    attribute/index traversal or a malformed format spec MUST surface as a
+    sanitized ValidationError 422 (not a 500 with a stack trace), with no
+    LLM call and no audit event."""
+    template = MagicMock()
+    template.config = {"system_prompt": hostile_prompt}
+
+    service, llm_router = _make_service(template=template, completion=_completion())
+
+    publish_calls: list[Any] = []
+
+    async def _spy_publish(*a: Any, **k: Any) -> Any:
+        publish_calls.append(a)
+        return uuid4()
+
+    monkeypatch.setattr(svc_module, "publish", _spy_publish)
+
+    with pytest.raises(ValidationError) as exc_info:
+        await service.run(
+            template_id=uuid4(),
+            arguments={"x": "value"},
+            enabled_tool_ids=None,
+            timeout_seconds=5.0,
+        )
+    # Sanitized detail — no template content, no raw exception message.
+    assert hostile_prompt not in str(exc_info.value.detail)
+    assert "__class__" not in str(exc_info.value.detail)
+    assert publish_calls == []
+    llm_router.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_format_spec_still_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit A-01 regression guard — plain ``{variable}`` substitution and
+    benign format specs keep working through the restricted formatter."""
+    template = MagicMock()
+    template.config = {"system_prompt": "pad: {topic:>8}."}
+
+    service, _ = _make_service(template=template, completion=_completion())
+    monkeypatch.setattr(svc_module, "publish", AsyncMock(return_value=uuid4()))
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
+
+    result = await service.run(
+        template_id=uuid4(),
+        arguments={"topic": "tests"},
+        enabled_tool_ids=None,
+        timeout_seconds=5.0,
+    )
+    assert result.prompt_resolved == "pad:    tests."
 
 
 @pytest.mark.asyncio
@@ -262,7 +330,7 @@ async def test_run_parsed_output_none_when_raw_is_not_json(
     service, _ = _make_service(template=template, completion=_completion(text="hello world"))
 
     monkeypatch.setattr(svc_module, "publish", AsyncMock(return_value=uuid4()))
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     result = await service.run(
         template_id=uuid4(),

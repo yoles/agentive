@@ -108,7 +108,7 @@ class CreateTemplateResponse(BaseModel):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-# Whitelist Sprint 1. Sera enrichie quand de nouveaux providers seront branchés (Story 4.6).
+# Sprint 1 whitelist. Will grow when new providers are wired (Story 4.6).
 LLMModel = Literal[
     "claude-3-5-sonnet-20241022",
     "claude-3-5-haiku-20241022",
@@ -116,7 +116,7 @@ LLMModel = Literal[
     "gpt-4o-mini",
 ]
 
-# Provider chain Sprint 1 — runtime fallback non actif (config-only, défer Story 4.6).
+# Provider chain Sprint 1 — runtime fallback not active (config-only, deferred Story 4.6).
 ProviderId = Literal["anthropic", "openai"]
 
 

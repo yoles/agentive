@@ -23,13 +23,13 @@ from agentive_backend.shared.exceptions import NotFoundError
 
 @pytest.fixture
 def event_publish_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
-    """Patch ``service.publish`` + ``service.emit_notify`` so we don't touch the bus."""
+    """Patch ``service.publish`` + ``service.notify_best_effort`` so we don't touch the bus."""
     pub_mock = AsyncMock(return_value=uuid4())
     notify_mock = AsyncMock(return_value=None)
     import agentive_backend.features.m2_agent_registry.service as svc_module
 
     monkeypatch.setattr(svc_module, "publish", pub_mock)
-    monkeypatch.setattr(svc_module, "emit_notify", notify_mock)
+    monkeypatch.setattr(svc_module, "notify_best_effort", notify_mock)
     yield pub_mock
 
 

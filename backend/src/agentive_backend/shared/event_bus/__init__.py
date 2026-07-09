@@ -8,6 +8,9 @@ Public API
     INSERT, commit the session, then NOTIFY the worker. Fire-and-forget.
 :func:`emit_notify`
     Standalone NOTIFY helper for callers that own the commit themselves.
+:func:`notify_best_effort`
+    :func:`emit_notify` wrapped in the bus resilience policy (NOTIFY failure
+    is logged, never raised — the worker's poll fallback picks the event up).
 :func:`subscribe`
     Register an async handler for an exact event_type or a regex pattern.
 :class:`OutboxWorker`
@@ -29,6 +32,7 @@ from agentive_backend.shared.event_bus.outbox import OutboxWorker
 from agentive_backend.shared.event_bus.publisher import (
     OUTBOX_CHANNEL,
     emit_notify,
+    notify_best_effort,
     publish,
     publish_and_commit,
 )
@@ -45,6 +49,7 @@ __all__ = [
     "OutboxWorkerNotRunningError",
     "Subscription",
     "emit_notify",
+    "notify_best_effort",
     "publish",
     "publish_and_commit",
     "subscribe",

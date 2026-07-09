@@ -27,6 +27,7 @@ from agentive_backend.features.m5_tool_hub.schemas import (
     ToolServerView,
 )
 from agentive_backend.features.m5_tool_hub.service import ToolHubService
+from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.exceptions import DependencyError, ForbiddenError
 from agentive_backend.shared.repositories import AgentTemplateRepo, ToolRepo, ToolServerRepo
@@ -168,8 +169,6 @@ async def invoke_tool(
     # on the active sandbox mode.
     backend = getattr(request.app.state, "mcp_sandbox_backend", None)
     if backend is None:
-        from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
-
         backend = detect_sandbox_backend()
 
     start = time.monotonic()

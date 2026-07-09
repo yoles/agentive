@@ -79,12 +79,12 @@ def _build_service(request: Request) -> AgentRegistryService:
             },
         )
 
-    # P-16 (CR 2026-05-10) — atomicité P-02 Story 2.1 exige que les 4 repos
-    # partagent la même session_factory (sinon `service.publish(session=…)`
-    # et `repo.create_in_session(session, …)` opéreraient sur des pools
-    # différents, cassant silencieusement l'invariant "même transaction").
-    # En production tous viennent de `app.state.session_factory` — le passage
-    # explicite ci-dessous + l'assertion défensive verrouillent l'invariant.
+    # P-16 (CR 2026-05-10) — Story 2.1 P-02 atomicity requires all 4 repos
+    # to share the same session_factory (otherwise `service.publish(session=…)`
+    # and `repo.create_in_session(session, …)` would operate on different
+    # pools, silently breaking the "same transaction" invariant).
+    # In production they all come from `app.state.session_factory` — the
+    # explicit passing below + the defensive assertion lock the invariant.
     template_repo = AgentTemplateRepo(session_factory=session_factory)
     prompt_repo = PromptRepo(session_factory=session_factory)
     instance_repo = AgentInstanceRepo(session_factory=session_factory)
