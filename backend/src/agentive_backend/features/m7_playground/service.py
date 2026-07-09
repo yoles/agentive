@@ -22,13 +22,15 @@ Isolation contract (AC2) — enforced by what this module does NOT import :
 from __future__ import annotations
 
 import json
+import string
 import time
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
 
 from agentive_backend.features.m7_playground.schemas import RunPlaygroundResponse
 from agentive_backend.shared.contracts.events import PlaygroundRunCompletedEvent
-from agentive_backend.shared.event_bus import emit_notify, publish
+from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import (
     DependencyError,
     NotFoundError,
@@ -47,6 +49,42 @@ if TYPE_CHECKING:
     )
 
 _log = get_logger(__name__)
+
+# Audit M-01 (1.4) — named defaults for the LLM call when the template's
+# ``config.llm`` snapshot omits a field. The default MODEL is a product
+# choice — it lives here as a visible, testable constant instead of a
+# literal buried in ``run()``. max_tokens/temperature mirror the
+# ``LLMParams`` defaults in m2 schemas (cross-feature import forbidden by
+# the ``features-isolated`` contract — keep in sync manually).
+#
+# ⚠️ Known divergence surfaced by the audit: this model is NOT in the m2
+# ``LLMModel`` whitelist (claude-3-5-*/gpt-4o*). To resolve when the
+# whitelist is refreshed (Story 4.6).
+DEFAULT_LLM_MODEL: Final = "claude-sonnet-4-6"
+DEFAULT_MAX_TOKENS: Final = 4096
+DEFAULT_TEMPERATURE: Final = 0.7
+
+
+class _SafeFormatter(string.Formatter):
+    """Restricted ``string.Formatter`` for ``system_prompt`` resolution.
+
+    ``str.format_map`` allows attribute / index traversal in replacement
+    fields (``{x.__class__}``, ``{x[0]}``) — the classic Python
+    format-string info-disclosure vector. Since ``prompt_resolved`` is
+    echoed back to the caller, a malicious or malformed template could
+    exfiltrate server-side object internals. This formatter keeps plain
+    ``{variable}`` substitution (and format specs) but rejects any field
+    traversal with ``ValueError`` — translated to a sanitized 422 by the
+    caller.
+    """
+
+    def get_field(self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> Any:
+        if "." in field_name or "[" in field_name:
+            raise ValueError(f"unsupported field reference: {field_name!r}")
+        return super().get_field(field_name, args, kwargs)
+
+
+_SAFE_FORMATTER = _SafeFormatter()
 
 
 class PlaygroundService:
@@ -82,7 +120,9 @@ class PlaygroundService:
             ``template_id`` does not exist.
         ValidationError
             ``arguments`` is missing a variable referenced by the
-            template's ``system_prompt`` (``KeyError`` at format_map).
+            template's ``system_prompt``, or the template could not be
+            resolved (positional field, attribute/index traversal,
+            malformed format spec — audit A-01).
         ValidationError
             ``enabled_tool_ids`` references a tool NOT assigned to this
             template.
@@ -126,10 +166,15 @@ class PlaygroundService:
                 )
             tools_activated_count = len(requested)
 
-        # 3. Resolve prompt: str.format_map with safe-default for missing.
+        # 3. Resolve prompt via the restricted formatter (audit A-01 /
+        #    CR P-02). Beyond KeyError (missing variable), a template can
+        #    raise IndexError ({0} with no positional args), ValueError
+        #    (malformed spec or blocked field traversal) or AttributeError.
+        #    All of them map to a sanitized 422 — never a 500 with a
+        #    stack trace.
         system_prompt_template: str = str(config_snapshot.get("system_prompt", ""))
         try:
-            prompt_resolved = system_prompt_template.format_map(arguments)
+            prompt_resolved = _SAFE_FORMATTER.vformat(system_prompt_template, (), dict(arguments))
         except KeyError as exc:
             raise ValidationError(
                 detail=(
@@ -140,20 +185,30 @@ class PlaygroundService:
                     "template_id": str(template_id),
                 },
             ) from exc
+        except (IndexError, ValueError, AttributeError, TypeError) as exc:
+            raise ValidationError(
+                detail="system_prompt could not be resolved from the provided arguments",
+                # No exploitable detail (no template content, no exception
+                # message) — the template may embed server-side context.
+                context={"template_id": str(template_id)},
+            ) from exc
 
         # 4. Call LLMRouter.complete (Sprint 1 : no tool_use formal — D80
         #    deferred Story 4.x. ``tool_invocations`` remains empty in the
         #    response Sprint 1, structure preserved for the frontend).
         llm_cfg: dict[str, Any] = config_snapshot.get("llm", {}) or {}
-        model: str = str(llm_cfg.get("model", "claude-sonnet-4-6"))
-        max_tokens: int = int(llm_cfg.get("max_tokens", 4096))
-        temperature: float = float(llm_cfg.get("temperature", 0.7))
+        model: str = str(llm_cfg.get("model", DEFAULT_LLM_MODEL))
+        max_tokens: int = int(llm_cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
+        temperature: float = float(llm_cfg.get("temperature", DEFAULT_TEMPERATURE))
 
         user_message_content = json.dumps(arguments, ensure_ascii=False)
         messages: list[ChatMessage] = [
             ChatMessage(role="user", content=user_message_content),
         ]
 
+        # "tool_error" is RESERVED — never produced Sprint 1 (formal
+        # tool_use deferred Story 4.x / D80). Kept in the Literal so the
+        # event contract is stable for consumers (audit 3.3.1).
         status: Literal["success", "llm_error", "tool_error"] = "success"
         raw_output: str = ""
         input_tokens = 0
@@ -207,7 +262,7 @@ class PlaygroundService:
             candidate = json.loads(raw_output)
             if isinstance(candidate, dict):
                 parsed_output = candidate
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except json.JSONDecodeError, TypeError, ValueError:
             parsed_output = None
 
         duration_ms_total = int((time.monotonic() - start) * 1000)
@@ -299,14 +354,7 @@ class PlaygroundService:
                 error_message=str(audit_exc)[:200],
             )
             return
-        try:
-            await emit_notify(event_id, PlaygroundRunCompletedEvent.event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=PlaygroundRunCompletedEvent.event_type,
-            )
+        await notify_best_effort(event_id, PlaygroundRunCompletedEvent.event_type)
 
 
 __all__ = ["PlaygroundService"]

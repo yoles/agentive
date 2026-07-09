@@ -162,6 +162,26 @@ async def emit_notify(event_id: UUID, event_type: str) -> None:
             await conn.execute("SELECT pg_notify(%s, %s)", (OUTBOX_CHANNEL, message))
 
 
+async def notify_best_effort(event_id: UUID, event_type: str) -> None:
+    """:func:`emit_notify` wrapped in the bus resilience policy (audit A-06).
+
+    A NOTIFY failure after a committed outbox INSERT must never propagate:
+    the row is durable and the worker's poll fallback (5s default) will
+    pick it up — re-raising would push callers to retry, i.e. duplicate
+    events. Before this helper the ``try/except + warning`` block was
+    copy-pasted at 8 call sites across m2/m5/m7 ; the policy now has ONE
+    owner.
+    """
+    try:
+        await emit_notify(event_id, event_type)
+    except Exception:
+        _log.warning(
+            "event_bus_notify_failed_will_be_polled",
+            event_id=str(event_id),
+            event_type=event_type,
+        )
+
+
 async def publish_and_commit(
     session: AsyncSession,
     event_type: str,
@@ -184,12 +204,5 @@ async def publish_and_commit(
     """
     event_id = await publish(event_type, payload, session=session, correlation_id=correlation_id)
     await session.commit()
-    try:
-        await emit_notify(event_id, event_type)
-    except Exception:
-        _log.warning(
-            "event_bus.notify_failed_will_be_polled",
-            event_id=str(event_id),
-            event_type=event_type,
-        )
+    await notify_best_effort(event_id, event_type)
     return event_id

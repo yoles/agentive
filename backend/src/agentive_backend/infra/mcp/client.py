@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -33,6 +33,12 @@ from agentive_backend.infra.mcp.sandbox import (
     SandboxBackend,
     SandboxProfile,
 )
+
+# Audit M-01 (1.4/3.1.5) — single source of truth for MCP timeout budgets.
+# Callers (m5_tool_hub service) import these instead of re-literalizing
+# 10.0 / 30.0, so the values cannot silently diverge between layers.
+DEFAULT_DISCOVERY_TIMEOUT_S: Final = 10.0
+DEFAULT_INVOKE_TIMEOUT_S: Final = 30.0
 
 
 @dataclass(frozen=True)
@@ -69,7 +75,7 @@ async def discover_tools(
     *,
     transport: Literal["stdio", "sse"],
     connection_config: dict[str, Any],
-    timeout: float = 10.0,
+    timeout: float = DEFAULT_DISCOVERY_TIMEOUT_S,
 ) -> list[ToolInfo]:
     """Discover the tools exposed by a remote MCP server.
 
@@ -184,7 +190,7 @@ async def _list_tools_via_session(read: Any, write: Any) -> list[ToolInfo]:
                     name=tool.name,
                     description=tool.description or "",
                     # `inputSchema` is camelCase in the MCP wire format — we
-                    # snake_case it for our DB layer (Story 2.5 décision #1).
+                    # snake_case it for our DB layer (Story 2.5 decision #1).
                     input_schema=dict(tool.inputSchema or {}),
                     output_schema=(dict(output_schema_raw) if output_schema_raw else None),
                 )
@@ -198,7 +204,7 @@ async def call_tool(
     connection_config: dict[str, Any],
     tool_name: str,
     arguments: dict[str, Any],
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_INVOKE_TIMEOUT_S,
     profile: SandboxProfile | None = None,
     backend: SandboxBackend | None = None,
 ) -> dict[str, Any]:
@@ -467,6 +473,8 @@ async def _call_tool_via_session(
 
 
 __all__ = [
+    "DEFAULT_DISCOVERY_TIMEOUT_S",
+    "DEFAULT_INVOKE_TIMEOUT_S",
     "MCPDiscoveryTimeoutError",
     "MCPExecutionError",
     "MCPExecutionTimeoutError",

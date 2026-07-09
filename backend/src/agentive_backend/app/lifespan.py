@@ -104,6 +104,48 @@ def _init_auth_token(app: FastAPI) -> None:
     log.info("auth.token_initialized", mode=mode, env=settings.environment)
 
 
+def _enforce_mcp_sandbox_policy(backend: str) -> None:
+    """Guard the flag/sandbox-backend combination at boot (audit A-03 / 5.3).
+
+    The ``setrlimit`` fallback caps CPU/memory/nproc but CANNOT isolate
+    network or filesystem (documented in ``infra/mcp/sandbox.py``). With
+    ``AGENTIVE_ALLOW_MCP_REGISTRATION=true`` on such a backend, executing
+    an untrusted MCP tool is an uncontained RCE/SSRF surface. Before this
+    guard the degradation was silent (a lone WARNING at detection time,
+    not correlated with the flag).
+
+    Policy — same fail-fast philosophy as :func:`_init_auth_token`:
+    * production → refuse to boot (``RuntimeError`` with operator hint) ;
+    * dev/test   → loud WARNING (bwrap is commonly inoperative in local
+      Docker profiles ; blocking dev would hurt more than it protects).
+    """
+    if not settings.mcp_allow_registration or backend != "setrlimit":
+        return
+    if settings.is_production:
+        log.critical(
+            "mcp_sandbox.refusing_boot_degraded_backend",
+            backend=backend,
+            env=settings.environment,
+        )
+        raise RuntimeError(
+            "AGENTIVE_ALLOW_MCP_REGISTRATION=true but the effective sandbox "
+            "backend is 'setrlimit' — no network/filesystem isolation for "
+            "MCP tool execution. Refusing to boot in production. Fix: run "
+            "the backend with a bwrap-capable kernel (CAP_SYS_ADMIN or "
+            "kernel.unprivileged_userns_clone=1), or set "
+            "AGENTIVE_ALLOW_MCP_REGISTRATION=false."
+        )
+    log.warning(
+        "mcp_sandbox.degraded_backend_with_registration_enabled",
+        backend=backend,
+        risk="MCP tools run WITHOUT network/filesystem isolation (RCE/SSRF uncontained)",
+        remediation=(
+            "enable bwrap (CAP_SYS_ADMIN / kernel.unprivileged_userns_clone=1) "
+            "or set AGENTIVE_ALLOW_MCP_REGISTRATION=false"
+        ),
+    )
+
+
 def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRouter:
     """Build the singleton :class:`LLMRouter` for the process.
 
@@ -213,6 +255,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "mcp_sandbox.backend_selected",
         backend=app.state.mcp_sandbox_backend,
     )
+    # Audit A-03 (5.3) — refuse (prod) or warn (dev) when MCP registration
+    # is enabled while the sandbox has no network/FS isolation.
+    _enforce_mcp_sandbox_policy(app.state.mcp_sandbox_backend)
     # P-14 (CR 2026-05-11) — AC3 demands a ``mcp_sandbox_backend{kind=...}``
     # counter (per-backend invocation count). Stored on app.state as a
     # plain dict ; Prometheus integration formalized Story 7.x (D65).
@@ -362,4 +407,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             _correlation_id_var.reset(shutdown_token)
 
 
-__all__ = ["_build_llm_router", "_init_auth_token", "lifespan"]
+__all__ = ["_build_llm_router", "_enforce_mcp_sandbox_policy", "_init_auth_token", "lifespan"]

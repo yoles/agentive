@@ -32,6 +32,8 @@ from agentive_backend.features.m5_tool_hub.schemas import (
     ToolView,
 )
 from agentive_backend.infra.mcp.client import (
+    DEFAULT_DISCOVERY_TIMEOUT_S,
+    DEFAULT_INVOKE_TIMEOUT_S,
     MCPDiscoveryTimeoutError,
     MCPExecutionError,
     MCPExecutionTimeoutError,
@@ -39,15 +41,16 @@ from agentive_backend.infra.mcp.client import (
     call_tool,
     discover_tools,
 )
-from agentive_backend.infra.mcp.sandbox import SandboxBackend
+from agentive_backend.infra.mcp.sandbox import SandboxBackend, detect_sandbox_backend
 from agentive_backend.shared.contracts.events import (
     ToolDiscoveredEvent,
     ToolInvokedEvent,
     ToolServerConnectedEvent,
 )
-from agentive_backend.shared.event_bus import emit_notify, publish
-from agentive_backend.shared.exceptions import DependencyError, NotFoundError
+from agentive_backend.shared.event_bus import notify_best_effort, publish
+from agentive_backend.shared.exceptions import ConflictError, DependencyError, NotFoundError
 from agentive_backend.shared.logging import get_logger
+from agentive_backend.shared.security import REDACTED, is_secret_key, redact_recursive
 
 if TYPE_CHECKING:
     from agentive_backend.shared.repositories import (
@@ -67,16 +70,23 @@ _log = get_logger(__name__)
 # ``url``) are exposed ; values that hold secrets (``env``, ``headers``)
 # are replaced by their key list (``["KEY1", "KEY2"]``) so the caller can
 # see the SHAPE without reading the secret values.
+#
+# Audit A-02 (5.6) — per-key matching now delegates to the SHARED
+# ``is_secret_key`` predicate (``shared/security/redaction.py``) instead
+# of a local closed set of 6 exact names. The old set let secrets under
+# ``bearer`` / ``credential`` / ``passphrase`` / ``client_secret`` /
+# ``access_key`` leak in clear through ``GET /tools/servers/{id}`` while
+# the same keys were masked in tool arguments.
 _REDACTED_VALUE_KEY_LIST = "<redacted-keys>"
 
 
 def _redact_connection_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``config`` with secret-bearing values masked.
 
-    Secret-bearing keys (env, headers, Authorization, token, password,
-    api_key, secret) are replaced by the SHAPE of their value (list of
-    sub-keys for dicts ; ``"<redacted>"`` for strings) so consumers can
-    inspect the wiring without leaking credentials.
+    ``env`` / ``headers`` containers are replaced by the SHAPE of their
+    value (list of sub-keys) ; any other key matching the shared
+    :func:`is_secret_key` predicate is masked, so consumers can inspect
+    the wiring without leaking credentials.
     """
     if not isinstance(config, dict):
         return {}
@@ -89,67 +99,18 @@ def _redact_connection_config(config: dict[str, Any]) -> dict[str, Any]:
                 safe[key] = {"_redacted_keys": sorted(str(k) for k in value)}
             else:
                 safe[key] = _REDACTED_VALUE_KEY_LIST
-        # Direct secret-name match — mask the value.
-        elif lkey in {"authorization", "token", "password", "api_key", "secret", "auth"}:
-            safe[key] = "<redacted>"
+        # Secret-name match — SAME predicate as tool-arguments redaction.
+        elif is_secret_key(key):
+            safe[key] = REDACTED
         else:
             safe[key] = value
     return safe
 
 
-# P-05 (CR 2026-05-11) — tool-arguments redaction.
-#
-# Distinct from ``_redact_connection_config`` (which understands the
-# known structural shape ``{env, headers, ...}`` of a connection_config
-# dict), ``_redact_arguments`` walks arbitrary user-supplied dicts/lists
-# recursively and masks values whose KEY matches a secret-name pattern
-# (case-insensitive substring). This is the helper Story 2.6 P-05 calls
-# out for the audit payload : tool callers can supply any shape, secret-
-# bearing keys can appear at any depth, under any of many synonyms.
-_SECRET_KEY_PATTERNS: tuple[str, ...] = (
-    "token",
-    "password",
-    "secret",
-    "api_key",
-    "apikey",
-    "_key",  # covers openai_key, private_key, access_key, signing_key, etc.
-    "key_",  # covers key_id, key_secret, etc.
-    "auth",  # matches authorization, auth_header, bearer_auth, etc.
-    "bearer",
-    "credential",  # credentials, aws_credential, etc.
-    "passphrase",
-    "client_secret",
-)
-
-
-def _key_is_secret(key: str) -> bool:
-    """True if ``key`` (case-insensitive) contains any secret-name pattern."""
-    lkey = key.lower()
-    return any(pat in lkey for pat in _SECRET_KEY_PATTERNS)
-
-
-def _redact_arguments(value: Any, *, depth: int = 0) -> Any:
-    """Recursively redact secret-bearing values in arbitrary tool arguments.
-
-    Walks dicts + lists ; masks values whose KEY (in a parent dict)
-    matches a secret-name pattern. Non-dict / non-list values are returned
-    as-is. Depth-bounded at 8 levels (defensive against pathological
-    nested input).
-    """
-    if depth > 8:
-        return "<redacted-deep>"
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for k, v in value.items():
-            key_str = str(k)
-            if _key_is_secret(key_str):
-                result[key_str] = "<redacted>"
-            else:
-                result[key_str] = _redact_arguments(v, depth=depth + 1)
-        return result
-    if isinstance(value, list):
-        return [_redact_arguments(item, depth=depth + 1) for item in value]
-    return value
+# P-05 (CR 2026-05-11) — tool-arguments redaction. Audit A-02: now a thin
+# alias over the shared recursive walker so the coverage can never diverge
+# from ``_redact_connection_config`` again.
+_redact_arguments = redact_recursive
 
 
 class ToolHubService:
@@ -202,8 +163,6 @@ class ToolHubService:
                 # ConflictError raised explicitly here (vs IntegrityError on
                 # INSERT) so we fail fast with a clear message before the
                 # MCP discovery costs a full timeout window.
-                from agentive_backend.shared.exceptions import ConflictError
-
                 raise ConflictError(
                     detail=f"Tool server '{name}' already registered",
                     context={"name": name},
@@ -216,7 +175,7 @@ class ToolHubService:
             discovered = await discover_tools(
                 transport=transport,  # type: ignore[arg-type]  # Literal narrowed upstream
                 connection_config=connection_config,
-                timeout=10.0,
+                timeout=DEFAULT_DISCOVERY_TIMEOUT_S,
             )
         except MCPDiscoveryTimeoutError as exc:
             raise DependencyError(
@@ -311,14 +270,7 @@ class ToolHubService:
             # commit happens at __aexit__ if no exception is raised.
 
         # Step 4 — Post-commit best-effort NOTIFY (Story 1.4 outbox pattern).
-        try:
-            await emit_notify(server_event_id, ToolServerConnectedEvent.event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(server_event_id),
-                event_type=ToolServerConnectedEvent.event_type,
-            )
+        await notify_best_effort(server_event_id, ToolServerConnectedEvent.event_type)
 
         _log.info(
             "tool_server_connected",
@@ -419,7 +371,7 @@ class ToolHubService:
         tool_id: UUID,
         arguments: dict[str, Any],
         agent_template_id: UUID | None = None,
-        timeout: float = 30.0,
+        timeout: float = DEFAULT_INVOKE_TIMEOUT_S,
         sandbox_backend: SandboxBackend | None = None,
         tenant_id: UUID | None = None,
     ) -> dict[str, Any]:
@@ -503,8 +455,6 @@ class ToolHubService:
         #    may pick "setrlimit" in containers where bwrap is non-functional.
         #    The resolved value is forwarded to call_tool AND used in the
         #    audit event + response, so all three see the same truth.
-        from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
-
         effective_backend: SandboxBackend = sandbox_backend or detect_sandbox_backend()
         start = time.monotonic()
         status: Literal["success", "timeout", "error"] = "error"
@@ -680,14 +630,7 @@ class ToolHubService:
             )
             # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
             event_id = await publish(ToolInvokedEvent.event_type, event, session=session)
-        try:
-            await emit_notify(event_id, ToolInvokedEvent.event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=ToolInvokedEvent.event_type,
-            )
+        await notify_best_effort(event_id, ToolInvokedEvent.event_type)
 
 
 __all__ = ["ToolHubService"]

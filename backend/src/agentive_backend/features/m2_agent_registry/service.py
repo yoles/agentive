@@ -56,7 +56,7 @@ from agentive_backend.shared.contracts.events import (
     AgentTemplateToolUnassignedEvent,
     AgentTemplateUpdatedEvent,
 )
-from agentive_backend.shared.event_bus import emit_notify, publish
+from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import NotFoundError, ValidationError
 from agentive_backend.shared.logging import get_logger
 
@@ -87,13 +87,13 @@ class AgentRegistryService:
         tool_repo: ToolRepo,
         assignment_repo: AgentTemplateToolRepo,
     ) -> None:
-        # P-16 (CR 2026-05-10) — invariant : pour que l'atomicité P-02
-        # Story 2.1 (with_tenant + same session pour template SELECT +
-        # instance INSERT + outbox publish) tienne, les 4 repos DOIVENT
-        # partager la même session_factory. L'assertion vit dans
-        # `_build_service` (router.py) qui produit le wiring production ;
-        # ici le constructeur accepte des repos hétérogènes pour préserver
-        # la testabilité (les unit tests mockent chaque repo séparément).
+        # P-16 (CR 2026-05-10) — invariant: for Story 2.1 P-02 atomicity
+        # (with_tenant + same session for template SELECT + instance
+        # INSERT + outbox publish) to hold, the 4 repos MUST share the
+        # same session_factory. The assertion lives in `_build_service`
+        # (router.py), which produces the production wiring; here the
+        # constructor accepts heterogeneous repos to keep testability
+        # (unit tests mock each repo separately).
         self._registry = registry
         self._template_repo = template_repo
         self._prompt_repo = prompt_repo
@@ -204,14 +204,7 @@ class AgentRegistryService:
         # Worker poll fallback (Story 1.4) covers any missed NOTIFY, so a
         # failure here is logged but never re-raised — the row + outbox
         # are already durable.
-        try:
-            await emit_notify(event_id, event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=event_type,
-            )
+        await notify_best_effort(event_id, event_type)
 
         _log.info(
             "agent_template_created",
@@ -295,11 +288,11 @@ class AgentRegistryService:
             old_version = existing.version
             merged_config = dict(existing.config or {})
 
-            # P-01 fix — bump version + insert prompts row UNIQUEMENT si le
-            # `system_prompt` change réellement (vs identique à l'existant).
-            # Sans ce check, la default UX path (Save sans modification du
-            # prompt) duplique des rows `prompts` byte-identiques et inflate
-            # `agent_templates.version` à chaque clic.
+            # P-01 fix — bump version + insert prompts row ONLY when the
+            # `system_prompt` actually changes (vs identical to current).
+            # Without this check, the default UX path (Save without touching
+            # the prompt) duplicates byte-identical `prompts` rows and
+            # inflates `agent_templates.version` on every click.
             current_system_prompt = merged_config.get("system_prompt")
             system_prompt_changed = (
                 payload.system_prompt is not None and payload.system_prompt != current_system_prompt
@@ -358,23 +351,16 @@ class AgentRegistryService:
             # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
             event_id = await publish(event_type, event, session=session)
 
-            # P-05 fix — `updated_at` capturé À L'INTÉRIEUR du with_tenant block,
-            # juste avant le commit (qui s'exécute à `__aexit__`). Sans ça, la
-            # valeur retournée incluait la latence de `emit_notify` post-commit
-            # (jusqu'à plusieurs centaines de ms sous charge) — incohérent pour
-            # un timestamp qui prétend refléter l'écriture DB.
+            # P-05 fix — `updated_at` captured INSIDE the with_tenant block,
+            # right before the commit (which runs at `__aexit__`). Without
+            # this, the returned value included the post-commit notify
+            # latency (up to several hundred ms under load) — inconsistent
+            # for a timestamp that claims to reflect the DB write.
             updated_at = datetime.now(tz=UTC)
             # commit happens at __aexit__ if no exception is raised.
 
         # ─── Post-commit: best-effort NOTIFY ───
-        try:
-            await emit_notify(event_id, event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=event_type,
-            )
+        await notify_best_effort(event_id, event_type)
 
         _log.info(
             "agent_template_updated",
@@ -386,10 +372,11 @@ class AgentRegistryService:
             bump_version=bump_version,
         )
 
-        # `updated_at` Sprint 1 — la table n'a pas de colonne dédiée. La valeur
-        # retournée est capturée juste avant le commit (P-05) ; au besoin l'état
-        # historique est retrouvable via ``MAX(prompts.created_at) WHERE agent_template_id = ?``
-        # pour les rows qui ont déclenché un bump version.
+        # `updated_at` Sprint 1 — the table has no dedicated column. The
+        # returned value is captured right before the commit (P-05); if
+        # needed, historical state can be recovered via
+        # ``MAX(prompts.created_at) WHERE agent_template_id = ?`` for rows
+        # that triggered a version bump.
         return UpdateTemplateResponse(
             template_id=updated.id,
             name=updated.name,
@@ -455,13 +442,13 @@ class AgentRegistryService:
                     )
 
             # 3. Build the immutable snapshot. P-15 (CR 2026-05-10) — deep
-            #    copy via `copy.deepcopy` (was shallow `dict(...)`) car
-            #    `template.config` contient des nested dicts (`llm_params`,
+            #    copy via `copy.deepcopy` (was shallow `dict(...)`) because
+            #    `template.config` holds nested dicts (`llm_params`,
             #    `error_policy`, `input_contract`, `provider_chain` list)
-            #    qui restaient partagés par référence sous shallow. Sprint 1
-            #    SQLAlchemy JSONB renvoie un fresh dict à chaque fetch donc
-            #    OK en pratique ; deep copy = defense-in-depth contre des
-            #    futurs paths qui réutiliseraient l'objet en session.
+            #    that stayed shared by reference under shallow copy. Sprint 1
+            #    SQLAlchemy JSONB returns a fresh dict on every fetch so it
+            #    is fine in practice; deep copy = defense-in-depth against
+            #    future paths that would reuse the in-session object.
             snapshot: dict[str, Any] = {
                 "template_id": str(template.id),
                 "template_version": template.version,
@@ -494,14 +481,7 @@ class AgentRegistryService:
             # commit happens at __aexit__ if no exception.
 
         # ─── Post-commit: best-effort NOTIFY (Story 1.4 outbox pattern).
-        try:
-            await emit_notify(event_id, event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=event_type,
-            )
+        await notify_best_effort(event_id, event_type)
 
         _log.info(
             "agent_instance_created",
@@ -522,11 +502,11 @@ class AgentRegistryService:
             template_id=instance.template_id,
             template_version=instance.template_version,
             workflow_run_id=instance.workflow_run_id,
-            # P-17 (CR 2026-05-10) — output symmetric copy : cohérence avec
-            # le defensive copy en entrée (snapshot construit via deepcopy).
-            # Évite tout aliasing de l'objet ORM `instance.snapshot` post-
-            # session-close (paranoïa : middleware response peut techniquement
-            # muter l'objet).
+            # P-17 (CR 2026-05-10) — output symmetric copy: consistent with
+            # the defensive copy on input (snapshot built via deepcopy).
+            # Avoids any aliasing of the ORM object `instance.snapshot`
+            # post-session-close (paranoia: response middleware could
+            # technically mutate the object).
             snapshot=dict(instance.snapshot),
             created_at=instance.created_at,
         )
@@ -690,14 +670,7 @@ class AgentRegistryService:
 
         # Post-commit best-effort NOTIFY (1 per event with its real event_type).
         for eid, event_type in events_emitted:
-            try:
-                await emit_notify(eid, event_type)
-            except Exception:
-                _log.warning(
-                    "event_bus_notify_failed_will_be_polled",
-                    event_id=str(eid),
-                    event_type=event_type,
-                )
+            await notify_best_effort(eid, event_type)
 
         _log.info(
             "agent_template_tools_replaced",
@@ -806,14 +779,7 @@ class AgentRegistryService:
             )
             # commit at __aexit__.
 
-        try:
-            await emit_notify(event_id, AgentTemplateToolUnassignedEvent.event_type)
-        except Exception:
-            _log.warning(
-                "event_bus_notify_failed_will_be_polled",
-                event_id=str(event_id),
-                event_type=AgentTemplateToolUnassignedEvent.event_type,
-            )
+        await notify_best_effort(event_id, AgentTemplateToolUnassignedEvent.event_type)
 
         _log.info(
             "agent_template_tool_unassigned",

@@ -97,7 +97,9 @@ class Namespace(Base):
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    # Type enum : 'client' | 'metier' | 'operationnelle' | 'contextuelle'
+    # Type enum — enforced by ck_namespace_type below. The CHECK exists in
+    # the DB since the initial migration (20260419000000); the model was
+    # missing the declaration (model/DB desync fixed by audit M-05).
     type: Mapped[str] = mapped_column(String(50), nullable=False)
     department: Mapped[str | None] = mapped_column(String(100), nullable=True)
     project: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -111,6 +113,13 @@ class Namespace(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('client', 'metier', 'operationnelle', 'contextuelle')",
+            name="ck_namespace_type",
+        ),
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -217,7 +226,20 @@ class AgentTemplate(Base):
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
-    __table_args__ = (UniqueConstraint("name", "version", "tenant_id", name="uq_agent_template"),)
+    __table_args__ = (
+        UniqueConstraint("name", "version", "tenant_id", name="uq_agent_template"),
+        # Audit M-05 (4.4b) — the 8 universal archetype IDs (source:
+        # features/m2_agent_registry/templates/archetype-schema.yaml).
+        # Before this CHECK, `archetype = 'banana'` passed the DB — the
+        # invariant only lived in the registry/service. Adding a 9th
+        # archetype = YAML entry + migration extending this constraint
+        # (deliberate friction: archetypes are a stable product concept).
+        CheckConstraint(
+            "archetype IN ('orchestrateur', 'chercheur', 'analyste', 'producteur', "
+            "'stratege', 'controleur', 'veilleur', 'communicateur')",
+            name="ck_agent_template_archetype",
+        ),
+    )
 
 
 class AgentInstance(Base):

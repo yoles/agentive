@@ -44,7 +44,10 @@ dependencies = [
     # Story 2.1 — used to load `features/m2_agent_registry/templates/archetype-schema.yaml`.
     # Already a transitive dep (langgraph), now declared explicitly per direct usage.
     "pyyaml>=6.0",
-    "slowapi>=0.1.9",
+    # slowapi retiré (audit A-04 2026-07) : déclaré depuis le scaffolding mais
+    # jamais câblé (aucun Limiter/@limit dans src/). Dépendance morte = surface
+    # supply-chain inutile. Le rate limiting sera réintroduit AVEC son design
+    # (par-endpoint, storage partagé) en Story 9.5 — prérequis multi-user.
     "sqlalchemy[asyncio]>=2.0.49",
     "sse-starlette>=3.3.4",
     "structlog>=25.5.0",
@@ -87,11 +90,21 @@ select = [
     "ARG",  # flake8-unused-arguments
     "PTH",  # flake8-use-pathlib
     "RUF",  # ruff-specific
+    "C90",  # mccabe — cyclomatic complexity gate (audit A-15/B-01)
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
     "B008",   # do not perform function calls in argument defaults (FastAPI Depends)
 ]
+
+# Audit A-15 (B-01) — gate de complexité cyclomatique via ruff/mccabe (déjà
+# dans la toolchain, contrairement à radon/xenon proposés par l'audit).
+# État au 2026-07-09 : max mesuré = 15 (`shared/llm/router.py::complete`),
+# 6 fonctions entre 11 et 15. Seuil ratchet calé sur l'existant : ne PAS
+# l'augmenter pour faire passer une nouvelle fonction — la découper. À
+# resserrer (12 puis 10) au fil du refactoring SRP (audit A-09, Vague 2).
+[tool.ruff.lint.mccabe]
+max-complexity = 15
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ARG", "B", "N"]

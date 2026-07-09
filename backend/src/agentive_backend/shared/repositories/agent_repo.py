@@ -278,12 +278,12 @@ class AgentInstanceRepo(BaseRepo):
         natural chronological UX (the consumer Story 8.x trace explorer
         renders runs left-to-right by start time).
         """
-        # P-19 (CR 2026-05-10) — secondary sort sur `id` pour déterminisme.
-        # Postgres `now()` retourne le timestamp du DÉBUT de la transaction ;
-        # 2 INSERT dans la MÊME transaction (Story 4.x quand workflow_engine
-        # batchera des instantiations) auront `created_at` IDENTIQUES → ordre
-        # indéterminé sans secondary key. UUID v4 random est suffisant pour
-        # fixer l'ordre stable côté tests.
+        # P-19 (CR 2026-05-10) — secondary sort on `id` for determinism.
+        # Postgres `now()` returns the timestamp of the transaction START;
+        # 2 INSERTs in the SAME transaction (Story 4.x once workflow_engine
+        # batches instantiations) will have IDENTICAL `created_at` → order
+        # is undefined without a secondary key. Random UUID v4 is enough to
+        # pin a stable order for tests.
         stmt = (
             select(AgentInstance)
             .where(AgentInstance.workflow_run_id == workflow_run_id)

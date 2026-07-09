@@ -338,7 +338,7 @@ async def test_invoke_tool_happy_path_returns_call_tool_result(
 
     monkeypatch.setattr(svc_module, "publish", _fake_publish)
     monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     result = await service.invoke_tool(
         server_id=server_id,
@@ -386,7 +386,7 @@ async def test_invoke_tool_translates_execution_timeout_to_dependency_error(
 
     monkeypatch.setattr(svc_module, "publish", _fake_publish)
     monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     with pytest.raises(DependencyError) as exc_info:
         await service.invoke_tool(
@@ -431,7 +431,7 @@ async def test_invoke_tool_translates_tool_error_to_not_found(
 
     monkeypatch.setattr(svc_module, "publish", _fake_publish)
     monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     with pytest.raises(NotFoundError) as exc_info:
         await service.invoke_tool(
@@ -475,7 +475,7 @@ async def test_invoke_tool_args_redaction_masks_secrets_in_audit_payload(
 
     monkeypatch.setattr(svc_module, "publish", _fake_publish)
     monkeypatch.setattr(svc_module, "call_tool", _fake_call_tool)
-    monkeypatch.setattr(svc_module, "emit_notify", AsyncMock())
+    monkeypatch.setattr(svc_module, "notify_best_effort", AsyncMock())
 
     await service.invoke_tool(
         server_id=server_id,
