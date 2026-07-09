@@ -165,3 +165,19 @@ lerna-debug.log*
 
 infrastructure/
 infrastructure_idem_helper/
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Audit sécurité 2026-07-07 — fichiers hors-projet / perso / bloat
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fichiers personnels / hors-projet (P1)
+dream_job.txt
+
+# Assistant IA local — mémoire & profil (machine-specific) (P3)
+.claude/projects/
+
+# Formation — binaires générés (régénérables depuis le Markdown) (P4)
+formation/*.pdf
+formation/*.epub
+
+# Diffs de review régénérables (bloat) (P5)
+_bmad-output/**/.review-*.diff
