@@ -235,7 +235,7 @@ class OutboxWorker:
                     finally:
                         # Closing the generator releases the wait-for-notify state.
                         await gen.aclose()
-                except psycopg.OperationalError, psycopg.InterfaceError:
+                except (psycopg.OperationalError, psycopg.InterfaceError):
                     _log.exception("event_bus.listen_connection_lost")
                     with contextlib.suppress(Exception):
                         await self._listen_conn.close()
