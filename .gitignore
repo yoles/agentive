@@ -179,5 +179,6 @@ dream_job.txt
 formation/*.pdf
 formation/*.epub
 
-# Diffs de review régénérables (bloat) (P5)
-_bmad-output/**/.review-*.diff
+# Framework/planning BMAD — hors code, ne doit pas vivre dans ce repo (P5)
+_bmad/
+_bmad-output/
