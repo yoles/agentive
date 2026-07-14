@@ -23,6 +23,7 @@ Domain errors raised :
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
@@ -111,6 +112,18 @@ def _redact_connection_config(config: dict[str, Any]) -> dict[str, Any]:
 # alias over the shared recursive walker so the coverage can never diverge
 # from ``_redact_connection_config`` again.
 _redact_arguments = redact_recursive
+
+
+@dataclass(frozen=True, slots=True)
+class _InvocationOutcome:
+    """Result of one tool execution — the value ``invoke_tool`` audits once
+    then either raises (``error``) or returns (``result``). Audit A-09: lets
+    the success / timeout / error paths converge on a single audit call."""
+
+    status: Literal["success", "timeout", "error"]
+    result: dict[str, Any]
+    duration_ms: int
+    error: Exception | None
 
 
 class ToolHubService:
@@ -405,58 +418,110 @@ class ToolHubService:
         DependencyError
             Sandbox crash / timeout / SDK protocol error.
         """
-        # 1. Resolve server + tool rows (NotFoundError if missing).
+        # A-09 (audit §2.1a) — the method reads as its own table of contents:
+        # resolve → check attribution → execute (timed) → audit ONCE → return
+        # or raise. Each step is a focused, independently-testable helper.
+        tool_name, transport, connection_config = await self._resolve_server_and_tool(
+            server_id=server_id, tool_id=tool_id, tenant_id=tenant_id
+        )
+        await self._assert_template_exists(agent_template_id, tenant_id=tenant_id)
+
+        # Resolve the sandbox backend ONCE (P-03) — never default to literal
+        # "bwrap"; detect_sandbox_backend may pick "setrlimit" in containers
+        # where bwrap is non-functional. The resolved value is forwarded to
+        # call_tool AND recorded in the audit event, so both see the same truth.
+        effective_backend: SandboxBackend = sandbox_backend or detect_sandbox_backend()
+        outcome = await self._execute_tool_with_timing(
+            transport=transport,
+            connection_config=connection_config,
+            tool_name=tool_name,
+            arguments=arguments,
+            timeout=timeout,
+            backend=effective_backend,
+            server_id=server_id,
+            tool_id=tool_id,
+        )
+
+        # Single audit-publish path (P-08/P-17 + DRY §3.1.3) — success, timeout
+        # and error all converge here. The tool has already run (side effects),
+        # so an audit-publish failure is logged, never re-raised, and never
+        # shadows the captured domain exception.
+        await self._audit_invocation(
+            tool_id=tool_id,
+            server_id=server_id,
+            agent_template_id=agent_template_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            backend=effective_backend,
+            tenant_id=tenant_id,
+            outcome=outcome,
+        )
+
+        _log.info(
+            "tool_invoked",
+            tool_id=str(tool_id),
+            server_id=str(server_id),
+            tool_name=tool_name,
+            duration_ms=outcome.duration_ms,
+            status=outcome.status,
+            sandbox_backend=effective_backend,
+        )
+
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
+
+    # ─── invoke_tool helpers (A-09 decomposition) ─────────────────
+
+    async def _resolve_server_and_tool(
+        self, *, server_id: UUID, tool_id: UUID, tenant_id: UUID | None
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Resolve the server + tool rows; return ``(tool_name, transport,
+        connection_config)``. Raises :class:`NotFoundError` with a uniform
+        "Tool not found" message whether the tool is missing OR belongs to
+        another server (P-20 — avoids leaking cross-server tool existence)."""
         async with self._server_repo.with_tenant(tenant_id) as session:
             server = await self._server_repo.require_by_id_in_session(session, server_id)
             tool = await self._tool_repo.get_by_id_in_session(session, tool_id)
             if tool is None or tool.server_id != server_id:
-                # P-20 (CR 2026-05-11) — uniform "Tool not found" message
-                # in both branches (missing OR wrong server). Avoids leaking
-                # cross-server tool_id existence to authenticated callers
-                # (relevant Story 12 multi-tenant).
                 raise NotFoundError(
                     detail=f"Tool '{tool_id}' not found",
                     context={"server_id": str(server_id), "tool_id": str(tool_id)},
                 )
-            tool_name = tool.name
-            transport = server.transport
-            connection_config = dict(server.connection_config or {})
+            return tool.name, server.transport, dict(server.connection_config or {})
 
-        # P-11 (CR 2026-05-11) — verify ``agent_template_id`` exists (when
-        # supplied) before consuming the audit attribution. Without this
-        # check, an authenticated caller could attribute invocations to
-        # any template UUID, polluting the audit trail. Allowlist runtime
-        # ("tool in agent_template's assigned_tools") remains Story 4.x.
-        if agent_template_id is not None and self._template_repo is not None:
-            async with self._template_repo.with_tenant(tenant_id) as session:
-                template = await self._template_repo.get_by_id_in_session(
-                    session, agent_template_id
-                )
-            if template is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{agent_template_id}' not found",
-                    context={
-                        "agent_template_id": str(agent_template_id),
-                    },
-                )
+    async def _assert_template_exists(
+        self, agent_template_id: UUID | None, *, tenant_id: UUID | None
+    ) -> None:
+        """Verify ``agent_template_id`` exists before it is consumed as audit
+        attribution (P-11 — else a caller could attribute invocations to any
+        template UUID). No-op when no attribution is supplied."""
+        if agent_template_id is None or self._template_repo is None:
+            return
+        async with self._template_repo.with_tenant(tenant_id) as session:
+            template = await self._template_repo.get_by_id_in_session(session, agent_template_id)
+        if template is None:
+            raise NotFoundError(
+                detail=f"Agent template '{agent_template_id}' not found",
+                context={"agent_template_id": str(agent_template_id)},
+            )
 
-        # 2. Resolve the actual sandbox backend ONCE (P-03 CR 2026-05-11)
-        #    — never default to literal "bwrap" since detect_sandbox_backend
-        #    may pick "setrlimit" in containers where bwrap is non-functional.
-        #    The resolved value is forwarded to call_tool AND used in the
-        #    audit event + response, so all three see the same truth.
-        effective_backend: SandboxBackend = sandbox_backend or detect_sandbox_backend()
+    async def _execute_tool_with_timing(
+        self,
+        *,
+        transport: str,
+        connection_config: dict[str, Any],
+        tool_name: str,
+        arguments: dict[str, Any],
+        timeout: float,
+        backend: SandboxBackend,
+        server_id: UUID,
+        tool_id: UUID,
+    ) -> _InvocationOutcome:
+        """Run the tool and map every MCP failure to its domain exception,
+        capturing ``(status, result, duration_ms, error)`` instead of raising
+        inline — so the caller can audit once before re-raising."""
         start = time.monotonic()
-        status: Literal["success", "timeout", "error"] = "error"
-        result: dict[str, Any] = {}
-        # P-17 (CR 2026-05-11) — single audit-publish path. The 3 except
-        # branches used to duplicate ~12 lines each, and an audit failure
-        # in any branch shadowed the original domain exception. Now we
-        # capture (status, domain_exception_to_raise) inside try/except,
-        # publish ONCE in a try/except-wrapped block (P-08 alignment), and
-        # re-raise the captured domain error so the original cause is
-        # preserved.
-        domain_exception_to_raise: Exception | None = None
         try:
             result = await call_tool(
                 transport=transport,  # type: ignore[arg-type]  # Literal narrowed by DB CHECK
@@ -464,12 +529,10 @@ class ToolHubService:
                 tool_name=tool_name,
                 arguments=arguments,
                 timeout=timeout,
-                backend=effective_backend,
+                backend=backend,
             )
-            status = "success"
         except MCPExecutionTimeoutError as exc:
-            status = "timeout"
-            domain_exception_to_raise = DependencyError(
+            error: Exception = DependencyError(
                 detail=f"MCP tool '{tool_name}' execution timeout",
                 context={
                     "server_id": str(server_id),
@@ -477,10 +540,10 @@ class ToolHubService:
                     "timeout_seconds": exc.timeout,
                 },
             )
-            domain_exception_to_raise.__cause__ = exc
+            error.__cause__ = exc
+            return _InvocationOutcome("timeout", {}, self._elapsed_ms(start), error)
         except MCPToolError as exc:
-            status = "error"
-            domain_exception_to_raise = NotFoundError(
+            error = NotFoundError(
                 detail=f"MCP tool '{tool_name}' returned error: {exc.detail}",
                 context={
                     "server_id": str(server_id),
@@ -488,10 +551,10 @@ class ToolHubService:
                     "tool_name": tool_name,
                 },
             )
-            domain_exception_to_raise.__cause__ = exc
+            error.__cause__ = exc
+            return _InvocationOutcome("error", {}, self._elapsed_ms(start), error)
         except MCPExecutionError as exc:
-            status = "error"
-            domain_exception_to_raise = DependencyError(
+            error = DependencyError(
                 detail=f"MCP tool '{tool_name}' subprocess error (rc={exc.returncode})",
                 context={
                     "server_id": str(server_id),
@@ -499,48 +562,30 @@ class ToolHubService:
                     "returncode": exc.returncode,
                 },
             )
-            domain_exception_to_raise.__cause__ = exc
+            error.__cause__ = exc
+            return _InvocationOutcome("error", {}, self._elapsed_ms(start), error)
+        return _InvocationOutcome("success", result, self._elapsed_ms(start), None)
 
-        # If a domain error was captured, publish the failure audit then
-        # re-raise. Audit-publish failures are logged at warning level but
-        # NEVER replace the original domain exception (P-08 contract).
-        if domain_exception_to_raise is not None:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            try:
-                await self._publish_invoked(
-                    session_factory_owner=self._server_repo,
-                    tool_id=tool_id,
-                    server_id=server_id,
-                    agent_template_id=agent_template_id,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    duration_ms=duration_ms,
-                    status=status,
-                    sandbox_backend=effective_backend,
-                    tenant_id=tenant_id,
-                )
-            except Exception as audit_exc:
-                _log.warning(
-                    "tool_invoked_audit_publish_failed_on_error_path",
-                    tool_id=str(tool_id),
-                    server_id=str(server_id),
-                    tool_name=tool_name,
-                    domain_status=status,
-                    error_type=type(audit_exc).__name__,
-                    error_message=str(audit_exc)[:200],
-                )
-            raise domain_exception_to_raise
+    @staticmethod
+    def _elapsed_ms(start: float) -> int:
+        return int((time.monotonic() - start) * 1000)
 
-        duration_ms = int((time.monotonic() - start) * 1000)
-
-        # 3. Audit event tool_hub.tool.invoked (success path).
-        #
-        # P-08 (CR 2026-05-11) — wrap audit publish in try/except : the tool
-        # has ALREADY executed (with side effects), so an audit-publish DB
-        # failure must NOT shadow the successful result. Returning the tool
-        # result here is better than 500-ing the caller (which would retry
-        # and multiply side effects). The audit gap is documented in D68 ;
-        # background recovery jobs can replay missing audits.
+    async def _audit_invocation(
+        self,
+        *,
+        tool_id: UUID,
+        server_id: UUID,
+        agent_template_id: UUID | None,
+        tool_name: str,
+        arguments: dict[str, Any],
+        backend: SandboxBackend,
+        tenant_id: UUID | None,
+        outcome: _InvocationOutcome,
+    ) -> None:
+        """Publish ``tool_hub.tool.invoked`` once, for any outcome. Best-effort:
+        the tool has already executed, so an audit-publish failure is logged at
+        WARNING and swallowed (D68 gap; recovery jobs replay). It never shadows
+        the domain exception the caller is about to re-raise."""
         try:
             await self._publish_invoked(
                 session_factory_owner=self._server_repo,
@@ -549,9 +594,9 @@ class ToolHubService:
                 agent_template_id=agent_template_id,
                 tool_name=tool_name,
                 arguments=arguments,
-                duration_ms=duration_ms,
-                status=status,
-                sandbox_backend=effective_backend,
+                duration_ms=outcome.duration_ms,
+                status=outcome.status,
+                sandbox_backend=backend,
                 tenant_id=tenant_id,
             )
         except Exception as audit_exc:
@@ -560,22 +605,11 @@ class ToolHubService:
                 tool_id=str(tool_id),
                 server_id=str(server_id),
                 tool_name=tool_name,
-                duration_ms=duration_ms,
+                duration_ms=outcome.duration_ms,
+                domain_status=outcome.status,
                 error_type=type(audit_exc).__name__,
                 error_message=str(audit_exc)[:200],
             )
-
-        _log.info(
-            "tool_invoked",
-            tool_id=str(tool_id),
-            server_id=str(server_id),
-            tool_name=tool_name,
-            duration_ms=duration_ms,
-            status=status,
-            sandbox_backend=effective_backend,
-        )
-
-        return result
 
     async def _publish_invoked(
         self,
