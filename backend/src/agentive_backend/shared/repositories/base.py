@@ -25,10 +25,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import TypeVar
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from agentive_backend.shared.exceptions import NotFoundError
+
+_E = TypeVar("_E")
 
 
 class BaseRepo:
@@ -41,6 +46,30 @@ class BaseRepo:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    @staticmethod
+    def _require_found(
+        entity: _E | None,
+        *,
+        label: str,
+        entity_id: object,
+        context_key: str,
+    ) -> _E:
+        """Return ``entity`` unchanged, or raise :class:`NotFoundError` if it is ``None``.
+
+        The single source of the lookup-or-404 pattern (audit A-07). Every
+        concrete repo's ``require_by_id`` / ``require_by_id_in_session`` routes
+        through this helper so the RFC 7807 message and ``context`` shape are
+        identical across the codebase (``"<Label> '<id>' not found"`` +
+        ``{context_key: str(entity_id)}``), instead of being re-spelled at each
+        of the ~12 former call sites in the service layer.
+        """
+        if entity is None:
+            raise NotFoundError(
+                detail=f"{label} '{entity_id}' not found",
+                context={context_key: str(entity_id)},
+            )
+        return entity
 
     @asynccontextmanager
     async def with_tenant(self, tenant_id: UUID | None) -> AsyncIterator[AsyncSession]:

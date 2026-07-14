@@ -53,7 +53,13 @@ def _make_service(
 
     template_repo = AsyncMock()
     template_repo.with_tenant = _with_tenant
-    template_repo.get_by_id_in_session = AsyncMock(return_value=template)
+    # A-07 — service calls the lookup-or-404 helper; emulate its contract.
+    if template is None:
+        template_repo.require_by_id_in_session = AsyncMock(
+            side_effect=NotFoundError(detail="Agent template not found", context={})
+        )
+    else:
+        template_repo.require_by_id_in_session = AsyncMock(return_value=template)
 
     instance_repo = AsyncMock()
     instance_repo.with_tenant = _with_tenant
@@ -83,7 +89,12 @@ def _make_service(
     instance_repo.create_in_session = AsyncMock(side_effect=_mock_create)
 
     workflow_run_repo = AsyncMock()
-    workflow_run_repo.get_by_id_in_session = AsyncMock(return_value=workflow_run)
+    if workflow_run is None:
+        workflow_run_repo.require_by_id_in_session = AsyncMock(
+            side_effect=NotFoundError(detail="Workflow run not found", context={})
+        )
+    else:
+        workflow_run_repo.require_by_id_in_session = AsyncMock(return_value=workflow_run)
 
     prompt_repo = AsyncMock()
     # Story 2.5 — added kwargs ; not exercised by instantiate paths.
@@ -199,7 +210,7 @@ async def test_instantiate_template_with_workflow_run_attaches_fk(
         template_id=template.id, workflow_run_id=run.id
     )
 
-    wrepo.get_by_id_in_session.assert_awaited_once()
+    wrepo.require_by_id_in_session.assert_awaited_once()
     irepo.create_in_session.assert_awaited_once()
     assert irepo.create_in_session.await_args.kwargs["workflow_run_id"] == run.id
     assert response.workflow_run_id == run.id
@@ -236,7 +247,9 @@ async def test_get_instance_by_id_not_found_raises(
 ) -> None:
     """AC4 — instance inexistante ⇒ NotFoundError."""
     service, irepo, _trepo, _wrepo = _make_service(template=None)
-    irepo.get_by_id = AsyncMock(return_value=None)
+    irepo.require_by_id = AsyncMock(
+        side_effect=NotFoundError(detail="Agent instance not found", context={})
+    )
     with pytest.raises(NotFoundError, match="instance"):
         await service.get_instance_by_id(uuid4())
 
@@ -246,7 +259,6 @@ async def test_list_instances_by_workflow_run_404_when_run_missing(
     event_publish_mock: AsyncMock,
 ) -> None:
     """AC3 — run inexistant ⇒ NotFoundError (PAS une liste vide)."""
-    service, _irepo, _trepo, wrepo = _make_service(template=None, workflow_run=None)
-    wrepo.get_by_id_in_session = AsyncMock(return_value=None)
+    service, _irepo, _trepo, _wrepo = _make_service(template=None, workflow_run=None)
     with pytest.raises(NotFoundError, match="Workflow run"):
         await service.list_instances_by_workflow_run(uuid4())

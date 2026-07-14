@@ -336,12 +336,7 @@ class ToolHubService:
             ``server_id`` does not exist.
         """
         async with self._server_repo.with_tenant(tenant_id) as session:
-            server = await self._server_repo.get_by_id_in_session(session, server_id)
-            if server is None:
-                raise NotFoundError(
-                    detail=f"Tool server '{server_id}' not found",
-                    context={"server_id": str(server_id)},
-                )
+            server = await self._server_repo.require_by_id_in_session(session, server_id)
             tools = await self._tool_repo.list_by_server_in_session(session, server_id)
 
         return ToolServerDetailView(
@@ -412,12 +407,7 @@ class ToolHubService:
         """
         # 1. Resolve server + tool rows (NotFoundError if missing).
         async with self._server_repo.with_tenant(tenant_id) as session:
-            server = await self._server_repo.get_by_id_in_session(session, server_id)
-            if server is None:
-                raise NotFoundError(
-                    detail=f"Tool server '{server_id}' not found",
-                    context={"server_id": str(server_id)},
-                )
+            server = await self._server_repo.require_by_id_in_session(session, server_id)
             tool = await self._tool_repo.get_by_id_in_session(session, tool_id)
             if tool is None or tool.server_id != server_id:
                 # P-20 (CR 2026-05-11) — uniform "Tool not found" message

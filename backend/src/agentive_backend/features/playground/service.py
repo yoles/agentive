@@ -33,7 +33,6 @@ from agentive_backend.shared.contracts.events import PlaygroundRunCompletedEvent
 from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import (
     DependencyError,
-    NotFoundError,
     ValidationError,
 )
 from agentive_backend.shared.llm.exceptions import LLMError
@@ -135,12 +134,7 @@ class PlaygroundService:
         # 1. Resolve template (404 NotFoundError if missing). Snapshot
         #    config in memory — NO INSERT into agent_instances (AC2).
         async with self._template_repo.with_tenant(tenant_id) as session:
-            template = await self._template_repo.get_by_id_in_session(session, template_id)
-            if template is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{template_id}' not found",
-                    context={"template_id": str(template_id)},
-                )
+            template = await self._template_repo.require_by_id_in_session(session, template_id)
             config_snapshot: dict[str, Any] = dict(template.config or {})
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
                 session, template_id

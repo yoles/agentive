@@ -57,7 +57,14 @@ def _make_service(
     template_repo.with_tenant = (
         _with_tenant  # MagicMock would call it once per await — keep async-cm
     )
-    template_repo.get_by_id_in_session = AsyncMock(return_value=template)
+    # A-07 — the service now calls the lookup-or-404 helper; emulate its
+    # contract (return the row, or raise NotFoundError when absent).
+    if template is None:
+        template_repo.require_by_id_in_session = AsyncMock(
+            side_effect=NotFoundError(detail="Agent template not found", context={})
+        )
+    else:
+        template_repo.require_by_id_in_session = AsyncMock(return_value=template)
 
     # Mirror the real repo: mutate the template attributes then return it,
     # so the service's downstream code (`updated.version`, `updated.config`)
