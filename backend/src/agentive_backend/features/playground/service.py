@@ -25,6 +25,8 @@ import json
 import string
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
 
@@ -86,6 +88,33 @@ class _SafeFormatter(string.Formatter):
 _SAFE_FORMATTER = _SafeFormatter()
 
 
+def _best_effort_json(raw_output: str) -> dict[str, Any] | None:
+    """Parse ``raw_output`` as a JSON object, best-effort (Sprint 1 — full JSON
+    Schema validation against the output_contract deferred Story 4.x). Returns
+    ``None`` on any parse failure or a non-object payload."""
+    try:
+        candidate = json.loads(raw_output)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return candidate if isinstance(candidate, dict) else None
+
+
+@dataclass(frozen=True, slots=True)
+class _LLMOutcome:
+    """Result of the LLM completion step — the value ``run`` audits once then
+    either raises (``error``) or turns into the response. Audit A-09: lets the
+    success and llm_error paths converge on a single audit call."""
+
+    status: Literal["success", "llm_error"]
+    raw_output: str
+    input_tokens: int
+    output_tokens: int
+    cost_estimate_usd: Decimal | None
+    model_used: str
+    provider_used: str
+    error: Exception | None
+
+
 class PlaygroundService:
     """Run an agent-template in isolation — Story 2.7 FR48."""
 
@@ -129,46 +158,133 @@ class PlaygroundService:
             LLM provider failed (timeout / rate limit / classifier
             DependencyError — cf Story 1.6 error classifier).
         """
+        # A-09 (audit §2.1a) — the method reads as its own table of contents;
+        # each numbered step is a focused, independently-testable helper.
         start = time.monotonic()
 
-        # 1. Resolve template (404 NotFoundError if missing). Snapshot
-        #    config in memory — NO INSERT into agent_instances (AC2).
+        # 1. Load the template snapshot in memory — NO INSERT into
+        #    agent_instances (AC2 isolation). 404 if the template is missing.
+        config_snapshot, assigned_tools = await self._load_config_and_tools(template_id, tenant_id)
+        # 2. Resolve how many assigned tools this run activates (validates
+        #    enabled_tool_ids against the template's assignments).
+        tools_activated_count = self._count_activated_tools(
+            assigned_tools, enabled_tool_ids, template_id
+        )
+        # 3. Resolve the system prompt from the caller's arguments (sanitized
+        #    422 on any resolution failure — audit A-01 / CR P-02).
+        prompt_resolved = self._resolve_prompt(config_snapshot, arguments, template_id)
+        # 4. Call the LLM, capturing the outcome (never raising inline) so the
+        #    audit is published exactly once regardless of success/failure.
+        outcome = await self._complete(
+            config_snapshot=config_snapshot,
+            prompt_resolved=prompt_resolved,
+            arguments=arguments,
+            timeout_seconds=timeout_seconds,
+            template_id=template_id,
+        )
+
+        duration_ms_total = int((time.monotonic() - start) * 1000)
+
+        # 5. Single audit-publish path (AC5 — exactly one event) for both
+        #    the success and llm_error outcomes.
+        await self._publish_audit_event(
+            template_id=template_id,
+            tools_activated=tools_activated_count,
+            duration_ms_total=duration_ms_total,
+            input_tokens=outcome.input_tokens,
+            output_tokens=outcome.output_tokens,
+            cost_estimate_usd=outcome.cost_estimate_usd,
+            model_used=outcome.model_used,
+            provider_used=outcome.provider_used,
+            status=outcome.status,
+            tenant_id=tenant_id,
+        )
+
+        if outcome.error is not None:
+            raise outcome.error
+
+        # 6. Best-effort parse + response (success path only).
+        parsed_output = _best_effort_json(outcome.raw_output)
+
+        _log.info(
+            "playground_run_completed",
+            template_id=str(template_id),
+            tools_activated=tools_activated_count,
+            duration_ms_total=duration_ms_total,
+            input_tokens=outcome.input_tokens,
+            output_tokens=outcome.output_tokens,
+            status=outcome.status,
+            model_used=outcome.model_used,
+            provider_used=outcome.provider_used,
+            playground_run=True,  # AC2 OTel-style flag for log filtering
+        )
+
+        return RunPlaygroundResponse(
+            prompt_resolved=prompt_resolved,
+            raw_output=outcome.raw_output,
+            parsed_output=parsed_output,
+            tokens={
+                "input_tokens": outcome.input_tokens,
+                "output_tokens": outcome.output_tokens,
+            },
+            cost_estimate_usd=outcome.cost_estimate_usd,
+            model_used=outcome.model_used,
+            provider_used=outcome.provider_used,
+            tool_invocations=[],  # Sprint 1 — D80 defer Story 4.x
+            duration_ms_total=duration_ms_total,
+        )
+
+    # ─── run helpers (A-09 decomposition) ─────────────────────────
+
+    async def _load_config_and_tools(
+        self, template_id: UUID, tenant_id: UUID | None
+    ) -> tuple[dict[str, Any], list[tuple[Any, Any]]]:
+        """Load the template config snapshot + its tool assignments in a single
+        session. 404 ``NotFoundError`` if the template is missing."""
         async with self._template_repo.with_tenant(tenant_id) as session:
             template = await self._template_repo.require_by_id_in_session(session, template_id)
             config_snapshot: dict[str, Any] = dict(template.config or {})
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
                 session, template_id
             )
+        return config_snapshot, assigned_tools
 
-        # 2. Filter assigned tools by enabled_tool_ids (None = all enabled).
+    @staticmethod
+    def _count_activated_tools(
+        assigned_tools: list[tuple[Any, Any]],
+        enabled_tool_ids: list[UUID] | None,
+        template_id: UUID,
+    ) -> int:
+        """Count activated tools; ``None`` means all assigned. Raises 422 if
+        ``enabled_tool_ids`` references a tool not assigned to the template."""
         assigned_tool_ids: set[UUID] = {tool.id for tool, _at in assigned_tools}
         if enabled_tool_ids is None:
-            tools_activated_count = len(assigned_tool_ids)
-        else:
-            requested = set(enabled_tool_ids)
-            missing = requested - assigned_tool_ids
-            if missing:
-                raise ValidationError(
-                    detail=(
-                        f"enabled_tool_ids contains {len(missing)} tool(s) "
-                        f"not assigned to template '{template_id}'"
-                    ),
-                    context={
-                        "template_id": str(template_id),
-                        "missing_tool_ids": [str(t) for t in missing],
-                    },
-                )
-            tools_activated_count = len(requested)
+            return len(assigned_tool_ids)
+        requested = set(enabled_tool_ids)
+        missing = requested - assigned_tool_ids
+        if missing:
+            raise ValidationError(
+                detail=(
+                    f"enabled_tool_ids contains {len(missing)} tool(s) "
+                    f"not assigned to template '{template_id}'"
+                ),
+                context={
+                    "template_id": str(template_id),
+                    "missing_tool_ids": [str(t) for t in missing],
+                },
+            )
+        return len(requested)
 
-        # 3. Resolve prompt via the restricted formatter (audit A-01 /
-        #    CR P-02). Beyond KeyError (missing variable), a template can
-        #    raise IndexError ({0} with no positional args), ValueError
-        #    (malformed spec or blocked field traversal) or AttributeError.
-        #    All of them map to a sanitized 422 — never a 500 with a
-        #    stack trace.
+    @staticmethod
+    def _resolve_prompt(
+        config_snapshot: dict[str, Any], arguments: dict[str, Any], template_id: UUID
+    ) -> str:
+        """Resolve ``system_prompt`` via the restricted formatter. Every failure
+        mode (missing variable, positional field, blocked traversal, malformed
+        spec) becomes a sanitized 422 — never a 500 with a stack trace."""
         system_prompt_template: str = str(config_snapshot.get("system_prompt", ""))
         try:
-            prompt_resolved = _SAFE_FORMATTER.vformat(system_prompt_template, (), dict(arguments))
+            return _SAFE_FORMATTER.vformat(system_prompt_template, (), dict(arguments))
         except KeyError as exc:
             raise ValidationError(
                 detail=(
@@ -187,30 +303,28 @@ class PlaygroundService:
                 context={"template_id": str(template_id)},
             ) from exc
 
-        # 4. Call LLMRouter.complete (Sprint 1 : no tool_use formal — D80
-        #    deferred Story 4.x. ``tool_invocations`` remains empty in the
-        #    response Sprint 1, structure preserved for the frontend).
+    async def _complete(
+        self,
+        *,
+        config_snapshot: dict[str, Any],
+        prompt_resolved: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        template_id: UUID,
+    ) -> _LLMOutcome:
+        """Call ``LLMRouter.complete`` and capture the outcome. On ``LLMError``
+        the outcome carries ``status="llm_error"`` (zeroed usage, requested
+        model, no provider) plus the :class:`DependencyError` for the caller to
+        re-raise after the single audit publish — so the failure is always
+        audited exactly once (Sprint 1: no formal tool_use — D80 Story 4.x)."""
         llm_cfg: dict[str, Any] = config_snapshot.get("llm", {}) or {}
         model: str = str(llm_cfg.get("model", DEFAULT_LLM_MODEL))
         max_tokens: int = int(llm_cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
         temperature: float = float(llm_cfg.get("temperature", DEFAULT_TEMPERATURE))
 
-        user_message_content = json.dumps(arguments, ensure_ascii=False)
         messages: list[ChatMessage] = [
-            ChatMessage(role="user", content=user_message_content),
+            ChatMessage(role="user", content=json.dumps(arguments, ensure_ascii=False)),
         ]
-
-        # "tool_error" is RESERVED — never produced Sprint 1 (formal
-        # tool_use deferred Story 4.x / D80). Kept in the Literal so the
-        # event contract is stable for consumers (audit 3.3.1).
-        status: Literal["success", "llm_error", "tool_error"] = "success"
-        raw_output: str = ""
-        input_tokens = 0
-        output_tokens = 0
-        cost_estimate_usd = None
-        model_used = model
-        provider_used = ""
-
         try:
             completion = await self._llm_router.complete(
                 messages,
@@ -220,84 +334,34 @@ class PlaygroundService:
                 system=prompt_resolved,
                 timeout_s=timeout_seconds,
             )
-            raw_output = completion.text
-            input_tokens = completion.input_tokens
-            output_tokens = completion.output_tokens
-            cost_estimate_usd = completion.cost_estimate_usd
-            model_used = completion.model
-            provider_used = completion.provider
         except LLMError as exc:
-            status = "llm_error"
-            duration_ms_total = int((time.monotonic() - start) * 1000)
-            await self._publish_audit_event(
-                template_id=template_id,
-                tools_activated=tools_activated_count,
-                duration_ms_total=duration_ms_total,
-                input_tokens=0,
-                output_tokens=0,
-                cost_estimate_usd=None,
-                model_used=model,
-                provider_used="",
-                status=status,
-                tenant_id=tenant_id,
-            )
-            raise DependencyError(
+            error = DependencyError(
                 detail=f"LLM provider failure: {type(exc).__name__}",
                 context={
                     "template_id": str(template_id),
                     "error_type": type(exc).__name__,
                 },
-            ) from exc
-
-        # 5. Best-effort parse against output_contract (just JSON.loads
-        #    Sprint 1 — full JSON Schema validation deferred Story 4.x).
-        parsed_output: dict[str, Any] | None = None
-        try:
-            candidate = json.loads(raw_output)
-            if isinstance(candidate, dict):
-                parsed_output = candidate
-        except (json.JSONDecodeError, TypeError, ValueError):
-            parsed_output = None
-
-        duration_ms_total = int((time.monotonic() - start) * 1000)
-
-        # 6. Audit event (success path).
-        await self._publish_audit_event(
-            template_id=template_id,
-            tools_activated=tools_activated_count,
-            duration_ms_total=duration_ms_total,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_estimate_usd=cost_estimate_usd,
-            model_used=model_used,
-            provider_used=provider_used,
-            status=status,
-            tenant_id=tenant_id,
-        )
-
-        _log.info(
-            "playground_run_completed",
-            template_id=str(template_id),
-            tools_activated=tools_activated_count,
-            duration_ms_total=duration_ms_total,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            status=status,
-            model_used=model_used,
-            provider_used=provider_used,
-            playground_run=True,  # AC2 OTel-style flag for log filtering
-        )
-
-        return RunPlaygroundResponse(
-            prompt_resolved=prompt_resolved,
-            raw_output=raw_output,
-            parsed_output=parsed_output,
-            tokens={"input_tokens": input_tokens, "output_tokens": output_tokens},
-            cost_estimate_usd=cost_estimate_usd,
-            model_used=model_used,
-            provider_used=provider_used,
-            tool_invocations=[],  # Sprint 1 — D80 defer Story 4.x
-            duration_ms_total=duration_ms_total,
+            )
+            error.__cause__ = exc
+            return _LLMOutcome(
+                status="llm_error",
+                raw_output="",
+                input_tokens=0,
+                output_tokens=0,
+                cost_estimate_usd=None,
+                model_used=model,
+                provider_used="",
+                error=error,
+            )
+        return _LLMOutcome(
+            status="success",
+            raw_output=completion.text,
+            input_tokens=completion.input_tokens,
+            output_tokens=completion.output_tokens,
+            cost_estimate_usd=completion.cost_estimate_usd,
+            model_used=completion.model,
+            provider_used=completion.provider,
+            error=None,
         )
 
     async def _publish_audit_event(
