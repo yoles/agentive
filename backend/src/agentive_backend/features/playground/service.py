@@ -41,10 +41,10 @@ from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
     from agentive_backend.shared.llm.router import LLMRouter
-    from agentive_backend.shared.repositories import (
-        AgentTemplateRepo,
-        AgentTemplateToolRepo,
-        ToolRepo,
+    from agentive_backend.shared.repositories.ports import (
+        AgentTemplateRepository,
+        AgentTemplateToolRepository,
+        ToolRepository,
     )
 
 _log = get_logger(__name__)
@@ -92,9 +92,9 @@ class PlaygroundService:
     def __init__(
         self,
         *,
-        template_repo: AgentTemplateRepo,
-        tool_repo: ToolRepo,
-        assignment_repo: AgentTemplateToolRepo,
+        template_repo: AgentTemplateRepository,
+        tool_repo: ToolRepository,
+        assignment_repo: AgentTemplateToolRepository,
         llm_router: LLMRouter,
     ) -> None:
         self._template_repo = template_repo

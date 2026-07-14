@@ -53,10 +53,10 @@ from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.security import REDACTED, is_secret_key, redact_recursive
 
 if TYPE_CHECKING:
-    from agentive_backend.shared.repositories import (
-        AgentTemplateRepo,
-        ToolRepo,
-        ToolServerRepo,
+    from agentive_backend.shared.repositories.ports import (
+        AgentTemplateRepository,
+        ToolRepository,
+        ToolServerRepository,
     )
 
 _log = get_logger(__name__)
@@ -119,9 +119,9 @@ class ToolHubService:
     def __init__(
         self,
         *,
-        server_repo: ToolServerRepo,
-        tool_repo: ToolRepo,
-        template_repo: AgentTemplateRepo | None = None,
+        server_repo: ToolServerRepository,
+        tool_repo: ToolRepository,
+        template_repo: AgentTemplateRepository | None = None,
     ) -> None:
         # ``template_repo`` is optional Sprint 1 — only ``invoke_tool``
         # uses it (P-11 CR 2026-05-11 : verify ``agent_template_id`` FK

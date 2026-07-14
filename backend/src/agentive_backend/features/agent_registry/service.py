@@ -70,13 +70,13 @@ from agentive_backend.shared.exceptions import NotFoundError, ValidationError
 from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
-    from agentive_backend.shared.repositories import (
-        AgentInstanceRepo,
-        AgentTemplateRepo,
-        AgentTemplateToolRepo,
-        PromptRepo,
-        ToolRepo,
-        WorkflowRunRepo,
+    from agentive_backend.shared.repositories.ports import (
+        AgentInstanceRepository,
+        AgentTemplateRepository,
+        AgentTemplateToolRepository,
+        PromptRepository,
+        ToolRepository,
+        WorkflowRunRepository,
     )
 
 _log = get_logger(__name__)
@@ -89,12 +89,12 @@ class AgentRegistryService:
         self,
         *,
         registry: Mapping[str, ArchetypeDefinition],
-        template_repo: AgentTemplateRepo,
-        prompt_repo: PromptRepo,
-        instance_repo: AgentInstanceRepo,
-        workflow_run_repo: WorkflowRunRepo,
-        tool_repo: ToolRepo,
-        assignment_repo: AgentTemplateToolRepo,
+        template_repo: AgentTemplateRepository,
+        prompt_repo: PromptRepository,
+        instance_repo: AgentInstanceRepository,
+        workflow_run_repo: WorkflowRunRepository,
+        tool_repo: ToolRepository,
+        assignment_repo: AgentTemplateToolRepository,
     ) -> None:
         # P-16 (CR 2026-05-10) — invariant: for Story 2.1 P-02 atomicity
         # (with_tenant + same session for template SELECT + instance
