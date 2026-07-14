@@ -86,6 +86,7 @@ ignore_imports =
     agentive_backend.shared.repositories.memory_chunk_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.namespace_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.outbox_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.ports -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.prompt_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.tool_hub_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.user_repo -> agentive_backend.infra.db.models
