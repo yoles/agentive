@@ -1,30 +1,24 @@
-"""Service layer — Agent Registry orchestration (Story 2.1 + 2.2).
+"""Service layer — Agent Registry (Stories 2.1-2.5).
 
-The service sits between the FastAPI router and the repositories. It :
+Audit A-10 / §2.1b — the former single ``AgentRegistryService`` injected 7
+repositories and owned ≥ 3 orthogonal axes of change (template CRUD + prompt
+versioning + instantiation + tool assignment + archetypes). It is split into
+four focused services, each with a single responsibility and only the
+collaborators it needs:
 
-1. Validates the requested archetype against the in-process registry.
-2. Builds the default ``agent_templates.config`` JSON from the archetype.
-3. Composes the row INSERT and the audit-event publish in a SINGLE
-   transaction (Story 2.1 P-02 atomicity fix). The repository's
-   :meth:`AgentTemplateRepo.create_in_session` accepts an external session
-   so the service owns the transaction boundary, then ``event_bus.publish``
-   (no commit) writes to ``outbox_events`` in the same transaction. Commit
-   happens when the ``with_tenant`` context exits.
-4. The mapping ``IntegrityError`` → :class:`ConflictError` lives in the
-   repository layer so ``features/`` stay free of ``sqlalchemy`` imports
-   (``import-linter`` Contract 3 — Story 2.1 P-01).
-5. After the transaction commits, best-effort ``emit_notify`` to wake the
-   outbox worker. NOTIFY failure is non-fatal (poll fallback Story 1.4).
+* :class:`ArchetypeCatalog` — read-only archetype registry (no persistence).
+* :class:`AgentTemplateService` — template create / read / update (+ prompt
+  versioning). Repos: ``template_repo``, ``prompt_repo``.
+* :class:`TemplateInstantiationService` — instantiate + instance reads.
+  Repos: ``template_repo``, ``instance_repo``, ``workflow_run_repo``.
+* :class:`TemplateToolAssignmentService` — assign / replace / list / unassign
+  tools. Repos: ``template_repo``, ``tool_repo``, ``assignment_repo``.
 
-Story 2.2 adds :meth:`update_template` (PUT semantics, PATCH-like) and
-:meth:`get_template_by_id` (GET detail). The same single-transaction
-atomicity contract holds: template UPDATE + prompt INSERT + outbox INSERT
-in one transaction.
-
-The audit events ``agent_registry.agent_template.created`` (Story 2.1) and
-``agent_registry.agent_template.updated`` (Story 2.2) are published via the event-bus
-bypass pattern documented in Epic 1 retrospective 2026-05-08 (to be
-migrated to ``AuditEventRepo.record()`` in Story 9.1).
+Common invariants (unchanged) — every write composes the row DML and the
+outbox ``publish`` in a SINGLE ``with_tenant`` transaction (Story 2.1 P-02
+atomicity), then a best-effort post-commit ``notify_best_effort`` wakes the
+outbox worker (poll fallback Story 1.4). Audit events use the event-bus bypass
+pattern (Epic 1 retro 2026-05-08, migrate to ``AuditEventRepo`` in Story 9.1).
 """
 
 from __future__ import annotations
@@ -82,36 +76,11 @@ if TYPE_CHECKING:
 _log = get_logger(__name__)
 
 
-class AgentRegistryService:
-    """Orchestrate archetype lookup + template creation/update + instance lifecycle (Story 2.4)."""
+class ArchetypeCatalog:
+    """Read-only access to the 8 universal archetypes (in-process registry)."""
 
-    def __init__(
-        self,
-        *,
-        registry: Mapping[str, ArchetypeDefinition],
-        template_repo: AgentTemplateRepository,
-        prompt_repo: PromptRepository,
-        instance_repo: AgentInstanceRepository,
-        workflow_run_repo: WorkflowRunRepository,
-        tool_repo: ToolRepository,
-        assignment_repo: AgentTemplateToolRepository,
-    ) -> None:
-        # P-16 (CR 2026-05-10) — invariant: for Story 2.1 P-02 atomicity
-        # (with_tenant + same session for template SELECT + instance
-        # INSERT + outbox publish) to hold, the 4 repos MUST share the
-        # same session_factory. The assertion lives in `_build_service`
-        # (router.py), which produces the production wiring; here the
-        # constructor accepts heterogeneous repos to keep testability
-        # (unit tests mock each repo separately).
+    def __init__(self, *, registry: Mapping[str, ArchetypeDefinition]) -> None:
         self._registry = registry
-        self._template_repo = template_repo
-        self._prompt_repo = prompt_repo
-        self._instance_repo = instance_repo
-        self._workflow_run_repo = workflow_run_repo
-        self._tool_repo = tool_repo
-        self._assignment_repo = assignment_repo
-
-    # ─── Archetypes ───────────────────────────────────────────────
 
     def list_archetypes(self) -> list[ArchetypeSummary]:
         """Return the 8 archetypes as lean summaries (no prompt_base / contracts)."""
@@ -145,7 +114,20 @@ class AgentRegistryService:
             output_contract=ContractSkeletonView(**archetype.output_contract.model_dump()),
         )
 
-    # ─── Templates ────────────────────────────────────────────────
+
+class AgentTemplateService:
+    """Template lifecycle — create / read / update (+ prompt versioning)."""
+
+    def __init__(
+        self,
+        *,
+        registry: Mapping[str, ArchetypeDefinition],
+        template_repo: AgentTemplateRepository,
+        prompt_repo: PromptRepository,
+    ) -> None:
+        self._registry = registry
+        self._template_repo = template_repo
+        self._prompt_repo = prompt_repo
 
     async def create_template(
         self,
@@ -231,8 +213,6 @@ class AgentRegistryService:
             created_at=template.created_at,
         )
 
-    # ─── Template detail (Story 2.2 AC6) ──────────────────────────
-
     async def get_template_by_id(
         self,
         template_id: UUID,
@@ -254,8 +234,6 @@ class AgentRegistryService:
             config=template.config,
             created_at=template.created_at,
         )
-
-    # ─── Template update (Story 2.2 AC1) ──────────────────────────
 
     async def update_template(
         self,
@@ -399,7 +377,20 @@ class AgentRegistryService:
             updated_at=updated_at,
         )
 
-    # ─── Agent instances (Story 2.4 — distinction template vs instance) ─
+
+class TemplateInstantiationService:
+    """Agent instantiation + instance reads (Story 2.4)."""
+
+    def __init__(
+        self,
+        *,
+        template_repo: AgentTemplateRepository,
+        instance_repo: AgentInstanceRepository,
+        workflow_run_repo: WorkflowRunRepository,
+    ) -> None:
+        self._template_repo = template_repo
+        self._instance_repo = instance_repo
+        self._workflow_run_repo = workflow_run_repo
 
     async def instantiate_from_template(
         self,
@@ -566,7 +557,20 @@ class AgentRegistryService:
             for instance in instances
         ]
 
-    # ─── Tool assignment (Story 2.5 — junction agent_template_tools) ──
+
+class TemplateToolAssignmentService:
+    """Tool assignment on the ``agent_template_tools`` junction (Story 2.5)."""
+
+    def __init__(
+        self,
+        *,
+        template_repo: AgentTemplateRepository,
+        tool_repo: ToolRepository,
+        assignment_repo: AgentTemplateToolRepository,
+    ) -> None:
+        self._template_repo = template_repo
+        self._tool_repo = tool_repo
+        self._assignment_repo = assignment_repo
 
     async def replace_template_tools(
         self,
@@ -768,4 +772,9 @@ class AgentRegistryService:
         )
 
 
-__all__ = ["AgentRegistryService"]
+__all__ = [
+    "AgentTemplateService",
+    "ArchetypeCatalog",
+    "TemplateInstantiationService",
+    "TemplateToolAssignmentService",
+]

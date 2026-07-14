@@ -17,6 +17,7 @@ in ``app.main``.
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Request, status
@@ -36,7 +37,12 @@ from agentive_backend.features.agent_registry.schemas import (
     UpdateTemplateRequest,
     UpdateTemplateResponse,
 )
-from agentive_backend.features.agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.service import (
+    AgentTemplateService,
+    ArchetypeCatalog,
+    TemplateInstantiationService,
+    TemplateToolAssignmentService,
+)
 from agentive_backend.shared.exceptions import DependencyError
 from agentive_backend.shared.repositories import (
     AgentInstanceRepo,
@@ -50,8 +56,10 @@ from agentive_backend.shared.repositories import (
 router = APIRouter(tags=["agents"])
 
 
-def _build_service(request: Request) -> AgentRegistryService:
-    """Wire the service from ``app.state``.
+def _require_state(
+    request: Request,
+) -> tuple[dict[str, ArchetypeDefinition], Any]:
+    """Return ``(archetype_registry, session_factory)`` from ``app.state``.
 
     Story 2.1 P-08 — explicit guard for missing lifespan state. If the
     archetype registry or session factory are absent (e.g. lifespan was
@@ -78,40 +86,44 @@ def _build_service(request: Request) -> AgentRegistryService:
                 ]
             },
         )
+    return registry, session_factory
 
-    # P-16 (CR 2026-05-10) — Story 2.1 P-02 atomicity requires all 4 repos
-    # to share the same session_factory (otherwise `service.publish(session=…)`
-    # and `repo.create_in_session(session, …)` would operate on different
-    # pools, silently breaking the "same transaction" invariant).
-    # In production they all come from `app.state.session_factory` — the
-    # explicit passing below + the defensive assertion lock the invariant.
-    template_repo = AgentTemplateRepo(session_factory=session_factory)
-    prompt_repo = PromptRepo(session_factory=session_factory)
-    instance_repo = AgentInstanceRepo(session_factory=session_factory)
-    workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
-    tool_repo = ToolRepo(session_factory=session_factory)
-    assignment_repo = AgentTemplateToolRepo(session_factory=session_factory)
-    # P-16 Story 2.4 CR — atomicity invariant : the 6 repos must share the
-    # same session_factory so service-level transactions stay consistent.
-    assert (
-        template_repo._session_factory
-        is prompt_repo._session_factory
-        is instance_repo._session_factory
-        is workflow_run_repo._session_factory
-        is tool_repo._session_factory
-        is assignment_repo._session_factory
-    ), (
-        "AgentRegistryService wiring violation : repos must share session_factory "
-        "for atomicity P-02 (Story 2.1)."
-    )
-    return AgentRegistryService(
+
+# Audit A-10 — the former god-service is split into 4 focused services, each
+# wired here with only the repos it needs. P-16 (Story 2.1 P-02) atomicity is
+# preserved trivially: every repo a builder makes comes from the SAME
+# ``session_factory`` variable, so a builder's repos always share it.
+
+
+def _build_archetype_catalog(request: Request) -> ArchetypeCatalog:
+    registry, _session_factory = _require_state(request)
+    return ArchetypeCatalog(registry=registry)
+
+
+def _build_template_service(request: Request) -> AgentTemplateService:
+    registry, session_factory = _require_state(request)
+    return AgentTemplateService(
         registry=registry,
-        template_repo=template_repo,
-        prompt_repo=prompt_repo,
-        instance_repo=instance_repo,
-        workflow_run_repo=workflow_run_repo,
-        tool_repo=tool_repo,
-        assignment_repo=assignment_repo,
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        prompt_repo=PromptRepo(session_factory=session_factory),
+    )
+
+
+def _build_instantiation_service(request: Request) -> TemplateInstantiationService:
+    _registry, session_factory = _require_state(request)
+    return TemplateInstantiationService(
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        instance_repo=AgentInstanceRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+    )
+
+
+def _build_tool_assignment_service(request: Request) -> TemplateToolAssignmentService:
+    _registry, session_factory = _require_state(request)
+    return TemplateToolAssignmentService(
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        tool_repo=ToolRepo(session_factory=session_factory),
+        assignment_repo=AgentTemplateToolRepo(session_factory=session_factory),
     )
 
 
@@ -127,8 +139,8 @@ def _build_service(request: Request) -> AgentRegistryService:
 )
 async def list_archetypes(request: Request) -> list[ArchetypeSummary]:
     """Returns the 8 archetypes ordered as defined in the YAML registry."""
-    service = _build_service(request)
-    return service.list_archetypes()
+    catalog = _build_archetype_catalog(request)
+    return catalog.list_archetypes()
 
 
 @router.get(
@@ -141,8 +153,8 @@ async def get_archetype(request: Request, archetype_id: str) -> ArchetypeDetail:
 
     404 RFC 7807 if ``archetype_id`` is not one of the 8 known slugs.
     """
-    service = _build_service(request)
-    return service.get_archetype(archetype_id)
+    catalog = _build_archetype_catalog(request)
+    return catalog.get_archetype(archetype_id)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -164,7 +176,7 @@ async def create_template(request: Request, body: CreateTemplateRequest) -> Crea
     * 409 — ``(name, version=1, tenant_id)`` already exists.
     * 503 — lifespan state missing (registry / session factory).
     """
-    service = _build_service(request)
+    service = _build_template_service(request)
     return await service.create_template(
         name=body.name,
         archetype_id=body.archetype,
@@ -185,7 +197,7 @@ async def get_template(request: Request, template_id: UUID) -> TemplateDetailRes
     * 422 — ``template_id`` is not a UUID (FastAPI auto-validates ``UUID``).
     * 503 — lifespan state missing.
     """
-    service = _build_service(request)
+    service = _build_template_service(request)
     return await service.get_template_by_id(template_id, tenant_id=None)
 
 
@@ -209,7 +221,7 @@ async def update_template(
     * 422 — Pydantic body validation OR ``template_id`` not a UUID.
     * 503 — lifespan state missing.
     """
-    service = _build_service(request)
+    service = _build_template_service(request)
     return await service.update_template(template_id, body, tenant_id=None)
 
 
@@ -240,7 +252,7 @@ async def instantiate_template(
     * 422 — template_id not a UUID, or body Pydantic validation.
     * 503 — lifespan state missing.
     """
-    service = _build_service(request)
+    service = _build_instantiation_service(request)
     return await service.instantiate_from_template(
         template_id=template_id,
         workflow_run_id=body.workflow_run_id,
@@ -264,7 +276,7 @@ async def get_instance(
     * 422 — instance_id not a UUID.
     * 503 — lifespan state missing.
     """
-    service = _build_service(request)
+    service = _build_instantiation_service(request)
     return await service.get_instance_by_id(instance_id, tenant_id=None)
 
 
@@ -290,7 +302,7 @@ async def list_instances_by_run(
     * 422 — run_id not a UUID.
     * 503 — lifespan state missing.
     """
-    service = _build_service(request)
+    service = _build_instantiation_service(request)
     return await service.list_instances_by_workflow_run(run_id, tenant_id=None)
 
 
@@ -320,7 +332,7 @@ async def replace_template_tools(
       (no partial success — décision #8 Story 2.5).
     * 422 — Pydantic body validation OR template_id not a UUID.
     """
-    service = _build_service(request)
+    service = _build_tool_assignment_service(request)
     return await service.replace_template_tools(template_id, body.tool_ids, tenant_id=None)
 
 
@@ -339,7 +351,7 @@ async def list_template_tools(
     * 404 — template_id not found.
     * 422 — template_id not a UUID.
     """
-    service = _build_service(request)
+    service = _build_tool_assignment_service(request)
     return await service.list_template_tools(template_id, tenant_id=None)
 
 
@@ -362,7 +374,7 @@ async def delete_template_tool(
     * 404 — assignment ``(template_id, tool_id)`` does not exist.
     * 422 — template_id or tool_id not a UUID.
     """
-    service = _build_service(request)
+    service = _build_tool_assignment_service(request)
     await service.unassign_tool(template_id, tool_id, tenant_id=None)
 
 

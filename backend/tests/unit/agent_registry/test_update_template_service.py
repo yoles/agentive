@@ -23,7 +23,7 @@ from agentive_backend.features.agent_registry.schemas import (
     LLMParams,
     UpdateTemplateRequest,
 )
-from agentive_backend.features.agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.service import AgentTemplateService
 from agentive_backend.shared.exceptions import NotFoundError
 
 
@@ -42,8 +42,8 @@ def event_publish_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
 def _make_service(
     *,
     template: SimpleNamespace | None,
-) -> tuple[AgentRegistryService, AsyncMock, AsyncMock, AsyncMock]:
-    """Build a service with mocked repos. Returns (service, template_repo, prompt_repo, session)."""
+) -> tuple[AgentTemplateService, AsyncMock, AsyncMock, AsyncMock]:
+    """Build the service with mocked repos. Returns (service, template_repo, prompt_repo, session)."""
     session_mock = AsyncMock()
     session_mock.flush = AsyncMock()
     session_mock.refresh = AsyncMock()
@@ -86,21 +86,12 @@ def _make_service(
     prompt_repo = AsyncMock()
     prompt_repo.create_in_session = AsyncMock()
 
-    # Story 2.4 + 2.5 — service constructor expanded ; these aren't exercised
-    # by update_template, so plain AsyncMocks are sufficient.
-    instance_repo = AsyncMock()
-    workflow_run_repo = AsyncMock()
-    tool_repo = AsyncMock()
-    assignment_repo = AsyncMock()
-
-    service = AgentRegistryService(
-        registry={},  # not used in update_template paths
+    # Audit A-10 — update_template now lives on the focused AgentTemplateService
+    # (template_repo + prompt_repo only; registry unused on this path).
+    service = AgentTemplateService(
+        registry={},
         template_repo=template_repo,
         prompt_repo=prompt_repo,
-        instance_repo=instance_repo,
-        workflow_run_repo=workflow_run_repo,
-        tool_repo=tool_repo,
-        assignment_repo=assignment_repo,
     )
     return service, template_repo, prompt_repo, session_mock
 

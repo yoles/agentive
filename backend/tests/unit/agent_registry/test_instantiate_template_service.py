@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import pytest
 
-from agentive_backend.features.agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.service import TemplateInstantiationService
 from agentive_backend.shared.exceptions import NotFoundError
 
 
@@ -37,8 +37,8 @@ def _make_service(
     *,
     template: SimpleNamespace | None,
     workflow_run: SimpleNamespace | None = None,
-) -> tuple[AgentRegistryService, AsyncMock, AsyncMock, AsyncMock]:
-    """Build a service with mocked repos.
+) -> tuple[TemplateInstantiationService, AsyncMock, AsyncMock, AsyncMock]:
+    """Build the service with mocked repos.
 
     Returns (service, instance_repo, template_repo, workflow_run_repo).
     """
@@ -96,19 +96,12 @@ def _make_service(
     else:
         workflow_run_repo.require_by_id_in_session = AsyncMock(return_value=workflow_run)
 
-    prompt_repo = AsyncMock()
-    # Story 2.5 — added kwargs ; not exercised by instantiate paths.
-    tool_repo = AsyncMock()
-    assignment_repo = AsyncMock()
-
-    service = AgentRegistryService(
-        registry={},  # not used in instantiate paths
+    # Audit A-10 — instantiation now lives on the focused
+    # TemplateInstantiationService (template + instance + workflow_run repos).
+    service = TemplateInstantiationService(
         template_repo=template_repo,
-        prompt_repo=prompt_repo,
         instance_repo=instance_repo,
         workflow_run_repo=workflow_run_repo,
-        tool_repo=tool_repo,
-        assignment_repo=assignment_repo,
     )
     return service, instance_repo, template_repo, workflow_run_repo
 
