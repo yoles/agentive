@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agentive_backend.features.agent_registry.domain import value_objects as vo
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Archetypes — read-only, sourced from the YAML registry
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -128,6 +130,10 @@ class LLMParams(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=200_000)
 
+    def to_domain(self) -> vo.LLMParams:
+        """Convert this HTTP DTO into the framework-free domain VO."""
+        return vo.LLMParams(temperature=self.temperature, max_tokens=self.max_tokens)
+
 
 class ContractDefinition(BaseModel):
     """Contrat élastique — ``core`` typé runtime, ``extras`` zone permissive (H8 architecture)."""
@@ -136,6 +142,10 @@ class ContractDefinition(BaseModel):
 
     core: dict[str, Any] = Field(default_factory=dict)
     extras: dict[str, Any] = Field(default_factory=dict)
+
+    def to_domain(self) -> vo.Contract:
+        """Convert this HTTP DTO into the framework-free domain VO."""
+        return vo.Contract(core=dict(self.core), extras=dict(self.extras))
 
 
 class ErrorPolicy(BaseModel):
@@ -152,6 +162,14 @@ class ErrorPolicy(BaseModel):
     )
     max_retries: int = Field(default=3, ge=0, le=10)
     backoff_strategy: Literal["exponential", "linear", "constant"] = "exponential"
+
+    def to_domain(self) -> vo.ErrorPolicy:
+        """Convert this HTTP DTO into the framework-free domain VO."""
+        return vo.ErrorPolicy(
+            on_timeout=vo.OnTimeoutPolicy(self.on_timeout),
+            max_retries=self.max_retries,
+            backoff_strategy=vo.BackoffStrategy(self.backoff_strategy),
+        )
 
 
 class UpdateTemplateRequest(BaseModel):

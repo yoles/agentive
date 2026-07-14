@@ -36,6 +36,15 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from agentive_backend.features.agent_registry.archetypes import ArchetypeDefinition
+from agentive_backend.features.agent_registry.domain import (
+    AgentConfig,
+    Archetype,
+    ProviderChain,
+    Version,
+)
+from agentive_backend.features.agent_registry.domain import (
+    AgentTemplate as DomainAgentTemplate,
+)
 from agentive_backend.features.agent_registry.schemas import (
     AgentInstanceDetailResponse,
     AgentToolsResponse,
@@ -285,58 +294,72 @@ class AgentRegistryService:
                     context={"template_id": str(template_id)},
                 )
 
-            old_version = existing.version
-            merged_config = dict(existing.config or {})
+            # Rehydrate the domain aggregate from the persisted row, apply the
+            # PATCH-like update through the composite VO, and let the aggregate
+            # own the versioning consequence. The "system_prompt change ⇒ bump
+            # version + insert a prompt revision" rule — including the P-01
+            # guard (no bump when the prompt is byte-identical, so the default
+            # UX Save path stops duplicating rows) — now lives in
+            # `AgentTemplate.revise()` (audit §4.6), unit-tested without a DB.
+            aggregate = DomainAgentTemplate(
+                id=existing.id,
+                name=existing.name,
+                archetype=Archetype(existing.archetype),
+                version=Version(existing.version),
+                config=AgentConfig.from_mapping(existing.config),
+            )
+            old_version = int(aggregate.version)
 
-            # P-01 fix — bump version + insert prompts row ONLY when the
-            # `system_prompt` actually changes (vs identical to current).
-            # Without this check, the default UX path (Save without touching
-            # the prompt) duplicates byte-identical `prompts` rows and
-            # inflates `agent_templates.version` on every click.
-            current_system_prompt = merged_config.get("system_prompt")
-            system_prompt_changed = (
-                payload.system_prompt is not None and payload.system_prompt != current_system_prompt
+            merged_config = aggregate.config.merge_updates(
+                system_prompt=payload.system_prompt,
+                input_contract=(
+                    payload.input_contract.to_domain()
+                    if payload.input_contract is not None
+                    else None
+                ),
+                output_contract=(
+                    payload.output_contract.to_domain()
+                    if payload.output_contract is not None
+                    else None
+                ),
+                llm_model=payload.llm_model,
+                llm_params=payload.llm_params.to_domain()
+                if payload.llm_params is not None
+                else None,
+                provider_chain=(
+                    ProviderChain.from_mapping(payload.provider_chain)
+                    if payload.provider_chain is not None
+                    else None
+                ),
+                error_policy=(
+                    payload.error_policy.to_domain() if payload.error_policy is not None else None
+                ),
             )
 
-            if payload.system_prompt is not None:
-                merged_config["system_prompt"] = payload.system_prompt
-            if payload.input_contract is not None:
-                merged_config["input_contract"] = payload.input_contract.model_dump()
-            if payload.output_contract is not None:
-                merged_config["output_contract"] = payload.output_contract.model_dump()
-            if payload.llm_model is not None:
-                merged_config["llm_model"] = payload.llm_model
-            if payload.llm_params is not None:
-                merged_config["llm_params"] = payload.llm_params.model_dump()
-            if payload.provider_chain is not None:
-                merged_config["provider_chain"] = list(payload.provider_chain)
-            if payload.error_policy is not None:
-                merged_config["error_policy"] = payload.error_policy.model_dump()
+            revision = aggregate.revise(merged_config)
+            new_version = int(aggregate.version)
+            bump_version = revision is not None
+            config_dict = aggregate.config.to_mapping()
 
-            bump_version = system_prompt_changed
-            if bump_version:
-                new_version = old_version + 1
+            if revision is not None:
                 updated = await self._template_repo.update_in_session(
                     session,
                     template=existing,
-                    config=merged_config,
+                    config=config_dict,
                     new_version=new_version,
                 )
-                # `payload.system_prompt` is non-None — guarded by `system_prompt_changed`
-                # which short-circuits if `payload.system_prompt is None`.
                 await self._prompt_repo.create_in_session(
                     session,
                     agent_template_id=template_id,
-                    version=new_version,
-                    content=payload.system_prompt,  # type: ignore[arg-type]  # guarded
+                    version=revision.version.value,
+                    content=revision.content,
                     tenant_id=tenant_id,
                 )
             else:
-                new_version = old_version
                 updated = await self._template_repo.update_config_in_session(
                     session,
                     template=existing,
-                    config=merged_config,
+                    config=config_dict,
                 )
 
             event = AgentTemplateUpdatedEvent(
