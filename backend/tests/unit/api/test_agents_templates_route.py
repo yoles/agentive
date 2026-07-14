@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from agentive_backend.app.main import create_app
 from agentive_backend.features.agent_registry.schemas import CreateTemplateResponse
-from agentive_backend.features.agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.service import AgentTemplateService
 
 
 @pytest.fixture
@@ -146,7 +146,7 @@ def test_post_template_happy_path_uses_service(
         version=1,
         created_at=datetime.now(tz=UTC),
     )
-    fake_service_instance = AsyncMock(spec=AgentRegistryService)
+    fake_service_instance = AsyncMock(spec=AgentTemplateService)
     fake_service_instance.create_template.return_value = fake_response
 
     # Patch the build helper so any caller (router) gets our mock.
@@ -157,7 +157,9 @@ def test_post_template_happy_path_uses_service(
     import importlib
 
     router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
-    monkeypatch.setattr(router_module, "_build_service", lambda _request: fake_service_instance)
+    monkeypatch.setattr(
+        router_module, "_build_template_service", lambda _request: fake_service_instance
+    )
 
     resp = client.post(
         "/api/v1/agents/templates",
@@ -182,7 +184,7 @@ def _patch_service(monkeypatch: pytest.MonkeyPatch, mock_service: AsyncMock) -> 
     import importlib
 
     router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
-    monkeypatch.setattr(router_module, "_build_service", lambda _request: mock_service)
+    monkeypatch.setattr(router_module, "_build_template_service", lambda _request: mock_service)
 
 
 def test_put_template_invalid_uuid_returns_422(client: TestClient) -> None:
@@ -231,7 +233,7 @@ def test_put_template_happy_path_uses_service(
         config={"system_prompt": "v2 prompt", "llm_model": "claude-3-5-sonnet-20241022"},
         updated_at=datetime.now(tz=UTC),
     )
-    fake_service = AsyncMock(spec=AgentRegistryService)
+    fake_service = AsyncMock(spec=AgentTemplateService)
     fake_service.update_template.return_value = fake_response
     _patch_service(monkeypatch, fake_service)
 
@@ -274,7 +276,7 @@ def test_get_template_happy_path_uses_service(
         config={"prompt_base": "x", "role": "producer"},
         created_at=datetime.now(tz=UTC),
     )
-    fake_service = AsyncMock(spec=AgentRegistryService)
+    fake_service = AsyncMock(spec=AgentTemplateService)
     fake_service.get_template_by_id.return_value = fake_response
     _patch_service(monkeypatch, fake_service)
 
