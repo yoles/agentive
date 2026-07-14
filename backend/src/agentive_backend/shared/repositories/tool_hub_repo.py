@@ -42,6 +42,15 @@ class ToolServerRepo(BaseRepo):
     ) -> ToolServer | None:
         return await session.get(ToolServer, server_id)
 
+    async def require_by_id_in_session(self, session: AsyncSession, server_id: UUID) -> ToolServer:
+        """In-session fetch by id or raise :class:`NotFoundError` (audit A-07)."""
+        return self._require_found(
+            await self.get_by_id_in_session(session, server_id),
+            label="Tool server",
+            entity_id=server_id,
+            context_key="server_id",
+        )
+
     async def get_by_name_in_session(
         self,
         session: AsyncSession,
@@ -135,6 +144,15 @@ class ToolRepo(BaseRepo):
         tool_id: UUID,
     ) -> Tool | None:
         return await session.get(Tool, tool_id)
+
+    async def require_by_id_in_session(self, session: AsyncSession, tool_id: UUID) -> Tool:
+        """In-session fetch by id or raise :class:`NotFoundError` (audit A-07)."""
+        return self._require_found(
+            await self.get_by_id_in_session(session, tool_id),
+            label="Tool",
+            entity_id=tool_id,
+            context_key="tool_id",
+        )
 
     async def create_in_session(
         self,

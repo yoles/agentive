@@ -245,12 +245,7 @@ class AgentRegistryService:
             NotFoundError: ``template_id`` does not exist (or is filtered
                 out by RLS for the bound tenant).
         """
-        template = await self._template_repo.get_by_id(template_id, tenant_id=tenant_id)
-        if template is None:
-            raise NotFoundError(
-                detail=f"Agent template '{template_id}' not found",
-                context={"template_id": str(template_id)},
-            )
+        template = await self._template_repo.require_by_id(template_id, tenant_id=tenant_id)
         return TemplateDetailResponse(
             template_id=template.id,
             name=template.name,
@@ -287,12 +282,7 @@ class AgentRegistryService:
         event_type = AgentTemplateUpdatedEvent.event_type
 
         async with self._template_repo.with_tenant(tenant_id) as session:
-            existing = await self._template_repo.get_by_id_in_session(session, template_id)
-            if existing is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{template_id}' not found",
-                    context={"template_id": str(template_id)},
-                )
+            existing = await self._template_repo.require_by_id_in_session(session, template_id)
 
             # Rehydrate the domain aggregate from the persisted row, apply the
             # PATCH-like update through the composite VO, and let the aggregate
@@ -448,21 +438,11 @@ class AgentRegistryService:
 
         async with self._instance_repo.with_tenant(tenant_id) as session:
             # 1. SELECT template — must exist (404 sinon).
-            template = await self._template_repo.get_by_id_in_session(session, template_id)
-            if template is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{template_id}' not found",
-                    context={"template_id": str(template_id)},
-                )
+            template = await self._template_repo.require_by_id_in_session(session, template_id)
 
             # 2. Validate workflow_run FK if provided (404 sinon — strict).
             if workflow_run_id is not None:
-                run = await self._workflow_run_repo.get_by_id_in_session(session, workflow_run_id)
-                if run is None:
-                    raise NotFoundError(
-                        detail=f"Workflow run '{workflow_run_id}' not found",
-                        context={"workflow_run_id": str(workflow_run_id)},
-                    )
+                await self._workflow_run_repo.require_by_id_in_session(session, workflow_run_id)
 
             # 3. Build the immutable snapshot. P-15 (CR 2026-05-10) — deep
             #    copy via `copy.deepcopy` (was shallow `dict(...)`) because
@@ -546,12 +526,7 @@ class AgentRegistryService:
             NotFoundError: ``instance_id`` does not exist (or is filtered
                 out by RLS for the bound tenant).
         """
-        instance = await self._instance_repo.get_by_id(instance_id, tenant_id=tenant_id)
-        if instance is None:
-            raise NotFoundError(
-                detail=f"Agent instance '{instance_id}' not found",
-                context={"instance_id": str(instance_id)},
-            )
+        instance = await self._instance_repo.require_by_id(instance_id, tenant_id=tenant_id)
         return AgentInstanceDetailResponse(
             instance_id=instance.id,
             template_id=instance.template_id,
@@ -574,12 +549,7 @@ class AgentRegistryService:
         the run exists but has no instances.
         """
         async with self._instance_repo.with_tenant(tenant_id) as session:
-            run = await self._workflow_run_repo.get_by_id_in_session(session, workflow_run_id)
-            if run is None:
-                raise NotFoundError(
-                    detail=f"Workflow run '{workflow_run_id}' not found",
-                    context={"workflow_run_id": str(workflow_run_id)},
-                )
+            await self._workflow_run_repo.require_by_id_in_session(session, workflow_run_id)
             instances = await self._instance_repo.list_by_workflow_run_in_session(
                 session, workflow_run_id
             )
@@ -624,22 +594,12 @@ class AgentRegistryService:
         """
         async with self._template_repo.with_tenant(tenant_id) as session:
             # 1. Validate template exists.
-            template = await self._template_repo.get_by_id_in_session(session, template_id)
-            if template is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{template_id}' not found",
-                    context={"template_id": str(template_id)},
-                )
+            await self._template_repo.require_by_id_in_session(session, template_id)
 
             # 2. Validate ALL tools exist (decision #8 — strict 404, no partial).
             tools_by_id: dict[UUID, Any] = {}
             for tid in tool_ids:
-                tool = await self._tool_repo.get_by_id_in_session(session, tid)
-                if tool is None:
-                    raise NotFoundError(
-                        detail=f"Tool '{tid}' not found",
-                        context={"tool_id": str(tid)},
-                    )
+                tool = await self._tool_repo.require_by_id_in_session(session, tid)
                 tools_by_id[tool.id] = tool
 
             # 3 + 4. Compute diff + DML inside the same session.
@@ -734,12 +694,7 @@ class AgentRegistryService:
             ``template_id`` does not exist.
         """
         async with self._template_repo.with_tenant(tenant_id) as session:
-            template = await self._template_repo.get_by_id_in_session(session, template_id)
-            if template is None:
-                raise NotFoundError(
-                    detail=f"Agent template '{template_id}' not found",
-                    context={"template_id": str(template_id)},
-                )
+            await self._template_repo.require_by_id_in_session(session, template_id)
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
                 session, template_id
             )

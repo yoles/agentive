@@ -91,6 +91,15 @@ class WorkflowRunRepo(BaseRepo):
         """
         return await session.get(WorkflowRun, run_id)
 
+    async def require_by_id_in_session(self, session: AsyncSession, run_id: UUID) -> WorkflowRun:
+        """In-session fetch by id or raise :class:`NotFoundError` (audit A-07)."""
+        return self._require_found(
+            await self.get_by_id_in_session(session, run_id),
+            label="Workflow run",
+            entity_id=run_id,
+            context_key="workflow_run_id",
+        )
+
     async def list_by_workflow(
         self,
         workflow_id: UUID,

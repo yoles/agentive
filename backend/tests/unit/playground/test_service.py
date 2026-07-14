@@ -41,7 +41,13 @@ def _make_service(
     template_repo.with_tenant = MagicMock()
     template_repo.with_tenant.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
     template_repo.with_tenant.return_value.__aexit__ = AsyncMock(return_value=False)
-    template_repo.get_by_id_in_session = AsyncMock(return_value=template)
+    # A-07 — service resolves the template via the lookup-or-404 helper.
+    if template is None:
+        template_repo.require_by_id_in_session = AsyncMock(
+            side_effect=NotFoundError(detail="Agent template not found", context={})
+        )
+    else:
+        template_repo.require_by_id_in_session = AsyncMock(return_value=template)
 
     assignment_repo = MagicMock()
     assignment_repo.list_by_template_in_session = AsyncMock(return_value=assigned_tools or [])

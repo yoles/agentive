@@ -30,6 +30,17 @@ class AgentTemplateRepo(BaseRepo):
         async with self.with_tenant(tenant_id) as session:
             return await session.get(AgentTemplate, template_id)
 
+    async def require_by_id(
+        self, template_id: UUID, *, tenant_id: UUID | None = None
+    ) -> AgentTemplate:
+        """Fetch by id or raise :class:`NotFoundError` (lookup-or-404, audit A-07)."""
+        return self._require_found(
+            await self.get_by_id(template_id, tenant_id=tenant_id),
+            label="Agent template",
+            entity_id=template_id,
+            context_key="template_id",
+        )
+
     async def get_by_name_version(
         self,
         name: str,
@@ -125,6 +136,17 @@ class AgentTemplateRepo(BaseRepo):
         """
         return await session.get(AgentTemplate, template_id)
 
+    async def require_by_id_in_session(
+        self, session: AsyncSession, template_id: UUID
+    ) -> AgentTemplate:
+        """In-session fetch by id or raise :class:`NotFoundError` (audit A-07)."""
+        return self._require_found(
+            await self.get_by_id_in_session(session, template_id),
+            label="Agent template",
+            entity_id=template_id,
+            context_key="template_id",
+        )
+
     async def update_in_session(
         self,
         session: AsyncSession,
@@ -191,6 +213,17 @@ class AgentInstanceRepo(BaseRepo):
     ) -> AgentInstance | None:
         async with self.with_tenant(tenant_id) as session:
             return await session.get(AgentInstance, instance_id)
+
+    async def require_by_id(
+        self, instance_id: UUID, *, tenant_id: UUID | None = None
+    ) -> AgentInstance:
+        """Fetch by id or raise :class:`NotFoundError` (lookup-or-404, audit A-07)."""
+        return self._require_found(
+            await self.get_by_id(instance_id, tenant_id=tenant_id),
+            label="Agent instance",
+            entity_id=instance_id,
+            context_key="instance_id",
+        )
 
     async def create(
         self,

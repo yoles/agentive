@@ -298,7 +298,14 @@ def _make_invoke_service(*, server, tool) -> ToolHubService:
     server_repo.with_tenant = MagicMock()
     server_repo.with_tenant.return_value.__aenter__ = AsyncMock(return_value=session_mock)
     server_repo.with_tenant.return_value.__aexit__ = AsyncMock(return_value=False)
-    server_repo.get_by_id_in_session = AsyncMock(return_value=server)
+    # A-07 — invoke_tool resolves the server via the lookup-or-404 helper;
+    # the tool lookup keeps its bespoke uniform-message path (security P-20).
+    if server is None:
+        server_repo.require_by_id_in_session = AsyncMock(
+            side_effect=NotFoundError(detail="Tool server not found", context={})
+        )
+    else:
+        server_repo.require_by_id_in_session = AsyncMock(return_value=server)
 
     tool_repo = MagicMock()
     tool_repo.get_by_id_in_session = AsyncMock(return_value=tool)
