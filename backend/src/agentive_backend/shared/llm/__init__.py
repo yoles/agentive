@@ -37,7 +37,11 @@ from agentive_backend.shared.llm.exceptions import (
     LLMProviderTimeoutError,
     LLMProviderUnavailableError,
 )
-from agentive_backend.shared.llm.interface import LLMProvider
+from agentive_backend.shared.llm.interface import (
+    Completer,
+    LLMProvider,
+    RawProviderAccess,
+)
 from agentive_backend.shared.llm.router import (
     DEFAULT_MODEL_FALLBACK_MAP,
     FallbackCallback,
@@ -58,6 +62,7 @@ __all__ = [
     "AgentLLMConfig",
     "ChatMessage",
     "ChatRole",
+    "Completer",
     "Completion",
     "ErrorClass",
     "FallbackCallback",
@@ -74,6 +79,7 @@ __all__ = [
     "LLMProviderUnavailableError",
     "LLMRouter",
     "LLMUsage",
+    "RawProviderAccess",
     "RouterCall",
     "classify_error",
 ]
