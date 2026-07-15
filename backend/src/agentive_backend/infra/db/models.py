@@ -37,6 +37,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from agentive_backend.infra.db.types import EncryptedJSONB
+
 
 class Base(DeclarativeBase):
     """Base for all ORM models."""
@@ -367,8 +369,9 @@ class ToolServer(Base):
     - stdio : ``{"command": str, "args": list[str], "env"?: dict}``
     - sse   : ``{"url": str, "headers"?: dict[str, str]}``
 
-    Sprint 1 stores ``connection_config`` in clear (single-user dev). Story
-    9.2 will add Fernet encryption for credentials (D54).
+    ``connection_config`` is encrypted at rest via :class:`EncryptedJSONB`
+    (Fernet, Story 9.2 / audit M-09) — the DB holds ciphertext, callers see a
+    plaintext ``dict`` transparently. Legacy plaintext rows remain readable.
     """
 
     __tablename__ = "tool_servers"
@@ -378,7 +381,7 @@ class ToolServer(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     transport: Mapped[str] = mapped_column(Text, nullable=False)  # 'stdio' | 'sse'
-    connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    connection_config: Mapped[dict[str, Any]] = mapped_column(EncryptedJSONB, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     discovered_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
