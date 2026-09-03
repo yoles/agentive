@@ -1,4 +1,4 @@
-"""Service layer — Agent Registry (Stories 2.1-2.5).
+"""Service layer — Agent Registry (Stories 2.1-2.8).
 
 Audit A-10 / §2.1b — the former single ``AgentRegistryService`` injected 7
 repositories and owned ≥ 3 orthogonal axes of change (template CRUD + prompt
@@ -8,7 +8,8 @@ collaborators it needs:
 
 * :class:`ArchetypeCatalog` — read-only archetype registry (no persistence).
 * :class:`AgentTemplateService` — template create / read / update (+ prompt
-  versioning). Repos: ``template_repo``, ``prompt_repo``.
+  versioning) and the read-only Contrôleur/Producteur diversity check
+  (Story 2.8, FR15). Repos: ``template_repo``, ``prompt_repo``.
 * :class:`TemplateInstantiationService` — instantiate + instance reads.
   Repos: ``template_repo``, ``instance_repo``, ``workflow_run_repo``.
 * :class:`TemplateToolAssignmentService` — assign / replace / list / unassign
@@ -35,6 +36,7 @@ from agentive_backend.features.agent_registry.domain import (
     Archetype,
     ProviderChain,
     Version,
+    check_llm_diversity,
 )
 from agentive_backend.features.agent_registry.domain import (
     AgentTemplate as DomainAgentTemplate,
@@ -47,10 +49,14 @@ from agentive_backend.features.agent_registry.schemas import (
     AssignedToolView,
     ContractSkeletonView,
     CreateTemplateResponse,
+    DiversityCheckResponse,
     InstantiateTemplateResponse,
     TemplateDetailResponse,
     UpdateTemplateRequest,
     UpdateTemplateResponse,
+)
+from agentive_backend.features.agent_registry.schemas import (
+    LLMParams as LLMParamsSchema,
 )
 from agentive_backend.shared.contracts.events import (
     AgentInstanceCreatedEvent,
@@ -74,6 +80,21 @@ if TYPE_CHECKING:
     )
 
 _log = get_logger(__name__)
+
+
+def _to_llm_params_schema(config: AgentConfig) -> LLMParamsSchema | None:
+    """Project the ``LLMParams`` VO onto its API schema (``None`` if unset).
+
+    P-14 — single conversion point : the field list was enumerated by hand
+    twice in ``check_diversity``, so adding a field to the VO would have
+    silently dropped it from the response on both sides.
+    """
+    if config.llm_params is None:
+        return None
+    return LLMParamsSchema(
+        temperature=config.llm_params.temperature,
+        max_tokens=config.llm_params.max_tokens,
+    )
 
 
 class ArchetypeCatalog:
@@ -116,7 +137,12 @@ class ArchetypeCatalog:
 
 
 class AgentTemplateService:
-    """Template lifecycle — create / read / update (+ prompt versioning)."""
+    """Template lifecycle — create / read / update (+ prompt versioning).
+
+    Also owns ``check_diversity`` (Story 2.8, FR15) : a read-only comparison
+    of two template configs, same axis of change (the template and its
+    ``config``), no extra collaborator.
+    """
 
     def __init__(
         self,
@@ -233,6 +259,94 @@ class AgentTemplateService:
             version=template.version,
             config=template.config,
             created_at=template.created_at,
+        )
+
+    async def check_diversity(
+        self,
+        controller_template_id: UUID,
+        producer_template_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> DiversityCheckResponse:
+        """Verify Controller/Producer LLM diversity (Story 2.8 AC3, FR15).
+
+        No persisted Controller→Producer link (Epic 4, defer D84) : both
+        ids are ad-hoc query params, loaded independently.
+
+        The check is asymmetric (Story 2.8 I-01) : the template in controller
+        position MUST carry the ``controleur`` archetype, the controlled one is
+        left free. FR15 reads "le Contrôleur peut utiliser un modèle différent
+        de l'agent qu'il contrôle", and that agent is not necessarily a
+        ``producteur`` (a Contrôleur may review an ``analyste``, a ``chercheur``
+        or a ``communicateur``). Only the controller role is typed, cf Story 5.4
+        which requires its two reviewers to be ``archetype Contrôleur``.
+
+        Raises:
+            ValidationError: both ids are the same template (comparing a
+                template with itself would answer ``is_diverse=False`` with
+                ``reason="same llm_model and same llm_params"``, which is true
+                but hides the actual cause, Story 2.8 P-04) ; or the template
+                in controller position is not a ``controleur`` (I-01), which
+                also catches swapped ids and producer/producer pairs.
+            NotFoundError: either ``controller_template_id`` or
+                ``producer_template_id`` does not exist. The RFC 7807
+                ``detail`` names which one.
+        """
+        if controller_template_id == producer_template_id:
+            raise ValidationError(
+                detail=(
+                    "Controller and producer must be two distinct agent templates, "
+                    f"got '{controller_template_id}' for both"
+                ),
+                context={"template_id": str(controller_template_id)},
+            )
+        try:
+            controller = await self._template_repo.require_by_id(
+                controller_template_id, tenant_id=tenant_id
+            )
+        except NotFoundError as exc:
+            raise NotFoundError(
+                detail=f"Controller agent template '{controller_template_id}' not found",
+                context={"controller_template_id": str(controller_template_id)},
+            ) from exc
+        try:
+            producer = await self._template_repo.require_by_id(
+                producer_template_id, tenant_id=tenant_id
+            )
+        except NotFoundError as exc:
+            raise NotFoundError(
+                detail=f"Producer agent template '{producer_template_id}' not found",
+                context={"producer_template_id": str(producer_template_id)},
+            ) from exc
+
+        if controller.archetype != Archetype.CONTROLEUR:
+            raise ValidationError(
+                detail=(
+                    "The controller template must carry the "
+                    f"'{Archetype.CONTROLEUR.value}' archetype, "
+                    f"template '{controller_template_id}' is a "
+                    f"'{controller.archetype}'"
+                ),
+                context={
+                    "controller_template_id": str(controller_template_id),
+                    "archetype": str(controller.archetype),
+                    "expected_archetype": Archetype.CONTROLEUR.value,
+                },
+            )
+
+        controller_config = AgentConfig.from_mapping(controller.config)
+        producer_config = AgentConfig.from_mapping(producer.config)
+        result = check_llm_diversity(controller_config, producer_config)
+
+        return DiversityCheckResponse(
+            controller_archetype=controller.archetype,
+            producer_archetype=producer.archetype,
+            controller_model=controller_config.llm_model,
+            controller_params=_to_llm_params_schema(controller_config),
+            producer_model=producer_config.llm_model,
+            producer_params=_to_llm_params_schema(producer_config),
+            is_diverse=result.is_diverse,
+            reason=result.reason,
         )
 
     async def update_template(

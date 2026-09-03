@@ -1,6 +1,6 @@
-"""``/api/v1/agents/*`` — Agent Registry endpoints (Story 2.1 + 2.2).
+"""``/api/v1/agents/*`` — Agent Registry endpoints (Stories 2.1 to 2.8).
 
-Five endpoints :
+Twelve endpoints :
 
 * ``GET /agents/archetypes`` — lean list (UX-DR17 ArchetypeSelector).
 * ``GET /agents/archetypes/{id}`` — detail with prompt_base + contracts.
@@ -9,6 +9,17 @@ Five endpoints :
 * ``GET /agents/templates/{template_id}`` — Story 2.2 detail.
 * ``PUT /agents/templates/{template_id}`` — Story 2.2 PATCH-like update with
   prompt versioning when ``system_prompt`` is included.
+* ``GET /agents/templates/{controller_template_id}/diversity-check`` — Story
+  2.8 FR15 Contrôleur/Producteur LLM diversity verdict (ad-hoc pair, no
+  persisted link before Epic 4).
+* ``POST /agents/templates/{template_id}/instances`` — Story 2.4 instantiate.
+* ``GET /agents/instances/{instance_id}`` — Story 2.4 instance detail.
+* ``GET /workflows/runs/{run_id}/instances`` — Story 2.4 instances of a run.
+* ``POST /agents/templates/{template_id}/tools`` — Story 2.5 replace the
+  assigned tool set.
+* ``GET /agents/templates/{template_id}/tools`` — Story 2.5 assigned tools.
+* ``DELETE /agents/templates/{template_id}/tools/{tool_id}`` — Story 2.5
+  unassign a single tool.
 
 All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). ``AgentiveError``
 is raised for domain failures and converted to RFC 7807 by the global handler
@@ -30,6 +41,7 @@ from agentive_backend.features.agent_registry.schemas import (
     ArchetypeSummary,
     CreateTemplateRequest,
     CreateTemplateResponse,
+    DiversityCheckResponse,
     InstantiateTemplateRequest,
     InstantiateTemplateResponse,
     ReplaceAgentToolsRequest,
@@ -223,6 +235,36 @@ async def update_template(
     """
     service = _build_template_service(request)
     return await service.update_template(template_id, body, tenant_id=None)
+
+
+@router.get(
+    "/agents/templates/{controller_template_id}/diversity-check",
+    response_model=DiversityCheckResponse,
+    summary="Check Controller/Producer LLM diversity (Story 2.8 — FR15)",
+)
+async def check_diversity(
+    request: Request,
+    controller_template_id: UUID,
+    producer_template_id: UUID,
+) -> DiversityCheckResponse:
+    """200 on success — ``is_diverse`` is ``bool | None`` (see ``reason``).
+
+    No persisted Controller→Producer link (Epic 4, defer D84) : both ids are
+    ad-hoc query params.
+
+    Errors :
+    * 404 : ``controller_template_id`` or ``producer_template_id`` not found
+      (RFC 7807 ``detail`` names which one).
+    * 422 : either id is not a UUID, both ids name the same template, or the
+      template in controller position is not a ``controleur`` archetype
+      (Story 2.8 I-01, which also rejects swapped ids). The controlled
+      template's archetype is NOT constrained.
+    * 503 : lifespan state missing.
+    """
+    service = _build_template_service(request)
+    return await service.check_diversity(
+        controller_template_id, producer_template_id, tenant_id=None
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -374,6 +374,32 @@ class AgentToolsResponse(BaseModel):
     assigned_tools: list[AssignedToolView]
 
 
+class DiversityCheckResponse(BaseModel):
+    """Response for ``GET .../templates/{controller_template_id}/diversity-check``
+    (Story 2.8 AC3, FR15).
+
+    ``*_params`` reuse the existing :class:`LLMParams` shape read-only.
+    ``is_diverse`` is a three-state field (``bool | None``). ``None`` means
+    one of the two templates has an incomplete LLM config (cf
+    ``domain.diversity.check_llm_diversity``), never a silent ``False``.
+
+    ``*_archetype`` echo back the pair the verdict was computed on (Story 2.8
+    I-01) : the controller side is enforced to be ``controleur`` by the
+    service, the controlled side is free.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    controller_archetype: str
+    producer_archetype: str
+    controller_model: str | None
+    controller_params: LLMParams | None
+    producer_model: str | None
+    producer_params: LLMParams | None
+    is_diverse: bool | None
+    reason: str
+
+
 __all__ = [
     "AgentInstanceDetailResponse",
     "AgentToolsResponse",
@@ -384,6 +410,7 @@ __all__ = [
     "ContractSkeletonView",
     "CreateTemplateRequest",
     "CreateTemplateResponse",
+    "DiversityCheckResponse",
     "ErrorPolicy",
     "InstantiateTemplateRequest",
     "InstantiateTemplateResponse",

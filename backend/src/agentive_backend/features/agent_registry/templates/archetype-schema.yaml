@@ -131,7 +131,10 @@ archetypes:
     output_contract:
       core:
         verdict: string
-        comments: array
+        comments: >-
+          array de ReviewComment {location: string, severity:
+          blocking|suggestion|question, message: string, suggested_fix?:
+          string}, cf schema partagé agentive_backend.shared.contracts.review
       extras: {}
 
   - id: veilleur

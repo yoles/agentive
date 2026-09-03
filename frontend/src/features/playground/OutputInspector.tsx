@@ -7,7 +7,18 @@
  */
 
 import { useState } from "react";
+import type { ApiError } from "@/shared/api/client";
+import { ControllerReviewView } from "./ControllerReviewView";
+import { isControllerReview } from "./reviewDetection";
 import type { RunPlaygroundResponse } from "./types";
+
+/** P-14 — `apiFetch` always rejects with an `ApiError` shape (RFC 7807:
+ * `.detail`/`.title`), never a real `Error` with `.message`. Reading
+ * `.message` on that object is always `undefined`. */
+function errorMessage(error: Error): string {
+  const apiError = error as unknown as Partial<ApiError>;
+  return apiError.detail ?? apiError.title ?? error.message ?? "Erreur inconnue.";
+}
 
 type TabId = "prompt" | "raw" | "parsed" | "tools" | "tokens";
 
@@ -46,7 +57,7 @@ export function OutputInspector({ result, isPending, error }: Props) {
         data-testid="playground-output-error"
       >
         <h3 className="font-semibold">Erreur</h3>
-        <p className="mt-1 text-xs">{error.message}</p>
+        <p className="mt-1 text-xs">{errorMessage(error)}</p>
       </section>
     );
   }
@@ -119,8 +130,11 @@ export function OutputInspector({ result, isPending, error }: Props) {
         <div data-testid="playground-tab-parsed-content">
           {result.parsed_output === null ? (
             <p className="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700">
-              Parsing échoué : l'output brut n'est pas un objet JSON valide.
+              Parsing échoué : l'output brut n'est pas un objet JSON (JSON invalide, ou un
+              tableau / une valeur scalaire au lieu d'un objet).
             </p>
+          ) : isControllerReview(result.parsed_output) ? (
+            <ControllerReviewView review={result.parsed_output} />
           ) : (
             <pre className="max-h-96 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">
               {JSON.stringify(result.parsed_output, null, 2)}

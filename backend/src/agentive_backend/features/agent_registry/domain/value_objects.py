@@ -298,7 +298,20 @@ class AgentConfig:
                 Contract.from_mapping(raw["output_contract"]) if "output_contract" in raw else None
             ),
             llm_model=raw.get("llm_model"),
-            llm_params=LLMParams.from_mapping(raw["llm_params"]) if "llm_params" in raw else None,
+            # Story 2.8 P-02 — a bare ``"llm_params" in raw`` also matched a key
+            # present with a ``null`` (or ``{}``, or a scalar) value, and
+            # ``LLMParams.from_mapping`` then fabricated the defaults
+            # ``(0.7, 4096)``. Two templates in that state compared equal, so
+            # ``check_llm_diversity`` returned ``is_diverse=False`` instead of the
+            # ``None`` its three-state contract promises for an unconfigured
+            # template. Only a non-empty mapping counts as "configured".
+            # The sibling optional VOs below keep the ``in raw`` form: same latent
+            # hole, but no caller depends on telling absent from null for them.
+            llm_params=(
+                LLMParams.from_mapping(raw["llm_params"])
+                if isinstance(raw.get("llm_params"), Mapping) and raw["llm_params"]
+                else None
+            ),
             provider_chain=(
                 ProviderChain.from_mapping(raw["provider_chain"])
                 if "provider_chain" in raw
