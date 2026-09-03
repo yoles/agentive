@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     agentive_encryption_key: SecretStr = Field(
         default=SecretStr("change_me"), alias="AGENTIVE_ENCRYPTION_KEY"
     )
+    # Key-rotation window only (Story 9.2 AC3): set alongside a new
+    # AGENTIVE_ENCRYPTION_KEY so `shared.security.crypto` can still decrypt
+    # rows written under the outgoing key while `scripts/rotate_encryption_key.py`
+    # re-encrypts them under the new one. Unset once the rotation script confirms
+    # completion — never required outside of an active rotation.
+    agentive_encryption_key_previous: SecretStr | None = Field(
+        default=None, alias="AGENTIVE_ENCRYPTION_KEY_PREVIOUS"
+    )
 
     # ─── PostgreSQL (components — the DSN is built app-side via `computed_field`) ───
     # We store the components rather than a full DSN so the password can be
@@ -167,20 +175,31 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_invalid_fernet_key_in_production(self) -> Settings:
-        """Validate the Fernet encryption key format in production."""
+        """Validate the Fernet encryption key format(s) in production.
+
+        Validates ``AGENTIVE_ENCRYPTION_KEY`` always, and
+        ``AGENTIVE_ENCRYPTION_KEY_PREVIOUS`` too when set (Story 9.2 AC3
+        rotation window) — a malformed previous key would silently make
+        rotation's decrypt-fallback a no-op instead of failing fast.
+        """
         if self.environment != "production":
             return self
 
-        key = self.agentive_encryption_key.get_secret_value()
-        try:
-            Fernet(key.encode() if isinstance(key, str) else key)
-        except (ValueError, InvalidToken) as exc:
-            raise ValueError(
-                "AGENTIVE_ENCRYPTION_KEY is not a valid Fernet key "
-                "(expected 32 url-safe base64 bytes). "
-                "Generate one with: `python -c 'from cryptography.fernet import Fernet;"
-                " print(Fernet.generate_key().decode())'`."
-            ) from exc
+        keys = {"AGENTIVE_ENCRYPTION_KEY": self.agentive_encryption_key}
+        if self.agentive_encryption_key_previous is not None:
+            keys["AGENTIVE_ENCRYPTION_KEY_PREVIOUS"] = self.agentive_encryption_key_previous
+
+        for env_name, secret in keys.items():
+            key = secret.get_secret_value()
+            try:
+                Fernet(key.encode() if isinstance(key, str) else key)
+            except (ValueError, InvalidToken) as exc:
+                raise ValueError(
+                    f"{env_name} is not a valid Fernet key "
+                    "(expected 32 url-safe base64 bytes). "
+                    "Generate one with: `python -c 'from cryptography.fernet import Fernet;"
+                    " print(Fernet.generate_key().decode())'`."
+                ) from exc
         return self
 
 

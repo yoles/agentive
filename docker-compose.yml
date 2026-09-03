@@ -56,6 +56,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:?required}
       AGENTIVE_ENCRYPTION_KEY: ${AGENTIVE_ENCRYPTION_KEY:?required}
+      # Story 9.2 AC3 — renseignée UNIQUEMENT pendant une fenêtre de rotation de
+      # clé : l'ancienne clé y est déplacée pour que les lignes pas encore
+      # ré-chiffrées restent lisibles. À vider dès que
+      # `scripts/rotate_encryption_key.py` sort en code 0. Voir la procédure
+      # complète dans le docstring de ce script.
+      AGENTIVE_ENCRYPTION_KEY_PREVIOUS: ${AGENTIVE_ENCRYPTION_KEY_PREVIOUS:-}
       # Story 2.5 P-23 admin-gate (default false in prod for RCE/SSRF safety
       # until Story 2.6 sandbox lands). Override per-environment via .env.
       AGENTIVE_ALLOW_MCP_REGISTRATION: ${AGENTIVE_ALLOW_MCP_REGISTRATION:-false}
