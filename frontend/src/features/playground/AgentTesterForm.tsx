@@ -46,6 +46,9 @@ export function AgentTesterForm({ templateId, isRunning, onSubmit }: Props) {
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
+    // P-38 — guard against a rapid double-click firing two submits before
+    // `isRunning` (derived from the mutation's pending state) re-renders.
+    if (isRunning) return;
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(argumentsJson) as Record<string, unknown>;
@@ -57,11 +60,15 @@ export function AgentTesterForm({ templateId, isRunning, onSubmit }: Props) {
       setJsonError(err instanceof Error ? err.message : "JSON invalide");
       return;
     }
+    // P-37 — an emptied/invalid number input can produce NaN; fall back to
+    // the field's own default rather than sending an unusable value.
+    const safeTimeoutSeconds =
+      Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 30;
     onSubmit({
       arguments: parsed,
       enabled_tool_ids:
         enabledToolIds === null ? null : Array.from(enabledToolIds),
-      timeout_seconds: timeoutSeconds,
+      timeout_seconds: safeTimeoutSeconds,
     });
   }
 

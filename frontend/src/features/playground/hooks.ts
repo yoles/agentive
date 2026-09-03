@@ -37,5 +37,9 @@ export function usePlaygroundAssignedTools(templateId: string) {
         `/api/v1/agents/templates/${encodeURIComponent(templateId)}/tools`,
       ),
     enabled: Boolean(templateId),
+    // P-26 — matches the `staleTime: 30_000` convention already used for
+    // the equivalent Story 2.5 `useAgentTools` query (tool_hub/hooks.ts) ;
+    // the assigned-tools list rarely changes mid Playground-session.
+    staleTime: 30_000,
   });
 }

@@ -207,4 +207,56 @@ describe("PlaygroundPage", () => {
     expect(tokens).toHaveTextContent("200");
     expect(tokens).toHaveTextContent("0.005");
   });
+
+  it("re-run replaces the previous result without a page reload and preserves form input (AC4 / P-17)", async () => {
+    let runCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith(`/agents/templates/${TEMPLATE_ID}/tools`)) {
+        return Promise.resolve(
+          jsonResponse({ template_id: TEMPLATE_ID, assigned_tools: [] }),
+        );
+      }
+      if (url.endsWith(`/playground/agents/${TEMPLATE_ID}/run`) && method === "POST") {
+        runCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            prompt_resolved: "x",
+            raw_output: `run-${runCount}`,
+            parsed_output: null,
+            tokens: { input_tokens: 1, output_tokens: 1 },
+            cost_estimate_usd: "0.0001",
+            model_used: "claude-sonnet-4-6",
+            provider_used: "anthropic",
+            tool_invocations: [],
+            duration_ms_total: 1,
+          }),
+        );
+      }
+      return Promise.resolve(jsonResponse({}, { status: 404 }));
+    });
+    render(
+      <Providers>
+        <PlaygroundPage templateId={TEMPLATE_ID} />
+      </Providers>,
+    );
+    const textarea = await screen.findByTestId("playground-arguments-textarea");
+    fireEvent.change(textarea, { target: { value: '{"topic": "first"}' } });
+    fireEvent.click(screen.getByTestId("playground-run-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("playground-tab-raw-content")).toHaveTextContent("run-1");
+    });
+
+    // Adjust the input and run again — no page reload, form value preserved
+    // up to this edit, previous result replaced (not stacked/appended).
+    fireEvent.change(textarea, { target: { value: '{"topic": "second"}' } });
+    fireEvent.click(screen.getByTestId("playground-run-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("playground-tab-raw-content")).toHaveTextContent("run-2");
+    });
+    expect(screen.getByTestId("playground-tab-raw-content")).not.toHaveTextContent("run-1");
+    expect(textarea).toHaveValue('{"topic": "second"}');
+    expect(runCount).toBe(2);
+  });
 });

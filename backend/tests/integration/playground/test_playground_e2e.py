@@ -4,7 +4,9 @@ Covers :
 - AC1/AC3 — happy path POST /playground/.../run → 200 + body shape.
 - AC2 — strict isolation : 0 agent_instances row, 0 agent_registry.agent_instance.created,
   0 tool_hub.tool.invoked. Single playground.run.completed event.
-- AC6 — 404 ghost template_id, 403 flag disabled, 422 missing variable.
+- AC6 — 404 ghost template_id, 403 flag disabled, 422 missing variable
+  (P-18 fix-batch 2026-08-31 — this docstring used to claim the 422 case
+  was covered here when only 404/403 actually were).
 - P-23 gate alignment.
 
 The LLM router is monkeypatched on ``app.state.llm_router`` to avoid
@@ -124,15 +126,23 @@ async def test_playground_run_emits_single_audit_event_zero_instance_event(
         assert resp.status_code == 200, resp.text
 
         async with seed_session_factory() as session:
-            playground_count = await session.execute(
+            playground_status = await session.execute(
                 text(
-                    "SELECT count(*) FROM outbox_events "
+                    "SELECT payload->>'status' FROM outbox_events "
                     "WHERE event_type = 'playground.run.completed' "
                     "AND payload->>'template_id' = :tid"
                 ),
                 {"tid": template_id},
             )
-            assert int(playground_count.scalar_one()) == 1
+            rows = playground_status.scalars().all()
+            # P-06 (fix-batch 2026-08-31) — the AC7 code-review demanded proof
+            # of a 200-success path with an audited `status=success` (the
+            # manual smoke capture in the story's Completion Notes only ever
+            # ran without a real ANTHROPIC_API_KEY → 503 llm_error every
+            # time). This is the programmatic equivalent : a stubbed LLM
+            # router that returns a normal completion, asserting the audit
+            # payload's status field end-to-end through the real DB.
+            assert rows == ["success"]
 
             # AC2 — no agent_registry.agent_instance.created (no instance created).
             instance_event = await session.execute(
@@ -185,6 +195,51 @@ async def test_playground_run_template_not_found_returns_404(
                     "AND payload->>'template_id' = :tid"
                 ),
                 {"tid": str(ghost_id)},
+            )
+            assert int(audit.scalar_one()) == 0
+
+
+@pytest.mark.integration
+async def test_playground_run_422_when_variable_missing_from_arguments(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """P-18 (fix-batch 2026-08-31) — AC6 : a template whose system_prompt
+    references a variable absent from ``arguments`` → 422 RFC 7807, 0 audit
+    event. Previously only unit-tested (test_service.py); this closes the
+    gap at the HTTP + DB layer the docstring already (wrongly) claimed."""
+    app = _make_app(session_factory=app_session_factory)
+    app.state.llm_router = _stub_llm_router()
+    app.state.mcp_sandbox_backend = "setrlimit"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        tpl = await _create_template(client, "playground-422-missing-var")
+        template_id = tpl["template_id"]
+        # Story 2.2 PUT — set a system_prompt referencing {topic}, then omit
+        # it from the Playground run's arguments to trigger the 422 path.
+        put_resp = await client.put(
+            f"/api/v1/agents/templates/{template_id}",
+            headers=_auth_headers(),
+            json={"system_prompt": "Summarize {topic} for the reader."},
+        )
+        assert put_resp.status_code == 200, put_resp.text
+
+        resp = await client.post(
+            f"/api/v1/playground/agents/{template_id}/run",
+            headers=_auth_headers(),
+            json={"arguments": {}},
+        )
+        assert resp.status_code == 422, resp.text
+
+        async with seed_session_factory() as session:
+            audit = await session.execute(
+                text(
+                    "SELECT count(*) FROM outbox_events "
+                    "WHERE event_type = 'playground.run.completed' "
+                    "AND payload->>'template_id' = :tid"
+                ),
+                {"tid": template_id},
             )
             assert int(audit.scalar_one()) == 0
 

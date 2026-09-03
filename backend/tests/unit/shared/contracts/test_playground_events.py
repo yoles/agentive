@@ -34,8 +34,29 @@ def test_serializes_decimal_cost_as_string() -> None:
     assert dumped["cost_estimate_usd"] == "0.000456"
 
 
+def test_accepts_cancelled_status_with_none_token_counts() -> None:
+    """IG-01 (fix-batch 2026-09-02) — ``cancelled`` is a valid status, and
+    its token counts may be ``None`` : the run was interrupted before the
+    LLM call returned a ``Completion``, so actual usage is unknown, not
+    zero."""
+    event = PlaygroundRunCompletedEvent(
+        template_id=uuid4(),
+        tools_activated=1,
+        duration_ms_total=500,
+        input_tokens=None,
+        output_tokens=None,
+        cost_estimate_usd=None,
+        model_used="claude-sonnet-4-6",
+        provider_used="",
+        status="cancelled",
+    )
+    assert event.status == "cancelled"
+    assert event.input_tokens is None
+    assert event.output_tokens is None
+
+
 def test_rejects_invalid_status() -> None:
-    """``status`` Literal enforced — only success/llm_error/tool_error."""
+    """``status`` Literal enforced — only success/llm_error/tool_error/cancelled."""
     with pytest.raises(ValidationError):
         PlaygroundRunCompletedEvent(
             template_id=uuid4(),
