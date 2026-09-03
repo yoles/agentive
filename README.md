@@ -136,6 +136,7 @@ cp .env.example .env.dev
 Les variables critiques :
 - `AGENTIVE_API_TOKEN` — token auth MVP (random 32 bytes base64)
 - `AGENTIVE_ENCRYPTION_KEY` — clé Fernet pour chiffrement at-rest
+- `AGENTIVE_ENCRYPTION_KEY_PREVIOUS` — *optionnelle*, uniquement pendant une rotation de clé : y déplacer l'ancienne clé pour que les lignes pas encore ré-chiffrées restent lisibles, puis vider après un run réussi de `backend/scripts/rotate_encryption_key.py` (procédure détaillée dans le docstring du script)
 - `POSTGRES_APP_PASSWORD`, `POSTGRES_AUDIT_ADMIN_PASSWORD`, `POSTGRES_OWNER_PASSWORD` — mots de passe des 3 rôles PG
 - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` — providers LLM (gérés in-app à terme via Epic 9 Story 9.3)
 
