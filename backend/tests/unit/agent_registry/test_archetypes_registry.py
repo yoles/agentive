@@ -46,6 +46,25 @@ def test_load_default_registry_to_template_config_skeleton() -> None:
     assert config["prompt_base"] == producteur.prompt_base
 
 
+def test_controleur_output_contract_documents_review_comment_shape() -> None:
+    """Story 2.8 AC2 — the `controleur` archetype documents the `ReviewComment`
+    shape in `output_contract.core.comments`.
+
+    Without this assertion the enriched description is protected by nothing: the
+    other registry tests only check that `output_contract` is not None, so a
+    silent revert of the YAML value would keep the whole suite green.
+    """
+    controleur = load_registry()["controleur"]
+    comments = controleur.output_contract.core["comments"]
+
+    assert isinstance(comments, str)
+    assert "ReviewComment" in comments
+    for field in ("location", "severity", "message", "suggested_fix"):
+        assert field in comments
+    for severity in ("blocking", "suggestion", "question"):
+        assert severity in comments
+
+
 def test_load_registry_missing_file_raises_runtime_error(tmp_path: Path) -> None:
     """AC1 — missing YAML file → fail-fast RuntimeError with path context."""
     missing = tmp_path / "does-not-exist.yaml"

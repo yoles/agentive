@@ -34,3 +34,22 @@ export type RunPlaygroundResponse = {
   tool_invocations: ToolInvocationLog[];
   duration_ms_total: number;
 };
+
+/**
+ * Mirror of `agentive_backend.shared.contracts.review` (Story 2.8, FR14).
+ */
+export type ReviewSeverity = "blocking" | "suggestion" | "question";
+
+export type ReviewComment = {
+  location: string;
+  severity: ReviewSeverity;
+  message: string;
+  suggested_fix?: string | null;
+};
+
+export type ControllerReviewVerdict = "pass" | "fail" | "needs_fix";
+
+export type ControllerReview = {
+  comments: ReviewComment[];
+  verdict: ControllerReviewVerdict;
+};

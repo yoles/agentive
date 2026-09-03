@@ -186,6 +186,21 @@ def test_agent_config_partial_round_trip_preserves_only_present_keys() -> None:
     assert "llm_params" not in config.to_mapping()
 
 
+@pytest.mark.parametrize("stored", [None, {}, "0.7", 0.7, []])
+def test_agent_config_llm_params_present_but_not_a_populated_mapping_is_none(
+    stored: object,
+) -> None:
+    """Story 2.8 P-02 — a present-but-empty ``llm_params`` is NOT "configured".
+
+    The key used to be detected with ``"llm_params" in raw``, so a ``null`` /
+    ``{}`` / scalar value silently produced the defaults ``(0.7, 4096)``, which
+    defeated the three-state contract of ``check_llm_diversity``.
+    """
+    config = AgentConfig.from_mapping({"llm_model": "gpt-4o", "llm_params": stored})
+    assert config.llm_params is None
+    assert "llm_params" not in config.to_mapping()
+
+
 def test_agent_config_from_empty_mapping() -> None:
     assert AgentConfig.from_mapping({}).to_mapping() == {}
     assert AgentConfig.from_mapping(None).to_mapping() == {}
