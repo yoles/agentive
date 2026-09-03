@@ -28,6 +28,15 @@ dependencies = [
     # casser le format checkpoint sans déclencher le bump de langgraph lui-même.
     "langgraph-checkpoint-postgres==3.0.5",
     "mcp>=1.27.0",
+    # Story 2.7 fix-batch (C-01, 2026-09-02) : already a transitive dep of
+    # langsmith[otel] (via langgraph) in uv.lock's graph, but NOT part of
+    # this project's resolved/installed set (`from opentelemetry import
+    # trace` raised ModuleNotFoundError before this line). Declared
+    # directly per direct usage in playground/service.py (AC2 span
+    # attribute). API-only package (no SDK/exporter) : `set_attribute` on
+    # `get_current_span()` is a safe no-op when no tracer provider is
+    # configured, so this stays inert until Story 9.x wires a real one.
+    "opentelemetry-api>=1.41.0",
     "pgvector>=0.4.2",
     "prometheus-client>=0.20",
     # ━━━ psycopg version policy (Story 1.4 / event_bus LISTEN/NOTIFY) ━━━

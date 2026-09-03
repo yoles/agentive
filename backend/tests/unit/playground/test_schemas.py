@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 from agentive_backend.features.playground.schemas import (
     RunPlaygroundRequest,
     RunPlaygroundResponse,
+    TokenUsage,
     ToolInvocationLog,
 )
 
@@ -68,3 +70,40 @@ def test_tool_invocation_log_status_literal() -> None:
             duration_ms=0,
             status="completed",  # type: ignore[arg-type]
         )
+
+
+def test_token_usage_rejects_negative_counts() -> None:
+    """P-22 — ``TokenUsage`` replaces the untyped ``dict[str, int]``;
+    negative counts (an impossible LLM response) are rejected at the type
+    boundary rather than silently accepted."""
+    with pytest.raises(ValidationError):
+        TokenUsage(input_tokens=-1, output_tokens=0)
+
+
+def test_enabled_tool_ids_max_length_enforced() -> None:
+    """P-31 — ``enabled_tool_ids`` is capped at 100 entries."""
+    RunPlaygroundRequest.model_validate({"enabled_tool_ids": [str(uuid4()) for _ in range(100)]})
+    with pytest.raises(ValidationError):
+        RunPlaygroundRequest.model_validate(
+            {"enabled_tool_ids": [str(uuid4()) for _ in range(101)]}
+        )
+
+
+def test_arguments_oversized_payload_rejected() -> None:
+    """P-32 — an ``arguments`` payload above the 64 KiB Sprint 1 cap is
+    rejected at validation, not forwarded to the LLM."""
+    huge = {"blob": "x" * 100_000}
+    with pytest.raises(ValidationError):
+        RunPlaygroundRequest.model_validate({"arguments": huge})
+    # Comfortably under the cap — still accepted.
+    RunPlaygroundRequest.model_validate({"arguments": {"topic": "small payload"}})
+
+
+@pytest.mark.parametrize("bad_timeout", [math.nan, math.inf, -math.inf])
+def test_timeout_seconds_rejects_non_finite_values(bad_timeout: float) -> None:
+    """P-39 (reviewed, not patched) — NaN/Infinity are already rejected by
+    the existing ``gt``/``le`` bounds (any comparison against NaN is False ;
+    ``inf`` fails the ``le=120.0`` upper bound). This test locks that
+    behavior in rather than adding a redundant explicit check."""
+    with pytest.raises(ValidationError):
+        RunPlaygroundRequest.model_validate({"timeout_seconds": bad_timeout})

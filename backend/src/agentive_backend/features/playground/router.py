@@ -27,7 +27,6 @@ from agentive_backend.shared.exceptions import DependencyError, ForbiddenError
 from agentive_backend.shared.repositories import (
     AgentTemplateRepo,
     AgentTemplateToolRepo,
-    ToolRepo,
 )
 
 router = APIRouter(tags=["playground"])
@@ -36,7 +35,7 @@ router = APIRouter(tags=["playground"])
 def _build_service(request: Request) -> PlaygroundService:
     """Wire the PlaygroundService from ``app.state``.
 
-    Pattern P-09 Story 2.4 CR — the 4 repos must share
+    Pattern P-09 Story 2.4 CR — both repos must share
     ``app.state.session_factory`` for atomicity. The LLMRouter is picked
     up from ``app.state.llm_router`` (built by ``app.lifespan``).
     """
@@ -54,16 +53,18 @@ def _build_service(request: Request) -> PlaygroundService:
         )
 
     template_repo = AgentTemplateRepo(session_factory=session_factory)
-    tool_repo = ToolRepo(session_factory=session_factory)
     assignment_repo = AgentTemplateToolRepo(session_factory=session_factory)
-    assert (
-        template_repo._session_factory
-        is tool_repo._session_factory
-        is assignment_repo._session_factory
-    ), "PlaygroundService wiring violation : repos must share session_factory."
+    # P-08 (fix-batch 2026-08-31) — this used to be a bare ``assert``, which
+    # ``python -O`` (common in production images) strips entirely, silently
+    # disabling the wiring check it exists for. An explicit raise survives
+    # optimization flags.
+    if template_repo._session_factory is not assignment_repo._session_factory:
+        raise DependencyError(
+            detail="PlaygroundService wiring violation: repos must share session_factory.",
+            context={"missing": ["shared_session_factory"]},
+        )
     return PlaygroundService(
         template_repo=template_repo,
-        tool_repo=tool_repo,
         assignment_repo=assignment_repo,
         llm_router=llm_router,
     )

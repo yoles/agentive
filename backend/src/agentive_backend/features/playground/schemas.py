@@ -8,11 +8,19 @@ CR — defensive against ORM/result-dict drift).
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+# P-32 (fix-batch 2026-08-31) — Sprint 1 Playground arguments are typed
+# manually into a JSON textarea (no schema-driven form builder — D76 defer
+# Story 4.x). Without a size cap, a pasted multi-MB payload becomes a
+# multi-MB LLM system message on every run. 64 KiB comfortably covers any
+# manually-authored test payload.
+_MAX_ARGUMENTS_JSON_BYTES: Final = 65_536
 
 
 class RunPlaygroundRequest(BaseModel):
@@ -30,8 +38,29 @@ class RunPlaygroundRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     arguments: dict[str, Any] = Field(default_factory=dict)
-    enabled_tool_ids: list[UUID] | None = None
+    # P-31 (fix-batch 2026-08-31) — an unbounded list here means the
+    # service's ``_count_activated_tools`` builds an unbounded diff set on
+    # every request. 100 is far above what a Sprint 1 UI (manual checkbox
+    # toggles) could realistically assign.
+    enabled_tool_ids: list[UUID] | None = Field(default=None, max_length=100)
     timeout_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
+
+    @field_validator("arguments")
+    @classmethod
+    def _bound_arguments_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """P-32 — reject an ``arguments`` payload whose JSON-serialized size
+        exceeds :data:`_MAX_ARGUMENTS_JSON_BYTES`, instead of forwarding an
+        unbounded blob straight into the LLM system message."""
+        try:
+            size = len(json.dumps(v, ensure_ascii=False).encode("utf-8"))
+        except TypeError as exc:  # pragma: no cover — Any within JSON body is already JSON-safe
+            raise ValueError("arguments must be JSON-serializable") from exc
+        if size > _MAX_ARGUMENTS_JSON_BYTES:
+            raise ValueError(
+                f"arguments JSON payload is {size} bytes, exceeding the "
+                f"{_MAX_ARGUMENTS_JSON_BYTES}-byte Sprint 1 limit"
+            )
+        return v
 
 
 class ToolInvocationLog(BaseModel):
@@ -55,6 +84,17 @@ class ToolInvocationLog(BaseModel):
     status: Literal["success", "error", "timeout"]
 
 
+class TokenUsage(BaseModel):
+    """P-22 (fix-batch 2026-08-31) — typed replacement for the untyped
+    ``tokens: dict[str, int]`` field ; same wire shape (JSON object with
+    the two keys below), so no frontend change is required."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+
+
 class RunPlaygroundResponse(BaseModel):
     """Response of ``POST .../run`` — Story 2.7 AC3.
 
@@ -70,7 +110,7 @@ class RunPlaygroundResponse(BaseModel):
     prompt_resolved: str
     raw_output: str
     parsed_output: dict[str, Any] | None
-    tokens: dict[str, int]
+    tokens: TokenUsage
     cost_estimate_usd: Decimal | None
     model_used: str
     provider_used: str
@@ -85,5 +125,6 @@ class RunPlaygroundResponse(BaseModel):
 __all__ = [
     "RunPlaygroundRequest",
     "RunPlaygroundResponse",
+    "TokenUsage",
     "ToolInvocationLog",
 ]

@@ -26,10 +26,23 @@ class PlaygroundRunCompletedEvent(BaseModel):
 
     ``status`` taxonomy :
     - ``success`` : LLM call succeeded + audit recorded.
-    - ``llm_error`` : LLM provider failed (timeout, rate limit, etc.) ;
-      service raised DependencyError 503 to caller.
+    - ``llm_error`` : LLM provider failed (timeout, rate limit, bad
+      request, or any other provider-stack exception — see
+      ``playground/service.py`` H-02) ; service raised DependencyError
+      503 to caller.
     - ``tool_error`` : Sprint 1 unused (LLM does not invoke tools
       formally yet — Story 4.x will populate).
+    - ``cancelled`` (added fix-batch 2026-09-02, IG-01) : the run was
+      interrupted (client disconnect, server shutdown) while the LLM
+      call was in flight — distinct from ``llm_error`` so a wave of
+      client disconnects does not read as a provider incident on any
+      dashboard built on this event. ``input_tokens``/``output_tokens``
+      are ``None`` on this status : the call was cut off before
+      returning a ``Completion``, so actual usage is genuinely unknown,
+      not zero. NOTE for later : this is still one coarse bucket — if
+      cancellation volume becomes operationally significant, a future
+      story could distinguish "cancelled before any provider bytes
+      sent" from "cancelled mid-stream". Not needed now.
 
     Payload constraints (P-05 Story 2.6 alignment) :
     - NO ``prompt_resolved`` (may contain secrets injected via arguments).
@@ -43,12 +56,12 @@ class PlaygroundRunCompletedEvent(BaseModel):
     template_id: UUID
     tools_activated: int = Field(ge=0)
     duration_ms_total: int = Field(ge=0)
-    input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
     cost_estimate_usd: Decimal | None = None
     model_used: str
     provider_used: str
-    status: Literal["success", "llm_error", "tool_error"]
+    status: Literal["success", "llm_error", "tool_error", "cancelled"]
     actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
     tenant_id: UUID | None = None
 
