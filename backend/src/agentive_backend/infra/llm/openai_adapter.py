@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any, ClassVar, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import SecretStr
 
 from agentive_backend.shared.llm.exceptions import (
@@ -227,6 +227,33 @@ class OpenAIProvider:
         latency_ms = (time.perf_counter() - start) * 1000.0
 
         return self._to_completion(response, model, latency_ms)
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str,
+        timeout_s: float = 30.0,
+    ) -> list[list[float]]:
+        """Embed ``texts`` via ``langchain_openai.OpenAIEmbeddings`` (Story 3.1 T1.2).
+
+        Reuses :func:`_classify_openai_exception` — same error hierarchy as
+        :meth:`complete`, so callers translate embedding failures the same
+        way (auth/rate-limit/timeout/unavailable).
+        """
+        embeddings = OpenAIEmbeddings(
+            model=model,
+            openai_api_key=self._api_key,
+            request_timeout=timeout_s,
+            max_retries=self._max_retries,
+        )
+        try:
+            return await embeddings.aembed_documents(list(texts))
+        except Exception as exc:
+            translated = _classify_openai_exception(exc)
+            if translated is None:
+                raise
+            raise translated from exc
 
     async def raw_provider_call(self, **kwargs: Any) -> Any:
         kwargs.setdefault("openai_api_key", self._api_key)

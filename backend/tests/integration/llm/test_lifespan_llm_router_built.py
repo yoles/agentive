@@ -98,3 +98,49 @@ def test_no_keys_in_production_raises(fresh_settings) -> None:
 
     with pytest.raises(RuntimeError, match="any LLM provider"):
         _build_llm_router()
+
+
+# ─────────────────────────────────────────────────────────────
+# `_build_embedder` (Story 3.1 T1.5): same decision matrix as
+# `_build_llm_router`, minus the fallback chain. Added by the Story 3.1
+# code review (P12): the function can refuse the production boot and had
+# no test at all, every suite short-circuiting it via `app.state.embedder`.
+# ─────────────────────────────────────────────────────────────
+
+
+def test_build_embedder_with_openai_key_yields_openai_provider(fresh_settings) -> None:
+    fresh_settings(
+        anthropic=None,
+        openai="sk-test-fake-key-1234567890abcdefghij123456",
+        environment="development",
+    )
+    from agentive_backend.app.lifespan import _build_embedder
+    from agentive_backend.infra.llm import OpenAIProvider
+
+    assert isinstance(_build_embedder(), OpenAIProvider)
+
+
+def test_build_embedder_without_key_in_test_env_yields_mock(fresh_settings) -> None:
+    fresh_settings(anthropic=None, openai=None, environment="test")
+    from agentive_backend.app.lifespan import _build_embedder
+    from agentive_backend.shared.llm.testing import MockEmbedder
+
+    assert isinstance(_build_embedder(), MockEmbedder)
+
+
+def test_build_embedder_without_key_in_production_raises(fresh_settings) -> None:
+    fresh_settings(anthropic=None, openai=None, environment="production")
+    from agentive_backend.app.lifespan import _build_embedder
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        _build_embedder()
+
+
+def test_build_embedder_treats_whitespace_only_key_as_missing(fresh_settings) -> None:
+    """P12: a blank secret is truthy. Before the fix the production boot
+    succeeded and every `/memory/*` request then failed 401 at runtime."""
+    fresh_settings(anthropic=None, openai="   ", environment="production")
+    from agentive_backend.app.lifespan import _build_embedder
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        _build_embedder()

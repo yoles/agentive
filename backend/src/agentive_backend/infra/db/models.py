@@ -175,6 +175,12 @@ class ChunkEmbedding(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Which `Embedder.provider_name` produced this vector ("openai", "mock",
+    # ...). Nullable/unenforced provenance trail, not a search filter — code
+    # review Story 3.1, IG3: a mock-derived vector is otherwise stored under
+    # the exact same `model` string as a real one and indistinguishable
+    # after the fact.
+    source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
 
 class Workflow(Base):

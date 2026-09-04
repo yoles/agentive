@@ -5,12 +5,12 @@ Public API
 :class:`AnthropicProvider`
     Wraps ``langchain-anthropic`` (``ChatAnthropic``).
 :class:`OpenAIProvider`
-    Wraps ``langchain-openai`` (``ChatOpenAI``) — handles the
+    Wraps ``langchain-openai`` (``ChatOpenAI`` for chat, ``OpenAIEmbeddings``
+    for :meth:`~OpenAIProvider.embed` since Story 3.1) — handles the
     ``max_tokens`` vs ``max_completion_tokens`` divergence.
 
-Embedding adapters (Voyage, FastEmbed) are added in Story 3.1 / 3.6
-when the Embedding Router is built. The chat-completion abstraction
-lives here Sprint 0.
+Further embedding adapters (Voyage, FastEmbed) and multi-provider routing
+arrive in Story 3.6 (Embedding Router hybride local/cloud).
 """
 
 from __future__ import annotations

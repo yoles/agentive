@@ -29,11 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agentive_backend.app.middleware import AuthTokenMiddleware, CorrelationIdMiddleware
 from agentive_backend.features.agent_registry import load_registry
 from agentive_backend.features.agent_registry import router as agents_router
+from agentive_backend.features.memory_manager import router as memory_router
 from agentive_backend.features.playground import router as playground_router
 from agentive_backend.features.tool_hub import router as tools_router
 from agentive_backend.shared.config import settings as _runtime_settings
 from agentive_backend.shared.correlation import get_correlation_id
 from agentive_backend.shared.exceptions import AgentiveError
+from agentive_backend.shared.llm.testing import MockEmbedder
 
 # Reuse the repositories Postgres bootstrap (testcontainer + roles + alembic).
 from tests.integration.repositories.conftest import (  # noqa: F401
@@ -70,6 +72,12 @@ def make_e2e_app(
     app.state.auth_token_hash = token
     app.state.session_factory = session_factory
     app.state.archetype_registry = load_registry()
+    # Story 3.1 — default to the deterministic mock so memory_manager
+    # e2e tests don't need a real OPENAI_API_KEY. Tests that want to
+    # assert on embedder call kwargs override ``app.state.embedder``
+    # after building the app (same pattern as ``app.state.llm_router``
+    # in the playground e2e suite).
+    app.state.embedder = MockEmbedder()
 
     app.add_middleware(AuthTokenMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
@@ -80,6 +88,8 @@ def make_e2e_app(
     # Story 2.7 — m7 playground router (cross-feature : Playground tests
     # need template + tools + LLM router wired in app.state).
     app.include_router(playground_router, prefix="/api/v1")
+    # Story 3.1 — m4 memory_manager router.
+    app.include_router(memory_router, prefix="/api/v1")
 
     @app.exception_handler(AgentiveError)
     async def _handle_agentive_error(  # pragma: no cover — verbatim of app.main handler

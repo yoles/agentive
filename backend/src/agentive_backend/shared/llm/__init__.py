@@ -26,6 +26,7 @@ Direct imports of ``langchain-anthropic`` / ``langchain-openai`` from
 from __future__ import annotations
 
 from agentive_backend.shared.llm.config import AgentLLMConfig
+from agentive_backend.shared.llm.embedder import Embedder
 from agentive_backend.shared.llm.error_classifier import ErrorClass, classify_error
 from agentive_backend.shared.llm.exceptions import (
     LLMAllProvidersFailedError,
@@ -64,6 +65,7 @@ __all__ = [
     "ChatRole",
     "Completer",
     "Completion",
+    "Embedder",
     "ErrorClass",
     "FallbackCallback",
     "FallbackContext",

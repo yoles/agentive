@@ -36,6 +36,19 @@ class NamespaceRepo(BaseRepo):
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
 
+    async def require_by_name(self, name: str, *, tenant_id: UUID | None = None) -> Namespace:
+        """Fetch by name or raise :class:`NotFoundError` (lookup-or-404, audit A-07).
+
+        Story 3.1 AC1/AC2 — namespace creation is Story 3.2 (no implicit
+        creation here); an unknown ``name`` is a 404, not an auto-provision.
+        """
+        return self._require_found(
+            await self.get_by_name(name, tenant_id=tenant_id),
+            label="Namespace",
+            entity_id=name,
+            context_key="namespace",
+        )
+
     async def list_by_type(
         self,
         ns_type: NamespaceType,

@@ -208,12 +208,14 @@ def create_app() -> FastAPI:
 
     # ─── API versioned router — Story 2.1+ ────────────────────────────────
     from agentive_backend.features.agent_registry import router as agents_router
+    from agentive_backend.features.memory_manager import router as memory_router
     from agentive_backend.features.playground import router as playground_router
     from agentive_backend.features.tool_hub import router as tools_router
 
     app.include_router(agents_router, prefix="/api/v1")
     app.include_router(tools_router, prefix="/api/v1")
     app.include_router(playground_router, prefix="/api/v1")
+    app.include_router(memory_router, prefix="/api/v1")
 
     return app
 
