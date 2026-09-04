@@ -24,8 +24,14 @@ from agentive_backend.shared.contracts.events import (
 )
 from agentive_backend.shared.correlation import _correlation_id_var, new_correlation_id
 from agentive_backend.shared.event_bus import OutboxWorker, publish_and_commit
-from agentive_backend.shared.llm import Completion, FallbackCallback, FallbackContext, LLMRouter
-from agentive_backend.shared.llm.testing import MockProvider
+from agentive_backend.shared.llm import (
+    Completion,
+    Embedder,
+    FallbackCallback,
+    FallbackContext,
+    LLMRouter,
+)
+from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -228,6 +234,37 @@ def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRout
     )
 
 
+def _build_embedder() -> Embedder:
+    """Build the singleton :class:`Embedder` for the process (Story 3.1 T1.5).
+
+    Single-provider, no fallback chain (T1.3 anti-scope — Story 3.6
+    Embedding Router owns multi-provider routing). Mirrors
+    :func:`_build_llm_router`'s "never boot in production without a key,
+    fall back to a mock in dev/test" decision — just without the chain.
+    """
+    # `.strip()`: a whitespace-only secret is truthy, and used to let the
+    # production boot succeed with a key that fails 401 on every request
+    # instead of refusing to start. The `is None` / falsy test also narrows
+    # for mypy, replacing an `assert` that `python -O` would have erased
+    # (code review Story 3.1, P12).
+    openai_key = settings.openai_api_key
+    if openai_key is None or not openai_key.get_secret_value().strip():
+        if settings.is_production:
+            raise RuntimeError(
+                "Refusing to boot in production without OPENAI_API_KEY — "
+                "the memory manager embedding backend requires it."
+            )
+        log.warning(
+            "embedder.built_with_mock",
+            reason="no_openai_api_key_configured",
+            environment=settings.environment,
+        )
+        return MockEmbedder()
+
+    log.info("embedder.built", provider="openai", environment=settings.environment)
+    return OpenAIProvider(api_key=openai_key)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan : logging config, event-bus worker, lifecycle events."""
@@ -332,6 +369,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # would silently no-op the fallback event.
     llm_router = _build_llm_router(on_fallback=_publish_fallback)
     app.state.llm_router = llm_router
+
+    # Story 3.1 T1.5 — memory manager embedding backend, wired once at boot
+    # (same lifetime as llm_router).
+    app.state.embedder = _build_embedder()
 
     # Background tasks need an explicit correlation_id — there is no HTTP
     # request to inherit from, so the middleware never runs at startup.

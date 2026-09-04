@@ -215,6 +215,42 @@ async def test_complete_passes_max_completion_tokens_for_gpt5() -> None:
 
 
 @pytest.mark.asyncio
+async def test_embed_returns_vectors_in_input_order() -> None:
+    """Story 3.1 T1.2 — ``embed()`` delegates to ``OpenAIEmbeddings.aembed_documents``."""
+    provider = OpenAIProvider(api_key="sk-fake-key-only-1234567890abcdefghijklmn")
+
+    with patch("agentive_backend.infra.llm.openai_adapter.OpenAIEmbeddings") as embeddings_cls:
+        embeddings_cls.return_value.aembed_documents = AsyncMock(
+            return_value=[[0.1, 0.2], [0.3, 0.4]]
+        )
+        vectors = await provider.embed(["a", "b"], model="text-embedding-3-small")
+
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    embeddings_cls.assert_called_once()
+    call_kwargs = embeddings_cls.call_args.kwargs
+    assert call_kwargs["model"] == "text-embedding-3-small"
+    embeddings_cls.return_value.aembed_documents.assert_awaited_once_with(["a", "b"])
+
+
+@pytest.mark.asyncio
+async def test_embed_translates_openai_exceptions() -> None:
+    import httpx
+
+    provider = OpenAIProvider(api_key="sk-fake-test-only-not-real-1234567890abcdefghij")
+
+    with patch("agentive_backend.infra.llm.openai_adapter.OpenAIEmbeddings") as embeddings_cls:
+        embeddings_cls.return_value.aembed_documents = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "rate",
+                request=httpx.Request("POST", "http://localhost/"),
+                response=httpx.Response(429),
+            )
+        )
+        with pytest.raises(LLMProviderRateLimitError):
+            await provider.embed(["a"], model="text-embedding-3-small")
+
+
+@pytest.mark.asyncio
 async def test_complete_passes_max_tokens_for_legacy_gpt() -> None:
     from langchain_core.messages import AIMessage as _AI
 

@@ -1,6 +1,17 @@
-"""Memory Manager — Epic M4.
+"""Memory Manager — Epic M4 (Story 3.1+).
 
-**Stub Sprint 0** — feature module placeholder. Implementation arrives in the
-matching story. Present only so `import-linter` can verify the feature
-isolation contract declared in `.import-linter`.
+Story 3.1 — chunk storage + vector search (pgvector HNSW). Isolation
+(RLS département), archivage, decay temporel, Push Memory et purge/routing
+d'embedding arrivent Stories 3.2-3.6.
+
+Public surface:
+    - :data:`router` — FastAPI APIRouter for ``/api/v1/memory/*``.
+    - :class:`MemoryManagerService` — orchestrate chunk storage + ANN search.
 """
+
+from __future__ import annotations
+
+from agentive_backend.features.memory_manager.router import router
+from agentive_backend.features.memory_manager.service import MemoryManagerService
+
+__all__ = ["MemoryManagerService", "router"]

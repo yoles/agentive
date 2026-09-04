@@ -210,8 +210,9 @@ test-backend: ## Exécute les tests Python (parité CI : --network host + docker
 	  uv run pytest
 
 .PHONY: lint-backend
-lint-backend: ## Lint + format check Python (ruff + mypy)
+lint-backend: ## Lint + format check Python (ruff + mypy + import-linter, parité CI)
 	$(DC_DEV) run --rm backend sh -c "uv run ruff check . && uv run ruff format --check . && uv run mypy src/"
+	$(DC_DEV) run --rm -v $(CURDIR)/.import-linter:/.import-linter:ro backend uv run lint-imports --config /.import-linter
 
 .PHONY: format-backend
 format-backend: ## Format Python (ruff format)
