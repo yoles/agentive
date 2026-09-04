@@ -116,6 +116,9 @@ describe("OutputInspector", () => {
     fireEvent.click(screen.getByTestId("playground-tab-parsed"));
     // P-21 — the raw output MAY be valid JSON that just isn't an object
     // (array/scalar); the copy must not claim it is invalid JSON.
+    expect(screen.getByTestId("playground-tab-parsed-content")).toHaveTextContent(
+      "l'output brut n'est pas un objet JSON (JSON invalide, ou un tableau / une valeur scalaire au lieu d'un objet)",
+    );
     expect(screen.getByTestId("playground-tab-parsed-content")).not.toHaveTextContent(
       "n'est pas un objet JSON valide",
     );
