@@ -72,7 +72,7 @@ def verify_token(raw: str, stored: str) -> bool:
     if _BCRYPT_PREFIX_RE.match(stored):
         try:
             return bcrypt.checkpw(raw.encode(), stored.encode())
-        except (ValueError, TypeError):  # malformed hash, wrong version prefix, etc.
+        except ValueError, TypeError:  # malformed hash, wrong version prefix, etc.
             return False
     # Plaintext fallback — constant-time to prevent timing attacks even in
     # dev mode.

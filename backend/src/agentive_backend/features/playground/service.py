@@ -148,7 +148,7 @@ def _best_effort_json(raw_output: str) -> dict[str, Any] | None:
     ``None`` on any parse failure or a non-object payload."""
     try:
         candidate = json.loads(raw_output)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except json.JSONDecodeError, TypeError, ValueError:
         return None
     return candidate if isinstance(candidate, dict) else None
 

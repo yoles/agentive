@@ -451,7 +451,7 @@ def load_ground_truth(cfg: BenchConfig) -> list[list[str]] | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError, OSError:
         return None
     # Format pré-P4 (liste plate) ou format invalide → invalider.
     if not isinstance(payload, dict) or "metadata" not in payload or "truth" not in payload:
