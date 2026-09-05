@@ -17,6 +17,10 @@ from agentive_backend.shared.repositories.base import BaseRepo
 # get static-type leverage instead of relying on the DB to fail at runtime.
 NamespaceType = Literal["client", "metier", "operationnelle", "contextuelle"]
 
+# `NamespaceRepo.list_all`'s default `limit` — see its docstring (code
+# review Story 3.2, BS3).
+NAMESPACE_LISTING_SAFETY_CAP = 10_000
+
 
 class NamespaceRepo(BaseRepo):
     """Public API surface for Namespace. ALL DB access must go through this class.
@@ -64,12 +68,24 @@ class NamespaceRepo(BaseRepo):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def list_all(self, *, tenant_id: UUID | None = None, limit: int = 500) -> list[Namespace]:
+    async def list_all(
+        self, *, tenant_id: UUID | None = None, limit: int = NAMESPACE_LISTING_SAFETY_CAP
+    ) -> list[Namespace]:
         """All namespaces, no ``type``/``department`` filter (Story 3.2 AC3).
 
         Admin listing for ``Config > Namespaces`` — John (owner) needs to see
         every namespace to administer the memory system, unlike the
         department-scoped read/write path in ``MemoryManagerService``.
+
+        ``limit`` used to default to 500 with no pagination and no signal
+        when the cap was hit, silently contradicting AC3's "retourne tous
+        les namespaces" (code review Story 3.2, BS3). Unlike
+        ``memory_chunks``, namespaces are only ever created by an admin
+        through ``POST /memory/namespaces`` — there is no user-facing or
+        automated path that grows this table, so a generous cap is a safety
+        net against a runaway caller, not a real ceiling. The caller
+        (``MemoryManagerService.list_namespaces``) logs a warning if this
+        cap is ever actually hit, so a truncation is never silent.
 
         Ordered (``created_at``, ``id``) so row order is stable across
         refetches — Postgres makes no ordering guarantee on an unordered

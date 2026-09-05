@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -44,23 +44,32 @@ class MemoryChunkRepo(BaseRepo):
         namespace_ids: Sequence[UUID],
         *,
         tenant_id: UUID | None = None,
+        now: datetime | None = None,
     ) -> dict[UUID, int]:
-        """Live (non-archived) chunk count per namespace — Story 3.2 AC3.
+        """Live (non-archived, non-expired) chunk count per namespace — Story 3.2 AC3.
 
         ONE grouped query for N namespaces, not an N+1 loop (perf pattern
         scrutinized in Story 3.1 code review, BS1/BS2). A namespace with zero
         live chunks is simply absent from the returned dict — callers must
-        ``.get(namespace_id, 0)``, mirrored by the analogous `archived_at IS
-        NULL` filter already applied in ``ChunkEmbeddingRepo.search_ann``.
+        ``.get(namespace_id, 0)``.
+
+        Filters both ``archived_at`` AND ``expires_at`` — the same pair
+        ``ChunkEmbeddingRepo.search_ann`` applies. AC3 states this count is
+        "cohérent avec le filtre déjà appliqué par search_ann"; until Story
+        3.3's archival job runs, an expired-but-not-yet-archived chunk is
+        still searchable-looking here otherwise, over-counting what a
+        search would actually return (code review Story 3.2, BS2).
         """
         if not namespace_ids:
             return {}
+        now = now if now is not None else datetime.now(UTC)
         async with self.with_tenant(tenant_id) as session:
             stmt = (
                 select(MemoryChunk.namespace_id, func.count())
                 .where(
                     MemoryChunk.namespace_id.in_(namespace_ids),
                     MemoryChunk.archived_at.is_(None),
+                    (MemoryChunk.expires_at.is_(None)) | (MemoryChunk.expires_at > now),
                 )
                 .group_by(MemoryChunk.namespace_id)
             )

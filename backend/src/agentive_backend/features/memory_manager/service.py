@@ -58,7 +58,10 @@ from agentive_backend.shared.exceptions import (
     ValidationError,
 )
 from agentive_backend.shared.logging import get_logger
-from agentive_backend.shared.repositories.namespace_repo import NamespaceType
+from agentive_backend.shared.repositories.namespace_repo import (
+    NAMESPACE_LISTING_SAFETY_CAP,
+    NamespaceType,
+)
 
 if TYPE_CHECKING:
     from agentive_backend.infra.db.models import Namespace
@@ -399,6 +402,16 @@ class MemoryManagerService:
         frontend presentation detail, not part of this contract.
         """
         namespaces = await self._namespace_repo.list_all(tenant_id=tenant_id)
+        if len(namespaces) >= NAMESPACE_LISTING_SAFETY_CAP:
+            # AC3 promises "tous les namespaces" — the repo's cap is a
+            # safety net, not a real ceiling (see its docstring), so
+            # hitting it exactly is unexpected enough to warrant a signal
+            # rather than a silently truncated response (code review Story
+            # 3.2, BS3).
+            _log.warning(
+                "memory_manager.namespace_listing_hit_safety_cap",
+                cap=NAMESPACE_LISTING_SAFETY_CAP,
+            )
         counts = await self._memory_chunk_repo.count_by_namespace_ids(
             [ns.id for ns in namespaces], tenant_id=tenant_id
         )
