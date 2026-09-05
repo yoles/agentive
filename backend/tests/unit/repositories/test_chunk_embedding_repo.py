@@ -186,6 +186,48 @@ async def test_search_ann_rejects_out_of_range_ef_search(bad_ef_search: int) -> 
 
 
 @pytest.mark.asyncio
+async def test_search_ann_include_archived_lifts_both_archived_and_expired_filters() -> None:
+    """Story 3.3 AC2 — `include_archived=True` must drop BOTH filters, not
+    just `archived_at IS NULL`. Otherwise an expired-but-not-yet-archived
+    chunk (the window before the worker's next daily pass) stays invisible
+    even with the flag set — defeating its stated "recover for audit"
+    purpose (this story's Dev Notes § `include_archived`)."""
+    factory, session = make_session_factory_mock()
+    session.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+    repo = ChunkEmbeddingRepo(session_factory=factory)
+
+    await repo.search_ann(
+        [0.1],
+        model="text-embedding-3-small",
+        namespace_id=uuid4(),
+        top_k=5,
+        include_archived=True,
+    )
+
+    select_sql = str(session.execute.await_args_list[2].args[0]).lower()
+    assert "memory_chunks.archived_at is null" not in select_sql
+    assert "memory_chunks.expires_at is null" not in select_sql
+    # The join/model/namespace filters must still be present.
+    assert "chunk_embeddings.model = " in select_sql
+    assert "memory_chunks.namespace_id = " in select_sql
+
+
+@pytest.mark.asyncio
+async def test_search_ann_include_archived_defaults_to_false() -> None:
+    """Regression guard for the default — omitting the kwarg must keep the
+    original Story 3.1 filtering behaviour."""
+    factory, session = make_session_factory_mock()
+    session.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+    repo = ChunkEmbeddingRepo(session_factory=factory)
+
+    await repo.search_ann([0.1], model="text-embedding-3-small", namespace_id=uuid4(), top_k=5)
+
+    select_sql = str(session.execute.await_args_list[2].args[0]).lower()
+    assert "memory_chunks.archived_at is null" in select_sql
+    assert "memory_chunks.expires_at is null" in select_sql
+
+
+@pytest.mark.asyncio
 async def test_search_ann_maps_rows_to_score() -> None:
     factory, session = make_session_factory_mock()
     chunk = MagicMock()

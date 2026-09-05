@@ -18,6 +18,7 @@ from agentive_backend.features.memory_manager.schemas import (
     CreateMemoryChunkRequest,
     CreateNamespaceRequest,
     RetentionPolicyOverride,
+    SearchMemoryRequest,
 )
 
 
@@ -176,3 +177,16 @@ def test_create_namespace_accepts_omitted_department_and_project() -> None:
     req = CreateNamespaceRequest(name="ns", type="client")  # type: ignore[arg-type]
     assert req.department is None
     assert req.project is None
+
+
+# ─── SearchMemoryRequest.include_archived (Story 3.3 AC2) ──────────
+
+
+def test_search_memory_include_archived_defaults_to_false() -> None:
+    req = SearchMemoryRequest(q="hello", namespace="ns")
+    assert req.include_archived is False
+
+
+def test_search_memory_accepts_explicit_include_archived_true() -> None:
+    req = SearchMemoryRequest(q="hello", namespace="ns", include_archived=True)
+    assert req.include_archived is True

@@ -24,6 +24,7 @@ from agentive_backend.shared.contracts.events.agent_events import (
 )
 from agentive_backend.shared.contracts.events.health_events import HealthCheckEvent
 from agentive_backend.shared.contracts.events.memory_events import (
+    MemoryChunkArchivedEvent,
     NamespaceAccessDeniedEvent,
     NamespaceCreatedEvent,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "AgentTemplateToolUnassignedEvent",
     "AgentTemplateUpdatedEvent",
     "HealthCheckEvent",
+    "MemoryChunkArchivedEvent",
     "NamespaceAccessDeniedEvent",
     "NamespaceCreatedEvent",
     "PlaygroundRunCompletedEvent",

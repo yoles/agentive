@@ -104,6 +104,11 @@ class SearchMemoryRequest(BaseModel):
     q: str = Field(min_length=1, max_length=CONTENT_MAX_CHARS)
     namespace: str = Field(min_length=1, max_length=255)
     top_k: int = Field(default=5, ge=1, le=50)
+    # Story 3.3 AC2 — lifts BOTH the `archived_at` and `expires_at` filters
+    # for audit recovery (see `ChunkEmbeddingRepo.search_ann` docstring).
+    # A body field, not a query param, for the same URL-hygiene reason as
+    # `q`/`namespace` above.
+    include_archived: bool = Field(default=False)
 
     @field_validator("q", "namespace", mode="after")
     @classmethod
@@ -228,6 +233,9 @@ class MemorySearchResultView(BaseModel):
     score: float
     namespace: str
     created_at: datetime
+    # Story 3.3 AC2 — lets a caller distinguish a "live" result from one
+    # only surfaced because `include_archived=true` was set.
+    archived_at: datetime | None = None
 
 
 __all__ = [

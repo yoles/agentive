@@ -8,6 +8,8 @@ Naming convention follows the ``module.entity.action`` pattern (cf.
 * ``memory_manager.namespace.access_denied`` — Story 3.2, emitted when a
   caller's declared ``X-Acting-Department`` differs from the target
   namespace's ``department`` (AC2).
+* ``memory_manager.chunk.archived`` — Story 3.3, emitted after
+  ``MemoryArchivalWorker`` durably sets a chunk's ``archived_at`` (AC1/AC3).
 
 Filled in by Story 3.2 — this file was a placeholder left by Story 3.1
 ("Filled by Epic 3 stories").
@@ -58,4 +60,26 @@ class NamespaceAccessDeniedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
-__all__ = ["NamespaceAccessDeniedEvent", "NamespaceCreatedEvent"]
+class MemoryChunkArchivedEvent(BaseModel):
+    """Published after ``MemoryArchivalWorker`` durably archives a chunk
+    (Story 3.3 AC1/AC3), in the same transaction as the ``archived_at``
+    UPDATE (mirror atomicity ``MemoryManagerService.create_namespace``).
+
+    ``reason`` is a ``Literal`` (not a ``bool``) on purpose — Story 3.6 will
+    very likely reuse ``mark_archived``/this event for its manual-purge
+    soft-delete, adding a third reason (cf. this story's Dev Notes §
+    Project Context Reference); keeping it open avoids a breaking change
+    later.
+    """
+
+    event_type: ClassVar[str] = "memory_manager.chunk.archived"
+
+    chunk_id: UUID
+    namespace_id: UUID
+    namespace: str = Field(min_length=1, max_length=255)
+    reason: Literal["ttl_expired", "archive_after_seconds"]
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+__all__ = ["MemoryChunkArchivedEvent", "NamespaceAccessDeniedEvent", "NamespaceCreatedEvent"]

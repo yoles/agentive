@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from agentive_backend.shared.contracts.events import (
+    MemoryChunkArchivedEvent,
     NamespaceAccessDeniedEvent,
     NamespaceCreatedEvent,
 )
@@ -61,4 +62,48 @@ def test_namespace_access_denied_rejects_invalid_operation() -> None:
             namespace_department="Dev",
             acting_department="Design-UX",
             operation="delete",  # type: ignore[arg-type]  # NOT in Literal
+        )
+
+
+# ─── MemoryChunkArchivedEvent (Story 3.3 T3.1) ─────────────────────
+
+
+def test_memory_chunk_archived_event_type_constant() -> None:
+    assert MemoryChunkArchivedEvent.event_type == "memory_manager.chunk.archived"
+
+
+def test_memory_chunk_archived_serializes_with_required_fields() -> None:
+    event = MemoryChunkArchivedEvent(
+        chunk_id=uuid4(),
+        namespace_id=uuid4(),
+        namespace="dev-notes",
+        reason="ttl_expired",
+    )
+    dumped = event.model_dump()
+    assert dumped["namespace"] == "dev-notes"
+    assert dumped["reason"] == "ttl_expired"
+    assert dumped["actor"] == "system"  # D1 default
+    assert dumped["tenant_id"] is None
+
+
+def test_memory_chunk_archived_accepts_archive_after_seconds_reason() -> None:
+    """AC3's secondary path — kept a `Literal`, not a `bool`, so a future
+    story (3.6 manual purge) can add a third reason without a breaking
+    change (this story's Dev Notes § Project Context Reference)."""
+    event = MemoryChunkArchivedEvent(
+        chunk_id=uuid4(),
+        namespace_id=uuid4(),
+        namespace="dev-notes",
+        reason="archive_after_seconds",
+    )
+    assert event.reason == "archive_after_seconds"
+
+
+def test_memory_chunk_archived_rejects_invalid_reason() -> None:
+    with pytest.raises(ValidationError):
+        MemoryChunkArchivedEvent(
+            chunk_id=uuid4(),
+            namespace_id=uuid4(),
+            namespace="dev-notes",
+            reason="manual_purge",  # type: ignore[arg-type]  # NOT in Literal (yet — 3.6)
         )

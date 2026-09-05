@@ -270,8 +270,14 @@ class MemoryManagerService:
         top_k: int,
         tenant_id: UUID | None = None,
         acting_department: str | None = None,
+        include_archived: bool = False,
     ) -> list[MemorySearchResultView]:
-        """ANN search over a namespace's chunks — Story 3.1 AC2.
+        """ANN search over a namespace's chunks — Story 3.1 AC2, 3.3 AC2.
+
+        ``include_archived`` (Story 3.3 AC2) lifts both the ``archived_at``
+        and ``expires_at`` filters for audit recovery — see
+        :meth:`ChunkEmbeddingRepo.search_ann`'s docstring for the exact
+        scope.
 
         Raises
         ------
@@ -299,6 +305,7 @@ class MemoryManagerService:
             top_k=top_k,
             tenant_id=tenant_id,
             now=datetime.now(UTC),
+            include_archived=include_archived,
         )
 
         _log.info(
@@ -316,6 +323,7 @@ class MemoryManagerService:
                 score=score,
                 namespace=namespace_name,
                 created_at=chunk.created_at,
+                archived_at=chunk.archived_at,
             )
             for chunk, score in rows
         ]

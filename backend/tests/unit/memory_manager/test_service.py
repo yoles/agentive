@@ -59,12 +59,14 @@ def _make_chunk(
     content: str = "hello",
     ttl_seconds: int | None = None,
     expires_at: datetime | None = None,
+    archived_at: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
         content=content,
         ttl_seconds=ttl_seconds,
         expires_at=expires_at,
+        archived_at=archived_at,
         created_at=datetime.now(UTC),
     )
 
@@ -213,6 +215,38 @@ async def test_search_maps_repo_rows_to_dto() -> None:
     assert search_kwargs["model"] == EMBEDDING_MODEL
     assert search_kwargs["namespace_id"] == namespace.id
     assert search_kwargs["top_k"] == 5
+    assert search_kwargs["include_archived"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_passes_include_archived_through_to_search_ann() -> None:
+    """Story 3.3 AC2."""
+    namespace = _make_namespace()
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5, include_archived=True)
+
+    assert embedding_repo.search_ann.await_args.kwargs["include_archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_result_exposes_archived_at() -> None:
+    """Story 3.3 AC2 — lets a caller distinguish a live hit from one only
+    surfaced because `include_archived=true` was set."""
+    namespace = _make_namespace()
+    archived_at = datetime.now(UTC)
+    chunk = _make_chunk(content="stale", archived_at=archived_at)
+    service, _ns_repo, _chunk_repo, _embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(chunk, 0.4)]
+    )
+
+    results = await service.search(
+        namespace_name=namespace.name, query="q", top_k=5, include_archived=True
+    )
+
+    assert results[0].archived_at == archived_at
 
 
 @pytest.mark.asyncio
@@ -750,7 +784,8 @@ async def test_list_namespaces_tolerates_non_int_ttl() -> None:
     accepts it (`True` -> `1`), so it never raises here.
     """
     ns_bad = _make_namespace(
-        name="legacy-float", retention_policy={"default_ttl_seconds": 1.5}  # type: ignore[arg-type]
+        name="legacy-float",
+        retention_policy={"default_ttl_seconds": 1.5},  # type: ignore[arg-type]
     )
     namespace_repo = AsyncMock()
     namespace_repo.list_all = AsyncMock(return_value=[ns_bad])
