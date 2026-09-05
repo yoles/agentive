@@ -72,7 +72,7 @@ def _derive_fernet(key_material: bytes) -> Fernet:
     """
     try:
         return Fernet(key_material)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         derived = base64.urlsafe_b64encode(hashlib.sha256(key_material).digest())
         return Fernet(derived)
 

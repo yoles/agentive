@@ -64,7 +64,7 @@ def _parse_incoming_correlation_id(raw: str | None) -> str | None:
     try:
         # uuid.UUID rejects control chars, CR/LF, and any non-hex noise.
         return str(uuid.UUID(raw))
-    except (ValueError, AttributeError, TypeError):
+    except ValueError, AttributeError, TypeError:
         return None
 
 

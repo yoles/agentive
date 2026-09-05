@@ -113,12 +113,21 @@ async def discover_tools(
         bodies via Pydantic before reaching this point).
     """
     try:
-        return await asyncio.wait_for(
-            _discover_inner(transport=transport, connection_config=connection_config),
-            timeout=timeout,
-        )
+        async with asyncio.timeout(timeout) as cm:
+            return await _discover_inner(transport=transport, connection_config=connection_config)
     except TimeoutError as exc:
         raise MCPDiscoveryTimeoutError(timeout=timeout) from exc
+    except BaseExceptionGroup:
+        # Under the setrlimit sandbox fallback, cancelling at the deadline
+        # can race the stdio_client teardown: its background reader task
+        # tries to push a message after the read stream is already closed,
+        # raising anyio.BrokenResourceError instead of propagating our
+        # CancelledError — so asyncio.timeout can't convert it to
+        # TimeoutError on its own. cm.expired() still reports the deadline
+        # was hit regardless of which exception won that race.
+        if cm.expired():
+            raise MCPDiscoveryTimeoutError(timeout=timeout) from None
+        raise
 
 
 async def _discover_inner(
@@ -259,19 +268,28 @@ async def call_tool(
         the requested transport).
     """
     try:
-        return await asyncio.wait_for(
-            _call_tool_inner(
+        async with asyncio.timeout(timeout) as cm:
+            return await _call_tool_inner(
                 transport=transport,
                 connection_config=connection_config,
                 tool_name=tool_name,
                 arguments=arguments,
                 profile=profile,
                 backend=backend,
-            ),
-            timeout=timeout,
-        )
+            )
     except TimeoutError as exc:
         raise MCPExecutionTimeoutError(timeout=timeout) from exc
+    except BaseExceptionGroup:
+        # Same teardown race as discover_tools (see comment there): under
+        # the setrlimit fallback, the stdio_client's background reader can
+        # lose a race against our cancellation and raise
+        # anyio.BrokenResourceError, which _reraise_domain_error_from_group
+        # doesn't recognize as a domain error and re-raises as-is. Use
+        # cm.expired() to still detect this was a timeout, not a genuine
+        # protocol/connection failure.
+        if cm.expired():
+            raise MCPExecutionTimeoutError(timeout=timeout) from None
+        raise
 
 
 async def _call_tool_inner(
