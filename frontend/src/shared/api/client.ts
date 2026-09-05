@@ -5,9 +5,11 @@
  * - All API calls are RELATIVE (`/api/v1/...`) and routed through Caddy
  *   (same-origin on :8443 dev, :443 prod). No CORS, no Authorization header
  *   baked into the bundle.
- * - Story 1.7 will introduce session cookies (HTTP-only, Secure, SameSite=Lax).
- *   This client already sends `credentials: "include"` so cookies flow
- *   automatically once the backend sets them.
+ * - Story 1.7 uses one static Bearer token for the single-user MVP. The
+ *   plaintext token is entered at runtime and kept only in this module's
+ *   memory; it is never persisted or embedded in the Vite bundle.
+ * - `credentials: "include"` remains ready for the HTTP-only session cookie
+ *   flow planned for Growth.
  *
  * Critical : NEVER read `import.meta.env.VITE_*` for secrets — Vite inlines
  * them into the client bundle, making any secret PUBLIC. Any auth value must
@@ -18,6 +20,23 @@
  *  the frontend is genuinely talking to a different origin during dev (rare). */
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.trim() || "";
+
+let apiToken: string | null = null;
+
+/** Configure the single-user MVP token for this browser tab. */
+export function setApiToken(token: string): void {
+  const trimmed = token.trim();
+  apiToken = trimmed.length > 0 ? trimmed : null;
+}
+
+/** Forget the in-memory token, primarily for logout and isolated tests. */
+export function clearApiToken(): void {
+  apiToken = null;
+}
+
+export function isApiTokenConfigured(): boolean {
+  return apiToken !== null;
+}
 
 export type ApiError = {
   type: string;
@@ -64,6 +83,9 @@ export async function apiFetch<T>(
   }
   if (!headers.has("Accept")) {
     headers.set("Accept", "application/json");
+  }
+  if (!headers.has("Authorization") && apiToken !== null) {
+    headers.set("Authorization", `Bearer ${apiToken}`);
   }
 
   let response: Response;

@@ -16,10 +16,11 @@ import type {
  * `staleTime: Infinity` because the registry is loaded once at backend
  * lifespan and does not change at runtime.
  */
-export function useArchetypes() {
+export function useArchetypes(enabled = true) {
   return useQuery<ArchetypeSummary[]>({
     queryKey: ["archetypes"],
     queryFn: listArchetypes,
+    enabled,
     staleTime: Number.POSITIVE_INFINITY,
   });
 }

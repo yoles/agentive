@@ -20,7 +20,11 @@ import {
 } from "@/features/agent_registry";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
-import type { ApiError } from "@/shared/api/client";
+import {
+  isApiTokenConfigured,
+  setApiToken,
+  type ApiError,
+} from "@/shared/api/client";
 
 export const Route = createFileRoute("/config/agents/new")({
   component: NewAgentTemplatePage,
@@ -32,9 +36,13 @@ export function NewAgentTemplatePage() {
   const navigate = useNavigate();
   const [archetypeId, setArchetypeId] = useState<string | null>(null);
   const [name, setName] = useState<string>("");
+  const [tokenInput, setTokenInput] = useState("");
+  const [authConfigured, setAuthConfigured] = useState(isApiTokenConfigured);
 
-  const archetypesQuery = useArchetypes();
+  const archetypesQuery = useArchetypes(authConfigured);
   const createMutation = useCreateTemplate();
+  const queryError = archetypesQuery.error as Partial<ApiError> | null;
+  const needsToken = !authConfigured || queryError?.status === 401;
 
   const trimmedName = name.trim();
   const submitDisabled =
@@ -82,6 +90,20 @@ export function NewAgentTemplatePage() {
     }
   }
 
+  function handleTokenSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const token = tokenInput.trim();
+    if (token.length === 0) return;
+
+    setApiToken(token);
+    setTokenInput("");
+    if (authConfigured) {
+      void archetypesQuery.refetch();
+    } else {
+      setAuthConfigured(true);
+    }
+  }
+
   return (
     <section
       aria-labelledby="new-agent-heading"
@@ -100,10 +122,45 @@ export function NewAgentTemplatePage() {
         </p>
       </header>
 
-      {archetypesQuery.isLoading && (
+      {needsToken && (
+        <form
+          onSubmit={handleTokenSubmit}
+          className="max-w-lg rounded-lg border border-border bg-card p-5"
+        >
+          <h2 className="text-base font-semibold">Connexion à l'API</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Saisissez le jeton Bearer du MVP. Il reste uniquement en mémoire
+            dans cet onglet et sera oublié au rechargement.
+          </p>
+          <div className="mt-4 flex gap-2">
+            <label htmlFor="api-token" className="sr-only">
+              Jeton API
+            </label>
+            <Input
+              id="api-token"
+              type="password"
+              value={tokenInput}
+              onChange={(event) => setTokenInput(event.target.value)}
+              placeholder="Jeton API"
+              autoComplete="off"
+              aria-invalid={queryError?.status === 401}
+            />
+            <Button type="submit" disabled={tokenInput.trim().length === 0}>
+              Se connecter
+            </Button>
+          </div>
+          {queryError?.status === 401 && (
+            <p className="mt-2 text-sm text-destructive">
+              Jeton refusé. Vérifiez sa valeur puis réessayez.
+            </p>
+          )}
+        </form>
+      )}
+
+      {authConfigured && !needsToken && archetypesQuery.isLoading && (
         <p className="text-sm text-muted-foreground">Chargement des archétypes…</p>
       )}
-      {archetypesQuery.isError && (
+      {archetypesQuery.isError && queryError?.status !== 401 && (
         <p className="text-sm text-destructive">
           Impossible de charger les archétypes. Réessayez.
         </p>

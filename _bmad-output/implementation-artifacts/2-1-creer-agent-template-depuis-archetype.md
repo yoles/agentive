@@ -1,6 +1,6 @@
 # Story 2.1: Créer un agent-template depuis un archétype
 
-Status: Review
+Status: in-progress
 
 > 🎯 **Première story Epic 2 — Agent Platform**. Cette story pose les **8 archétypes universels** comme registry de référence, et le premier endpoint backend qui crée un `agent_template` à partir d'un archétype + nom. Pose la fondation API + UI consommée par les Stories 2.2-2.8 (configuration détaillée, mode wizard/expert, distinction template/instance, Tool Hub, sandbox, playground, review conversationnelle).
 >
@@ -246,6 +246,79 @@ Status: Review
   - `curl https://localhost:8443/api/v1/agents/archetypes` → 200 + 8 entrées.
   - `curl -X POST .../templates -d '{"archetype":"unknown","name":"X"}'` → 422 + body `application/problem+json` valide (type/title/status/correlation_id).
   - `docker compose logs backend | jq 'select(.event=="agent_template_created")'` → event structuré présent.
+
+### Review Findings
+
+Revue du 2026-09-05 — commit `e3234ac` contre `7bdbaf7`, mode complet, 37 fichiers (+3403 / -32), quatre couches terminées : Blind Hunter, Edge Case Hunter, Verification Gap, Acceptance Auditor. 23 constats individuels triés. Décisions validées par John : conserver le Bearer statique avec saisie runtime en mémoire, et reporter les deux incohérences de navigation à la Story 2.2. Résultat : **8 correctifs appliqués, 4 reports, 6 constats rejetés**.
+
+#### Décisions résolues
+
+- [x] [Review][Patch] **R1 — high — Le navigateur ne pouvait pas authentifier les appels de création.** Résolu avec une saisie du Bearer MVP au runtime, conservé uniquement en mémoire dans l'onglet et ajouté automatiquement aux appels `apiFetch`. Aucun secret Vite ou stockage persistant. Sources : edge-case-hunter, acceptance-auditor. [frontend/src/shared/api/client.ts:21]
+- [x] [Review][Defer] **R2 — medium — Le point d'entrée `/config/agents` est absent.** — deferred: AC5 et T5.4 sont contradictoires ; l'implémentation suit T5.4 avec le bouton « Nouveau » sur `/config/`. La vraie liste et sa route sont reportées à la Story 2.2. Sources : blind-hunter, acceptance-auditor. [frontend/src/app/routes/config/index.tsx:5]
+
+#### Correctifs appliqués
+
+- [x] [Review][Patch] **R4 — medium — Inclure `correlation_id` dans le payload de l'événement.** Le même UUID est maintenant fourni au modèle d'événement, à `publish`, au log métier et vérifié contre la colonne outbox. Sources : blind-hunter, acceptance-auditor. [backend/src/agentive_backend/shared/contracts/events/agent_events.py:36]
+- [x] [Review][Patch] **R5 — low — Journaliser l'échec de chargement du registry en erreur structurée.** Le lifespan journalise `archetype_registry_init_failed` avec la trace puis relance l'exception. Source : blind-hunter. [backend/src/agentive_backend/app/lifespan.py:202]
+- [x] [Review][Patch] **R6 — medium — Tester le branchement réel du registry au lifespan de production.** Deux tests isolent les services externes et exercent directement le context manager de production, succès et échec journalisé. Source : blind-hunter. [backend/tests/integration/m2_agent_registry/test_lifespan_registry.py:166]
+- [x] [Review][Patch] **R7 — medium — Couvrir le parcours de récupération après 409.** Le test vérifie le message, la valeur conservée, le focus et la réussite après renommage. Sources : blind-hunter, verification-gap. [frontend/src/app/routes/config/agents/new.test.tsx:264]
+- [x] [Review][Patch] **R8 — medium — Prouver le rollback template + outbox sur échec de publication.** Le test injecte l'échec de `publish` après le flush du template puis vérifie les deux absences depuis une session distincte. Source : verification-gap. [backend/tests/integration/m2_agent_registry/test_create_template_e2e.py:344]
+- [x] [Review][Patch] **R9 — medium — Vérifier le contenu et le changement de l'aperçu.** Le test sélectionne deux archétypes et vérifie leurs prompts, champs core et extras distincts. Source : verification-gap. [frontend/src/app/routes/config/agents/new.test.tsx:218]
+- [x] [Review][Patch] **R10 — medium — Compléter les scénarios d'intégration prescrits par AC7.** Les cas nom vide, rollback atomique, corrélation payload/colonne/log et lifespan de production portent le total au-delà du seuil demandé. Source : acceptance-auditor. [backend/tests/integration/m2_agent_registry/test_create_template_e2e.py:315]
+
+#### Reportés
+
+- [x] [Review][Defer] **R3 — medium — Attributs du template absents après création.** — deferred: AC5 demande ID, nom, archétype et version, tandis que T5.3 prescrit explicitement un placeholder avec seulement l'ID. Le chargement et l'affichage complets du template sont reportés à la Story 2.2. Sources : blind-hunter, acceptance-auditor. [frontend/src/app/routes/config/agents/$templateId.tsx:15]
+- [x] [Review][Defer] **R11 — maybe-false, impact medium non vérifié — Divergence contrainte ORM/migration.** La migration utilise `NULLS NOT DISTINCT`, contrairement à `models.py:217`. `make migrate-new` consomme cette metadata via autogenerate. Aucun chemin `create_all` actif trouvé ; les fixtures utilisent Alembic. — deferred: vérifier avec les versions verrouillées le DDL généré et un autogenerate après migration ; ne pas affirmer qu'une régression de base s'est déjà produite. Source : blind-hunter. [backend/alembic/versions/20260508_000000_agent_templates_unique_nulls_not_distinct.py:61]
+- [x] [Review][Defer] **R12 — maybe-false, impact medium non vérifié — Attente NOTIFY sans borne explicite dans le service.** `emit_notify` est attendu après commit ; les exceptions sont absorbées, mais pas une attente longue. — deferred: mécanisme hérité du publisher ; reproduire une connexion/query bloquée avec la configuration effective des timeouts avant d'imposer un nouveau délai. La persistance reste acquise pendant cette attente. Source : edge-case-hunter. [backend/src/agentive_backend/features/m2_agent_registry/service.py:159]
+
+#### Traçabilité des verdicts individuels
+
+Les verdicts portent sur chaque constat avant regroupement. B = blind-hunter, E = edge-case-hunter, V = verification-gap, A = acceptance-auditor.
+
+| ID | Source | Constat | Verdict et preuve | Destination |
+|---|---|---|---|---|
+| 1 | B | Route agents absente | medium : inventaire des routes sans index agents ; AC5/T5.4 contradictoires | R2, reporté 2.2 |
+| 2 | B | Attributs post-création absents | medium : seul templateId est lu/rendu | R3, reporté 2.2 |
+| 3 | B | Corrélation absente du payload | medium : modèle sans champ ; publisher sépare colonne et payload | R4 |
+| 4 | B | Registry superficiellement immuable | low : modèles/nested dicts mutables, mais aucun appelant courant ne les modifie | Rejected |
+| 5 | B | ORM/contrainte divergent | maybe-false : divergence établie, impact autogenerate/create_all non exécuté ; fixtures Alembic | R11 |
+| 6 | B | Toute IntegrityError devient doublon | false pour le scénario courant annoncé : session neuve, seul template validé ajouté avant flush ; aucune écriture étrangère pendante identifiée | Rejected |
+| 7 | B | Log error startup absent | low : seul log de succès après loader | R5 |
+| 8 | B | Lifespan testé différent de production | medium : closure locale appelle directement loader | R6 |
+| 9 | B | Test frontend 409 absent | medium : seulement deux tests, sans rejet de mutation | R7 |
+| 10 | B | Navigation radio par flèches absente | low : Enter/Space/Tab fonctionnent conformément à AC4 ; amélioration déjà reportée D3 | Rejected |
+| 11 | E | Auth navigateur absente | high : méthode dispatch exécutée avec headers équivalents navigateur retourne 401 missing-token ; proxies sans pont auth | R1, corrigé |
+| 12 | E | YAML UTF-8 invalide non normalisé | low : UnicodeDecodeError échappe au catch OSError mais arrête toujours le boot ; fixture livrée UTF-8 valide | Rejected |
+| 13 | E | NOTIFY pouvant attendre longtemps | maybe-false : pas de borne locale, panne/timeouts effectifs non reproduits | R12 |
+| 14 | E | Claim immutabilité non profond | low : même faiblesse structurelle que B4, sans mutateur courant | Rejected |
+| 15 | V | Atomicité sans test d'échec | medium : preuve de lacune fournie par reviewer ; succès et rollback outbox isolé ne prouvent pas rollback des deux | R8 |
+| 16 | V | Aperçu sans assertion du contenu | medium : preuve de lacune fournie par reviewer ; retirer le rendu ne casse pas les assertions existantes | R9 |
+| 17 | V | Récupération 409 sans vérification | medium : preuve de lacune fournie par reviewer ; backend 409 n'exerce pas UX | R7 |
+| 18 | A | Auth navigateur absente | high : confirmé indépendamment par lecture client/middleware et reproduction isolée | R1, corrigé |
+| 19 | A | Payload sans correlation_id | medium : test actuel vérifie seulement colonne, pas payload | R4 |
+| 20 | A | Page sans nom/archétype/version | medium : réponse de création non conservée par navigation | R3 |
+| 21 | A | Route `/config/agents` absente | medium : bouton réel sur `/config/`, AC5 et T5.4 divergent | R2 |
+| 22 | A | Minimum intégration non atteint | medium : six fonctions e2e + quatre lifespan, sans paramétrisation | R10 |
+| 23 | A | Détails de validation dans errors | low : information présente dans `errors`, `detail` reste une chaîne conforme au client partagé ; pas de consommateur cassé identifié | Rejected |
+
+#### Validation de cette revue
+
+- Lecture du diff complet et des dépendances pertinentes ; revue statique par quatre agents, aucune couche en échec.
+- Reproduction ciblée : exécution de la méthode de production `AuthTokenMiddleware.dispatch` extraite par AST, avec objets request/response de test et en-têtes identiques au client (`Accept`, sans Authorization) ; résultat `401 /errors/auth/missing-token`. Pas un test HTTP live.
+- Simulation CI locale après correctifs avec `uv 0.12.10`, CPython 3.14.7 et Node 24.20.0 : Ruff check/format vert (189 fichiers), MyPy strict vert (82 fichiers), Import Linter vert (5 contrats), gardes de configuration Import Linter vertes (7 tests), ESLint vert, TypeScript `--noEmit` vert, build Vite de production vert et Vitest vert (**29 tests**).
+- Backend sans dépendance Docker : **243 tests verts**. La commande pytest complète de la CI collecte 387 tests et atteint **336 verts**, puis **51 erreurs de setup exclusivement causées par l'absence du socket Docker/Testcontainers** ; aucune assertion de test n'échoue. Les 8 tests E2E DB de cette story font partie des tests bloqués par cet environnement.
+- Gitleaks 8.30.1 : le scan CI exact de l'historique a d'abord révélé 19 faux positifs préexistants sur les clés factices des tests de redaction. L'allowlist est désormais limitée aux préfixes factices et aux chemins de tests/runbook concernés ; scan exact des 89 commits vert, puis scan des 14 fichiers modifiés/non suivis vert. `git diff --check` est propre.
+- Restent à exécuter sur un runner avec Docker : builds des images dev, pytest avec PostgreSQL/Testcontainers (dont migration), spike M3 et validation Caddy. La story reste `in-progress` jusqu'au passage de ces jobs dans GitHub Actions ou un hôte Docker équivalent.
+
+#### Rejected
+
+- **4 / B — low :** immutabilité peu profonde réelle, mais aucun mutateur dans le parcours courant ; un gel récursif ajouterait de la complexité pour un risque non rencontré.
+- **6 / B — false :** le scénario d'une écriture pendante étrangère ne se produit pas dans le service courant : transaction neuve, unique objet template, entrée validée. Le catch est large, mais aucun autre IntegrityError atteignable n'a été établi ici.
+- **10 / B — low :** navigation par flèches déjà reportée D3 ; sélection Enter/Space/Tab explicitement demandée opérationnelle. Pas de réouverture sans nouveau besoin.
+- **12 / E — low :** YAML livré valide et fail-fast préservé même pour octets invalides ; normaliser ce cas rare exigerait une branche supplémentaire sans bénéfice courant.
+- **14 / E — low :** même limitation d'immuabilité que 4, conservée comme constat individuel mais écartée pour les mêmes raisons.
+- **23 / A — low :** les champs invalides restent disponibles sous `errors`, les consommateurs existants attendent `detail` chaîne ; aucune perte d'information ou panne actuelle démontrée. Ne pas modifier la spec pour solder ce constat.
 
 ## Dev Notes
 
@@ -508,3 +581,4 @@ Notés en sprint-status comme dette tech-debt traçable :
 | 2026-05-08 | Amelia (Dev) | Implémentation T1-T6 single-pass via `bmad-dev-story`. 35 nouveaux tests verts, 0 régression. Migration Alembic ajoutée (fix `NULLS DISTINCT` rétroactif Story 1.5). Status → `Review`. |
 | 2026-05-08 | Bob (SM) | **Spec amendments post-code-review (B1 + B2)** : (B1) AC3 RFC 7807 `type` URL réaligné sur convention canonique `/errors/validation` (la spec initiale citait une URL `https://agentive.idem-agency.fr/...` non-conforme) ; (B2) AC5 + T5.1 reformulés — Zod retiré (anti-scope §"Validation Zod → Story 2.3" prévalait, contradiction interne fixée). Implémentation reste cohérente avec les amendments. |
 | 2026-05-08 | Amelia (Dev) | **Fix-batch P-01 à P-14 (méthodologie multi-agent code-review)** suite à 3-layer review (Blind Hunter + Edge Case Hunter + Acceptance Auditor). 4 critiques + 10 should-fix patches appliqués. Voir §"Fix-batch détail" ci-dessous. 0 régression : 241 backend (vs 239) + 26 frontend tests verts. Smoke test re-validé : P-02 atomicité prouvée, P-05 whitespace bloqué, P-06 no-leak confirmé. Status reste `Review` — ready for second code-review pass. |
+| 2026-09-05 | Codex (Review) | **Seconde revue complète + correctifs R1/R4-R10.** Branchement du Bearer MVP en mémoire côté frontend ; `correlation_id` aligné entre header, payload, colonne outbox et logs ; journalisation fail-fast du registry ; tests ajoutés pour auth, aperçu, 409, rollback atomique, corrélation, nom vide et lifespan de production. R2/R3 reportés à Story 2.2 conformément aux contradictions AC5/T5.3-T5.4. Simulation CI locale verte hors jobs Docker ; faux positifs Gitleaks historiques corrigés par une allowlist ciblée. Statut `in-progress` jusqu'à validation des jobs Docker/Testcontainers. |

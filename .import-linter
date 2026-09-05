@@ -98,6 +98,10 @@ ignore_imports =
 [importlinter:contract:no-direct-db-access-from-features]
 name = Feature modules must not import sqlalchemy / psycopg directly
 type = forbidden
+# The rule is intentionally about direct imports. Features depend on the
+# public repository/event-bus facades, whose private implementations are
+# allowed to use database drivers.
+allow_indirect_imports = True
 source_modules =
     agentive_backend.features
 forbidden_modules =
@@ -118,6 +122,9 @@ forbidden_modules =
 [importlinter:contract:event-bus-only-public-api]
 name = Features must import only the public event_bus API (publish, subscribe)
 type = forbidden
+# Importing the public package necessarily reaches its private implementation
+# modules. Only feature -> private-module imports are forbidden.
+allow_indirect_imports = True
 source_modules =
     agentive_backend.features
 forbidden_modules =
