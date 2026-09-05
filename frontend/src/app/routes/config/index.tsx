@@ -40,6 +40,21 @@ export function ConfigPage() {
       <div className="rounded-lg border border-border bg-card p-6">
         <div className="flex items-center justify-between gap-4">
           <div>
+            <h2 className="text-lg font-semibold">Namespaces mémoire</h2>
+            <p className="text-sm text-muted-foreground">
+              Isolation par département/projet, 4 types avec rétention distincte.{" "}
+              <span className="font-mono text-xs">[Story 3.2]</span>
+            </p>
+          </div>
+          <Button asChild variant="outline">
+            <Link to="/config/namespaces">Gérer</Link>
+          </Button>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-border bg-card p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
             <h2 className="text-lg font-semibold">Outils MCP</h2>
             <p className="text-sm text-muted-foreground">
               Serveurs MCP enregistrés et outils découverts. Assignation aux agents.{" "}

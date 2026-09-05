@@ -5,8 +5,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
-from agentive_backend.shared.exceptions import NotFoundError
+from agentive_backend.shared.exceptions import ConflictError, NotFoundError
 from agentive_backend.shared.repositories import NamespaceRepo
 
 from .conftest import make_session_factory_mock
@@ -59,3 +60,51 @@ async def test_require_by_name_raises_not_found_when_missing() -> None:
     repo = NamespaceRepo(session_factory=factory)
     with pytest.raises(NotFoundError):
         await repo.require_by_name("ghost-namespace")
+
+
+# ─── create / create_in_session (Story 3.2) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_in_session_translates_integrity_error_to_conflict() -> None:
+    factory, session = make_session_factory_mock()
+    session.flush.side_effect = IntegrityError("INSERT", {}, Exception("duplicate key"))
+    repo = NamespaceRepo(session_factory=factory)
+    with pytest.raises(ConflictError, match="dup-ns"):
+        await repo.create_in_session(session, name="dup-ns", ns_type="client")
+
+
+@pytest.mark.asyncio
+async def test_create_delegates_to_create_in_session_within_transaction() -> None:
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    ns = await repo.create(name="dev-notes", ns_type="metier", department="Dev")
+    assert session.add.call_args.args[0] is ns
+    assert ns.name == "dev-notes"
+    assert ns.department == "Dev"
+
+
+# ─── list_all (Story 3.2 AC3) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_all_emits_select_without_type_predicate() -> None:
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.list_all(limit=500)
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "namespaces" in sql_text
+    assert "where" not in sql_text
+
+
+@pytest.mark.asyncio
+async def test_list_all_orders_by_created_at_then_id() -> None:
+    """An unordered `SELECT` has no stable row order across refetches
+
+    (code review Story 3.2, P6).
+    """
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.list_all(limit=500)
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "order by namespaces.created_at asc, namespaces.id asc" in sql_text

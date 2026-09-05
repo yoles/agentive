@@ -82,3 +82,32 @@ async def test_delete_by_id_emits_delete_scoped_to_the_id() -> None:
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "delete from memory_chunks" in sql_text
     assert "memory_chunks.id = " in sql_text
+
+
+# ─── count_by_namespace_ids (Story 3.2 AC3) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_count_by_namespace_ids_returns_empty_dict_for_empty_input() -> None:
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+    result = await repo.count_by_namespace_ids([])
+    assert result == {}
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_count_by_namespace_ids_emits_one_grouped_query() -> None:
+    ns_a, ns_b = uuid4(), uuid4()
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.tuples.return_value.all = lambda: [(ns_a, 3)]
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    result = await repo.count_by_namespace_ids([ns_a, ns_b])
+
+    assert session.execute.await_count == 1
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "group by" in sql_text
+    assert "archived_at is null" in sql_text
+    assert result == {ns_a: 3}
+    assert result.get(ns_b, 0) == 0

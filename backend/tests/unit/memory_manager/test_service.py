@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -18,7 +18,12 @@ from agentive_backend.features.memory_manager.service import (
     EMBEDDING_MODEL,
     MemoryManagerService,
 )
-from agentive_backend.shared.exceptions import DependencyError, InternalError, NotFoundError
+from agentive_backend.shared.exceptions import (
+    DependencyError,
+    ForbiddenError,
+    InternalError,
+    NotFoundError,
+)
 
 
 def _make_namespace(
@@ -26,13 +31,27 @@ def _make_namespace(
     name: str = "ns-test",
     retention_policy: dict | None = None,
     embedding_backend: str = "cloud",
+    department: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
         name=name,
         retention_policy=retention_policy or {},
         embedding_backend=embedding_backend,
+        department=department,
+        project=None,
+        type="metier",
+        created_at=datetime.now(UTC),
     )
+
+
+def _configure_with_tenant(repo: MagicMock, session: MagicMock) -> None:
+    """Wire ``repo.with_tenant(...)`` as an async context manager yielding
+    ``session`` — mirror of the pattern already used by
+    ``tests/unit/tool_hub/test_service.py``."""
+    repo.with_tenant = MagicMock()
+    repo.with_tenant.return_value.__aenter__ = AsyncMock(return_value=session)
+    repo.with_tenant.return_value.__aexit__ = AsyncMock(return_value=False)
 
 
 def _make_chunk(
@@ -56,14 +75,15 @@ def _make_service(
     namespace_not_found: bool = False,
     created_chunk: SimpleNamespace | None = None,
     search_rows: list[tuple[SimpleNamespace, float]] | None = None,
-) -> tuple[MemoryManagerService, AsyncMock, AsyncMock, AsyncMock, AsyncMock]:
-    namespace_repo = AsyncMock()
+) -> tuple[MemoryManagerService, MagicMock, AsyncMock, AsyncMock, AsyncMock]:
+    namespace_repo = MagicMock()
     if namespace_not_found:
         namespace_repo.require_by_name = AsyncMock(
             side_effect=NotFoundError(detail="Namespace 'ghost' not found", context={})
         )
     else:
         namespace_repo.require_by_name = AsyncMock(return_value=namespace)
+    _configure_with_tenant(namespace_repo, MagicMock())
 
     memory_chunk_repo = AsyncMock()
     memory_chunk_repo.create = AsyncMock(return_value=created_chunk)
@@ -388,3 +408,328 @@ async def test_search_passes_now_through_to_search_ann() -> None:
     await service.search(namespace_name=namespace.name, query="hello", top_k=5)
 
     assert isinstance(embedding_repo.search_ann.await_args.kwargs["now"], datetime)
+
+
+# ─── Story 3.2 AC2 — department isolation ─────────────────────────
+
+
+def _patch_event_bus(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    async def _fake_publish(event_type: str, event: object, **_kw: object) -> object:
+        captured["event_type"] = event_type
+        captured["event"] = event
+        return uuid4()
+
+    monkeypatch.setattr(service_module, "publish", _fake_publish)
+    monkeypatch.setattr(service_module, "notify_best_effort", AsyncMock())
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_search_denies_cross_department_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_event_bus(monkeypatch)
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(namespace=namespace)
+
+    with pytest.raises(ForbiddenError):
+        await service.search(
+            namespace_name=namespace.name,
+            query="q",
+            top_k=5,
+            acting_department="Design-UX",
+        )
+
+    embedding_repo.search_ann.assert_not_awaited()
+    assert captured["event_type"] == "memory_manager.namespace.access_denied"
+    assert captured["event"].namespace_department == "Dev"  # type: ignore[attr-defined]
+    assert captured["event"].acting_department == "Design-UX"  # type: ignore[attr-defined]
+    assert captured["event"].operation == "search"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_create_chunk_denies_cross_department_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_event_bus(monkeypatch)
+    namespace = _make_namespace(department="Dev")
+    service, _ns, chunk_repo, _embedding_repo, embedder = _make_service(namespace=namespace)
+
+    with pytest.raises(ForbiddenError):
+        await service.create_chunk(
+            namespace_name=namespace.name,
+            content="hello",
+            ttl_seconds=None,
+            acting_department="Design-UX",
+        )
+
+    chunk_repo.create.assert_not_awaited()
+    embedder.embed.assert_not_awaited()
+    assert captured["event"].operation == "create_chunk"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_search_allows_same_department() -> None:
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5, acting_department="Dev")
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_allows_cross_department_when_namespace_has_no_department() -> None:
+    namespace = _make_namespace(department=None)
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(
+        namespace_name=namespace.name, query="q", top_k=5, acting_department="Design-UX"
+    )
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_allows_when_no_acting_department_declared() -> None:
+    """Backward compatibility — every existing Story 3.1 call site (no
+    ``X-Acting-Department`` header) must keep working unrestricted."""
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_denied_access_commits_the_audit_event_before_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5.3 — the outbox INSERT must be committed (the `with_tenant` block
+    exited) before `ForbiddenError` is raised, or the audit trail row would
+    roll back along with an exception raised inside the block."""
+    events: list[str] = []
+
+    async def _fake_publish(event_type: str, event: object, **_kw: object) -> object:
+        events.append("published")
+        return uuid4()
+
+    monkeypatch.setattr(service_module, "publish", _fake_publish)
+    monkeypatch.setattr(service_module, "notify_best_effort", AsyncMock())
+
+    namespace = _make_namespace(department="Dev")
+    service, ns_repo, _chunk_repo, _embedding_repo, _embedder = _make_service(namespace=namespace)
+
+    aexit_calls: list[str] = []
+    original_aexit = ns_repo.with_tenant.return_value.__aexit__
+
+    async def _tracking_aexit(*args: object) -> bool | None:
+        aexit_calls.append("committed")
+        return await original_aexit(*args)
+
+    ns_repo.with_tenant.return_value.__aexit__ = _tracking_aexit
+
+    with pytest.raises(ForbiddenError):
+        await service.search(
+            namespace_name=namespace.name, query="q", top_k=5, acting_department="Design-UX"
+        )
+
+    assert events == ["published"]
+    assert aexit_calls == ["committed"]
+
+
+# ─── Story 3.2 AC1 — create_namespace ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_uses_type_default_retention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_event_bus(monkeypatch)
+    namespace_repo = MagicMock()
+    session = MagicMock()
+    _configure_with_tenant(namespace_repo, session)
+    created = _make_namespace(name="dev-notes", department="Dev", retention_policy={})
+    created.type = "metier"
+    namespace_repo.create_in_session = AsyncMock(return_value=created)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.create_namespace(name="dev-notes", ns_type="metier", department="Dev")
+
+    create_kwargs = namespace_repo.create_in_session.await_args.kwargs
+    assert create_kwargs["retention_policy"] == {"default_ttl_seconds": 31_536_000}
+    assert result.retention_policy == {
+        "default_ttl_seconds": 31_536_000,
+        "archive_after_seconds": None,
+    }
+    assert result.name == "dev-notes"
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_override_replaces_type_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentive_backend.features.memory_manager.domain.value_objects import RetentionPolicy
+
+    _patch_event_bus(monkeypatch)
+    namespace_repo = MagicMock()
+    _configure_with_tenant(namespace_repo, MagicMock())
+    created = _make_namespace(name="client-acme")
+    created.type = "client"
+    namespace_repo.create_in_session = AsyncMock(return_value=created)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    override = RetentionPolicy(default_ttl_seconds=3600)
+    await service.create_namespace(
+        name="client-acme", ns_type="client", retention_policy_override=override
+    )
+
+    create_kwargs = namespace_repo.create_in_session.await_args.kwargs
+    assert create_kwargs["retention_policy"] == {"default_ttl_seconds": 3600}
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_propagates_conflict_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentive_backend.shared.exceptions import ConflictError
+
+    _patch_event_bus(monkeypatch)
+    namespace_repo = MagicMock()
+    _configure_with_tenant(namespace_repo, MagicMock())
+    namespace_repo.create_in_session = AsyncMock(
+        side_effect=ConflictError(detail="Namespace 'dup' already exists", context={})
+    )
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    with pytest.raises(ConflictError):
+        await service.create_namespace(name="dup", ns_type="client")
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_unknown_type_raises_validation_error() -> None:
+    """The HTTP router already restricts `type` via Pydantic — this covers
+
+    a non-HTTP caller passing a raw string outside the 4 known types,
+    which used to surface as an opaque `ValueError`/500 instead of a typed
+    domain error (code review Story 3.2, P7).
+    """
+    from agentive_backend.shared.exceptions import ValidationError
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=AsyncMock(),
+        embedder=AsyncMock(),
+    )
+
+    with pytest.raises(ValidationError):
+        await service.create_namespace(name="ns", ns_type="bogus")  # type: ignore[arg-type]
+
+
+# ─── Story 3.2 AC3 — list_namespaces ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_zips_chunk_counts() -> None:
+    ns_a = _make_namespace(name="a", retention_policy={"default_ttl_seconds": 60})
+    ns_b = _make_namespace(name="b")
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns_a, ns_b])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={ns_a.id: 7})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    by_name = {view.name: view for view in result}
+    assert by_name["a"].chunk_count == 7
+    assert by_name["a"].retention_policy["default_ttl_seconds"] == 60
+    assert by_name["b"].chunk_count == 0  # absent from the counts dict
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_tolerates_malformed_retention_policy() -> None:
+    """A hand-seeded/legacy row with a malformed JSONB must not 500 the
+    entire admin listing (same P4 class of defensive guard as create_chunk)."""
+    ns_bad = _make_namespace(name="legacy", retention_policy="not-a-dict")  # type: ignore[arg-type]
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns_bad])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    assert result[0].retention_policy == {
+        "default_ttl_seconds": None,
+        "archive_after_seconds": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_tolerates_non_int_ttl() -> None:
+    """`from_mapping`'s own checks let a float TTL through (only the view's
+
+    `int` validation catches it, since a fractional float fails coercion) —
+    that failure must be caught at the same point as any other malformed
+    policy (code review Story 3.2, P1), not 500 the whole listing. A bool
+    TTL is not in this category: Pydantic's lax `int` coercion silently
+    accepts it (`True` -> `1`), so it never raises here.
+    """
+    ns_bad = _make_namespace(
+        name="legacy-float", retention_policy={"default_ttl_seconds": 1.5}  # type: ignore[arg-type]
+    )
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns_bad])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    assert result[0].retention_policy == {
+        "default_ttl_seconds": None,
+        "archive_after_seconds": None,
+    }
