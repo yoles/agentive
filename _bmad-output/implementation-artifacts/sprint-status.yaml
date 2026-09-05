@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-19
-last_updated: 2026-05-08  # Epic 2 in-progress + Story 2.1 ready-for-dev
+last_updated: 2026-09-05  # Story 2.1 second review fixes applied; CI verification pending
 # 2026-05-02 — Story 1.6 Core LLM abstraction done (+ post-review fix-batch 21 patches + AC5/AC9 spec amendments)
 # 2026-05-02 — Story 1.7 created (ready-for-dev): Core auth token statique MVP + rotation
 # 2026-05-03 — Story 1.7 code review fix-batch (18 patches P1-P18) — 326 tests, 0 régression
@@ -85,7 +85,7 @@ development_status:
 
   # Epic 2: Agent Platform (Sprint 1)
   epic-2: in-progress
-  2-1-creer-agent-template-depuis-archetype: review
+  2-1-creer-agent-template-depuis-archetype: in-progress
   2-2-configurer-agent-complet: backlog
   2-3-mode-wizard-vs-expert: backlog
   2-4-distinction-template-vs-instance: backlog

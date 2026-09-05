@@ -25,6 +25,8 @@ import {
 } from "@tanstack/react-router";
 import { Providers } from "@/app/providers";
 import { routeTree } from "@/app/routeTree.gen";
+import { clearApiToken, setApiToken } from "@/shared/api/client";
+import { queryClient } from "@/shared/api/queryClient";
 
 const FIXTURE_LIST = [
   {
@@ -54,6 +56,20 @@ const FIXTURE_DETAIL = {
   output_contract: { core: { artifact: "string" }, extras: {} },
 };
 
+const FIXTURE_CONTROL_DETAIL = {
+  id: "controleur",
+  display_name: "Contrôleur",
+  icon_name: "shield-check",
+  description: "Review un livrable.",
+  default_role: "controller",
+  prompt_base: "Tu contrôles chaque livrable.",
+  input_contract: {
+    core: { artifact: "string" },
+    extras: { review_notes: "string" },
+  },
+  output_contract: { core: { verdict: "string" }, extras: {} },
+};
+
 function jsonResponse(body: unknown, init: ResponseInit = { status: 200 }) {
   return new Response(JSON.stringify(body), {
     ...init,
@@ -77,13 +93,35 @@ describe("/config/agents/new", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    queryClient.clear();
+    setApiToken("integration-test-token");
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
   });
 
   afterEach(() => {
     cleanup();
+    clearApiToken();
+    queryClient.clear();
     vi.unstubAllGlobals();
+  });
+
+  it("collects the MVP token in memory before loading protected data", async () => {
+    clearApiToken();
+    fetchMock.mockResolvedValue(jsonResponse(FIXTURE_LIST));
+
+    renderRoute("/config/agents/new");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const tokenInput = await screen.findByLabelText(/jeton api/i);
+    fireEvent.change(tokenInput, { target: { value: "runtime-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: /se connecter/i }));
+
+    await screen.findByLabelText(/nom du template/i);
+    const [, init] = fetchMock.mock.calls[0] as [unknown, RequestInit];
+    expect(new Headers(init.headers).get("Authorization")).toBe(
+      "Bearer runtime-secret",
+    );
   });
 
   it("disables submit until both archetype and name are provided", async () => {
@@ -163,9 +201,100 @@ describe("/config/agents/new", () => {
     });
     expect(postCall).toBeDefined();
     const [, postInit] = postCall as [unknown, RequestInit];
+    expect(new Headers(postInit.headers).get("Authorization")).toBe(
+      "Bearer integration-test-token",
+    );
     expect(JSON.parse(postInit.body as string)).toEqual({
       archetype: "producteur",
       name: "Code Producer",
     });
+  });
+
+  it("renders prompt and contracts, then updates the preview on selection", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/api/v1/agents/archetypes")) {
+        return Promise.resolve(jsonResponse(FIXTURE_LIST));
+      }
+      if (url.endsWith("/api/v1/agents/archetypes/producteur")) {
+        return Promise.resolve(jsonResponse(FIXTURE_DETAIL));
+      }
+      if (url.endsWith("/api/v1/agents/archetypes/controleur")) {
+        return Promise.resolve(jsonResponse(FIXTURE_CONTROL_DETAIL));
+      }
+      return Promise.resolve(jsonResponse({}, { status: 404 }));
+    });
+
+    renderRoute("/config/agents/new");
+    fireEvent.click(await screen.findByTestId("archetype-card-producteur"));
+    expect(await screen.findByText("Tu es un producteur.")).toBeInTheDocument();
+    expect(screen.getByText("brief")).toBeInTheDocument();
+    expect(screen.getByText("artifact")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("archetype-card-controleur"));
+    expect(
+      await screen.findByText("Tu contrôles chaque livrable."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("review_notes")).toBeInTheDocument();
+    expect(screen.getByText("verdict")).toBeInTheDocument();
+  });
+
+  it("keeps the form and focuses the name after 409, then allows retry", async () => {
+    const newTemplateId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let postCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/v1/agents/archetypes")) {
+        return Promise.resolve(jsonResponse(FIXTURE_LIST));
+      }
+      if (url.endsWith("/api/v1/agents/archetypes/producteur")) {
+        return Promise.resolve(jsonResponse(FIXTURE_DETAIL));
+      }
+      if (url.endsWith("/api/v1/agents/templates") && method === "POST") {
+        postCount += 1;
+        if (postCount === 1) {
+          return Promise.resolve(
+            jsonResponse(
+              {
+                type: "/errors/conflict",
+                title: "Conflict",
+                status: 409,
+                detail: "Template already exists",
+              },
+              { status: 409 },
+            ),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            {
+              template_id: newTemplateId,
+              name: "Unique Producer",
+              archetype: "producteur",
+              version: 1,
+              created_at: new Date().toISOString(),
+            },
+            { status: 201 },
+          ),
+        );
+      }
+      return Promise.resolve(jsonResponse({}, { status: 404 }));
+    });
+
+    renderRoute("/config/agents/new");
+    const nameInput = await screen.findByLabelText(/nom du template/i);
+    fireEvent.change(nameInput, { target: { value: "Duplicate Producer" } });
+    fireEvent.click(screen.getByTestId("archetype-card-producteur"));
+    fireEvent.click(screen.getByRole("button", { name: /créer le template/i }));
+
+    await screen.findByText(/existe déjà/i);
+    expect(nameInput).toHaveValue("Duplicate Producer");
+    expect(nameInput).toHaveFocus();
+
+    fireEvent.change(nameInput, { target: { value: "Unique Producer" } });
+    fireEvent.click(screen.getByRole("button", { name: /créer le template/i }));
+    await screen.findByText(newTemplateId);
+    expect(postCount).toBe(2);
   });
 });

@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -120,7 +121,7 @@ async def _fetch_outbox_payload(
     name: str | None = None,
 ) -> dict[str, Any]:
     """Fetch the most recent outbox row for ``event_type`` (optionally filtered by ``name``)."""
-    sql = "SELECT correlation_id, payload FROM outbox_events WHERE event_type = :t"
+    sql = "SELECT correlation_id, payload, processed_at FROM outbox_events WHERE event_type = :t"
     params: dict[str, str] = {"t": event_type}
     if name is not None:
         sql += " AND payload->>'name' = :n"
@@ -129,7 +130,11 @@ async def _fetch_outbox_payload(
     async with factory() as session:
         result = await session.execute(text(sql), params)
         row = result.one()
-        return {"correlation_id": str(row[0]), "payload": row[1]}
+        return {
+            "correlation_id": str(row[0]),
+            "payload": row[1],
+            "processed_at": row[2],
+        }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -192,6 +197,8 @@ async def test_create_template_happy_path_persists_row_and_publishes_event(
         assert event["payload"]["archetype"] == "producteur"
         assert event["payload"]["version"] == 1
         assert event["payload"]["actor"] == "system"
+        assert event["payload"]["correlation_id"] == event["correlation_id"]
+        assert event["processed_at"] is None
 
 
 @pytest.mark.integration
@@ -281,15 +288,16 @@ async def test_create_template_propagates_correlation_id(
     transport = httpx.ASGITransport(app=app)
     cid = "01999999-9999-7999-8999-999999999999"  # UUID v7-ish
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/v1/agents/templates",
-            headers={**_auth_headers(), "X-Correlation-ID": cid},
-            json={"archetype": "chercheur", "name": "Curious George"},
-        )
-        assert resp.status_code == 201
-        # Correlation echoed in response header (CorrelationIdMiddleware).
-        assert resp.headers.get("x-correlation-id") == cid
+    with structlog.testing.capture_logs() as captured_logs:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/agents/templates",
+                headers={**_auth_headers(), "X-Correlation-ID": cid},
+                json={"archetype": "chercheur", "name": "Curious George"},
+            )
+            assert resp.status_code == 201
+            # Correlation echoed in response header (CorrelationIdMiddleware).
+            assert resp.headers.get("x-correlation-id") == cid
 
     # Scope by name (Story 2.1 P-03) so this assertion is robust to test
     # ordering even when other happy-path tests have inserted rows.
@@ -297,6 +305,88 @@ async def test_create_template_propagates_correlation_id(
         seed_session_factory, "m2.agent_template.created", name="Curious George"
     )
     assert event["correlation_id"] == cid
+    assert event["payload"]["correlation_id"] == cid
+    creation_logs = [
+        record for record in captured_logs if record.get("event") == "agent_template_created"
+    ]
+    assert creation_logs
+    assert creation_logs[0].get("correlation_id") == cid
+
+
+@pytest.mark.integration
+async def test_create_template_empty_name_returns_422_without_writes(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 + AC7 — empty names fail at the HTTP boundary and write nothing."""
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/agents/templates",
+            headers=_auth_headers(),
+            json={"archetype": "producteur", "name": ""},
+        )
+
+    assert resp.status_code == 422
+    assert resp.headers["content-type"] == "application/problem+json"
+    async with seed_session_factory() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM agent_templates WHERE name = :name"),
+            {"name": ""},
+        )
+        assert int(result.scalar_one()) == 0
+    assert (
+        await _count_outbox(
+            seed_session_factory,
+            "m2.agent_template.created",
+            name="",
+        )
+        == 0
+    )
+
+
+@pytest.mark.integration
+async def test_publish_failure_rolls_back_template_and_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """P-02 regression — template and audit event share one transaction."""
+    import importlib
+
+    service_module = importlib.import_module("agentive_backend.features.m2_agent_registry.service")
+
+    async def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected publish failure")
+
+    monkeypatch.setattr(service_module, "publish", fail_publish)
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=True)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="injected publish failure"):
+            await client.post(
+                "/api/v1/agents/templates",
+                headers=_auth_headers(),
+                json={"archetype": "producteur", "name": "Rollback Probe"},
+            )
+
+    async with seed_session_factory() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM agent_templates WHERE name = :name"),
+            {"name": "Rollback Probe"},
+        )
+        assert int(result.scalar_one()) == 0
+    assert (
+        await _count_outbox(
+            seed_session_factory,
+            "m2.agent_template.created",
+            name="Rollback Probe",
+        )
+        == 0
+    )
 
 
 @pytest.mark.integration

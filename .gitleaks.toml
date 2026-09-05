@@ -90,6 +90,26 @@ paths = [
 ]
 
 [[allowlists]]
+description = "Allowlist explicit fake provider keys used by redaction tests and documentation"
+targetRules = [
+    "anthropic-api-key",
+    "openai-project-key",
+    "voyage-api-key",
+]
+paths = [
+    '''^backend/tests/(unit|integration)/(llm|logging)/''',
+    '''^docs/runbooks/llm-usage\.md$''',
+]
+# Keep this content allowlist limited to the deliberate fake/canary prefixes.
+# Real provider-shaped values in the same files must continue to fail the scan.
+regexes = [
+    '''sk-ant-(fake|leak|leaked|otherkey|secret|test)[A-Za-z0-9_-]*''',
+    '''sk-(fake|test)[A-Za-z0-9_-]*''',
+    '''sk-proj-fake[A-Za-z0-9_-]*''',
+    '''pa-fake[A-Za-z0-9_-]*''',
+]
+
+[[allowlists]]
 description = "Allowlist tool-produced artifacts outside application code (ALL rules, default + custom)"
 # No `targetRules` → applies to every gitleaks rule (default + custom).
 # Intentional : planning docs / BMAD framework / Claude tooling are not

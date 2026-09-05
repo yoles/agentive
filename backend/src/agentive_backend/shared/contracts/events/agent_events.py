@@ -37,6 +37,7 @@ class AgentTemplateCreatedEvent(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     archetype: str = Field(min_length=1, max_length=50)
     version: int = Field(ge=1)
+    correlation_id: UUID
     actor: str = Field(default="system", description="user_id or 'system' for unattended creation")
     tenant_id: UUID | None = None
 

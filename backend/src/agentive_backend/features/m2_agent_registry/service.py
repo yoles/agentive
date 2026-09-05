@@ -35,6 +35,7 @@ from agentive_backend.features.m2_agent_registry.schemas import (
     CreateTemplateResponse,
 )
 from agentive_backend.shared.contracts.events import AgentTemplateCreatedEvent
+from agentive_backend.shared.correlation import require_correlation_id
 from agentive_backend.shared.event_bus import emit_notify, publish
 from agentive_backend.shared.exceptions import NotFoundError, ValidationError
 from agentive_backend.shared.logging import get_logger
@@ -128,6 +129,7 @@ class AgentRegistryService:
 
         config = archetype.to_template_config()
         event_type = AgentTemplateCreatedEvent.event_type
+        correlation_id = UUID(require_correlation_id())
 
         # ─── Single transaction: row INSERT + outbox INSERT ───
         # `with_tenant` opens an AsyncSession, binds tenant via SET LOCAL,
@@ -150,10 +152,16 @@ class AgentRegistryService:
                 name=template.name,
                 archetype=template.archetype,
                 version=template.version,
+                correlation_id=correlation_id,
                 actor="system",
                 tenant_id=tenant_id,
             )
-            event_id = await publish(event_type, event, session=session)
+            event_id = await publish(
+                event_type,
+                event,
+                session=session,
+                correlation_id=correlation_id,
+            )
             # commit happens at __aexit__ if no exception is raised.
 
         # ─── Post-commit: best-effort NOTIFY ───
@@ -175,6 +183,7 @@ class AgentRegistryService:
             name=template.name,
             archetype=template.archetype,
             version=template.version,
+            correlation_id=str(correlation_id),
         )
 
         return CreateTemplateResponse(

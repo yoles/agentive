@@ -199,7 +199,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Story 2.1 — load the 8 universal archetypes registry. Fail-fast if the
     # YAML is missing/malformed (RuntimeError surfaces the cause to the
     # operator instead of the app booting with an empty registry).
-    app.state.archetype_registry = load_registry()
+    try:
+        app.state.archetype_registry = load_registry()
+    except RuntimeError:
+        log.exception("archetype_registry_init_failed")
+        raise
     log.info("archetype_registry_loaded", count=len(app.state.archetype_registry))
 
     # Build the session factory FIRST so the LLM fallback callback can

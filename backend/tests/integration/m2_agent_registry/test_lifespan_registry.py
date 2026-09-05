@@ -18,11 +18,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agentive_backend.app.lifespan import lifespan as production_lifespan
 from agentive_backend.features.m2_agent_registry import load_registry
 from agentive_backend.features.m2_agent_registry.archetypes import EXPECTED_ARCHETYPE_IDS
 
@@ -120,3 +122,78 @@ def test_lifespan_reload_yields_equivalent_registry_snapshots() -> None:
                 app_a.state.archetype_registry[archetype_id].model_dump()
                 == app_b.state.archetype_registry[archetype_id].model_dump()
             )
+
+
+class _FakeSessionContext:
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _FakeWorker:
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+def _isolate_production_lifespan(monkeypatch: pytest.MonkeyPatch) -> object:
+    """Stub unrelated startup services while retaining production wiring."""
+    import agentive_backend.app.lifespan as lifespan_module
+
+    monkeypatch.setattr(lifespan_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        lifespan_module,
+        "_init_auth_token",
+        lambda app: setattr(app.state, "auth_token_hash", "test-token"),
+    )
+
+    def session_factory() -> _FakeSessionContext:
+        return _FakeSessionContext()
+
+    monkeypatch.setattr(lifespan_module, "get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(lifespan_module, "_build_llm_router", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        lifespan_module,
+        "OutboxWorker",
+        lambda **_kwargs: _FakeWorker(),
+    )
+    monkeypatch.setattr(lifespan_module, "publish_and_commit", AsyncMock())
+    return lifespan_module
+
+
+@pytest.mark.asyncio
+async def test_production_lifespan_wires_archetype_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6 — exercise the actual production lifespan, with other services isolated."""
+    _isolate_production_lifespan(monkeypatch)
+    app = FastAPI()
+
+    async with production_lifespan(app):
+        assert set(app.state.archetype_registry) == EXPECTED_ARCHETYPE_IDS
+
+
+@pytest.mark.asyncio
+async def test_production_lifespan_logs_registry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1 — a registry failure is logged at error level before boot aborts."""
+    lifespan_module = _isolate_production_lifespan(monkeypatch)
+    logger = MagicMock()
+    monkeypatch.setattr(lifespan_module, "log", logger)
+    monkeypatch.setattr(
+        lifespan_module,
+        "load_registry",
+        MagicMock(side_effect=RuntimeError("archetype registry init failed: bad yaml")),
+    )
+
+    app = FastAPI()
+    with pytest.raises(RuntimeError, match="archetype registry init failed"):
+        async with production_lifespan(app):
+            pass
+
+    logger.exception.assert_called_once_with("archetype_registry_init_failed")
