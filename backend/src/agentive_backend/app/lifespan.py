@@ -15,6 +15,7 @@ import bcrypt
 from fastapi import FastAPI
 
 from agentive_backend.features.agent_registry import load_registry
+from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
 from agentive_backend.shared.config import settings
@@ -389,6 +390,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise
     app.state.outbox_worker = worker
 
+    # Story 3.3 T9.1 — same start-up posture as OutboxWorker just above.
+    memory_archival_worker = MemoryArchivalWorker(session_factory=session_factory)
+    try:
+        await memory_archival_worker.start()
+    except Exception:
+        log.exception("agentive_memory_archival_worker_start_failed")
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.memory_archival_worker = memory_archival_worker
+
     # Best-effort startup event — a transient DB hiccup must not prevent the
     # app from serving traffic (the worker will replay any orphaned writes
     # next time the publish path succeeds).
@@ -441,6 +452,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         timeout=5.0,
                     )
 
+            with contextlib.suppress(Exception):
+                await memory_archival_worker.stop()
             with contextlib.suppress(Exception):
                 await worker.stop()
             log.info("agentive_shutdown", uptime_seconds=uptime_seconds)

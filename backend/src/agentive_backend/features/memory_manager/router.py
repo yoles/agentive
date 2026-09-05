@@ -151,6 +151,11 @@ async def search_memory(
     it never reaches access logs / reverse proxy / APM either (code review
     Story 3.1, BS4).
 
+    ``include_archived: true`` (Story 3.3 AC2) lifts the ``archived_at``
+    AND ``expires_at`` filters for audit recovery; each result then carries
+    its own ``archived_at`` so the caller can tell a live hit from one
+    surfaced only because of this flag.
+
     Errors:
     * 404 : ``namespace`` does not exist.
     * 403 : the ``X-Acting-Department`` header (if present) differs from the
@@ -168,6 +173,7 @@ async def search_memory(
         top_k=body.top_k,
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
         acting_department=_read_acting_department(request),
+        include_archived=body.include_archived,
     )
 
 

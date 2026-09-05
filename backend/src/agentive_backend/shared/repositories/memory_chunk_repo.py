@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentive_backend.infra.db.models import MemoryChunk
 from agentive_backend.shared.repositories.base import BaseRepo
@@ -75,6 +76,116 @@ class MemoryChunkRepo(BaseRepo):
             )
             result = await session.execute(stmt)
             return dict(result.tuples().all())
+
+    async def find_expired(
+        self,
+        now: datetime,
+        *,
+        limit: int,
+        tenant_id: UUID | None = None,
+    ) -> list[MemoryChunk]:
+        """Live chunks whose TTL has passed — Story 3.3 T1.1 (AC1).
+
+        Exploits the partial index ``ix_memory_chunks_expires_at``
+        (``WHERE archived_at IS NULL AND expires_at IS NOT NULL``, migrated
+        since the initial schema) — the predicate below is written to match
+        it exactly rather than adding a new index.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(MemoryChunk)
+                .where(
+                    MemoryChunk.archived_at.is_(None),
+                    MemoryChunk.expires_at.is_not(None),
+                    MemoryChunk.expires_at < now,
+                )
+                .order_by(MemoryChunk.expires_at)
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def find_archivable_in_namespace(
+        self,
+        namespace_id: UUID,
+        threshold: datetime,
+        *,
+        limit: int,
+        tenant_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> list[MemoryChunk]:
+        """Live, non-expired chunks old enough for ``archive_after_seconds``
+        — Story 3.3 T1.3 (AC3).
+
+        ``threshold`` is ``now - archive_after_seconds``, computed by the
+        caller (:class:`MemoryArchivalWorker`) from the namespace's
+        :class:`RetentionPolicy` — this repo stays agnostic of the domain
+        layer, same as every other method here. ``now`` defaults to the
+        current time (mirrors ``search_ann``/``count_by_namespace_ids``)
+        but should be passed explicitly by the worker so every chunk of a
+        single run is evaluated against one consistent instant.
+        """
+        now = now if now is not None else datetime.now(UTC)
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(MemoryChunk)
+                .where(
+                    MemoryChunk.namespace_id == namespace_id,
+                    MemoryChunk.archived_at.is_(None),
+                    (MemoryChunk.expires_at.is_(None)) | (MemoryChunk.expires_at > now),
+                    MemoryChunk.created_at <= threshold,
+                )
+                .order_by(MemoryChunk.created_at)
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def mark_archived(
+        self,
+        chunk_ids: Sequence[UUID],
+        *,
+        archived_at: datetime,
+        tenant_id: UUID | None = None,
+    ) -> int:
+        """Convenience wrapper — self-managed transaction (Story 3.3 T1.2).
+
+        Use :meth:`mark_archived_in_session` from inside an existing
+        transaction when the UPDATE must be atomic with publishing
+        ``MemoryChunkArchivedEvent`` (mirror ``NamespaceRepo.create`` /
+        ``.create_in_session``, Story 3.2 AC1).
+        """
+        async with self.with_tenant(tenant_id) as session:
+            return await self.mark_archived_in_session(session, chunk_ids, archived_at=archived_at)
+
+    async def mark_archived_in_session(
+        self,
+        session: AsyncSession,
+        chunk_ids: Sequence[UUID],
+        *,
+        archived_at: datetime,
+    ) -> int:
+        """UPDATE inside the caller's transaction — caller owns commit.
+
+        ``AND archived_at IS NULL`` avoids clobbering a value already set by
+        a concurrent/previous run. The returned count is rows ACTUALLY
+        updated (not ``len(chunk_ids)``) so a caller feeding the archival
+        metric stays exact under that race (Story 3.3 T1.2).
+        """
+        if not chunk_ids:
+            return 0
+        stmt = (
+            update(MemoryChunk)
+            .where(MemoryChunk.id.in_(chunk_ids), MemoryChunk.archived_at.is_(None))
+            .values(archived_at=archived_at)
+        )
+        result = await session.execute(stmt)
+        # `getattr` rather than a direct `.rowcount` access — `Result` (the
+        # generic return type of `session.execute()`) doesn't declare it,
+        # only the concrete `CursorResult` a DML statement actually returns
+        # does (same defensive access as `OutboxWorker._mark_processed`).
+        rowcount = getattr(result, "rowcount", None)
+        return rowcount if isinstance(rowcount, int) else 0
 
     async def create(
         self,

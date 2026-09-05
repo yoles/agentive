@@ -778,3 +778,122 @@ async def test_search_no_acting_department_header_is_unrestricted(
             json={"q": "hello", "namespace": "dept-dev-no-header"},
         )
     assert resp.status_code == 200, resp.text
+
+
+# ─── Story 3.3 — MemoryArchivalWorker end-to-end ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_archival_worker_archives_ttl_expired_chunk_end_to_end(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """T10.7 — namespace with a short TTL, chunk created, worker run with a
+    future ``now`` archives it: DB row + outbox event + search filtering."""
+    from datetime import UTC, datetime, timedelta
+
+    from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
+
+    await _create_namespace(app_session_factory, name="ttl-archival-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "will expire", "namespace": "ttl-archival-ns", "ttl": 1},
+        )
+        assert resp.status_code == 201, resp.text
+        chunk_id = resp.json()["chunk_id"]
+
+        worker = MemoryArchivalWorker(session_factory=app_session_factory)
+        summary = await worker.run_once(now=datetime.now(UTC) + timedelta(days=1))
+        assert summary.ttl_expired_count >= 1
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "will expire", "namespace": "ttl-archival-ns"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == []
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "will expire", "namespace": "ttl-archival-ns", "include_archived": True},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["chunk_id"] == chunk_id
+    assert body[0]["archived_at"] is not None
+
+    async with app_session_factory() as session:
+        result = await session.execute(
+            text("SELECT archived_at FROM memory_chunks WHERE id = :id"),
+            {"id": chunk_id},
+        )
+        row = result.mappings().one()
+        assert row["archived_at"] is not None
+
+        result = await session.execute(
+            text(
+                "SELECT payload FROM outbox_events "
+                "WHERE event_type = 'memory_manager.chunk.archived' "
+                "AND payload->>'chunk_id' = :chunk_id"
+            ),
+            {"chunk_id": chunk_id},
+        )
+        event_row = result.mappings().one_or_none()
+    assert event_row is not None
+    assert event_row["payload"]["reason"] == "ttl_expired"
+    assert event_row["payload"]["namespace"] == "ttl-archival-ns"
+
+
+@pytest.mark.asyncio
+async def test_archival_worker_archives_chunk_by_archive_after_seconds(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """T10.8 — a namespace with an explicit `archive_after_seconds` override
+    archives a chunk that never expired, tagged `reason="archive_after_seconds"`."""
+    from datetime import UTC, datetime, timedelta
+
+    from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
+
+    repo = NamespaceRepo(session_factory=app_session_factory)
+    await repo.create(
+        name="age-archival-ns",
+        ns_type="metier",
+        retention_policy={"archive_after_seconds": 60},
+    )
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "will age out", "namespace": "age-archival-ns"},
+        )
+        assert resp.status_code == 201, resp.text
+        chunk_id = resp.json()["chunk_id"]
+        assert resp.json()["expires_at"] is None  # no TTL — only the age path applies
+
+    worker = MemoryArchivalWorker(session_factory=app_session_factory)
+    summary = await worker.run_once(now=datetime.now(UTC) + timedelta(days=1))
+    assert summary.archive_after_seconds_count >= 1
+
+    async with app_session_factory() as session:
+        result = await session.execute(
+            text(
+                "SELECT payload FROM outbox_events "
+                "WHERE event_type = 'memory_manager.chunk.archived' "
+                "AND payload->>'chunk_id' = :chunk_id"
+            ),
+            {"chunk_id": chunk_id},
+        )
+        row = result.mappings().one_or_none()
+    assert row is not None
+    assert row["payload"]["reason"] == "archive_after_seconds"
+    assert row["payload"]["namespace"] == "age-archival-ns"

@@ -90,6 +90,7 @@ class ChunkEmbeddingRepo(BaseRepo):
         tenant_id: UUID | None = None,
         ef_search: int = 100,
         now: datetime | None = None,
+        include_archived: bool = False,
     ) -> list[tuple[MemoryChunk, float]]:
         """ANN search over ``chunk_embeddings`` via the HNSW cosine index (Story 3.1 T2.3).
 
@@ -98,6 +99,17 @@ class ChunkEmbeddingRepo(BaseRepo):
         Story 3.1, IG2). A TTL'd chunk otherwise stayed fully searchable
         forever; this only hides it from search results, it does not
         reclaim storage (that's still Story 3.3's job).
+
+        ``include_archived`` (Story 3.3 AC2) lifts BOTH the ``archived_at``
+        AND the ``expires_at`` filters when ``True`` — not just the former.
+        An expired-but-not-yet-archived chunk (the window between expiry and
+        the next daily ``MemoryArchivalWorker`` pass) would otherwise sit in
+        a blind spot: invisible to a normal search AND unrecoverable via
+        ``include_archived=True`` until the worker actually runs. Lifting
+        both filters together keeps the parameter useful for its stated
+        purpose ("recover for audit") in that window too (deliberate scope
+        extension beyond the epic's literal text — see this story's Dev
+        Notes § ``include_archived``).
 
         Returns ``(chunk, score)`` pairs sorted by descending similarity,
         where ``score = 1.0 - cosine_distance`` (cosine distance range
@@ -170,20 +182,22 @@ class ChunkEmbeddingRepo(BaseRepo):
             await session.execute(text("SET LOCAL hnsw.iterative_scan = 'strict_order'"))
             embedding_expr = cast(ChunkEmbedding.embedding, Vector(len(query_embedding)))
             distance = embedding_expr.cosine_distance(list(query_embedding))
+            filters = [
+                ChunkEmbedding.model == model,
+                MemoryChunk.namespace_id == namespace_id,
+            ]
+            if not include_archived:
+                filters.append(MemoryChunk.archived_at.is_(None))
+                # A TTL'd chunk otherwise stays fully searchable forever —
+                # nothing else in this story enforces expiry at read time
+                # (code review Story 3.1, IG2). Physical reclamation of
+                # expired rows is still Story 3.3's job; this only hides
+                # them from search.
+                filters.append((MemoryChunk.expires_at.is_(None)) | (MemoryChunk.expires_at > now))
             stmt = (
                 select(MemoryChunk, distance.label("distance"))
                 .join(ChunkEmbedding, ChunkEmbedding.chunk_id == MemoryChunk.id)
-                .where(
-                    ChunkEmbedding.model == model,
-                    MemoryChunk.namespace_id == namespace_id,
-                    MemoryChunk.archived_at.is_(None),
-                    # A TTL'd chunk otherwise stays fully searchable forever
-                    # — nothing else in this story enforces expiry at read
-                    # time (code review Story 3.1, IG2). Physical reclamation
-                    # of expired rows is still Story 3.3's job; this only
-                    # hides them from search.
-                    (MemoryChunk.expires_at.is_(None)) | (MemoryChunk.expires_at > now),
-                )
+                .where(*filters)
                 # Tie-break: identical content embeds to an identical vector,
                 # so `distance` alone leaves the order up to the plan and two
                 # identical requests could return different rows at the same

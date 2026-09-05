@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -132,3 +133,116 @@ async def test_count_by_namespace_ids_filters_expired_chunks_like_search_ann() -
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "expires_at is null" in sql_text
     assert "expires_at >" in sql_text
+
+
+# ─── find_expired / mark_archived / find_archivable_in_namespace (Story 3.3) ──
+
+
+@pytest.mark.asyncio
+async def test_find_expired_emits_select_matching_the_partial_index() -> None:
+    """T1.1 — the predicate must match `ix_memory_chunks_expires_at`
+    (``archived_at IS NULL AND expires_at IS NOT NULL``) exactly, plus the
+    `expires_at < now` cutoff, ordered and limited."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalars.return_value.all = lambda: []
+    repo = MemoryChunkRepo(session_factory=factory)
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+
+    await repo.find_expired(now, limit=50)
+
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "archived_at is null" in sql_text
+    assert "expires_at is not null" in sql_text
+    assert "expires_at <" in sql_text
+    assert "order by" in sql_text
+    assert "limit" in sql_text
+
+
+@pytest.mark.asyncio
+async def test_find_archivable_in_namespace_emits_select_with_all_three_filters() -> None:
+    """T1.3 — namespace scope, live (not expired), old enough."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalars.return_value.all = lambda: []
+    repo = MemoryChunkRepo(session_factory=factory)
+    namespace_id = uuid4()
+    threshold = datetime(2029, 1, 1, tzinfo=UTC)
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+
+    await repo.find_archivable_in_namespace(namespace_id, threshold, limit=50, now=now)
+
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "memory_chunks.namespace_id = " in sql_text
+    assert "memory_chunks.archived_at is null" in sql_text
+    assert "memory_chunks.expires_at is null" in sql_text
+    assert "memory_chunks.expires_at > " in sql_text
+    assert "memory_chunks.created_at <= " in sql_text
+
+
+@pytest.mark.asyncio
+async def test_find_archivable_in_namespace_defaults_now_to_the_current_time() -> None:
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalars.return_value.all = lambda: []
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    await repo.find_archivable_in_namespace(uuid4(), datetime(2029, 1, 1, tzinfo=UTC), limit=50)
+
+    stmt = session.execute.await_args.args[0]
+    bound_now = stmt.compile().params.get("expires_at_1")
+    assert bound_now is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_archived_returns_zero_for_empty_input_without_a_query() -> None:
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    result = await repo.mark_archived([], archived_at=datetime(2030, 1, 1, tzinfo=UTC))
+
+    assert result == 0
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mark_archived_emits_update_guarded_by_archived_at_is_null() -> None:
+    """T1.2 — the guard avoids clobbering a value already set by a
+    concurrent/previous run."""
+    factory, session = make_session_factory_mock()
+    session.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+    repo = MemoryChunkRepo(session_factory=factory)
+    chunk_id = uuid4()
+    archived_at = datetime(2030, 1, 1, tzinfo=UTC)
+
+    result = await repo.mark_archived([chunk_id], archived_at=archived_at)
+
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "update memory_chunks set" in sql_text
+    assert "archived_at is null" in sql_text
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_archived_returns_actual_rowcount_not_len_of_input() -> None:
+    """A concurrent run may have already archived one of the two ids — the
+    caller (the metric, the run summary) must see 1, not 2."""
+    factory, session = make_session_factory_mock()
+    session.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    result = await repo.mark_archived(
+        [uuid4(), uuid4()], archived_at=datetime(2030, 1, 1, tzinfo=UTC)
+    )
+
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_archived_defensively_handles_a_missing_rowcount() -> None:
+    """`Result` (the generic type `session.execute()` returns) doesn't
+    declare `.rowcount` — a driver/mock that omits it must not crash."""
+    factory, session = make_session_factory_mock()
+    session.execute = AsyncMock(return_value=MagicMock(spec=[]))
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    result = await repo.mark_archived([uuid4()], archived_at=datetime(2030, 1, 1, tzinfo=UTC))
+
+    assert result == 0
