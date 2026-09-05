@@ -107,3 +107,38 @@ def test_archivable_at_none_when_policy_never_archives() -> None:
 def test_archivable_at_offsets_from_created() -> None:
     policy = RetentionPolicy(archive_after_seconds=86400)
     assert policy.archivable_at(_CREATED) == _CREATED + timedelta(days=1)
+
+
+# ─── default_for_type (Story 3.2 AC1) ─────────────────────────────
+
+
+def test_default_for_type_contextuelle_is_7_days() -> None:
+    policy = RetentionPolicy.default_for_type(NamespaceType.CONTEXTUELLE)
+    assert policy.default_ttl_seconds == 604_800
+    assert policy.archive_after_seconds is None
+
+
+def test_default_for_type_operationnelle_is_90_days() -> None:
+    policy = RetentionPolicy.default_for_type(NamespaceType.OPERATIONNELLE)
+    assert policy.default_ttl_seconds == 7_776_000
+
+
+def test_default_for_type_metier_is_365_days() -> None:
+    policy = RetentionPolicy.default_for_type(NamespaceType.METIER)
+    assert policy.default_ttl_seconds == 31_536_000
+
+
+def test_default_for_type_client_is_unlimited() -> None:
+    policy = RetentionPolicy.default_for_type(NamespaceType.CLIENT)
+    assert policy.default_ttl_seconds is None
+
+
+def test_default_for_type_covers_every_namespace_type() -> None:
+    """Guards the module-level exhaustiveness assertion's intent: every
+
+    `NamespaceType` member must resolve without the internal `KeyError`
+    that `default_for_type` used to leak as an opaque 500 (code review
+    Story 3.2, P7).
+    """
+    for ns_type in NamespaceType:
+        RetentionPolicy.default_for_type(ns_type)

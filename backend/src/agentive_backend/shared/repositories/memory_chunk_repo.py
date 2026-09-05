@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from agentive_backend.infra.db.models import MemoryChunk
 from agentive_backend.shared.repositories.base import BaseRepo
@@ -37,6 +38,34 @@ class MemoryChunkRepo(BaseRepo):
             stmt = select(MemoryChunk).where(MemoryChunk.namespace_id == namespace_id).limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    async def count_by_namespace_ids(
+        self,
+        namespace_ids: Sequence[UUID],
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[UUID, int]:
+        """Live (non-archived) chunk count per namespace — Story 3.2 AC3.
+
+        ONE grouped query for N namespaces, not an N+1 loop (perf pattern
+        scrutinized in Story 3.1 code review, BS1/BS2). A namespace with zero
+        live chunks is simply absent from the returned dict — callers must
+        ``.get(namespace_id, 0)``, mirrored by the analogous `archived_at IS
+        NULL` filter already applied in ``ChunkEmbeddingRepo.search_ann``.
+        """
+        if not namespace_ids:
+            return {}
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(MemoryChunk.namespace_id, func.count())
+                .where(
+                    MemoryChunk.namespace_id.in_(namespace_ids),
+                    MemoryChunk.archived_at.is_(None),
+                )
+                .group_by(MemoryChunk.namespace_id)
+            )
+            result = await session.execute(stmt)
+            return dict(result.tuples().all())
 
     async def create(
         self,

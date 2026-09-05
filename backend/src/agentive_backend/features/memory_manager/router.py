@@ -1,12 +1,22 @@
-"""``/api/v1/memory/*`` — Memory Manager endpoints (Story 3.1).
+"""``/api/v1/memory/*`` — Memory Manager endpoints (Stories 3.1, 3.2).
 
-Two endpoints:
+Four endpoints:
 
-* ``POST /memory/chunks`` : write a chunk + its embedding (AC1).
-* ``POST /memory/search`` : ANN search over a namespace (AC2). AC2
+* ``POST /memory/chunks`` : write a chunk + its embedding (3.1 AC1).
+* ``POST /memory/search`` : ANN search over a namespace (3.1 AC2). AC2
   originally specified a GET with ``q`` as a query param; moved to POST with
   ``q`` in the body so the search text never lands in a URL (and therefore
   never in access logs / reverse proxy / APM, code review Story 3.1, BS4).
+* ``POST /memory/namespaces`` : create a namespace with a per-type default
+  retention (3.2 AC1).
+* ``GET /memory/namespaces`` : admin listing, all departments, with live
+  chunk counts (3.2 AC3).
+
+``POST /memory/chunks`` and ``POST /memory/search`` read the optional
+``X-Acting-Department`` header (3.2 AC2) — see
+``MemoryManagerService._check_department_access`` for what this does and
+does not guarantee. ``POST``/``GET /memory/namespaces`` ignore it (global
+administration actions, not subject to department scoping).
 
 All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). The global
 ``AgentiveError`` handler converts domain errors to RFC 7807.
@@ -16,17 +26,54 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, status
 
+from agentive_backend.features.memory_manager.domain.value_objects import RetentionPolicy
 from agentive_backend.features.memory_manager.schemas import (
     CreateMemoryChunkRequest,
+    CreateNamespaceRequest,
     MemoryChunkCreateView,
     MemorySearchResultView,
+    NamespaceCreateView,
+    NamespaceListItemView,
     SearchMemoryRequest,
 )
 from agentive_backend.features.memory_manager.service import MemoryManagerService
-from agentive_backend.shared.exceptions import DependencyError
+from agentive_backend.shared.exceptions import DependencyError, ValidationError
 from agentive_backend.shared.repositories import ChunkEmbeddingRepo, MemoryChunkRepo, NamespaceRepo
 
 router = APIRouter(tags=["memory"])
+
+# Story 3.2 AC2 — self-declared, non-authenticating scope header. See
+# Dev Notes § Département in the story file for why this is not a real
+# security boundary at MVP (single shared static token, no per-user
+# session — Growth RBAC, Sprint 4, will replace this).
+ACTING_DEPARTMENT_HEADER = "X-Acting-Department"
+
+# Mirrors `CreateNamespaceRequest.department`'s cap (schemas.py) — this
+# header is exactly as client-controlled as that body field, and flows
+# into `outbox_events` payloads and log lines the same way (code review
+# Story 3.2, P3).
+ACTING_DEPARTMENT_MAX_LENGTH = 100
+
+
+def _read_acting_department(request: Request) -> str | None:
+    """Read ``X-Acting-Department``, treating an empty header as absent.
+
+    A header present but empty (``X-Acting-Department:``) reads as ``""``,
+    not ``None`` — left unhandled, that used to fail
+    ``_check_department_access``'s equality check and produce a spurious
+    403 plus a persisted audit event (code review Story 3.2, P2).
+    """
+    value = request.headers.get(ACTING_DEPARTMENT_HEADER)
+    if not value:
+        return None
+    if len(value) > ACTING_DEPARTMENT_MAX_LENGTH:
+        raise ValidationError(
+            detail=(
+                f"{ACTING_DEPARTMENT_HEADER} must not exceed "
+                f"{ACTING_DEPARTMENT_MAX_LENGTH} characters"
+            ),
+        )
+    return value
 
 
 def _build_service(request: Request) -> MemoryManagerService:
@@ -64,7 +111,9 @@ async def create_memory_chunk(
     """201 on success.
 
     Errors:
-    * 404 : ``namespace`` does not exist (creation is Story 3.2).
+    * 404 : ``namespace`` does not exist.
+    * 403 : the ``X-Acting-Department`` header (if present) differs from the
+      namespace's department (Story 3.2 AC2).
     * 422 : Pydantic body validation, or a malformed namespace
       ``retention_policy`` the domain layer refuses.
     * 503 : memory manager not initialised, or the embedder returned no
@@ -83,6 +132,7 @@ async def create_memory_chunk(
         content=body.content,
         ttl_seconds=body.ttl,
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
+        acting_department=_read_acting_department(request),
     )
 
 
@@ -103,6 +153,8 @@ async def search_memory(
 
     Errors:
     * 404 : ``namespace`` does not exist.
+    * 403 : the ``X-Acting-Department`` header (if present) differs from the
+      namespace's department (Story 3.2 AC2).
     * 422 : ``top_k`` out of ``[1, 50]`` bounds, or a blank/unstorable ``q``.
     * 503 : memory manager not initialised, or the embedder returned no
       vector.
@@ -115,7 +167,57 @@ async def search_memory(
         query=body.q,
         top_k=body.top_k,
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
+        acting_department=_read_acting_department(request),
     )
+
+
+@router.post(
+    "/memory/namespaces",
+    response_model=NamespaceCreateView,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a namespace with a per-type default retention (Story 3.2 AC1)",
+)
+async def create_namespace(
+    request: Request,
+    body: CreateNamespaceRequest,
+) -> NamespaceCreateView:
+    """201 on success. Not subject to ``X-Acting-Department`` (global
+    administration action).
+
+    Errors:
+    * 409 : ``name`` already exists.
+    * 422 : Pydantic body validation (``type`` outside the 4-value enum,
+      blank/unstorable ``name``, out-of-bounds ``retention_policy``).
+    """
+    service = _build_service(request)
+    return await service.create_namespace(
+        name=body.name,
+        ns_type=body.type,
+        department=body.department,
+        project=body.project,
+        retention_policy_override=(
+            None
+            if body.retention_policy is None
+            else RetentionPolicy(
+                default_ttl_seconds=body.retention_policy.default_ttl_seconds,
+                archive_after_seconds=body.retention_policy.archive_after_seconds,
+            )
+        ),
+        tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
+    )
+
+
+@router.get(
+    "/memory/namespaces",
+    response_model=list[NamespaceListItemView],
+    summary="List all namespaces with live chunk counts (Story 3.2 AC3)",
+)
+async def list_namespaces(request: Request) -> list[NamespaceListItemView]:
+    """200 — admin listing, all departments (no ``X-Acting-Department``
+    scoping — John, owner, needs to see everything to administer the
+    memory system). Grouping by department/type is a frontend concern."""
+    service = _build_service(request)
+    return await service.list_namespaces(tenant_id=None)
 
 
 __all__ = ["router"]

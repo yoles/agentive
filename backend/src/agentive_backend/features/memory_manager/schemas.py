@@ -11,7 +11,9 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+from agentive_backend.shared.repositories.namespace_repo import NamespaceType
 
 # `text-embedding-3-small` tops out at 8191 tokens. Past that,
 # `OpenAIEmbeddings` silently splits the text and AVERAGES the resulting
@@ -109,6 +111,102 @@ class SearchMemoryRequest(BaseModel):
         return ensure_embeddable_text(value, field=info.field_name or "value")
 
 
+class RetentionPolicyOverride(BaseModel):
+    """Optional override of a namespace's default retention (Story 3.2 AC1).
+
+    Replaces the type default entirely when provided (no field-by-field
+    merge): a field left unset here means "unlimited" for that field, not
+    "keep the type default". An override with every field unset would
+    therefore silently produce an unlimited-retention namespace, defeating
+    AC1's per-type default (code review Story 3.2, BS1). Rejected instead:
+    at least one field must be explicit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_ttl_seconds: int | None = Field(default=None, ge=0, le=TTL_MAX_SECONDS)
+    archive_after_seconds: int | None = Field(default=None, ge=0, le=TTL_MAX_SECONDS)
+
+    @model_validator(mode="after")
+    def _reject_empty_override(self) -> RetentionPolicyOverride:
+        if self.default_ttl_seconds is None and self.archive_after_seconds is None:
+            raise ValueError(
+                "retention_policy must set at least one field; omit the "
+                "field entirely (or send no retention_policy at all) to use "
+                "the type default"
+            )
+        return self
+
+
+class CreateNamespaceRequest(BaseModel):
+    """Body of ``POST /api/v1/memory/namespaces`` (Story 3.2 AC1).
+
+    ``embedding_backend`` is NOT exposed here — always hardcoded to
+    ``"cloud"`` server-side (same anti-scope as Story 3.1 T1.6, no other
+    backend is wired before Story 3.6).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    type: NamespaceType
+    department: str | None = Field(default=None, max_length=100)
+    project: str | None = Field(default=None, max_length=100)
+    retention_policy: RetentionPolicyOverride | None = None
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _reject_unstorable_text(cls, value: str) -> str:
+        return ensure_embeddable_text(value, field="name")
+
+    @field_validator("department", "project", mode="after")
+    @classmethod
+    def _reject_unstorable_optional_text(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Same guard as ``name``, minus the ``required`` cardinality.
+
+        Previously only ``name`` went through ``ensure_embeddable_text``,
+        so a NUL byte or lone surrogate in ``department``/``project`` sailed
+        through Pydantic and 500'd at ``session.flush()`` instead of 422
+        (code review Story 3.2, P4).
+        """
+        if value is None:
+            return None
+        return ensure_embeddable_text(value, field=info.field_name or "value")
+
+
+class NamespaceCreateView(BaseModel):
+    """Response of ``POST /api/v1/memory/namespaces`` — 201 (Story 3.2 AC1)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    namespace_id: UUID
+    name: str
+    type: str
+    department: str | None
+    project: str | None
+    retention_policy: dict[str, int | None]
+    embedding_backend: str
+    created_at: datetime
+
+
+class NamespaceListItemView(BaseModel):
+    """One item of ``GET /api/v1/memory/namespaces`` — 200 (Story 3.2 AC3)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    namespace_id: UUID
+    name: str
+    type: str
+    department: str | None
+    project: str | None
+    retention_policy: dict[str, int | None]
+    embedding_backend: str
+    chunk_count: int
+    created_at: datetime
+
+
 class MemorySearchResultView(BaseModel):
     """One result item of ``POST /api/v1/memory/search`` (Story 3.1 AC2).
 
@@ -130,8 +228,12 @@ __all__ = [
     "CONTENT_MAX_CHARS",
     "TTL_MAX_SECONDS",
     "CreateMemoryChunkRequest",
+    "CreateNamespaceRequest",
     "MemoryChunkCreateView",
     "MemorySearchResultView",
+    "NamespaceCreateView",
+    "NamespaceListItemView",
+    "RetentionPolicyOverride",
     "SearchMemoryRequest",
     "ensure_embeddable_text",
 ]

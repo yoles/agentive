@@ -122,6 +122,40 @@ class RetentionPolicy:
             return None
         return created_at + timedelta(seconds=self.archive_after_seconds)
 
+    @classmethod
+    def default_for_type(cls, ns_type: NamespaceType) -> RetentionPolicy:
+        """The per-type default TTL mandated by Story 3.2 AC1 (epics.md).
+
+        ``archive_after_seconds`` is deliberately left ``None`` here — Story
+        3.3 (automatic archival job) owns picking its own default, AC1 only
+        specifies a TTL per type.
+        """
+        try:
+            return cls(default_ttl_seconds=_DEFAULT_TTL_SECONDS_BY_TYPE[ns_type])
+        except KeyError as exc:
+            # `ns_type` is an enum member, so this can only fire if a new
+            # `NamespaceType` value is added without updating the table
+            # below — the module-level assertion catches that at import
+            # time, this is the defense in depth for anything that slips
+            # past it (code review Story 3.2, P7).
+            raise DomainValidationError(
+                f"no default retention configured for namespace type {ns_type!r}"
+            ) from exc
+
+
+# Story 3.2 AC1 (epics.md line 1011) — one default per namespace type.
+_DEFAULT_TTL_SECONDS_BY_TYPE: Final[dict[NamespaceType, int | None]] = {
+    NamespaceType.CONTEXTUELLE: 604_800,  # 7 jours
+    NamespaceType.OPERATIONNELLE: 7_776_000,  # 90 jours
+    NamespaceType.METIER: 31_536_000,  # 365 jours
+    NamespaceType.CLIENT: None,  # illimité sauf override explicite à la création
+}
+
+assert set(_DEFAULT_TTL_SECONDS_BY_TYPE) == set(NamespaceType), (
+    "_DEFAULT_TTL_SECONDS_BY_TYPE must have exactly one entry per NamespaceType "
+    "member (code review Story 3.2, P7)"
+)
+
 
 __all__ = [
     "DomainValidationError",

@@ -5,9 +5,12 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import asc, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentive_backend.infra.db.models import Namespace
+from agentive_backend.shared.exceptions import ConflictError
 from agentive_backend.shared.repositories.base import BaseRepo
 
 # Mirror of the Postgres CHECK constraint on ``namespaces.type`` so callers
@@ -61,6 +64,26 @@ class NamespaceRepo(BaseRepo):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def list_all(self, *, tenant_id: UUID | None = None, limit: int = 500) -> list[Namespace]:
+        """All namespaces, no ``type``/``department`` filter (Story 3.2 AC3).
+
+        Admin listing for ``Config > Namespaces`` — John (owner) needs to see
+        every namespace to administer the memory system, unlike the
+        department-scoped read/write path in ``MemoryManagerService``.
+
+        Ordered (``created_at``, ``id``) so row order is stable across
+        refetches — Postgres makes no ordering guarantee on an unordered
+        ``SELECT`` (code review Story 3.2, P6).
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(Namespace)
+                .order_by(asc(Namespace.created_at), asc(Namespace.id))
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
     async def create(
         self,
         *,
@@ -72,17 +95,68 @@ class NamespaceRepo(BaseRepo):
         embedding_backend: str = "cloud",
         tenant_id: UUID | None = None,
     ) -> Namespace:
+        """Convenience wrapper — self-managed transaction.
+
+        Use :meth:`create_in_session` from inside an existing transaction
+        when you need to compose the INSERT with another write (e.g.
+        publishing an outbox event atomically — Story 3.2 AC1).
+
+        Raises:
+            ConflictError: If ``name`` already exists.
+        """
         async with self.with_tenant(tenant_id) as session:
-            ns = Namespace(
+            return await self.create_in_session(
+                session,
                 name=name,
-                type=ns_type,
+                ns_type=ns_type,
                 department=department,
                 project=project,
-                retention_policy=retention_policy or {},
+                retention_policy=retention_policy,
                 embedding_backend=embedding_backend,
                 tenant_id=tenant_id,
             )
-            session.add(ns)
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        name: str,
+        ns_type: NamespaceType,
+        department: str | None = None,
+        project: str | None = None,
+        retention_policy: dict[str, Any] | None = None,
+        embedding_backend: str = "cloud",
+        tenant_id: UUID | None = None,
+    ) -> Namespace:
+        """INSERT inside the caller's transaction — caller owns commit.
+
+        Story 3.2 T5.1 — used by ``MemoryManagerService.create_namespace`` to
+        publish ``NamespaceCreatedEvent`` in the same transaction as the row
+        INSERT (atomicity with the outbox pattern, same mirror as
+        ``AgentTemplateRepo.create_in_session``).
+
+        Raises:
+            ConflictError: If ``name`` already exists. The repo translates
+                ``IntegrityError`` (``namespaces.name`` UNIQUE constraint) so
+                feature code stays free of ``sqlalchemy`` imports
+                (``import-linter`` Contract 3).
+        """
+        ns = Namespace(
+            name=name,
+            type=ns_type,
+            department=department,
+            project=project,
+            retention_policy=retention_policy or {},
+            embedding_backend=embedding_backend,
+            tenant_id=tenant_id,
+        )
+        session.add(ns)
+        try:
             await session.flush()
-            await session.refresh(ns)
-            return ns
+        except IntegrityError as exc:
+            raise ConflictError(
+                detail=f"Namespace '{name}' already exists",
+                context={"name": name},
+            ) from exc
+        await session.refresh(ns)
+        return ns

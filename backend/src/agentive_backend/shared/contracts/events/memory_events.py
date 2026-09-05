@@ -1,5 +1,61 @@
-"""Memory chunk events — placeholder until M4 Memory Manager ships.
+"""Memory manager events — Epic 3.
 
-Filled by Epic 3 stories (3.1 — vector storage, 3.3 — TTL & archival, 3.5 —
-push memory). The naming convention ``memory_manager.chunk.*`` is fixed.
+Naming convention follows the ``module.entity.action`` pattern (cf.
+``shared/event_bus/naming.py``). Events shipped:
+
+* ``memory_manager.namespace.created`` — Story 3.2, emitted after a
+  namespace row is durably committed via ``POST /memory/namespaces``.
+* ``memory_manager.namespace.access_denied`` — Story 3.2, emitted when a
+  caller's declared ``X-Acting-Department`` differs from the target
+  namespace's ``department`` (AC2).
+
+Filled in by Story 3.2 — this file was a placeholder left by Story 3.1
+("Filled by Epic 3 stories").
 """
+
+from __future__ import annotations
+
+from typing import ClassVar, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class NamespaceCreatedEvent(BaseModel):
+    """Published after a new ``namespaces`` row is durably committed
+    (Story 3.2 AC1). Lives in ``outbox_events`` until Story 9.1 wires
+    :class:`AuditEventRepo` (same audit-bypass posture as the rest of the
+    codebase's typed events).
+    """
+
+    event_type: ClassVar[str] = "memory_manager.namespace.created"
+
+    namespace_id: UUID
+    name: str = Field(min_length=1, max_length=255)
+    namespace_type: str
+    department: str | None = None
+    project: str | None = None
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+class NamespaceAccessDeniedEvent(BaseModel):
+    """Published when a request's ``X-Acting-Department`` differs from the
+    target namespace's ``department`` (Story 3.2 AC2). Committed BEFORE the
+    caller-facing ``ForbiddenError`` is raised — see
+    ``MemoryManagerService._check_department_access`` for why the ordering
+    matters (a rollback would silently drop this audit trail row).
+    """
+
+    event_type: ClassVar[str] = "memory_manager.namespace.access_denied"
+
+    namespace_id: UUID
+    namespace: str = Field(min_length=1, max_length=255)
+    namespace_department: str
+    acting_department: str
+    operation: Literal["create_chunk", "search"]
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+__all__ = ["NamespaceAccessDeniedEvent", "NamespaceCreatedEvent"]
