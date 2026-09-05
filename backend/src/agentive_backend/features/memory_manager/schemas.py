@@ -202,6 +202,12 @@ class NamespaceListItemView(BaseModel):
     department: str | None
     project: str | None
     retention_policy: dict[str, int | None]
+    # `False` only when the DB row's `retention_policy` JSONB could not be
+    # parsed (hand-seeded/legacy data) — `retention_policy` then falls back
+    # to an empty policy, which reads exactly like a legitimate unlimited
+    # `client` namespace unless this field says otherwise (product
+    # decision, code review Story 3.2, IG2).
+    retention_policy_valid: bool = True
     embedding_backend: str
     chunk_count: int
     created_at: datetime

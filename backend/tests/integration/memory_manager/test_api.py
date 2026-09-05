@@ -564,6 +564,33 @@ async def test_list_namespaces_zero_chunks_when_none_created(
 
 
 @pytest.mark.asyncio
+async def test_list_namespaces_flags_a_malformed_retention_policy(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A corrupted `retention_policy` used to render exactly like a
+
+    legitimate unlimited `client` namespace, indistinguishable to an
+    admin. `retention_policy_valid: false` is the explicit signal
+    (product decision, code review Story 3.2, IG2).
+    """
+    await _create_namespace(
+        app_session_factory,
+        name="legacy-corrupt-policy",
+        retention_policy={"default_ttl_seconds": "not-an-int"},
+    )
+    await _create_namespace(app_session_factory, name="legit-unlimited-client")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/memory/namespaces", headers=_auth_headers())
+    assert resp.status_code == 200, resp.text
+    by_name = {ns["name"]: ns for ns in resp.json()}
+    assert by_name["legacy-corrupt-policy"]["retention_policy_valid"] is False
+    assert by_name["legit-unlimited-client"]["retention_policy_valid"] is True
+
+
+@pytest.mark.asyncio
 async def test_list_namespaces_chunk_count_excludes_expired_chunks(
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -663,6 +690,29 @@ async def test_search_same_department_succeeds(
             "/api/v1/memory/search",
             headers={**_auth_headers(), "X-Acting-Department": "Dev"},
             json={"q": "hello", "namespace": "dept-dev-same"},
+        )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_search_same_department_case_and_whitespace_insensitive(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Product decision (code review Story 3.2, IG1): this header is not a
+
+    real security boundary before Growth RBAC, so a case/whitespace
+    mismatch must not turn into a spurious 403.
+    """
+    repo = NamespaceRepo(session_factory=app_session_factory)
+    await repo.create(name="dept-dev-fuzzy", ns_type="metier", department="Dev")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers={**_auth_headers(), "X-Acting-Department": " dev "},
+            json={"q": "hello", "namespace": "dept-dev-fuzzy"},
         )
     assert resp.status_code == 200, resp.text
 
