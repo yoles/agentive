@@ -98,7 +98,17 @@ export function NamespacesPage() {
                       <td className="py-3 font-medium">{ns.name}</td>
                       <td className="py-3 text-muted-foreground">{ns.project ?? "—"}</td>
                       <td className="py-3">
-                        {formatRetention(ns.retention_policy.default_ttl_seconds)}
+                        {ns.retention_policy_valid ? (
+                          formatRetention(ns.retention_policy.default_ttl_seconds)
+                        ) : (
+                          <span
+                            className="font-medium text-destructive"
+                            title="La donnée de rétention en base est corrompue et ne peut pas être interprétée. Contactez un développeur."
+                            data-testid={`retention-invalid-${ns.namespace_id}`}
+                          >
+                            donnée invalide
+                          </span>
+                        )}
                       </td>
                       <td className="py-3">{ns.chunk_count}</td>
                     </tr>

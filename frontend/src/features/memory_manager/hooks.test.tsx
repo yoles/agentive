@@ -63,6 +63,7 @@ describe("Memory Manager namespaces hooks", () => {
           department: "Dev",
           project: null,
           retention_policy: { default_ttl_seconds: 31_536_000, archive_after_seconds: null },
+          retention_policy_valid: true,
           embedding_backend: "cloud",
           chunk_count: 3,
           created_at: new Date().toISOString(),
@@ -75,6 +76,7 @@ describe("Memory Manager namespaces hooks", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.[0].name).toBe("dev-notes");
     expect(result.current.data?.[0].chunk_count).toBe(3);
+    expect(result.current.data?.[0].retention_policy_valid).toBe(true);
   });
 
   it("useCreateNamespace POSTs body and invalidates ['memory-namespaces']", async () => {

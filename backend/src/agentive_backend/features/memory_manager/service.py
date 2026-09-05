@@ -81,6 +81,15 @@ _log = get_logger(__name__)
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 
+def _normalize_department(value: str) -> str:
+    """Case- and whitespace-insensitive key for department comparison
+
+    (product decision, code review Story 3.2, IG1). Only used to compare —
+    the stored/echoed value is never altered.
+    """
+    return value.strip().casefold()
+
+
 def _warn_if_backend_not_cloud(namespace_name: str, embedding_backend: str) -> None:
     """T1.6 — warn (never block) when a namespace asks for a backend we do
     not wire yet. Applies to reads as much as writes: search forces the same
@@ -460,6 +469,7 @@ class MemoryManagerService:
                     department=ns.department,
                     project=ns.project,
                     retention_policy={"default_ttl_seconds": None, "archive_after_seconds": None},
+                    retention_policy_valid=False,
                     embedding_backend=ns.embedding_backend,
                     chunk_count=counts.get(ns.id, 0),
                     created_at=ns.created_at,
@@ -486,12 +496,19 @@ class MemoryManagerService:
         ``X-Acting-Department`` header — rest of the callers, including every
         existing 3.1 call site, are unaffected) or when the namespace itself
         has no department (cross-cutting/shared namespace).
+
+        The comparison itself is case- and whitespace-insensitive (product
+        decision, code review Story 3.2, IG1): this header is explicitly
+        not a real security boundary before Growth RBAC (Sprint 4), so a
+        typo'd case or a stray trailing space must not turn into a spurious
+        403 plus a persisted audit event for what is really the same
+        department.
         """
         if acting_department is None:
             return
         if namespace.department is None:
             return
-        if namespace.department == acting_department:
+        if _normalize_department(namespace.department) == _normalize_department(acting_department):
             return
 
         event = NamespaceAccessDeniedEvent(

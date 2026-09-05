@@ -479,6 +479,41 @@ async def test_search_allows_same_department() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_allows_same_department_case_insensitive() -> None:
+    """Product decision (code review Story 3.2, IG1): this header is not a
+
+    real security boundary before Growth RBAC, so a case mismatch must not
+    turn into a spurious 403.
+    """
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5, acting_department="dev")
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_allows_same_department_with_stray_whitespace() -> None:
+    """A trailing space in either value (typo, copy-paste) must not turn
+
+    into a spurious 403 (code review Story 3.2, IG1).
+    """
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(
+        namespace_name=namespace.name, query="q", top_k=5, acting_department=" Dev "
+    )
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_search_allows_cross_department_when_namespace_has_no_department() -> None:
     namespace = _make_namespace(department=None)
     service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
@@ -674,6 +709,7 @@ async def test_list_namespaces_zips_chunk_counts() -> None:
     by_name = {view.name: view for view in result}
     assert by_name["a"].chunk_count == 7
     assert by_name["a"].retention_policy["default_ttl_seconds"] == 60
+    assert by_name["a"].retention_policy_valid is True
     assert by_name["b"].chunk_count == 0  # absent from the counts dict
 
 
@@ -700,6 +736,7 @@ async def test_list_namespaces_tolerates_malformed_retention_policy() -> None:
         "default_ttl_seconds": None,
         "archive_after_seconds": None,
     }
+    assert result[0].retention_policy_valid is False
 
 
 @pytest.mark.asyncio
@@ -733,6 +770,7 @@ async def test_list_namespaces_tolerates_non_int_ttl() -> None:
         "default_ttl_seconds": None,
         "archive_after_seconds": None,
     }
+    assert result[0].retention_policy_valid is False
 
 
 @pytest.mark.asyncio

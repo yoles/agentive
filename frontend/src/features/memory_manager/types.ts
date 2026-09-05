@@ -25,6 +25,12 @@ export type Namespace = {
 
 export type NamespaceListItem = Namespace & {
   chunk_count: number;
+  // `false` only for a hand-seeded/legacy row whose `retention_policy`
+  // JSONB could not be parsed — `retention_policy` then falls back to an
+  // empty policy, which would otherwise render exactly like a legitimate
+  // unlimited `client` namespace (product decision, code review Story
+  // 3.2, IG2).
+  retention_policy_valid: boolean;
 };
 
 export type CreateNamespaceRequest = {
