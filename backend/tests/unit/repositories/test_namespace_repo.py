@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from agentive_backend.shared.exceptions import ConflictError, NotFoundError
 from agentive_backend.shared.repositories import NamespaceRepo
+from agentive_backend.shared.repositories.namespace_repo import NAMESPACE_LISTING_SAFETY_CAP
 
 from .conftest import make_session_factory_mock
 
@@ -108,3 +109,18 @@ async def test_list_all_orders_by_created_at_then_id() -> None:
     await repo.list_all(limit=500)
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "order by namespaces.created_at asc, namespaces.id asc" in sql_text
+
+
+@pytest.mark.asyncio
+async def test_list_all_default_limit_is_a_generous_safety_net() -> None:
+    """AC3 promises "tous les namespaces" — the old default of 500 was a
+
+    silent, undocumented ceiling. Namespaces are only ever admin-created
+    (unlike `memory_chunks`), so a much higher default is safe (code
+    review Story 3.2, BS3).
+    """
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.list_all()
+    stmt = session.execute.await_args.args[0]
+    assert stmt.compile().params["param_1"] == NAMESPACE_LISTING_SAFETY_CAP

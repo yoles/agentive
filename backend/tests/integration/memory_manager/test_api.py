@@ -563,6 +563,38 @@ async def test_list_namespaces_zero_chunks_when_none_created(
     assert by_name["list-empty"]["chunk_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_list_namespaces_chunk_count_excludes_expired_chunks(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 states `chunk_count` is coherent with `search_ann`'s own filter,
+
+    which excludes expired chunks in addition to archived ones. Before the
+    BS2 fix, an expired-but-not-yet-archived chunk was still counted here,
+    over-stating what a search would actually return (code review Story
+    3.2, BS2).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from agentive_backend.shared.repositories import MemoryChunkRepo
+
+    namespace = await _create_namespace(app_session_factory, name="expired-chunk-ns")
+    chunk_repo = MemoryChunkRepo(session_factory=app_session_factory)
+    await chunk_repo.create(
+        namespace_id=namespace.id,
+        content="stale",
+        expires_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/memory/namespaces", headers=_auth_headers())
+    assert resp.status_code == 200, resp.text
+    by_name = {ns["name"]: ns for ns in resp.json()}
+    assert by_name["expired-chunk-ns"]["chunk_count"] == 0
+
+
 # ─── Story 3.2 AC2 — department isolation ─────────────────────────
 
 

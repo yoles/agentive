@@ -109,5 +109,26 @@ async def test_count_by_namespace_ids_emits_one_grouped_query() -> None:
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "group by" in sql_text
     assert "archived_at is null" in sql_text
+    assert "expires_at" in sql_text
     assert result == {ns_a: 3}
     assert result.get(ns_b, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_count_by_namespace_ids_filters_expired_chunks_like_search_ann() -> None:
+    """AC3 claims this count is coherent with `search_ann`'s own filter,
+
+    which also excludes expired (not just archived) chunks — this used to
+    be false, over-counting chunks a search would never return (code
+    review Story 3.2, BS2).
+    """
+    ns_a = uuid4()
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.tuples.return_value.all = lambda: []
+    repo = MemoryChunkRepo(session_factory=factory)
+
+    await repo.count_by_namespace_ids([ns_a])
+
+    sql_text = str(session.execute.await_args.args[0]).lower()
+    assert "expires_at is null" in sql_text
+    assert "expires_at >" in sql_text

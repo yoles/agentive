@@ -733,3 +733,53 @@ async def test_list_namespaces_tolerates_non_int_ttl() -> None:
         "default_ttl_seconds": None,
         "archive_after_seconds": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_warns_when_hitting_the_safety_cap() -> None:
+    """AC3 promises "tous les namespaces" — hitting the repo's safety cap
+
+    must never be silent (code review Story 3.2, BS3).
+    """
+    from agentive_backend.shared.repositories.namespace_repo import (
+        NAMESPACE_LISTING_SAFETY_CAP,
+    )
+
+    namespaces = [_make_namespace(name=f"ns-{i}") for i in range(NAMESPACE_LISTING_SAFETY_CAP)]
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=namespaces)
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    with patch.object(service_module._log, "warning") as warn:
+        await service.list_namespaces()
+
+    warn.assert_called_once()
+    assert warn.call_args.args[0] == "memory_manager.namespace_listing_hit_safety_cap"
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_does_not_warn_below_the_safety_cap() -> None:
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[_make_namespace(name="ns")])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    with patch.object(service_module._log, "warning") as warn:
+        await service.list_namespaces()
+
+    warn.assert_not_called()
