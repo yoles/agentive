@@ -15,6 +15,9 @@
 # Claude Code runtime — session lock (sessionId, pid). NEVER commit.
 .claude/*.lock
 
+# Claude Code personal local overrides (permissions, etc.) — not team-shared.
+.claude/settings.local.json
+
 # Spike M3 (Story 1.2) — thread_id transient file for crash/resume tests
 .spike-thread-id
 backend/.spike-thread-id
