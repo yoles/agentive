@@ -1,4 +1,4 @@
-"""``/api/v1/memory/*`` — Memory Manager endpoints (Stories 3.1, 3.2).
+"""``/api/v1/memory/*`` — Memory Manager endpoints (Stories 3.1, 3.2, 3.4).
 
 Four endpoints:
 
@@ -8,7 +8,7 @@ Four endpoints:
   ``q`` in the body so the search text never lands in a URL (and therefore
   never in access logs / reverse proxy / APM, code review Story 3.1, BS4).
 * ``POST /memory/namespaces`` : create a namespace with a per-type default
-  retention (3.2 AC1).
+  retention (3.2 AC1) and an optional temporal decay policy (3.4 AC1).
 * ``GET /memory/namespaces`` : admin listing, all departments, with live
   chunk counts (3.2 AC3).
 
@@ -26,7 +26,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, status
 
-from agentive_backend.features.memory_manager.domain.value_objects import RetentionPolicy
+from agentive_backend.features.memory_manager.domain.value_objects import (
+    DecayPolicy,
+    RetentionPolicy,
+)
 from agentive_backend.features.memory_manager.schemas import (
     CreateMemoryChunkRequest,
     CreateNamespaceRequest,
@@ -156,6 +159,15 @@ async def search_memory(
     its own ``archived_at`` so the caller can tell a live hit from one
     surfaced only because of this flag.
 
+    Results are ranked by ``score``, which since Story 3.4 AC2 is the
+    FINAL score ``clamp(similarity, 0, 1) x decay_factor(age)``. Its two
+    terms come back as ``similarity`` and ``decay_factor`` so a caller can
+    tell an aged-down result from a genuinely poor match. On a namespace
+    with no ``decay_policy`` — every namespace created before Story 3.4 —
+    ``decay_factor`` is ``1.0`` and ``score`` equals ``similarity``,
+    exactly as before. ``rerank: false`` opts out and ranks on raw
+    similarity alone.
+
     Errors:
     * 404 : ``namespace`` does not exist.
     * 403 : the ``X-Acting-Department`` header (if present) differs from the
@@ -174,6 +186,7 @@ async def search_memory(
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
         acting_department=_read_acting_department(request),
         include_archived=body.include_archived,
+        rerank=body.rerank,
     )
 
 
@@ -190,10 +203,17 @@ async def create_namespace(
     """201 on success. Not subject to ``X-Acting-Department`` (global
     administration action).
 
+    ``decay_policy`` (Story 3.4 AC1) is optional and has NO per-type
+    default: omitting it means the namespace's search results are ranked on
+    similarity alone, exactly as before 3.4. Its parameters are
+    function-scoped and mutually exclusive — a parameter that does not
+    belong to the declared ``function`` is a 422, never silently ignored.
+
     Errors:
     * 409 : ``name`` already exists.
     * 422 : Pydantic body validation (``type`` outside the 4-value enum,
-      blank/unstorable ``name``, out-of-bounds ``retention_policy``).
+      blank/unstorable ``name``, out-of-bounds ``retention_policy``,
+      incoherent ``decay_policy`` function/parameter combination).
     """
     service = _build_service(request)
     return await service.create_namespace(
@@ -207,6 +227,17 @@ async def create_namespace(
             else RetentionPolicy(
                 default_ttl_seconds=body.retention_policy.default_ttl_seconds,
                 archive_after_seconds=body.retention_policy.archive_after_seconds,
+            )
+        ),
+        decay_policy_override=(
+            None
+            if body.decay_policy is None
+            else DecayPolicy(
+                function=body.decay_policy.function,
+                half_life_seconds=body.decay_policy.half_life_seconds,
+                horizon_seconds=body.decay_policy.horizon_seconds,
+                threshold_seconds=body.decay_policy.threshold_seconds,
+                factor=body.decay_policy.factor,
             )
         ),
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.

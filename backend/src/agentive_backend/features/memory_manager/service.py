@@ -13,8 +13,11 @@ The service sits between the FastAPI router and the repositories:
    *effective* TTL (override, else the namespace's ``default_ttl_seconds``),
    not the raw override alone, so it never contradicts ``expires_at`` (code
    review Story 3.1, BS3).
-3. **AC2** — computes the query embedding and delegates the ANN search to
-   :meth:`ChunkEmbeddingRepo.search_ann`.
+3. **AC2** — computes the query embedding, delegates the ANN search to
+   :meth:`ChunkEmbeddingRepo.search_ann`, then reranks its rows by
+   ``similarity x decay_factor(age)`` (Story 3.4). The ANN pass is
+   *oversampled* whenever that rerank can actually change the ordering —
+   see :func:`~.reranker.fetch_k_for`.
 4. **AC3** — isolation is satisfied by construction: every repo call goes
    through ``with_tenant(tenant_id)``, and Sprint 1 always passes
    ``tenant_id=None`` (mono-tenant MVP) so the ``tenant_isolation`` RLS
@@ -34,12 +37,21 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
+from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from agentive_backend.features.memory_manager.domain.value_objects import (
+    DecayPolicy,
+    RetentionPolicy,
+)
+from agentive_backend.features.memory_manager.domain.value_objects import (
     NamespaceType as DomainNamespaceType,
 )
-from agentive_backend.features.memory_manager.domain.value_objects import RetentionPolicy
+
+# Aliased: `search()` takes a `rerank: bool` flag, which would shadow the
+# function inside the method body.
+from agentive_backend.features.memory_manager.reranker import fetch_k_for
+from agentive_backend.features.memory_manager.reranker import rerank as rerank_rows
 from agentive_backend.features.memory_manager.schemas import (
     MemoryChunkCreateView,
     MemorySearchResultView,
@@ -58,6 +70,10 @@ from agentive_backend.shared.exceptions import (
     ValidationError,
 )
 from agentive_backend.shared.logging import get_logger
+from agentive_backend.shared.repositories.chunk_embedding_repo import (
+    EF_SEARCH_DEFAULT,
+    EF_SEARCH_MAX,
+)
 from agentive_backend.shared.repositories.namespace_repo import (
     NAMESPACE_LISTING_SAFETY_CAP,
     NamespaceType,
@@ -79,6 +95,15 @@ _log = get_logger(__name__)
 # `namespace.embedding_backend` is read (warning if != "cloud") but not
 # branched — Story 3.6 (Embedding Router) wires that dimension.
 EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Story 3.4 T5.2 — `list_namespaces` now parses `retention_policy` and
+# `decay_policy` under separate guards, so the retention guard can no
+# longer lean on `NamespaceListItemView`'s own field validation to reject a
+# malformed value. This adapter applies exactly that field's type
+# (`dict[str, int | None]`) at the same point, preserving the P1 fix:
+# `from_mapping` lets a float TTL through, and only `int` validation
+# catches it (code review Story 3.2, P1).
+_RETENTION_ADAPTER: TypeAdapter[dict[str, int | None]] = TypeAdapter(dict[str, int | None])
 
 
 def _normalize_department(value: str) -> str:
@@ -271,13 +296,20 @@ class MemoryManagerService:
         tenant_id: UUID | None = None,
         acting_department: str | None = None,
         include_archived: bool = False,
+        rerank: bool = True,
     ) -> list[MemorySearchResultView]:
-        """ANN search over a namespace's chunks — Story 3.1 AC2, 3.3 AC2.
+        """ANN search over a namespace's chunks — Story 3.1 AC2, 3.3 AC2, 3.4 AC2.
 
         ``include_archived`` (Story 3.3 AC2) lifts both the ``archived_at``
         and ``expires_at`` filters for audit recovery — see
         :meth:`ChunkEmbeddingRepo.search_ann`'s docstring for the exact
         scope.
+
+        ``rerank`` (Story 3.4 AC2) applies the namespace's temporal decay to
+        the ANN candidates. It is a no-op on a namespace whose
+        ``decay_policy`` is empty — which is every namespace created before
+        Story 3.4 — so the pre-3.4 ordering and the pre-3.4 ANN cost are
+        both preserved by construction.
 
         Raises
         ------
@@ -297,16 +329,66 @@ class MemoryManagerService:
         )
         _warn_if_backend_not_cloud(namespace_name, namespace.embedding_backend)
 
+        decay_policy, _policy_valid = self._decay_policy_for(namespace)
+        # `rerank=False` opts out of the WHOLE decay path, not just the
+        # oversampling: the effective policy becomes the neutral one, so
+        # `score == similarity` and the caller gets the raw cosine ranking
+        # it asked for. Passing the namespace's real policy here while
+        # skipping the oversampling would be the worst of both — a decayed
+        # ranking over a set truncated on similarity alone.
+        effective_policy = decay_policy if rerank else DecayPolicy()
+        # ⚠️ Oversample BEFORE truncating. `search_ann` applies its
+        # `LIMIT` in SQL, so reranking its `top_k` rows could only permute
+        # a set already cut by cosine distance alone — a recent chunk
+        # ranked just past `top_k` would never surface, and AC2 would be
+        # satisfied in the unit tests while being false end to end.
+        fetch_k = fetch_k_for(top_k, effective_policy, rerank_enabled=rerank)
+
         vectors = await self._embedder.embed([query], model=EMBEDDING_MODEL)
+        # ONE clock read for the whole request (T4.2). The same instant feeds
+        # `search_ann`'s `expires_at` filter and the decay scoring: two
+        # separate `datetime.now()` calls would let a chunk be kept by the
+        # filter and scored against a slightly later "now", so the filtering
+        # and the ranking would not agree on what time it is.
+        #
+        # Taken AFTER the embedding round-trip, not before it: a slow provider
+        # call (retries included) would otherwise have every chunk aged, and
+        # every `expires_at` compared, against an instant that is already
+        # stale by the time the query runs, widening the window in which an
+        # expired chunk still passes the filter (code review Story 3.4, P6).
+        now = datetime.now(UTC)
         rows = await self._chunk_embedding_repo.search_ann(
             _first_vector(vectors, namespace_name=namespace_name),
             model=EMBEDDING_MODEL,
             namespace_id=namespace.id,
-            top_k=top_k,
+            top_k=fetch_k,
             tenant_id=tenant_id,
-            now=datetime.now(UTC),
+            # Keep the HNSW candidate window at least as wide as what we are
+            # asking for. `ef_search` defaults to 100 while oversampling takes
+            # `fetch_k` to 200 from `top_k >= 11` on, and asking for more rows
+            # than the window holds leans entirely on `hnsw.iterative_scan`,
+            # which `search_ann`'s own docstring calls "a mitigation, not a
+            # hard guarantee". Before this story `top_k` never exceeded 50, so
+            # the regime never arose (code review Story 3.4, P4).
+            ef_search=min(max(EF_SEARCH_DEFAULT, fetch_k), EF_SEARCH_MAX),
+            now=now,
             include_archived=include_archived,
         )
+        # Scoring runs under the same "a read degrades, it never 500s" posture
+        # as the parsing above (AC3). `_decay_policy_for` only guards
+        # `from_mapping`; an arithmetic fault raised inside `decay_factor`
+        # would escape from here instead, on the read path (code review
+        # Story 3.4, P5).
+        try:
+            scored = rerank_rows(rows, policy=effective_policy, now=now, top_k=top_k)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            _log.warning(
+                "memory_manager.decay_scoring_failed",
+                namespace=namespace_name,
+                decay_function=effective_policy.function.value,
+                error=str(exc),
+            )
+            scored = rerank_rows(rows, policy=DecayPolicy(), now=now, top_k=top_k)
 
         # `include_archived` is logged because it lifts BOTH retention filters
         # (`archived_at` and `expires_at`), so a caller can read data whose TTL
@@ -317,23 +399,72 @@ class MemoryManagerService:
             "memory_manager.search_executed",
             namespace=namespace_name,
             top_k=top_k,
-            result_count=len(rows),
+            fetch_k=fetch_k,
+            rerank=rerank,
+            # The namespace's CONFIGURED function, not the effective one:
+            # paired with `rerank`, this tells an operator both "this
+            # namespace decays" and "this particular call opted out".
+            decay_function=decay_policy.function.value,
+            # `result_count` is post-truncation, so at most `top_k`.
+            # `candidate_count` is the window the rerank actually saw: read
+            # together they tell an operator whether the ANN pass came back
+            # saturated (`candidate_count == fetch_k`, i.e. decay reordered an
+            # already-truncated set) or comfortable. It is also the only
+            # signal for the HNSW under-fill `search_ann` documents (code
+            # review Story 3.4, P9).
+            result_count=len(scored),
+            candidate_count=len(rows),
             include_archived=include_archived,
             duration_ms=int((time.monotonic() - start) * 1000),
         )
 
         return [
             MemorySearchResultView(
-                chunk_id=chunk.id,
-                content=chunk.content,
-                score=score,
+                chunk_id=item.chunk.id,
+                content=item.chunk.content,
+                score=item.final_score,
+                similarity=item.similarity,
+                decay_factor=item.decay_factor,
                 namespace=namespace_name,
-                created_at=chunk.created_at,
-                archived_at=chunk.archived_at,
-                expires_at=chunk.expires_at,
+                created_at=item.chunk.created_at,
+                archived_at=item.chunk.archived_at,
+                expires_at=item.chunk.expires_at,
             )
-            for chunk, score in rows
+            for item in scored
         ]
+
+    def _decay_policy_for(self, namespace: Namespace) -> tuple[DecayPolicy, bool]:
+        """Parse ``namespaces.decay_policy``, degrading instead of failing.
+
+        Returns ``(policy, valid)``. On a malformed JSONB — hand-seeded row,
+        legacy data, a ``function`` this version does not know — it logs a
+        warning and falls back to an empty (no-decay) policy with
+        ``valid=False``.
+
+        Deliberately NOT the same posture as ``create_chunk``'s guard on
+        ``retention_policy``, which raises :class:`InternalError`: a **write**
+        must fail loudly rather than silently persist under a policy nobody
+        asked for, while a **read** must keep serving results. A corrupt
+        decay policy degrades a search's *ranking*; refusing to answer at all
+        would be the worse failure (Story 3.4 AC3).
+        """
+        try:
+            return DecayPolicy.from_mapping(namespace.decay_policy), True
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            _log.warning(
+                "memory_manager.decay_policy_invalid",
+                namespace=namespace.name,
+                error=str(exc),
+                # The offending value itself. `str(exc)` carries it for a
+                # `DomainValidationError`, but not for an `AttributeError` or
+                # a `TypeError`, and without it an operator learns that a row
+                # is broken without learning what to repair. Truncated, and
+                # read through `getattr` because the attribute access is
+                # itself one of the things that can fail here (code review
+                # Story 3.4, P14).
+                raw_policy=repr(getattr(namespace, "decay_policy", None))[:200],
+            )
+            return DecayPolicy(), False
 
     async def create_namespace(
         self,
@@ -343,6 +474,7 @@ class MemoryManagerService:
         department: str | None = None,
         project: str | None = None,
         retention_policy_override: RetentionPolicy | None = None,
+        decay_policy_override: DecayPolicy | None = None,
         tenant_id: UUID | None = None,
     ) -> NamespaceCreateView:
         """Create a namespace with a per-type default retention — Story 3.2 AC1.
@@ -370,6 +502,12 @@ class MemoryManagerService:
                 raise ValidationError(detail=f"unknown namespace type {ns_type!r}") from exc
             policy = RetentionPolicy.default_for_type(domain_ns_type)
 
+        # Story 3.4 T5.1 — no `default_for_type` equivalent here, on purpose:
+        # an unset `decay_policy` means "no decay", so a namespace created
+        # today ranks exactly as it did before 3.4. Enabling decay is an
+        # explicit per-namespace opt-in (see the story's Dev Notes).
+        decay_policy = decay_policy_override or DecayPolicy()
+
         # Same atomicity pattern as `AgentRegistryService.create_template` —
         # the row INSERT and the outbox event publish share one transaction
         # so a crash between the two never leaves an unaudited namespace.
@@ -381,6 +519,7 @@ class MemoryManagerService:
                 department=department,
                 project=project,
                 retention_policy=policy.to_mapping(),
+                decay_policy=decay_policy.to_mapping(),
                 tenant_id=tenant_id,
             )
             event = NamespaceCreatedEvent(
@@ -412,6 +551,7 @@ class MemoryManagerService:
                 "default_ttl_seconds": policy.default_ttl_seconds,
                 "archive_after_seconds": policy.archive_after_seconds,
             },
+            decay_policy=decay_policy.to_mapping(),
             embedding_backend=namespace.embedding_backend,
             created_at=namespace.created_at,
         )
@@ -444,26 +584,26 @@ class MemoryManagerService:
         for ns in namespaces:
             # A hand-seeded/legacy row can carry a malformed JSONB (same P4
             # class of issue as `create_chunk`'s guard) — one bad namespace
-            # must not 500 the entire admin listing. `from_mapping` catches
-            # most malformed shapes, but a float/bool TTL slips past its
-            # own checks and only fails later, at `NamespaceListItemView`'s
-            # `int` validation (code review Story 3.2, P1) — so both steps
-            # share this try and fall back to the same empty policy.
+            # must not 500 the entire admin listing.
+            #
+            # The two policies are parsed under SEPARATE guards (Story 3.4
+            # T5.2): they are independent columns, so a corrupt
+            # `retention_policy` must not brand a healthy `decay_policy`
+            # invalid, nor the reverse. Each falls back to its own empty
+            # policy and raises only its own `*_valid` flag.
+            retention_policy_valid = True
             try:
-                policy = RetentionPolicy.from_mapping(ns.retention_policy)
-                view = NamespaceListItemView(
-                    namespace_id=ns.id,
-                    name=ns.name,
-                    type=ns.type,
-                    department=ns.department,
-                    project=ns.project,
-                    retention_policy={
-                        "default_ttl_seconds": policy.default_ttl_seconds,
-                        "archive_after_seconds": policy.archive_after_seconds,
-                    },
-                    embedding_backend=ns.embedding_backend,
-                    chunk_count=counts.get(ns.id, 0),
-                    created_at=ns.created_at,
+                retention = RetentionPolicy.from_mapping(ns.retention_policy)
+                # `from_mapping` catches most malformed shapes, but a
+                # float/bool TTL slips past its own checks and only fails
+                # later, at `NamespaceListItemView`'s `int` validation (code
+                # review Story 3.2, P1) — so the field-level validation runs
+                # inside this try too.
+                retention_view = _RETENTION_ADAPTER.validate_python(
+                    {
+                        "default_ttl_seconds": retention.default_ttl_seconds,
+                        "archive_after_seconds": retention.archive_after_seconds,
+                    }
                 )
             except (
                 AttributeError,
@@ -477,19 +617,27 @@ class MemoryManagerService:
                     namespace=ns.name,
                     error=str(exc),
                 )
-                view = NamespaceListItemView(
+                retention_view = {"default_ttl_seconds": None, "archive_after_seconds": None}
+                retention_policy_valid = False
+
+            decay, decay_policy_valid = self._decay_policy_for(ns)
+
+            views.append(
+                NamespaceListItemView(
                     namespace_id=ns.id,
                     name=ns.name,
                     type=ns.type,
                     department=ns.department,
                     project=ns.project,
-                    retention_policy={"default_ttl_seconds": None, "archive_after_seconds": None},
-                    retention_policy_valid=False,
+                    retention_policy=retention_view,
+                    retention_policy_valid=retention_policy_valid,
+                    decay_policy=decay.to_mapping(),
+                    decay_policy_valid=decay_policy_valid,
                     embedding_backend=ns.embedding_backend,
                     chunk_count=counts.get(ns.id, 0),
                     created_at=ns.created_at,
                 )
-            views.append(view)
+            )
         return views
 
     async def _check_department_access(

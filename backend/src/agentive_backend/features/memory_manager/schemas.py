@@ -9,11 +9,18 @@ response models use ``extra="ignore"`` (defensive against ORM drift).
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from agentive_backend.features.memory_manager.domain.value_objects import SECONDS_MIN
+from agentive_backend.features.memory_manager.domain.value_objects import (
+    DECAY_PARAM_NAMES,
+    DECAY_PARAMS_BY_FUNCTION,
+    SECONDS_MAX,
+    SECONDS_MIN,
+    DecayFunction,
+)
 from agentive_backend.shared.repositories.namespace_repo import NamespaceType
 
 # `text-embedding-3-small` tops out at 8191 tokens. Past that,
@@ -24,8 +31,10 @@ CONTENT_MAX_CHARS = 32_000
 
 # `memory_chunks.ttl_seconds` is a 32-bit INTEGER, and `datetime + timedelta`
 # overflows well before that. 10 years is far past any real retention need and
-# keeps both safe (code review Story 3.1, P1).
-TTL_MAX_SECONDS = 315_360_000
+# keeps both safe (code review Story 3.1, P1). Aliased to the domain constant
+# rather than repeating the literal: the HTTP bound and the domain bound have
+# to be the same number, and two literals eventually drift (Story 3.4, P5).
+TTL_MAX_SECONDS = SECONDS_MAX
 
 
 def ensure_embeddable_text(value: str, *, field: str) -> str:
@@ -112,6 +121,16 @@ class SearchMemoryRequest(BaseModel):
     # A body field, not a query param, for the same URL-hygiene reason as
     # `q`/`namespace` above.
     include_archived: bool = Field(default=False)
+    # Story 3.4 AC2 — opt OUT of the temporal-decay rerank. Defaults to
+    # `True` because a namespace that configured a decay policy expects it
+    # applied; on a namespace without one it is a no-op either way
+    # (`DecayFunction.NONE` → factor 1.0 → `score == similarity`), and the
+    # service skips ANN oversampling entirely in that case. Setting it to
+    # `False` is how a caller asks for raw similarity ranking on a namespace
+    # that *does* decay (debugging, or comparing the two orderings).
+    # A body field, not a query param, for the same URL-hygiene reason as
+    # `q`/`namespace` above.
+    rerank: bool = Field(default=True)
 
     @field_validator("q", "namespace", mode="after")
     @classmethod
@@ -146,6 +165,52 @@ class RetentionPolicyOverride(BaseModel):
         return self
 
 
+class DecayPolicyOverride(BaseModel):
+    """Optional per-namespace temporal decay configuration (Story 3.4 AC1).
+
+    Mirror of :class:`RetentionPolicyOverride`, and like it a *replacement*
+    rather than a merge. Omitting ``decay_policy`` entirely means "no
+    decay" (``function: none``, factor 1.0, ``final_score == similarity``)
+    — there is no per-type default to preserve here, deliberately: turning
+    decay on by default would silently reorder every namespace created by
+    Stories 3.1-3.3.
+
+    The cross-field rules below duplicate :class:`DecayPolicy`'s own
+    ``__post_init__`` on purpose, so an incoherent body is a **422 at the
+    HTTP boundary** rather than a ``DomainValidationError`` escaping as a
+    500 further in — exactly what ``RetentionPolicyOverride`` already does
+    by re-declaring ``SECONDS_MIN``/``TTL_MAX_SECONDS`` bounds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    function: DecayFunction
+    half_life_seconds: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
+    horizon_seconds: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
+    threshold_seconds: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
+    factor: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _enforce_function_parameters(self) -> DecayPolicyOverride:
+        # The domain's table, not a copy of it. A local dict would be an
+        # unguarded second source of truth: the domain's carries an
+        # exhaustiveness `assert`, so a 5th `DecayFunction` member fails at
+        # import; a copy would instead raise `KeyError` here, inside a
+        # `model_validator`, i.e. a 500 on `POST /namespaces` where this class
+        # exists precisely to produce a 422 (code review Story 3.4, P8).
+        required = DECAY_PARAMS_BY_FUNCTION[self.function]
+        for name in DECAY_PARAM_NAMES:
+            value = getattr(self, name)
+            if name in required and value is None:
+                raise ValueError(f"{name} is required when function is {self.function.value!r}")
+            if name not in required and value is not None:
+                raise ValueError(
+                    f"{name} is not a parameter of decay function "
+                    f"{self.function.value!r}; remove it or change the function"
+                )
+        return self
+
+
 class CreateNamespaceRequest(BaseModel):
     """Body of ``POST /api/v1/memory/namespaces`` (Story 3.2 AC1).
 
@@ -161,6 +226,8 @@ class CreateNamespaceRequest(BaseModel):
     department: str | None = Field(default=None, max_length=100)
     project: str | None = Field(default=None, max_length=100)
     retention_policy: RetentionPolicyOverride | None = None
+    # Story 3.4 AC1 — omitted means "no decay" (see `DecayPolicyOverride`).
+    decay_policy: DecayPolicyOverride | None = None
 
     @field_validator("name", mode="after")
     @classmethod
@@ -195,6 +262,13 @@ class NamespaceCreateView(BaseModel):
     department: str | None
     project: str | None
     retention_policy: dict[str, int | None]
+    # Story 3.4 AC1 — the policy actually persisted, as `DecayPolicy`
+    # serializes it: `{}` for "no decay", otherwise `function` plus that
+    # function's own parameters only. Required, like its `retention_policy`
+    # twin: a default would let a construction site that forgot the field
+    # answer "no decay" instead of failing, which is the silent-drop mode
+    # this story rejects everywhere else (code review Story 3.4, P11).
+    decay_policy: dict[str, Any]
     embedding_backend: str
     created_at: datetime
 
@@ -216,17 +290,36 @@ class NamespaceListItemView(BaseModel):
     # `client` namespace unless this field says otherwise (product
     # decision, code review Story 3.2, IG2).
     retention_policy_valid: bool = True
+    # Story 3.4 AC1/AC3 — same pair, same rationale, but tracked with its
+    # OWN validity flag: a corrupt `retention_policy` must not brand a
+    # healthy `decay_policy` invalid, nor the reverse. Required for the same
+    # reason as on `NamespaceCreateView` (code review Story 3.4, P11).
+    decay_policy: dict[str, Any]
+    decay_policy_valid: bool = True
     embedding_backend: str
     chunk_count: int
     created_at: datetime
 
 
 class MemorySearchResultView(BaseModel):
-    """One result item of ``POST /api/v1/memory/search`` (Story 3.1 AC2).
+    """One result item of ``POST /api/v1/memory/search`` (Story 3.1 AC2,
+    3.4 AC2).
 
-    ``score = 1 - cosine_distance`` — raw similarity, no temporal decay
-    (``final_score = similarity x decay(age)`` is Story 3.4, out of scope
-    here).
+    ``score`` is the FINAL score the results are ranked by:
+    ``clamp(similarity, 0, 1) x decay_factor(age)`` (Story 3.4 AC1). The
+    field keeps its name — it has been the ranking score since 3.1 — and
+    its two terms are exposed alongside it:
+
+    * ``similarity`` — ``clamp(1 - cosine_distance, 0, 1)``, what ``score``
+      used to be before 3.4. Clamped because cosine distance ranges over
+      ``[0, 2]``, so the raw value can be negative.
+    * ``decay_factor`` — the namespace's :class:`DecayPolicy` evaluated at
+      this chunk's age, always in ``[0, 1]``.
+
+    On a namespace with no ``decay_policy`` (every namespace created before
+    Story 3.4) ``decay_factor`` is ``1.0`` and ``score == similarity``, so
+    the contract is unchanged in practice. Both terms are exposed because a
+    score demoted by age is otherwise indistinguishable from a poor match.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -234,6 +327,9 @@ class MemorySearchResultView(BaseModel):
     chunk_id: UUID
     content: str
     score: float
+    # Story 3.4 AC2 — the two terms of `score`, see the class docstring.
+    similarity: float
+    decay_factor: float
     namespace: str
     created_at: datetime
     # Story 3.3 AC2 — lets a caller distinguish a "live" result from one
@@ -254,6 +350,7 @@ __all__ = [
     "TTL_MAX_SECONDS",
     "CreateMemoryChunkRequest",
     "CreateNamespaceRequest",
+    "DecayPolicyOverride",
     "MemoryChunkCreateView",
     "MemorySearchResultView",
     "NamespaceCreateView",

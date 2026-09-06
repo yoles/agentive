@@ -14,6 +14,10 @@ from uuid import uuid4
 import pytest
 
 from agentive_backend.features.memory_manager import service as service_module
+from agentive_backend.features.memory_manager.domain.value_objects import (
+    DecayFunction,
+    DecayPolicy,
+)
 from agentive_backend.features.memory_manager.service import (
     EMBEDDING_MODEL,
     MemoryManagerService,
@@ -30,6 +34,7 @@ def _make_namespace(
     *,
     name: str = "ns-test",
     retention_policy: dict | None = None,
+    decay_policy: dict | None = None,
     embedding_backend: str = "cloud",
     department: str | None = None,
 ) -> SimpleNamespace:
@@ -37,6 +42,9 @@ def _make_namespace(
         id=uuid4(),
         name=name,
         retention_policy=retention_policy or {},
+        # Story 3.4 — `{}` is the column default and means "no decay", so
+        # every pre-3.4 assertion in this module keeps its exact meaning.
+        decay_policy=decay_policy or {},
         embedding_backend=embedding_backend,
         department=department,
         project=None,
@@ -60,6 +68,7 @@ def _make_chunk(
     ttl_seconds: int | None = None,
     expires_at: datetime | None = None,
     archived_at: datetime | None = None,
+    created_at: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
@@ -67,7 +76,9 @@ def _make_chunk(
         ttl_seconds=ttl_seconds,
         expires_at=expires_at,
         archived_at=archived_at,
-        created_at=datetime.now(UTC),
+        # Story 3.4 — the decay reranker reads `created_at`, so it has to be
+        # steerable to assert an ordering at an exact age.
+        created_at=created_at or datetime.now(UTC),
     )
 
 
@@ -856,3 +867,295 @@ async def test_list_namespaces_does_not_warn_below_the_safety_cap() -> None:
         await service.list_namespaces()
 
     warn.assert_not_called()
+
+
+# ─── search — décroissance temporelle (Story 3.4) ─────────────────
+
+_EXPONENTIAL_1D = {"function": "exponential", "half_life_seconds": 86_400}
+
+
+@pytest.mark.asyncio
+async def test_search_without_decay_policy_does_not_oversample() -> None:
+    """T9.7's guarantee at the service level: a namespace with no
+
+    `decay_policy` pays exactly the ANN cost it paid before Story 3.4.
+    """
+    namespace = _make_namespace()
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    assert embedding_repo.search_ann.await_args.kwargs["top_k"] == 5
+
+
+@pytest.mark.asyncio
+async def test_search_oversamples_the_ann_query_when_decay_is_configured() -> None:
+    """THE guard of this story. `search_ann` truncates in SQL, so without a
+
+    bigger `top_k` the rerank could only permute an already-cut set and AC2
+    would be false end to end while every unit test still passed. Do not
+    delete this test (story Dev Notes § "le vrai piège").
+    """
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    assert embedding_repo.search_ann.await_args.kwargs["top_k"] == 50
+
+
+@pytest.mark.asyncio
+async def test_search_oversampling_is_capped() -> None:
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(namespace_name=namespace.name, query="q", top_k=50)
+
+    assert embedding_repo.search_ann.await_args.kwargs["top_k"] == 200
+
+
+@pytest.mark.asyncio
+async def test_search_rerank_false_skips_oversampling_and_decay() -> None:
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    old = _make_chunk(content="old", created_at=datetime.now(UTC) - timedelta(days=30))
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(old, 0.9)]
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=5, rerank=False)
+
+    assert embedding_repo.search_ann.await_args.kwargs["top_k"] == 5
+    assert results[0].score == pytest.approx(0.9)
+    assert results[0].similarity == pytest.approx(0.9)
+    assert results[0].decay_factor == 1.0
+
+
+@pytest.mark.asyncio
+async def test_search_applies_decay_and_reorders_results() -> None:
+    """AC2 — at close similarity the recent chunk comes out on top."""
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    now = datetime.now(UTC)
+    old = _make_chunk(content="old", created_at=now - timedelta(days=3))
+    recent = _make_chunk(content="recent", created_at=now)
+    service, _ns_repo, _chunk_repo, _embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(old, 0.90), (recent, 0.85)]
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    assert [r.content for r in results] == ["recent", "old"]
+    assert results[0].score == pytest.approx(0.85, abs=1e-3)
+    assert results[1].decay_factor == pytest.approx(0.125, abs=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_search_truncates_to_top_k_after_reranking() -> None:
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    rows = [(_make_chunk(content=f"c{i}"), 0.9 - i / 100) for i in range(8)]
+    service, _ns_repo, _chunk_repo, _embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=rows
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=3)
+
+    assert len(results) == 3
+
+
+@pytest.mark.asyncio
+async def test_search_tolerates_a_malformed_decay_policy() -> None:
+    """AC3 — a corrupt JSONB degrades the ranking, it never 500s a read.
+
+    Deliberately the opposite posture from `create_chunk`'s guard on
+    `retention_policy`, which raises: a write must fail loudly, a read must
+    keep serving.
+    """
+    namespace = _make_namespace(decay_policy={"function": "sigmoid"})
+    chunk = _make_chunk(content="x", created_at=datetime.now(UTC) - timedelta(days=900))
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(chunk, 0.7)]
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    assert results[0].decay_factor == 1.0
+    assert results[0].score == pytest.approx(0.7)
+    assert embedding_repo.search_ann.await_args.kwargs["top_k"] == 5
+
+
+@pytest.mark.asyncio
+async def test_search_uses_one_clock_for_the_expiry_filter_and_the_scoring() -> None:
+    """T4.2 — two `datetime.now()` calls would let `search_ann` keep a chunk
+
+    against one instant while the reranker ages it against another.
+    """
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    created_at = datetime.now(UTC) - timedelta(days=1)
+    chunk = _make_chunk(content="x", created_at=created_at)
+    service, _ns_repo, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(chunk, 1.0)]
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    filter_now = embedding_repo.search_ann.await_args.kwargs["now"]
+    # The factor is `0.5 ** (age / 86400)` evaluated at that very instant —
+    # recomputing it from `filter_now` must reproduce the returned value bit
+    # for bit, which is only true if a single `now` fed both.
+    expected = 0.5 ** ((filter_now - created_at).total_seconds() / 86_400)
+    assert results[0].decay_factor == expected
+
+
+@pytest.mark.asyncio
+async def test_search_clamps_a_negative_similarity_end_to_end() -> None:
+    """Cosine distance ranges over [0, 2], so `1 - distance` can be negative;
+
+    without the clamp the product would promote the least relevant chunk.
+    """
+    namespace = _make_namespace(decay_policy=_EXPONENTIAL_1D)
+    chunk = _make_chunk(content="opposite", created_at=datetime.now(UTC) - timedelta(days=10))
+    service, _ns_repo, _chunk_repo, _embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[(chunk, -0.4)]
+    )
+
+    results = await service.search(namespace_name=namespace.name, query="q", top_k=5)
+
+    assert results[0].similarity == 0.0
+    assert results[0].score == 0.0
+
+
+# ─── create / list namespaces — decay policy (Story 3.4 T5) ───────
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_defaults_to_no_decay() -> None:
+    """No per-type default, on purpose: enabling decay by default would
+
+    silently reorder every namespace created by Stories 3.1-3.3.
+    """
+    namespace_repo = MagicMock()
+    session = MagicMock()
+    _configure_with_tenant(namespace_repo, session)
+    created = _make_namespace(name="ns-new")
+    namespace_repo.create_in_session = AsyncMock(return_value=created)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+    with (
+        patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+    ):
+        view = await service.create_namespace(name="ns-new", ns_type="metier")
+
+    assert namespace_repo.create_in_session.await_args.kwargs["decay_policy"] == {}
+    assert view.decay_policy == {}
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_persists_an_explicit_decay_override() -> None:
+    namespace_repo = MagicMock()
+    session = MagicMock()
+    _configure_with_tenant(namespace_repo, session)
+    created = _make_namespace(name="ns-decay")
+    namespace_repo.create_in_session = AsyncMock(return_value=created)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+    override = DecayPolicy(function=DecayFunction.LINEAR, horizon_seconds=86_400)
+    with (
+        patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+    ):
+        view = await service.create_namespace(
+            name="ns-decay", ns_type="metier", decay_policy_override=override
+        )
+
+    expected = {"function": "linear", "horizon_seconds": 86_400}
+    assert namespace_repo.create_in_session.await_args.kwargs["decay_policy"] == expected
+    assert view.decay_policy == expected
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_exposes_decay_policy() -> None:
+    ns = _make_namespace(name="a", decay_policy=_EXPONENTIAL_1D)
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    assert result[0].decay_policy == _EXPONENTIAL_1D
+    assert result[0].decay_policy_valid is True
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_flags_a_malformed_decay_policy() -> None:
+    ns = _make_namespace(name="a", decay_policy={"function": "sigmoid"})
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    assert result[0].decay_policy == {}
+    assert result[0].decay_policy_valid is False
+    assert result[0].retention_policy_valid is True
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_keeps_the_two_policy_flags_independent() -> None:
+    """T5.2 — a corrupt `retention_policy` must not brand a healthy
+
+    `decay_policy` invalid, nor the reverse. Two columns, two guards.
+    """
+    ns = _make_namespace(
+        name="half-corrupt",
+        retention_policy="not-a-dict",  # type: ignore[arg-type]
+        decay_policy=_EXPONENTIAL_1D,
+    )
+    namespace_repo = AsyncMock()
+    namespace_repo.list_all = AsyncMock(return_value=[ns])
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.count_by_namespace_ids = AsyncMock(return_value={})
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+
+    result = await service.list_namespaces()
+
+    assert result[0].retention_policy_valid is False
+    assert result[0].decay_policy_valid is True
+    assert result[0].decay_policy == _EXPONENTIAL_1D

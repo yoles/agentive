@@ -9,6 +9,9 @@ chunk-and-averaged embedding for an oversized `content`.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from uuid import uuid4
+
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
@@ -17,6 +20,8 @@ from agentive_backend.features.memory_manager.schemas import (
     TTL_MAX_SECONDS,
     CreateMemoryChunkRequest,
     CreateNamespaceRequest,
+    DecayPolicyOverride,
+    MemorySearchResultView,
     RetentionPolicyOverride,
     SearchMemoryRequest,
 )
@@ -210,3 +215,94 @@ def test_search_memory_include_archived_defaults_to_false() -> None:
 def test_search_memory_accepts_explicit_include_archived_true() -> None:
     req = SearchMemoryRequest(q="hello", namespace="ns", include_archived=True)
     assert req.include_archived is True
+
+
+# ─── Story 3.4 — rerank flag + DecayPolicyOverride ────────────────
+
+
+def test_search_memory_rerank_defaults_to_true() -> None:
+    assert SearchMemoryRequest(q="hello", namespace="ns").rerank is True
+
+
+def test_search_memory_accepts_explicit_rerank_false() -> None:
+    assert SearchMemoryRequest(q="hello", namespace="ns", rerank=False).rerank is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"function": "none"},
+        {"function": "exponential", "half_life_seconds": 2_592_000},
+        {"function": "linear", "horizon_seconds": 86_400},
+        {"function": "step", "threshold_seconds": 3_600, "factor": 0.25},
+    ],
+)
+def test_decay_policy_override_accepts_every_well_formed_function(
+    payload: dict[str, object],
+) -> None:
+    assert DecayPolicyOverride(**payload).function == payload["function"]  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # missing the parameter its function requires
+        {"function": "exponential"},
+        {"function": "linear"},
+        {"function": "step", "threshold_seconds": 60},
+        {"function": "step", "factor": 0.5},
+        # carrying a parameter that belongs to another function
+        {"function": "exponential", "half_life_seconds": 60, "horizon_seconds": 60},
+        {"function": "linear", "horizon_seconds": 60, "factor": 0.5},
+        {"function": "step", "threshold_seconds": 60, "factor": 0.5, "half_life_seconds": 60},
+        {"function": "none", "half_life_seconds": 60},
+        # out-of-bounds values
+        {"function": "exponential", "half_life_seconds": 0},
+        {"function": "step", "threshold_seconds": 60, "factor": 1.5},
+        {"function": "step", "threshold_seconds": 60, "factor": -0.1},
+        # unknown function
+        {"function": "sigmoid", "half_life_seconds": 60},
+    ],
+)
+def test_decay_policy_override_rejects_incoherent_bodies(payload: dict[str, object]) -> None:
+    """422 at the HTTP boundary, never a `DomainValidationError` escaping as
+
+    a 500 further in — the reason these rules are duplicated from the
+    domain VO on purpose.
+    """
+    with pytest.raises(PydanticValidationError):
+        DecayPolicyOverride(**payload)  # type: ignore[arg-type]
+
+
+def test_decay_policy_override_rejects_unknown_fields() -> None:
+    with pytest.raises(PydanticValidationError):
+        DecayPolicyOverride(function="none", lambda_=0.1)  # type: ignore[call-arg]
+
+
+def test_create_namespace_decay_policy_is_optional() -> None:
+    assert CreateNamespaceRequest(name="ns", type="metier").decay_policy is None
+
+
+def test_create_namespace_accepts_a_decay_policy() -> None:
+    body = CreateNamespaceRequest(
+        name="ns",
+        type="metier",
+        decay_policy=DecayPolicyOverride(function="exponential", half_life_seconds=60),
+    )
+    assert body.decay_policy is not None
+    assert body.decay_policy.half_life_seconds == 60
+
+
+def test_search_result_view_carries_both_score_terms() -> None:
+    view = MemorySearchResultView(
+        chunk_id=uuid4(),
+        content="x",
+        score=0.45,
+        similarity=0.9,
+        decay_factor=0.5,
+        namespace="ns",
+        created_at=datetime.now(UTC),
+    )
+    assert view.similarity == 0.9
+    assert view.decay_factor == 0.5
+    assert view.score == 0.45
