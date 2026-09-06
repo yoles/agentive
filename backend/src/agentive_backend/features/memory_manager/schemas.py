@@ -238,7 +238,15 @@ class MemorySearchResultView(BaseModel):
     created_at: datetime
     # Story 3.3 AC2 — lets a caller distinguish a "live" result from one
     # only surfaced because `include_archived=true` was set.
+    #
+    # `archived_at` alone cannot make that distinction: `include_archived`
+    # lifts BOTH retention filters, so a chunk whose TTL has elapsed but that
+    # the daily worker has not archived yet (a window of up to `interval_s`)
+    # comes back with `archived_at: null`, indistinguishable from a live hit.
+    # `expires_at` closes it: past that instant the result is retained data,
+    # not a search hit (code review Story 3.3, P10).
     archived_at: datetime | None = None
+    expires_at: datetime | None = None
 
 
 __all__ = [

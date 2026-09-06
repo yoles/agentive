@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -83,6 +83,7 @@ class MemoryChunkRepo(BaseRepo):
         *,
         limit: int,
         tenant_id: UUID | None = None,
+        exclude_ids: Collection[UUID] | None = None,
     ) -> list[MemoryChunk]:
         """Live chunks whose TTL has passed — Story 3.3 T1.1 (AC1).
 
@@ -90,6 +91,19 @@ class MemoryChunkRepo(BaseRepo):
         (``WHERE archived_at IS NULL AND expires_at IS NOT NULL``, migrated
         since the initial schema) — the predicate below is written to match
         it exactly rather than adding a new index.
+
+        ``exclude_ids`` lets the caller skip chunks it already failed on
+        during this run. Without it the ``ORDER BY expires_at`` always
+        re-serves the same head of the queue, so a chunk that fails
+        deterministically blocks every chunk behind it, forever (code review
+        Story 3.3, P2).
+
+        The cutoff is ``<=``, not ``<``. The domain owns the boundary
+        semantics (``MemoryChunk.is_expired`` is ``now >= expires_at``) and
+        ``search_ann`` treats a chunk as live only while ``expires_at > now``,
+        so a strict ``<`` here left a chunk sitting exactly on the instant
+        invisible to search AND never selected for archival. The three
+        predicates are now complementary (code review Story 3.3, P9).
         """
         async with self.with_tenant(tenant_id) as session:
             stmt = (
@@ -97,11 +111,13 @@ class MemoryChunkRepo(BaseRepo):
                 .where(
                     MemoryChunk.archived_at.is_(None),
                     MemoryChunk.expires_at.is_not(None),
-                    MemoryChunk.expires_at < now,
+                    MemoryChunk.expires_at <= now,
                 )
                 .order_by(MemoryChunk.expires_at)
                 .limit(limit)
             )
+            if exclude_ids:
+                stmt = stmt.where(MemoryChunk.id.not_in(exclude_ids))
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -113,6 +129,7 @@ class MemoryChunkRepo(BaseRepo):
         limit: int,
         tenant_id: UUID | None = None,
         now: datetime | None = None,
+        exclude_ids: Collection[UUID] | None = None,
     ) -> list[MemoryChunk]:
         """Live, non-expired chunks old enough for ``archive_after_seconds``
         — Story 3.3 T1.3 (AC3).
@@ -124,6 +141,9 @@ class MemoryChunkRepo(BaseRepo):
         current time (mirrors ``search_ann``/``count_by_namespace_ids``)
         but should be passed explicitly by the worker so every chunk of a
         single run is evaluated against one consistent instant.
+
+        ``exclude_ids`` serves the same head-of-line purpose as in
+        :meth:`find_expired` (code review Story 3.3, P2).
         """
         now = now if now is not None else datetime.now(UTC)
         async with self.with_tenant(tenant_id) as session:
@@ -138,6 +158,8 @@ class MemoryChunkRepo(BaseRepo):
                 .order_by(MemoryChunk.created_at)
                 .limit(limit)
             )
+            if exclude_ids:
+                stmt = stmt.where(MemoryChunk.id.not_in(exclude_ids))
             result = await session.execute(stmt)
             return list(result.scalars().all())
 

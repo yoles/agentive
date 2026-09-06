@@ -816,6 +816,10 @@ async def test_archival_worker_archives_ttl_expired_chunk_end_to_end(
             json={"q": "will expire", "namespace": "ttl-archival-ns"},
         )
         assert resp.status_code == 200, resp.text
+        # NOTE: this emptiness is owed to the `expires_at` filter inherited
+        # from Story 3.1, not to archival — the chunk was already invisible
+        # before the worker ran. The `archived_at` filter is proved on a
+        # NON-expired chunk in the T10.8 test below (code review Story 3.3, P11).
         assert resp.json() == []
 
         resp = await client.post(
@@ -828,6 +832,9 @@ async def test_archival_worker_archives_ttl_expired_chunk_end_to_end(
     assert len(body) == 1
     assert body[0]["chunk_id"] == chunk_id
     assert body[0]["archived_at"] is not None
+    # P10 — `archived_at` alone cannot tell a live hit from an expired one the
+    # worker has not reached yet; `expires_at` is what makes that readable.
+    assert body[0]["expires_at"] is not None
 
     async with app_session_factory() as session:
         result = await session.execute(
@@ -856,7 +863,13 @@ async def test_archival_worker_archives_chunk_by_archive_after_seconds(
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """T10.8 — a namespace with an explicit `archive_after_seconds` override
-    archives a chunk that never expired, tagged `reason="archive_after_seconds"`."""
+    archives a chunk that never expired, tagged `reason="archive_after_seconds"`.
+
+    This is also where the `archived_at` search filter is actually proved: the
+    chunk has NO TTL, so its disappearance from `/memory/search` after the run
+    can only come from archival. The T10.7 test above cannot make that claim,
+    its chunk was already hidden by `expires_at` (code review Story 3.3, P11).
+    """
     from datetime import UTC, datetime, timedelta
 
     from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
@@ -880,9 +893,32 @@ async def test_archival_worker_archives_chunk_by_archive_after_seconds(
         chunk_id = resp.json()["chunk_id"]
         assert resp.json()["expires_at"] is None  # no TTL — only the age path applies
 
-    worker = MemoryArchivalWorker(session_factory=app_session_factory)
-    summary = await worker.run_once(now=datetime.now(UTC) + timedelta(days=1))
-    assert summary.archive_after_seconds_count >= 1
+        search_body = {"q": "will age out", "namespace": "age-archival-ns"}
+        resp = await client.post("/api/v1/memory/search", headers=_auth_headers(), json=search_body)
+        assert resp.status_code == 200, resp.text
+        live = resp.json()
+        assert [hit["chunk_id"] for hit in live] == [chunk_id]
+        assert live[0]["archived_at"] is None
+        assert live[0]["expires_at"] is None
+
+        worker = MemoryArchivalWorker(session_factory=app_session_factory)
+        summary = await worker.run_once(now=datetime.now(UTC) + timedelta(days=1))
+        assert summary.archive_after_seconds_count >= 1
+
+        # Same query, same chunk, no TTL involved: gone because it is archived.
+        resp = await client.post("/api/v1/memory/search", headers=_auth_headers(), json=search_body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == []
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={**search_body, "include_archived": True},
+        )
+        assert resp.status_code == 200, resp.text
+        recovered = resp.json()
+        assert [hit["chunk_id"] for hit in recovered] == [chunk_id]
+        assert recovered[0]["archived_at"] is not None
 
     async with app_session_factory() as session:
         result = await session.execute(

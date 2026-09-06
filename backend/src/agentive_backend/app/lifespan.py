@@ -396,6 +396,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await memory_archival_worker.start()
     except Exception:
         log.exception("agentive_memory_archival_worker_start_failed")
+        # Unlike the OutboxWorker block above, this one is NOT first in the
+        # sequence: the outbox worker is already running with a live LISTEN
+        # connection, and raising here abandons the lifespan before its
+        # `finally` ever runs. Copying that block verbatim therefore leaked
+        # the `_listen_loop` task and its connection (code review Story 3.3, P6).
+        with contextlib.suppress(Exception):
+            await worker.stop()
         _correlation_id_var.reset(startup_token)
         raise
     app.state.memory_archival_worker = memory_archival_worker
