@@ -10,6 +10,9 @@ Naming convention follows the ``module.entity.action`` pattern (cf.
   namespace's ``department`` (AC2).
 * ``memory_manager.chunk.archived`` — Story 3.3, emitted after
   ``MemoryArchivalWorker`` durably sets a chunk's ``archived_at`` (AC1/AC3).
+* ``memory_manager.namespace.decay_policy_updated`` — Story 3.4, emitted
+  after ``PATCH /memory/namespaces/{name}`` durably changes a namespace's
+  ``decay_policy`` (code review BS1).
 
 Filled in by Story 3.2 — this file was a placeholder left by Story 3.1
 ("Filled by Epic 3 stories").
@@ -17,7 +20,7 @@ Filled in by Story 3.2 — this file was a placeholder left by Story 3.1
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -82,4 +85,30 @@ class MemoryChunkArchivedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
-__all__ = ["MemoryChunkArchivedEvent", "NamespaceAccessDeniedEvent", "NamespaceCreatedEvent"]
+class NamespaceDecayPolicyUpdatedEvent(BaseModel):
+    """Published after a namespace's ``decay_policy`` is durably committed
+    (Story 3.4, code review BS1). Lives in ``outbox_events`` until Story 9.1
+    wires :class:`AuditEventRepo`, same posture as the events above.
+
+    Carries the policy itself, unlike :class:`NamespaceCreatedEvent` which is
+    identity-only: here the configuration IS the event. A decay policy
+    silently reorders every future search on the namespace, so "who changed
+    it to what" is the whole audit value — recording only that *something*
+    changed would leave nothing to reconstruct.
+    """
+
+    event_type: ClassVar[str] = "memory_manager.namespace.decay_policy_updated"
+
+    namespace_id: UUID
+    name: str = Field(min_length=1, max_length=255)
+    decay_policy: dict[str, Any]
+    actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
+    tenant_id: UUID | None = None
+
+
+__all__ = [
+    "MemoryChunkArchivedEvent",
+    "NamespaceAccessDeniedEvent",
+    "NamespaceCreatedEvent",
+    "NamespaceDecayPolicyUpdatedEvent",
+]

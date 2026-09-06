@@ -57,16 +57,19 @@ from agentive_backend.features.memory_manager.schemas import (
     MemorySearchResultView,
     NamespaceCreateView,
     NamespaceListItemView,
+    NamespaceUpdateView,
 )
 from agentive_backend.shared.contracts.events import (
     NamespaceAccessDeniedEvent,
     NamespaceCreatedEvent,
+    NamespaceDecayPolicyUpdatedEvent,
 )
 from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import (
     DependencyError,
     ForbiddenError,
     InternalError,
+    NotFoundError,
     ValidationError,
 )
 from agentive_backend.shared.logging import get_logger
@@ -329,7 +332,7 @@ class MemoryManagerService:
         )
         _warn_if_backend_not_cloud(namespace_name, namespace.embedding_backend)
 
-        decay_policy, _policy_valid = self._decay_policy_for(namespace)
+        decay_policy, decay_policy_valid = self._decay_policy_for(namespace)
         # `rerank=False` opts out of the WHOLE decay path, not just the
         # oversampling: the effective policy becomes the neutral one, so
         # `score == similarity` and the caller gets the raw cosine ranking
@@ -404,7 +407,21 @@ class MemoryManagerService:
             # The namespace's CONFIGURED function, not the effective one:
             # paired with `rerank`, this tells an operator both "this
             # namespace decays" and "this particular call opted out".
+            #
+            # It reads `none` in two very different situations, which is why
+            # `decay_policy_valid` sits right next to it: either the namespace
+            # genuinely never opted in, or its JSONB is malformed and
+            # `_decay_policy_for` already fell back. Without the flag the two
+            # are indistinguishable here and in the response alike, and an
+            # operator cannot tell a namespace that does not decay from one
+            # that fails to (code review Story 3.4, IG1).
+            #
+            # Deliberately NOT surfaced on `MemorySearchResultView`: validity
+            # is a namespace-level fact and `GET /memory/namespaces` already
+            # exposes `decay_policy_valid` per namespace, whereas the search
+            # response is per result.
             decay_function=decay_policy.function.value,
+            decay_policy_valid=decay_policy_valid,
             # `result_count` is post-truncation, so at most `top_k`.
             # `candidate_count` is the window the rerank actually saw: read
             # together they tell an operator whether the ANN pass came back
@@ -465,6 +482,40 @@ class MemoryManagerService:
                 raw_policy=repr(getattr(namespace, "decay_policy", None))[:200],
             )
             return DecayPolicy(), False
+
+    def _retention_view_for(self, namespace: Namespace) -> tuple[dict[str, int | None], bool]:
+        """Parse ``namespaces.retention_policy`` into its view shape,
+        degrading instead of failing — twin of :meth:`_decay_policy_for`.
+
+        ``from_mapping`` catches most malformed shapes, but a float/bool TTL
+        slips past its own checks and only fails later, at the view's ``int``
+        validation (code review Story 3.2, P1) — so the field-level
+        validation runs inside the same guard.
+        """
+        try:
+            retention = RetentionPolicy.from_mapping(namespace.retention_policy)
+            return (
+                _RETENTION_ADAPTER.validate_python(
+                    {
+                        "default_ttl_seconds": retention.default_ttl_seconds,
+                        "archive_after_seconds": retention.archive_after_seconds,
+                    }
+                ),
+                True,
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            PydanticValidationError,
+        ) as exc:
+            _log.warning(
+                "memory_manager.namespace_retention_policy_invalid",
+                namespace=namespace.name,
+                error=str(exc),
+            )
+            return {"default_ttl_seconds": None, "archive_after_seconds": None}, False
 
     async def create_namespace(
         self,
@@ -556,6 +607,81 @@ class MemoryManagerService:
             created_at=namespace.created_at,
         )
 
+    async def update_namespace_decay_policy(
+        self,
+        *,
+        name: str,
+        decay_policy_override: DecayPolicy | None,
+        tenant_id: UUID | None = None,
+    ) -> NamespaceUpdateView:
+        """Replace a namespace's decay policy — Story 3.4, code review BS1.
+
+        The reason this exists: ``decay_policy`` was settable at creation
+        only, so every namespace Stories 3.1-3.3 had already created — all of
+        them — could never opt into decay at all. ``AC1``'s "configurable per
+        namespace" was true of new rows and false of the existing table.
+
+        ``decay_policy_override=None`` clears the policy back to "no decay",
+        restoring ``final_score == similarity`` on that namespace.
+
+        Not subject to ``_check_department_access``: like creation, this is a
+        global administration action, not a memory read/write.
+
+        Raises
+        ------
+        NotFoundError
+            No namespace carries that ``name``.
+        """
+        decay_policy = decay_policy_override or DecayPolicy()
+
+        # Same atomicity pattern as `create_namespace`: the UPDATE and the
+        # outbox publish share one transaction, so a namespace never starts
+        # reordering its search results with nothing in the outbox saying
+        # when that began.
+        async with self._namespace_repo.with_tenant(tenant_id) as session:
+            namespace = await self._namespace_repo.set_decay_policy_in_session(
+                session,
+                name=name,
+                decay_policy=decay_policy.to_mapping(),
+            )
+            if namespace is None:
+                raise NotFoundError(
+                    detail=f"Namespace '{name}' not found",
+                    context={"namespace": name},
+                )
+            retention_view, _retention_valid = self._retention_view_for(namespace)
+            event = NamespaceDecayPolicyUpdatedEvent(
+                namespace_id=namespace.id,
+                name=namespace.name,
+                decay_policy=decay_policy.to_mapping(),
+                tenant_id=tenant_id,
+            )
+            event_id = await publish(
+                NamespaceDecayPolicyUpdatedEvent.event_type, event, session=session
+            )
+            # commit happens at __aexit__ if no exception is raised.
+
+        await notify_best_effort(event_id, NamespaceDecayPolicyUpdatedEvent.event_type)
+
+        _log.info(
+            "memory_manager.namespace_decay_policy_updated",
+            namespace=namespace.name,
+            namespace_id=str(namespace.id),
+            decay_function=decay_policy.function.value,
+        )
+
+        return NamespaceUpdateView(
+            namespace_id=namespace.id,
+            name=namespace.name,
+            type=namespace.type,
+            department=namespace.department,
+            project=namespace.project,
+            retention_policy=retention_view,
+            decay_policy=decay_policy.to_mapping(),
+            embedding_backend=namespace.embedding_backend,
+            created_at=namespace.created_at,
+        )
+
     async def list_namespaces(
         self, *, tenant_id: UUID | None = None
     ) -> list[NamespaceListItemView]:
@@ -591,35 +717,7 @@ class MemoryManagerService:
             # `retention_policy` must not brand a healthy `decay_policy`
             # invalid, nor the reverse. Each falls back to its own empty
             # policy and raises only its own `*_valid` flag.
-            retention_policy_valid = True
-            try:
-                retention = RetentionPolicy.from_mapping(ns.retention_policy)
-                # `from_mapping` catches most malformed shapes, but a
-                # float/bool TTL slips past its own checks and only fails
-                # later, at `NamespaceListItemView`'s `int` validation (code
-                # review Story 3.2, P1) — so the field-level validation runs
-                # inside this try too.
-                retention_view = _RETENTION_ADAPTER.validate_python(
-                    {
-                        "default_ttl_seconds": retention.default_ttl_seconds,
-                        "archive_after_seconds": retention.archive_after_seconds,
-                    }
-                )
-            except (
-                AttributeError,
-                TypeError,
-                ValueError,
-                OverflowError,
-                PydanticValidationError,
-            ) as exc:
-                _log.warning(
-                    "memory_manager.namespace_retention_policy_invalid",
-                    namespace=ns.name,
-                    error=str(exc),
-                )
-                retention_view = {"default_ttl_seconds": None, "archive_after_seconds": None}
-                retention_policy_valid = False
-
+            retention_view, retention_policy_valid = self._retention_view_for(ns)
             decay, decay_policy_valid = self._decay_policy_for(ns)
 
             views.append(

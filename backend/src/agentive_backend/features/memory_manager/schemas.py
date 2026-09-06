@@ -251,6 +251,28 @@ class CreateNamespaceRequest(BaseModel):
         return ensure_embeddable_text(value, field=info.field_name or "value")
 
 
+class UpdateNamespaceRequest(BaseModel):
+    """Body of ``PATCH /api/v1/memory/namespaces/{name}`` (Story 3.4, code
+    review BS1).
+
+    Exists because `decay_policy` used to be settable at creation only, which
+    made the whole feature unreachable on every namespace Stories 3.1-3.3 had
+    already created — i.e. all of them. Enabling decay had no path short of
+    hand-editing the JSONB, the very thing the read guards treat as suspect.
+
+    `decay_policy` is required, and `null` is meaningful: it clears the policy
+    back to "no decay". Leaving it optional would need a sentinel to tell
+    "leave it alone" from "remove it", and with a single mutable field that
+    ambiguity buys nothing. `retention_policy` is deliberately NOT mutable
+    here: changing a TTL retroactively decides the fate of chunks already
+    written, which is a Story 3.3 concern, not this one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decay_policy: DecayPolicyOverride | None
+
+
 class NamespaceCreateView(BaseModel):
     """Response of ``POST /api/v1/memory/namespaces`` — 201 (Story 3.2 AC1)."""
 
@@ -271,6 +293,15 @@ class NamespaceCreateView(BaseModel):
     decay_policy: dict[str, Any]
     embedding_backend: str
     created_at: datetime
+
+
+class NamespaceUpdateView(NamespaceCreateView):
+    """Response of ``PATCH /api/v1/memory/namespaces/{name}`` — 200.
+
+    Same shape as the creation response, by subclassing rather than by
+    copy: a caller that just reconfigured a namespace wants to read back
+    exactly what creating it that way would have returned.
+    """
 
 
 class NamespaceListItemView(BaseModel):
@@ -355,7 +386,9 @@ __all__ = [
     "MemorySearchResultView",
     "NamespaceCreateView",
     "NamespaceListItemView",
+    "NamespaceUpdateView",
     "RetentionPolicyOverride",
     "SearchMemoryRequest",
+    "UpdateNamespaceRequest",
     "ensure_embeddable_text",
 ]

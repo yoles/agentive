@@ -33,11 +33,14 @@ from agentive_backend.features.memory_manager.domain.value_objects import (
 from agentive_backend.features.memory_manager.schemas import (
     CreateMemoryChunkRequest,
     CreateNamespaceRequest,
+    DecayPolicyOverride,
     MemoryChunkCreateView,
     MemorySearchResultView,
     NamespaceCreateView,
     NamespaceListItemView,
+    NamespaceUpdateView,
     SearchMemoryRequest,
+    UpdateNamespaceRequest,
 )
 from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.shared.exceptions import DependencyError, ValidationError
@@ -190,6 +193,24 @@ async def search_memory(
     )
 
 
+def _to_decay_policy(override: DecayPolicyOverride | None) -> DecayPolicy | None:
+    """Map the HTTP override onto the domain value object.
+
+    Shared by the create and update routes so the two cannot drift on which
+    parameters they forward — a parameter silently dropped on one path only
+    is the exact failure mode this story rejects everywhere else.
+    """
+    if override is None:
+        return None
+    return DecayPolicy(
+        function=override.function,
+        half_life_seconds=override.half_life_seconds,
+        horizon_seconds=override.horizon_seconds,
+        threshold_seconds=override.threshold_seconds,
+        factor=override.factor,
+    )
+
+
 @router.post(
     "/memory/namespaces",
     response_model=NamespaceCreateView,
@@ -229,17 +250,42 @@ async def create_namespace(
                 archive_after_seconds=body.retention_policy.archive_after_seconds,
             )
         ),
-        decay_policy_override=(
-            None
-            if body.decay_policy is None
-            else DecayPolicy(
-                function=body.decay_policy.function,
-                half_life_seconds=body.decay_policy.half_life_seconds,
-                horizon_seconds=body.decay_policy.horizon_seconds,
-                threshold_seconds=body.decay_policy.threshold_seconds,
-                factor=body.decay_policy.factor,
-            )
-        ),
+        decay_policy_override=_to_decay_policy(body.decay_policy),
+        tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
+    )
+
+
+@router.patch(
+    "/memory/namespaces/{namespace_name}",
+    response_model=NamespaceUpdateView,
+    summary="Replace a namespace's temporal decay policy (Story 3.4 AC1)",
+)
+async def update_namespace(
+    request: Request,
+    namespace_name: str,
+    body: UpdateNamespaceRequest,
+) -> NamespaceUpdateView:
+    """200 on success. Not subject to ``X-Acting-Department`` (global
+    administration action, same posture as creation).
+
+    This is what makes decay reachable at all on namespaces created before
+    Story 3.4: configuring it at creation time only left every existing
+    namespace — i.e. every namespace — stuck on similarity-only ranking, with
+    no path to opt in short of hand-editing the JSONB (code review BS1).
+
+    ``decay_policy`` is the only mutable field, and sending ``null`` clears it
+    back to "no decay". ``retention_policy`` is not mutable here: changing a
+    TTL retroactively decides the fate of chunks already written, which is
+    Story 3.3's concern.
+
+    Errors:
+    * 404 : no namespace carries that name.
+    * 422 : incoherent ``decay_policy`` function/parameter combination.
+    """
+    service = _build_service(request)
+    return await service.update_namespace_decay_policy(
+        name=namespace_name,
+        decay_policy_override=_to_decay_policy(body.decay_policy),
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
     )
 

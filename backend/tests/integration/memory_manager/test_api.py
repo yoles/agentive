@@ -1286,3 +1286,134 @@ async def test_search_on_a_malformed_decay_policy_returns_200_not_500(
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()[0]["decay_factor"] == 1.0
+
+
+# ─── PATCH /memory/namespaces/{name} — Story 3.4, code review BS1 ──
+
+
+@pytest.mark.asyncio
+async def test_patch_namespace_enables_decay_on_a_pre_existing_namespace(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The finding this endpoint closes: `decay_policy` used to be settable
+
+    at creation only, so every namespace Stories 3.1-3.3 created — all of
+    them — could never opt into decay. This walks the real path: a namespace
+    born WITHOUT a policy, ranking on similarity alone, then switched on and
+    reordering.
+    """
+    await _create_namespace(app_session_factory, name="decay-late")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "quarterly revenue report", "namespace": "decay-late"},
+        )
+        assert resp.status_code == 201, resp.text
+        aged_id = resp.json()["chunk_id"]
+
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "an unrelated onboarding checklist", "namespace": "decay-late"},
+        )
+        assert resp.status_code == 201, resp.text
+        recent_id = resp.json()["chunk_id"]
+
+        await _backdate_chunk(app_session_factory, chunk_id=aged_id, days=10)
+
+        search = {"q": "quarterly revenue report", "namespace": "decay-late", "top_k": 2}
+
+        # Before: no policy, so the exact phrasing wins on raw similarity.
+        resp = await client.post("/api/v1/memory/search", headers=_auth_headers(), json=search)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()[0]["chunk_id"] == aged_id
+        assert resp.json()[0]["decay_factor"] == 1.0
+
+        resp = await client.patch(
+            "/api/v1/memory/namespaces/decay-late",
+            headers=_auth_headers(),
+            json={"decay_policy": {"function": "linear", "horizon_seconds": 86_400}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["decay_policy"] == {
+            "function": "linear",
+            "horizon_seconds": 86_400,
+        }
+
+        # After: the aged chunk is past the horizon, factor 0.0, demoted.
+        resp = await client.post("/api/v1/memory/search", headers=_auth_headers(), json=search)
+        assert resp.status_code == 200, resp.text
+        after = resp.json()
+        assert after[0]["chunk_id"] == recent_id
+        assert next(r for r in after if r["chunk_id"] == aged_id)["decay_factor"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_patch_namespace_clears_the_policy_with_null(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Round trip: clearing writes `{}`, the column default, so the namespace
+
+    is indistinguishable from one that never opted in.
+    """
+    await _create_namespace(app_session_factory, name="decay-clear", decay_policy=_DECAY_1D)
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            "/api/v1/memory/namespaces/decay-clear",
+            headers=_auth_headers(),
+            json={"decay_policy": None},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["decay_policy"] == {}
+
+        resp = await client.get("/api/v1/memory/namespaces", headers=_auth_headers())
+        assert resp.status_code == 200, resp.text
+        listed = next(n for n in resp.json() if n["name"] == "decay-clear")
+        assert listed["decay_policy"] == {}
+        assert listed["decay_policy_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_patch_unknown_namespace_returns_404(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            "/api/v1/memory/namespaces/does-not-exist",
+            headers=_auth_headers(),
+            json={"decay_policy": None},
+        )
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_patch_namespace_rejects_an_incoherent_policy_with_422(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Same 422-not-500 guarantee as the creation path — the parameter belongs
+
+    to another function, so it is rejected rather than silently dropped.
+    """
+    await _create_namespace(app_session_factory, name="decay-422")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            "/api/v1/memory/namespaces/decay-422",
+            headers=_auth_headers(),
+            json={"decay_policy": {"function": "linear", "half_life_seconds": 60}},
+        )
+
+    assert resp.status_code == 422, resp.text
