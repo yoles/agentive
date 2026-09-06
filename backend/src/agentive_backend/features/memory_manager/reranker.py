@@ -128,10 +128,11 @@ def rerank[ChunkT: RerankableChunk](
     ``rows`` is exactly what ``ChunkEmbeddingRepo.search_ann`` returns:
     ``(MemoryChunk, 1.0 - cosine_distance)`` pairs.
 
-    The final ordering key mirrors ``search_ann``'s own SQL tie-break
-    (``distance, created_at DESC, id`` — code review Story 3.1, P7) so two
-    identical requests always return the same order, including when several
-    chunks land on the same ``final_score``.
+    The final ordering key extends ``search_ann``'s own SQL tie-break
+    (``distance, created_at DESC, id`` — code review Story 3.1, P7) with
+    ``similarity`` in second position, so two identical requests always
+    return the same order, including when several chunks land on the same
+    ``final_score``.
     """
     scored: list[ScoredChunk[ChunkT]] = []
     for chunk, raw_similarity in rows:
@@ -153,7 +154,23 @@ def rerank[ChunkT: RerankableChunk](
             )
         )
 
-    scored.sort(key=lambda s: (-s.final_score, -s.chunk.created_at.timestamp(), str(s.chunk.id)))
+    # `similarity` sits between the score and the recency tie-break for one
+    # regime: when every candidate's factor collapses to 0.0 — `linear` past
+    # its horizon, or `step` with `factor = 0.0` past its threshold — every
+    # `final_score` is 0.0 and the ordering would otherwise be decided purely
+    # by `created_at`, silently turning "most relevant" into "most recent".
+    # A chunk at similarity 0.01 would outrank one at 0.99 for being a second
+    # newer. Consulting the raw similarity first keeps "decay demotes, it
+    # never overrules" true in that regime too, and changes nothing whenever
+    # scores actually differ (code review Story 3.4, IG2).
+    scored.sort(
+        key=lambda s: (
+            -s.final_score,
+            -s.similarity,
+            -s.chunk.created_at.timestamp(),
+            str(s.chunk.id),
+        )
+    )
     return scored[:top_k]
 
 

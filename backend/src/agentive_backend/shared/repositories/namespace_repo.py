@@ -100,6 +100,34 @@ class NamespaceRepo(BaseRepo):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def set_decay_policy_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        name: str,
+        decay_policy: dict[str, Any],
+    ) -> Namespace | None:
+        """UPDATE ``decay_policy`` inside the caller's transaction.
+
+        Returns ``None`` when no namespace carries that ``name``, leaving the
+        404 to the service (same lookup-or-404 split as
+        :meth:`require_by_name`).
+
+        Session-scoped like :meth:`create_in_session` so the service can
+        publish ``NamespaceDecayPolicyUpdatedEvent`` in the same transaction
+        as the write: a crash between the two would otherwise leave a
+        namespace silently reordering its search results with nothing in the
+        outbox to say when that started (Story 3.4, code review BS1).
+        """
+        stmt = select(Namespace).where(Namespace.name == name)
+        namespace = (await session.execute(stmt)).scalar_one_or_none()
+        if namespace is None:
+            return None
+        namespace.decay_policy = decay_policy
+        await session.flush()
+        await session.refresh(namespace)
+        return namespace
+
     async def create(
         self,
         *,

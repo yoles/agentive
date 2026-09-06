@@ -226,3 +226,61 @@ def test_future_created_at_never_scores_above_similarity() -> None:
 
     assert scored[0].decay_factor == 1.0
     assert scored[0].final_score == pytest.approx(0.8)
+
+
+# ─── IG2 — a saturated-zero decay must not become a recency sort ──
+
+
+_LINEAR_1D = DecayPolicy(function=DecayFunction.LINEAR, horizon_seconds=86_400)
+
+
+def test_all_zero_scores_still_order_by_similarity() -> None:
+    """Past a `linear` horizon every factor is 0.0, so every `final_score` is
+
+    0.0 too. Without `similarity` in the sort key the order would be decided
+    by `created_at` alone, quietly turning "most relevant" into "most
+    recent": here the barely-relevant chunk is also the newest of the two
+    aged ones, and it must NOT come first (code review Story 3.4, IG2).
+    """
+    relevant_older = _chunk(age_days=10.0)
+    irrelevant_newer = _chunk(age_days=2.0)
+
+    scored = rerank(
+        [(irrelevant_newer, 0.01), (relevant_older, 0.99)],
+        policy=_LINEAR_1D,
+        now=_NOW,
+        top_k=2,
+    )
+
+    assert all(s.final_score == 0.0 for s in scored)
+    assert [s.chunk for s in scored] == [relevant_older, irrelevant_newer]
+
+
+def test_step_with_a_zero_factor_still_orders_by_similarity() -> None:
+    """`factor=0.0` is accepted (`ge=0.0`), so `step` reaches the same
+
+    saturated-zero regime as `linear` past its horizon.
+    """
+    policy = DecayPolicy(function=DecayFunction.STEP, threshold_seconds=3_600, factor=0.0)
+    weak = _chunk(age_days=1.0)
+    strong = _chunk(age_days=5.0)
+
+    scored = rerank([(weak, 0.10), (strong, 0.95)], policy=policy, now=_NOW, top_k=2)
+
+    assert all(s.final_score == 0.0 for s in scored)
+    assert [s.chunk for s in scored] == [strong, weak]
+
+
+def test_similarity_never_overrides_a_real_score_difference() -> None:
+    """The new key changes nothing when scores actually differ: similarity is
+
+    only ever consulted on an exact `final_score` tie.
+    """
+    old_strong = _chunk(age_days=1.0)  # 0.95 x 0.5 = 0.475
+    recent_weak = _chunk(age_days=0.0)  # 0.40 x 1.0 = 0.40
+
+    scored = rerank(
+        [(recent_weak, 0.40), (old_strong, 0.95)], policy=_EXPONENTIAL, now=_NOW, top_k=2
+    )
+
+    assert [s.chunk for s in scored] == [old_strong, recent_weak]

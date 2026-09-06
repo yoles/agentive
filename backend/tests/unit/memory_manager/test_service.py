@@ -1159,3 +1159,114 @@ async def test_list_namespaces_keeps_the_two_policy_flags_independent() -> None:
     assert result[0].retention_policy_valid is False
     assert result[0].decay_policy_valid is True
     assert result[0].decay_policy == _EXPONENTIAL_1D
+
+
+# ─── update_namespace_decay_policy — Story 3.4, code review BS1 ───
+
+
+def _decay_update_service() -> tuple[MemoryManagerService, MagicMock]:
+    namespace_repo = MagicMock()
+    _configure_with_tenant(namespace_repo, MagicMock())
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedder=AsyncMock(),
+    )
+    return service, namespace_repo
+
+
+@pytest.mark.asyncio
+async def test_update_namespace_decay_policy_persists_the_override() -> None:
+    """The whole point of the endpoint: a namespace created before Story 3.4
+
+    (so with `decay_policy == {}`) can be switched on after the fact.
+    """
+    service, namespace_repo = _decay_update_service()
+    existing = _make_namespace(name="ns-legacy", decay_policy={})
+    namespace_repo.set_decay_policy_in_session = AsyncMock(return_value=existing)
+
+    with (
+        patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+    ):
+        view = await service.update_namespace_decay_policy(
+            name="ns-legacy",
+            decay_policy_override=DecayPolicy(
+                function=DecayFunction.EXPONENTIAL, half_life_seconds=86_400
+            ),
+        )
+
+    expected = {"function": "exponential", "half_life_seconds": 86_400}
+    assert namespace_repo.set_decay_policy_in_session.await_args.kwargs["decay_policy"] == expected
+    assert view.decay_policy == expected
+
+
+@pytest.mark.asyncio
+async def test_update_namespace_decay_policy_clears_with_none() -> None:
+    """`None` writes `{}`, which is byte-for-byte the column default: turning
+
+    decay off leaves no trace distinguishing it from never having opted in.
+    """
+    service, namespace_repo = _decay_update_service()
+    namespace_repo.set_decay_policy_in_session = AsyncMock(
+        return_value=_make_namespace(name="ns-on", decay_policy={"function": "linear"})
+    )
+
+    with (
+        patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+    ):
+        view = await service.update_namespace_decay_policy(name="ns-on", decay_policy_override=None)
+
+    assert namespace_repo.set_decay_policy_in_session.await_args.kwargs["decay_policy"] == {}
+    assert view.decay_policy == {}
+
+
+@pytest.mark.asyncio
+async def test_update_namespace_decay_policy_raises_not_found() -> None:
+    service, namespace_repo = _decay_update_service()
+    namespace_repo.set_decay_policy_in_session = AsyncMock(return_value=None)
+
+    with (
+        patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+        pytest.raises(NotFoundError),
+    ):
+        await service.update_namespace_decay_policy(name="ghost", decay_policy_override=None)
+
+
+@pytest.mark.asyncio
+async def test_update_namespace_decay_policy_publishes_in_the_write_transaction() -> None:
+    """Same atomicity posture as `create_namespace`: the publish takes the
+
+    session, so a crash cannot leave a namespace reordering its results with
+    nothing in the outbox saying when that started.
+    """
+    service, namespace_repo = _decay_update_service()
+    namespace_repo.set_decay_policy_in_session = AsyncMock(
+        return_value=_make_namespace(name="ns-audit")
+    )
+    publish = AsyncMock(return_value=uuid4())
+
+    with (
+        patch.object(service_module, "publish", publish),
+        patch.object(service_module, "notify_best_effort", AsyncMock()),
+    ):
+        await service.update_namespace_decay_policy(
+            name="ns-audit",
+            decay_policy_override=DecayPolicy(
+                function=DecayFunction.STEP, threshold_seconds=60, factor=0.25
+            ),
+        )
+
+    assert publish.await_args.args[0] == "memory_manager.namespace.decay_policy_updated"
+    assert publish.await_args.kwargs["session"] is not None
+    event = publish.await_args.args[1]
+    # The policy travels WITH the event: an audit trail saying only that
+    # "something changed" would leave nothing to reconstruct.
+    assert event.decay_policy == {
+        "function": "step",
+        "factor": 0.25,
+        "threshold_seconds": 60,
+    }

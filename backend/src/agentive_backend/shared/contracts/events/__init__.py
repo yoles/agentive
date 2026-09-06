@@ -27,6 +27,7 @@ from agentive_backend.shared.contracts.events.memory_events import (
     MemoryChunkArchivedEvent,
     NamespaceAccessDeniedEvent,
     NamespaceCreatedEvent,
+    NamespaceDecayPolicyUpdatedEvent,
 )
 from agentive_backend.shared.contracts.events.playground_events import (
     PlaygroundRunCompletedEvent,
@@ -51,6 +52,7 @@ __all__ = [
     "MemoryChunkArchivedEvent",
     "NamespaceAccessDeniedEvent",
     "NamespaceCreatedEvent",
+    "NamespaceDecayPolicyUpdatedEvent",
     "PlaygroundRunCompletedEvent",
     "SystemShutdownEvent",
     "SystemStartedEvent",

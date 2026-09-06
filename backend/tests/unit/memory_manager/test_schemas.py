@@ -24,6 +24,7 @@ from agentive_backend.features.memory_manager.schemas import (
     MemorySearchResultView,
     RetentionPolicyOverride,
     SearchMemoryRequest,
+    UpdateNamespaceRequest,
 )
 
 
@@ -306,3 +307,46 @@ def test_search_result_view_carries_both_score_terms() -> None:
     assert view.similarity == 0.9
     assert view.decay_factor == 0.5
     assert view.score == 0.45
+
+
+# ─── UpdateNamespaceRequest — Story 3.4, code review BS1 ──────────
+
+
+def test_update_namespace_request_accepts_a_policy() -> None:
+    body = UpdateNamespaceRequest.model_validate(
+        {"decay_policy": {"function": "exponential", "half_life_seconds": 86_400}}
+    )
+
+    assert body.decay_policy is not None
+    assert body.decay_policy.half_life_seconds == 86_400
+
+
+def test_update_namespace_request_accepts_null_to_clear_the_policy() -> None:
+    """`null` is meaningful here, not "unset": it is how an operator turns
+
+    decay back off on a namespace that has it.
+    """
+    assert UpdateNamespaceRequest.model_validate({"decay_policy": None}).decay_policy is None
+
+
+def test_update_namespace_request_requires_the_field() -> None:
+    with pytest.raises(PydanticValidationError):
+        UpdateNamespaceRequest.model_validate({})
+
+
+def test_update_namespace_request_forbids_unknown_fields() -> None:
+    """`retention_policy` is deliberately NOT mutable here — a typo must be a
+
+    422, not a silently ignored field.
+    """
+    with pytest.raises(PydanticValidationError):
+        UpdateNamespaceRequest.model_validate(
+            {"decay_policy": None, "retention_policy": {"default_ttl_seconds": 60}}
+        )
+
+
+def test_update_namespace_request_rejects_an_incoherent_policy() -> None:
+    with pytest.raises(PydanticValidationError):
+        UpdateNamespaceRequest.model_validate(
+            {"decay_policy": {"function": "exponential", "horizon_seconds": 60}}
+        )
