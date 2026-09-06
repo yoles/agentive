@@ -112,22 +112,19 @@ async def discover_tools(
         transport (defensive — the FastAPI route should reject malformed
         bodies via Pydantic before reaching this point).
     """
+    # `cm` is bound BEFORE the `async with` so the handler below can always
+    # read it: bound inside, it exists only if `Timeout.__aenter__` succeeded
+    # (CR 2026-09-06, P15).
+    cm = asyncio.timeout(timeout)
     try:
-        async with asyncio.timeout(timeout) as cm:
+        async with cm:
             return await _discover_inner(transport=transport, connection_config=connection_config)
     except TimeoutError as exc:
         raise MCPDiscoveryTimeoutError(timeout=timeout) from exc
-    except BaseExceptionGroup:
-        # Under the setrlimit sandbox fallback, cancelling at the deadline
-        # can race the stdio_client teardown: its background reader task
-        # tries to push a message after the read stream is already closed,
-        # raising anyio.BrokenResourceError instead of propagating our
-        # CancelledError — so asyncio.timeout can't convert it to
-        # TimeoutError on its own. cm.expired() still reports the deadline
-        # was hit regardless of which exception won that race.
-        if cm.expired():
-            raise MCPDiscoveryTimeoutError(timeout=timeout) from None
-        raise
+    except BaseExceptionGroup as exc_group:
+        if not _deadline_won_the_race(expired=cm.expired()):
+            raise
+        raise MCPDiscoveryTimeoutError(timeout=timeout) from exc_group
 
 
 async def _discover_inner(
@@ -267,8 +264,9 @@ async def call_tool(
         ``connection_config`` is malformed (missing required keys for
         the requested transport).
     """
+    cm = asyncio.timeout(timeout)
     try:
-        async with asyncio.timeout(timeout) as cm:
+        async with cm:
             return await _call_tool_inner(
                 transport=transport,
                 connection_config=connection_config,
@@ -279,17 +277,11 @@ async def call_tool(
             )
     except TimeoutError as exc:
         raise MCPExecutionTimeoutError(timeout=timeout) from exc
-    except BaseExceptionGroup:
-        # Same teardown race as discover_tools (see comment there): under
-        # the setrlimit fallback, the stdio_client's background reader can
-        # lose a race against our cancellation and raise
-        # anyio.BrokenResourceError, which _reraise_domain_error_from_group
-        # doesn't recognize as a domain error and re-raises as-is. Use
-        # cm.expired() to still detect this was a timeout, not a genuine
-        # protocol/connection failure.
-        if cm.expired():
-            raise MCPExecutionTimeoutError(timeout=timeout) from None
-        raise
+    except BaseExceptionGroup as exc_group:
+        # Same teardown race as `discover_tools` — see `_deadline_won_the_race`.
+        if not _deadline_won_the_race(expired=cm.expired()):
+            raise
+        raise MCPExecutionTimeoutError(timeout=timeout) from exc_group
 
 
 async def _call_tool_inner(
@@ -373,6 +365,39 @@ async def _call_tool_inner(
             return await _call_tool_via_session(read, write, tool_name, arguments)
     else:
         raise ValueError(f"Unknown transport: {transport!r}")
+
+
+def _deadline_won_the_race(*, expired: bool) -> bool:
+    """True iff an exception group escaping the timeout block is the teardown
+    debris of OUR own deadline, and may therefore be reported as a timeout.
+
+    Under the setrlimit sandbox fallback, cancelling at the deadline races the
+    ``stdio_client`` teardown: its background reader task pushes onto an
+    already closed stream and raises ``anyio.BrokenResourceError``, so what
+    reaches the caller is an exception GROUP, not the bare ``CancelledError``
+    that ``asyncio.timeout`` knows how to convert into ``TimeoutError``.
+    ``expired()`` still reports the deadline was hit, whichever exception won
+    that race — hence this shortcut.
+
+    Two guards keep the shortcut from swallowing something real
+    (CR 2026-09-06, P15):
+
+    - the deadline must actually have fired ;
+    - a cancellation still pending on this task wins over it. Withdrawing its
+      own request is the FIRST thing ``asyncio.timeout.__aexit__`` does, so a
+      non-zero ``Task.cancelling()`` here can only come from somebody else (an
+      enclosing timeout, a shutdown). Reporting a tool timeout in that case
+      converts a cooperative cancellation into a domain error and the caller
+      never stops.
+
+    The group itself is chained onto the raised error (``from exc_group``, not
+    the previous ``from None``), so an unrelated failure that shared the race
+    stays readable in the traceback instead of vanishing.
+    """
+    if not expired:
+        return False
+    task = asyncio.current_task()
+    return task is None or task.cancelling() == 0
 
 
 def _reraise_domain_error_from_group(exc_group: BaseExceptionGroup) -> None:
