@@ -33,9 +33,15 @@ async def _create_namespace(
     *,
     name: str,
     retention_policy: dict[str, Any] | None = None,
+    decay_policy: dict[str, Any] | None = None,
 ) -> Any:
     repo = NamespaceRepo(session_factory=session_factory)
-    return await repo.create(name=name, ns_type="metier", retention_policy=retention_policy)
+    return await repo.create(
+        name=name,
+        ns_type="metier",
+        retention_policy=retention_policy,
+        decay_policy=decay_policy,
+    )
 
 
 @pytest.mark.asyncio
@@ -933,3 +939,350 @@ async def test_archival_worker_archives_chunk_by_archive_after_seconds(
     assert row is not None
     assert row["payload"]["reason"] == "archive_after_seconds"
     assert row["payload"]["namespace"] == "age-archival-ns"
+
+
+# ─── Story 3.4 — scoring avec décroissance temporelle ─────────────
+
+# One-day half-life: a chunk backdated 3 days keeps 1/8 of its similarity,
+# which is enough to lose to a same-day chunk of similar (but lower) raw
+# similarity, and not enough to lose to a genuinely unrelated one.
+_DECAY_1D = {"function": "exponential", "half_life_seconds": 86_400}
+
+
+async def _backdate_chunk(
+    session_factory: async_sessionmaker[AsyncSession], *, chunk_id: str, days: int
+) -> None:
+    """Age a chunk by rewriting ``created_at`` directly.
+
+    The column is ``server_default=func.now()`` and the API offers no way
+    to write it, so a real end-to-end age can only be produced here.
+    """
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE memory_chunks SET created_at = now() - make_interval(days => :d) "
+                "WHERE id = :id"
+            ),
+            {"d": days, "id": chunk_id},
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_namespaces_decay_policy_column_exists_after_migration(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """T2 — the Alembic migration is exercised by the integration harness;
+
+    this asserts the column it adds is actually there, with its `'{}'`
+    default, rather than trusting the ORM declaration alone.
+    """
+    async with app_session_factory() as session:
+        result = await session.execute(
+            text(
+                "SELECT is_nullable, column_default FROM information_schema.columns "
+                "WHERE table_name = 'namespaces' AND column_name = 'decay_policy'"
+            )
+        )
+        row = result.one_or_none()
+    assert row is not None, "migration 20260906000000 did not add namespaces.decay_policy"
+    is_nullable, column_default = row
+    assert is_nullable == "NO"
+    assert "'{}'" in (column_default or "")
+
+
+@pytest.mark.asyncio
+async def test_search_demotes_an_aged_chunk_below_a_recent_one(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC2 end to end — the aged chunk is the EXACT phrasing of the query, so
+
+    it ranks first on raw cosine distance; only the decay can push it below
+    a fresher, less similar one. The ordering flip between the two requests
+    below is the whole point of oversampling the ANN pass.
+
+    `linear` with a 1-day horizon rather than `exponential`: it reaches
+    exactly ``0.0`` past its horizon, so this asserts an exact value on data
+    that made a real round trip through Postgres.
+    """
+    await _create_namespace(
+        app_session_factory,
+        name="decay-ranks",
+        decay_policy={"function": "linear", "horizon_seconds": 86_400},
+    )
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "quarterly revenue report", "namespace": "decay-ranks"},
+        )
+        assert resp.status_code == 201, resp.text
+        aged_id = resp.json()["chunk_id"]
+
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "an unrelated onboarding checklist", "namespace": "decay-ranks"},
+        )
+        assert resp.status_code == 201, resp.text
+        recent_id = resp.json()["chunk_id"]
+
+        await _backdate_chunk(app_session_factory, chunk_id=aged_id, days=10)
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "quarterly revenue report", "namespace": "decay-ranks", "top_k": 2},
+        )
+        assert resp.status_code == 200, resp.text
+        decayed = resp.json()
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={
+                "q": "quarterly revenue report",
+                "namespace": "decay-ranks",
+                "top_k": 2,
+                "rerank": False,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        raw = resp.json()
+
+    aged = next(r for r in decayed if r["chunk_id"] == aged_id)
+    assert aged["similarity"] > 0.999, "the aged chunk is still the best raw match"
+    assert aged["decay_factor"] == 0.0
+    assert aged["score"] == 0.0
+    assert decayed[0]["chunk_id"] == recent_id
+    # `approx`, not `== 1.0`: the "recent" chunk is already a little old by
+    # the time the search runs, and `1 - age / 86400s` is not exactly 1. Only
+    # the aged chunk's factor above is an exact value (past the horizon,
+    # linear is flat at 0.0), which is why that one is asserted exactly.
+    #
+    # `rel=1e-3`, not `1e-6`: with a 86_400s horizon, `1e-6` only tolerated an
+    # age of 86ms, and the elapsed budget here covers two chunk POSTs (each
+    # with an embedding call), a backdating UPDATE, a commit and the search
+    # itself. Green on a quiet machine, flaky on a loaded CI runner. `1e-3`
+    # allows ~86s and still fails on any real decay (code review Story 3.4,
+    # P7).
+    assert decayed[0]["decay_factor"] == pytest.approx(1.0, rel=1e-3)
+
+    # `rerank: false` gives back the pure-similarity ordering, which is the
+    # exact opposite — proof the flip above came from the decay and not from
+    # `search_ann`'s own `created_at DESC` tie-break.
+    assert raw[0]["chunk_id"] == aged_id
+    assert raw[0]["decay_factor"] == 1.0  # exact: `rerank: false` skips decay entirely
+    assert raw[0]["score"] == pytest.approx(raw[0]["similarity"])
+    assert raw[0]["score"] > 0.999
+
+
+@pytest.mark.asyncio
+async def test_search_score_is_similarity_times_decay_factor(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1 end to end — two chunks with IDENTICAL content embed to the same
+
+    vector, so their similarity is identical and the only thing separating
+    their scores is their age. A 3-day-old chunk under a 1-day half-life is
+    worth 1/8 of a same-day one.
+    """
+    await _create_namespace(app_session_factory, name="decay-formula", decay_policy=_DECAY_1D)
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        ids = []
+        for _ in range(2):
+            resp = await client.post(
+                "/api/v1/memory/chunks",
+                headers=_auth_headers(),
+                json={"content": "identical content", "namespace": "decay-formula"},
+            )
+            assert resp.status_code == 201, resp.text
+            ids.append(resp.json()["chunk_id"])
+        aged_id, recent_id = ids
+
+        await _backdate_chunk(app_session_factory, chunk_id=aged_id, days=3)
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "identical content", "namespace": "decay-formula", "top_k": 2},
+        )
+    assert resp.status_code == 200, resp.text
+    by_id = {r["chunk_id"]: r for r in resp.json()}
+
+    recent, aged = by_id[recent_id], by_id[aged_id]
+    assert recent["similarity"] == pytest.approx(aged["similarity"])
+    # `rel=1e-3` for the same reason as above: against an 86_400s half-life,
+    # `1e-6` left only 125ms of wall clock for two POSTs, an UPDATE, a commit
+    # and the search (code review Story 3.4, P7).
+    assert recent["decay_factor"] == pytest.approx(1.0, rel=1e-3)
+    assert recent["score"] == pytest.approx(recent["similarity"])
+    # Three half-lives. `rel` rather than an exact 0.125 only because the few
+    # ms between the backdating and the search shift the age very slightly.
+    assert aged["decay_factor"] == pytest.approx(0.125, rel=1e-3)
+    assert aged["score"] == pytest.approx(aged["similarity"] * aged["decay_factor"])
+    assert aged["score"] < recent["score"]
+
+
+@pytest.mark.asyncio
+async def test_search_without_decay_policy_keeps_score_equal_to_similarity(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """T9.7 end to end — a namespace created before 3.4 (empty
+
+    `decay_policy`) ranks exactly as it did, whatever a chunk's age.
+    """
+    await _create_namespace(app_session_factory, name="no-decay-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "apples and oranges", "namespace": "no-decay-ns"},
+        )
+        assert resp.status_code == 201, resp.text
+        await _backdate_chunk(app_session_factory, chunk_id=resp.json()["chunk_id"], days=400)
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "apples and oranges", "namespace": "no-decay-ns", "top_k": 5},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body[0]["decay_factor"] == 1.0
+    assert body[0]["score"] == pytest.approx(body[0]["similarity"])
+    assert body[0]["score"] > 0.999
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_with_a_decay_policy_returns_201_and_persists_it(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/namespaces",
+            headers=_auth_headers(),
+            json={
+                "name": "decay-created-ns",
+                "type": "metier",
+                "decay_policy": {"function": "step", "threshold_seconds": 3600, "factor": 0.2},
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+
+        resp = await client.get("/api/v1/memory/namespaces", headers=_auth_headers())
+        assert resp.status_code == 200, resp.text
+        listed = {ns["name"]: ns for ns in resp.json()}["decay-created-ns"]
+
+    expected = {"function": "step", "threshold_seconds": 3600, "factor": 0.2}
+    assert created["decay_policy"] == expected
+    assert listed["decay_policy"] == expected
+    assert listed["decay_policy_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_without_decay_policy_defaults_to_none(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/namespaces",
+            headers=_auth_headers(),
+            json={"name": "no-decay-created-ns", "type": "metier"},
+        )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["decay_policy"] == {}
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_incoherent_decay_policy_returns_422(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A parameter that does not belong to the declared function is a 422 at
+
+    the boundary, never a `DomainValidationError` escaping as a 500.
+    """
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/namespaces",
+            headers=_auth_headers(),
+            json={
+                "name": "bad-decay-ns",
+                "type": "metier",
+                "decay_policy": {"function": "exponential", "horizon_seconds": 60},
+            },
+        )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_namespaces_flags_a_malformed_decay_policy(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 — a hand-seeded/legacy `decay_policy` must be signalled, and must
+
+    not brand a healthy `retention_policy` invalid alongside it.
+    """
+    await _create_namespace(
+        app_session_factory,
+        name="corrupt-decay-ns",
+        retention_policy={"default_ttl_seconds": 3600},
+        decay_policy={"function": "sigmoid"},
+    )
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/memory/namespaces", headers=_auth_headers())
+    assert resp.status_code == 200, resp.text
+    ns = {n["name"]: n for n in resp.json()}["corrupt-decay-ns"]
+    assert ns["decay_policy_valid"] is False
+    assert ns["decay_policy"] == {}
+    assert ns["retention_policy_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_on_a_malformed_decay_policy_returns_200_not_500(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC3 — a read degrades, it never fails, on a corrupt JSONB."""
+    await _create_namespace(
+        app_session_factory, name="corrupt-decay-search", decay_policy={"function": "sigmoid"}
+    )
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "still searchable", "namespace": "corrupt-decay-search"},
+        )
+        assert resp.status_code == 201, resp.text
+
+        resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "still searchable", "namespace": "corrupt-decay-search", "top_k": 5},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()[0]["decay_factor"] == 1.0

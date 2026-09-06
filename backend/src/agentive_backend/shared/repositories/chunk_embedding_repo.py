@@ -17,6 +17,10 @@ from agentive_backend.shared.repositories.base import BaseRepo
 # Postgres reject the SET LOCAL with an unmapped error.
 EF_SEARCH_MIN = 1
 EF_SEARCH_MAX = 1000
+# Named rather than left as a bare default, so a caller that has to widen the
+# candidate window can say "at least the default" without repeating the
+# literal (code review Story 3.4, P4).
+EF_SEARCH_DEFAULT = 100
 
 
 class ChunkEmbeddingRepo(BaseRepo):
@@ -88,7 +92,7 @@ class ChunkEmbeddingRepo(BaseRepo):
         namespace_id: UUID,
         top_k: int,
         tenant_id: UUID | None = None,
-        ef_search: int = 100,
+        ef_search: int = EF_SEARCH_DEFAULT,
         now: datetime | None = None,
         include_archived: bool = False,
     ) -> list[tuple[MemoryChunk, float]]:

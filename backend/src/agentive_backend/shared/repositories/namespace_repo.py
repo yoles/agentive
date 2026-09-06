@@ -108,6 +108,7 @@ class NamespaceRepo(BaseRepo):
         department: str | None = None,
         project: str | None = None,
         retention_policy: dict[str, Any] | None = None,
+        decay_policy: dict[str, Any] | None = None,
         embedding_backend: str = "cloud",
         tenant_id: UUID | None = None,
     ) -> Namespace:
@@ -128,6 +129,7 @@ class NamespaceRepo(BaseRepo):
                 department=department,
                 project=project,
                 retention_policy=retention_policy,
+                decay_policy=decay_policy,
                 embedding_backend=embedding_backend,
                 tenant_id=tenant_id,
             )
@@ -141,6 +143,7 @@ class NamespaceRepo(BaseRepo):
         department: str | None = None,
         project: str | None = None,
         retention_policy: dict[str, Any] | None = None,
+        decay_policy: dict[str, Any] | None = None,
         embedding_backend: str = "cloud",
         tenant_id: UUID | None = None,
     ) -> Namespace:
@@ -163,6 +166,9 @@ class NamespaceRepo(BaseRepo):
             department=department,
             project=project,
             retention_policy=retention_policy or {},
+            # Story 3.4 T6.1 — `{}` is `DecayFunction.NONE`, i.e. a constant
+            # factor of 1.0, i.e. the pre-3.4 ordering. Callers opt in.
+            decay_policy=decay_policy or {},
             embedding_backend=embedding_backend,
             tenant_id=tenant_id,
         )

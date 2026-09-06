@@ -124,3 +124,36 @@ async def test_list_all_default_limit_is_a_generous_safety_net() -> None:
     await repo.list_all()
     stmt = session.execute.await_args.args[0]
     assert stmt.compile().params["param_1"] == NAMESPACE_LISTING_SAFETY_CAP
+
+
+@pytest.mark.asyncio
+async def test_create_defaults_decay_policy_to_empty_mapping() -> None:
+    """Story 3.4 T6.1 — `{}` is `DecayFunction.NONE`, i.e. the pre-3.4
+
+    ranking. A namespace created without an explicit policy must not decay.
+    """
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.create(name="no-decay-ns", ns_type="metier")
+    assert session.add.call_args.args[0].decay_policy == {}
+
+
+@pytest.mark.asyncio
+async def test_create_persists_an_explicit_decay_policy() -> None:
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    policy = {"function": "exponential", "half_life_seconds": 2_592_000}
+    await repo.create(name="decay-ns", ns_type="metier", decay_policy=policy)
+    assert session.add.call_args.args[0].decay_policy == policy
+
+
+@pytest.mark.asyncio
+async def test_create_in_session_persists_decay_policy() -> None:
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    policy = {"function": "linear", "horizon_seconds": 86_400}
+    async with repo.with_tenant(None) as opened:
+        await repo.create_in_session(
+            opened, name="decay-ns-2", ns_type="metier", decay_policy=policy
+        )
+    assert session.add.call_args.args[0].decay_policy == policy

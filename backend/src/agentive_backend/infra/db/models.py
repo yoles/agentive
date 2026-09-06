@@ -108,6 +108,11 @@ class Namespace(Base):
     retention_policy: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default="{}"
     )
+    # Story 3.4 AC1 — per-namespace temporal decay, read through the
+    # `DecayPolicy` domain VO. Kept separate from `retention_policy`: that
+    # one's `to_mapping()` rebuilds its dict from its own two fields, so
+    # decay keys stored there would be dropped on the next write.
+    decay_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
     embedding_backend: Mapped[str] = mapped_column(
         String(50), nullable=False, server_default="cloud"
     )
