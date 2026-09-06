@@ -50,7 +50,12 @@ class NamespaceType(StrEnum):
 
 # ─── RetentionPolicy ──────────────────────────────────────────────
 
-SECONDS_MIN: Final[int] = 0
+# Floor is 1, not 0: a zero-second lifetime is never a real retention
+# intent, but it is a silently destructive one. `archive_after_seconds=0`
+# makes `created_at <= now - 0` match every chunk in the namespace on the
+# very next archival pass, and `default_ttl_seconds=0` expires a chunk at
+# the instant it is written (code review Story 3.3, IG1).
+SECONDS_MIN: Final[int] = 1
 
 
 @dataclass(frozen=True, slots=True)

@@ -45,6 +45,26 @@ def test_rejects_ttl_above_the_cap(ttl: int) -> None:
         CreateMemoryChunkRequest(**_body(ttl=ttl))  # type: ignore[arg-type]
 
 
+def test_rejects_a_zero_second_ttl() -> None:
+    """A chunk that expires at the instant it is written is never the intent
+    (code review Story 3.3, IG1). Rejected here so the domain floor cannot
+    surface as a 500."""
+    with pytest.raises(PydanticValidationError):
+        CreateMemoryChunkRequest(**_body(ttl=0))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["default_ttl_seconds", "archive_after_seconds"],
+)
+def test_retention_override_rejects_zero_seconds(field: str) -> None:
+    """`archive_after_seconds=0` would archive every chunk of the namespace on
+    the next pass, `default_ttl_seconds=0` expires them at write time
+    (code review Story 3.3, IG1)."""
+    with pytest.raises(PydanticValidationError):
+        RetentionPolicyOverride(**{field: 0})  # type: ignore[arg-type]
+
+
 def test_rejects_negative_ttl() -> None:
     with pytest.raises(PydanticValidationError):
         CreateMemoryChunkRequest(**_body(ttl=-1))  # type: ignore[arg-type]

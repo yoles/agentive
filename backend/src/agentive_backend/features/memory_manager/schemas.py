@@ -13,6 +13,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from agentive_backend.features.memory_manager.domain.value_objects import SECONDS_MIN
 from agentive_backend.shared.repositories.namespace_repo import NamespaceType
 
 # `text-embedding-3-small` tops out at 8191 tokens. Past that,
@@ -61,7 +62,9 @@ class CreateMemoryChunkRequest(BaseModel):
 
     content: str = Field(min_length=1, max_length=CONTENT_MAX_CHARS)
     namespace: str = Field(min_length=1, max_length=255)
-    ttl: int | None = Field(default=None, ge=0, le=TTL_MAX_SECONDS)
+    # `ge=SECONDS_MIN`, not `ge=0`: the domain rejects a zero-second TTL, so
+    # accepting it here would turn a 422 into a 500 (code review Story 3.3, IG1).
+    ttl: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
 
     @field_validator("content", "namespace", mode="after")
     @classmethod
@@ -129,8 +132,8 @@ class RetentionPolicyOverride(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_ttl_seconds: int | None = Field(default=None, ge=0, le=TTL_MAX_SECONDS)
-    archive_after_seconds: int | None = Field(default=None, ge=0, le=TTL_MAX_SECONDS)
+    default_ttl_seconds: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
+    archive_after_seconds: int | None = Field(default=None, ge=SECONDS_MIN, le=TTL_MAX_SECONDS)
 
     @model_validator(mode="after")
     def _reject_empty_override(self) -> RetentionPolicyOverride:
