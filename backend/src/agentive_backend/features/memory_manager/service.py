@@ -308,11 +308,17 @@ class MemoryManagerService:
             include_archived=include_archived,
         )
 
+        # `include_archived` is logged because it lifts BOTH retention filters
+        # (`archived_at` and `expires_at`), so a caller can read data whose TTL
+        # has elapsed. Real audit persistence is Story 9.1; until then this log
+        # line is the only trace such an access ever happened (code review
+        # Story 3.3, IG2).
         _log.info(
             "memory_manager.search_executed",
             namespace=namespace_name,
             top_k=top_k,
             result_count=len(rows),
+            include_archived=include_archived,
             duration_ms=int((time.monotonic() - start) * 1000),
         )
 

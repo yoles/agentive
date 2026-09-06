@@ -53,6 +53,16 @@ def test_retention_policy_rejects_negative_seconds() -> None:
         RetentionPolicy(archive_after_seconds=-5)
 
 
+def test_retention_policy_rejects_zero_seconds() -> None:
+    """Zero is not "no lifecycle" (that is ``None``), it is "expire/archive
+    immediately" — silently destructive on the very next archival pass
+    (code review Story 3.3, IG1)."""
+    with pytest.raises(DomainValidationError, match="default_ttl_seconds"):
+        RetentionPolicy(default_ttl_seconds=0)
+    with pytest.raises(DomainValidationError, match="archive_after_seconds"):
+        RetentionPolicy(archive_after_seconds=0)
+
+
 def test_retention_policy_round_trip_emits_only_present_keys() -> None:
     raw = {"default_ttl_seconds": 3600, "archive_after_seconds": 86400}
     assert RetentionPolicy.from_mapping(raw).to_mapping() == raw
@@ -95,6 +105,11 @@ def test_expires_at_override_on_policy_without_default() -> None:
 def test_expires_at_rejects_negative_override() -> None:
     with pytest.raises(DomainValidationError, match="ttl_override_seconds"):
         RetentionPolicy().expires_at(_CREATED, ttl_override_seconds=-1)
+
+
+def test_expires_at_rejects_a_zero_override() -> None:
+    with pytest.raises(DomainValidationError, match="ttl_override_seconds"):
+        RetentionPolicy().expires_at(_CREATED, ttl_override_seconds=0)
 
 
 # ─── archivable_at ────────────────────────────────────────────────
