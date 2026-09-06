@@ -330,6 +330,7 @@ class MemoryManagerService:
                 namespace=namespace_name,
                 created_at=chunk.created_at,
                 archived_at=chunk.archived_at,
+                expires_at=chunk.expires_at,
             )
             for chunk, score in rows
         ]

@@ -142,7 +142,7 @@ async def test_count_by_namespace_ids_filters_expired_chunks_like_search_ann() -
 async def test_find_expired_emits_select_matching_the_partial_index() -> None:
     """T1.1 — the predicate must match `ix_memory_chunks_expires_at`
     (``archived_at IS NULL AND expires_at IS NOT NULL``) exactly, plus the
-    `expires_at < now` cutoff, ordered and limited."""
+    `expires_at <= now` cutoff, ordered and limited."""
     factory, session = make_session_factory_mock()
     session.execute.return_value.scalars.return_value.all = lambda: []
     repo = MemoryChunkRepo(session_factory=factory)
@@ -153,7 +153,10 @@ async def test_find_expired_emits_select_matching_the_partial_index() -> None:
     sql_text = str(session.execute.await_args.args[0]).lower()
     assert "archived_at is null" in sql_text
     assert "expires_at is not null" in sql_text
-    assert "expires_at <" in sql_text
+    # `<=`, not `<`: complementary to `search_ann`'s `expires_at > now`, so a
+    # chunk sitting exactly on its expiry instant is neither invisible to
+    # search nor unselectable for archival (code review Story 3.3, P9).
+    assert "expires_at <=" in sql_text
     assert "order by" in sql_text
     assert "limit" in sql_text
 
@@ -180,15 +183,23 @@ async def test_find_archivable_in_namespace_emits_select_with_all_three_filters(
 
 @pytest.mark.asyncio
 async def test_find_archivable_in_namespace_defaults_now_to_the_current_time() -> None:
+    """Asserted by VALUE, not by SQLAlchemy's auto-generated parameter name.
+    Reading `params["expires_at_1"]` and checking `is not None` passed just as
+    happily on a `datetime(1970, 1, 1)` default, and broke on any reordering
+    of the filters (code review Story 3.3, P12)."""
     factory, session = make_session_factory_mock()
     session.execute.return_value.scalars.return_value.all = lambda: []
     repo = MemoryChunkRepo(session_factory=factory)
+    threshold = datetime(2029, 1, 1, tzinfo=UTC)
 
-    await repo.find_archivable_in_namespace(uuid4(), datetime(2029, 1, 1, tzinfo=UTC), limit=50)
+    before = datetime.now(UTC)
+    await repo.find_archivable_in_namespace(uuid4(), threshold, limit=50)
+    after = datetime.now(UTC)
 
-    stmt = session.execute.await_args.args[0]
-    bound_now = stmt.compile().params.get("expires_at_1")
-    assert bound_now is not None
+    params = session.execute.await_args.args[0].compile().params
+    bound_datetimes = [v for v in params.values() if isinstance(v, datetime) and v != threshold]
+    assert len(bound_datetimes) == 1
+    assert before <= bound_datetimes[0] <= after
 
 
 @pytest.mark.asyncio
