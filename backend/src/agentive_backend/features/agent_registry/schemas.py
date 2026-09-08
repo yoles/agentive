@@ -172,6 +172,50 @@ class ErrorPolicy(BaseModel):
         )
 
 
+class PushMemoryConfig(BaseModel):
+    """Push Memory config d'un template — Story 3.5 AC2, FR20.
+
+    ``namespace`` déclare le namespace mémoire à interroger avant chaque run ;
+    ``optin`` lève l'opt-out par défaut des Contrôleurs (AC2).
+
+    ⚠️ **Les deux champs sont requis** (revue Story 3.5, IG2), contrairement
+    à ``LLMParams``/``ErrorPolicy`` dont cette classe est par ailleurs le
+    mirror. Raison : ce bloc est remplacé EN ENTIER par ``merge_updates``
+    (sémantique PATCH au premier niveau seulement), et ici les valeurs par
+    défaut ne sont pas anodines : ce sont les valeurs "éteint". Avec des
+    champs optionnels, ``PUT {"push_memory": {"optin": true}}`` sur un
+    template déjà configuré effaçait silencieusement son ``namespace`` et
+    désactivait la feature, en répondant 200. Les défauts de ``LLMParams``
+    (``0.7``/``4096``) sont eux des valeurs de travail valides, d'où
+    l'asymétrie assumée.
+
+    Un remplacement doit donc énoncer l'intention complète :
+
+    * activer          : ``{"namespace": "team-alpha", "optin": true}``
+    * activer sans opt-in (archétypes non-Contrôleur, où ``optin`` est
+      ignoré) : ``{"namespace": "team-alpha", "optin": false}``
+    * éteindre         : ``{"namespace": null, "optin": false}``
+
+    ``optin: true`` sans ``namespace`` est refusé en 422 : s'abonner à rien
+    n'est pas un état exprimable, c'est la faute de frappe que IG2 décrit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str | None = Field(min_length=1, max_length=255)
+    optin: bool
+
+    @model_validator(mode="after")
+    def _optin_requires_a_namespace(self) -> PushMemoryConfig:
+        if self.optin and self.namespace is None:
+            raise ValueError("push_memory.namespace is required when push_memory.optin is true")
+        return self
+
+    def to_domain(self) -> vo.PushMemorySettings:
+        """Convert this HTTP DTO into the framework-free domain VO."""
+        return vo.PushMemorySettings(namespace=self.namespace, optin=self.optin)
+
+
 class UpdateTemplateRequest(BaseModel):
     """Body of ``PUT /api/v1/agents/templates/{id}`` — PATCH-like sémantique.
 
@@ -196,6 +240,7 @@ class UpdateTemplateRequest(BaseModel):
     llm_params: LLMParams | None = None
     provider_chain: list[ProviderId] | None = Field(default=None, min_length=1, max_length=4)
     error_policy: ErrorPolicy | None = None
+    push_memory: PushMemoryConfig | None = None
 
     @field_validator("provider_chain", mode="after")
     @classmethod
@@ -223,6 +268,7 @@ class UpdateTemplateRequest(BaseModel):
                 "llm_params",
                 "provider_chain",
                 "error_policy",
+                "push_memory",
             )
         ):
             raise ValueError("at least one field must be provided in the update payload")
@@ -417,6 +463,7 @@ __all__ = [
     "LLMModel",
     "LLMParams",
     "ProviderId",
+    "PushMemoryConfig",
     "ReplaceAgentToolsRequest",
     "TemplateDetailResponse",
     "UpdateTemplateRequest",

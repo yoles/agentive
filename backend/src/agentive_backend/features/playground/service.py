@@ -22,6 +22,7 @@ Isolation contract (AC2) — enforced by what this module does NOT import :
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import string
@@ -34,7 +35,15 @@ from uuid import UUID
 
 from opentelemetry import trace
 
-from agentive_backend.features.playground.schemas import RunPlaygroundResponse, TokenUsage
+from agentive_backend.features.playground.metrics import (
+    PLAYGROUND_PUSH_MEMORY_CHUNKS_INJECTED_TOTAL,
+    PLAYGROUND_PUSH_MEMORY_TOKENS_USED_TOTAL,
+)
+from agentive_backend.features.playground.schemas import (
+    PushMemoryUsage,
+    RunPlaygroundResponse,
+    TokenUsage,
+)
 from agentive_backend.shared.contracts.events import PlaygroundRunCompletedEvent
 from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import (
@@ -43,9 +52,11 @@ from agentive_backend.shared.exceptions import (
 )
 from agentive_backend.shared.llm.types import ChatMessage
 from agentive_backend.shared.logging import get_logger
+from agentive_backend.shared.memory.push_memory import DEFAULT_SIMILARITY_THRESHOLD
 
 if TYPE_CHECKING:
     from agentive_backend.shared.llm.router import LLMRouter
+    from agentive_backend.shared.memory.push_memory import PushMemoryProvider
     from agentive_backend.shared.repositories.ports import (
         AgentTemplateRepository,
         AgentTemplateToolRepository,
@@ -54,7 +65,8 @@ if TYPE_CHECKING:
 _log = get_logger(__name__)
 
 # Audit M-01 (1.4) — named defaults for the LLM call when the template's
-# ``config.llm`` snapshot omits a field. The default MODEL is a product
+# ``config`` snapshot omits ``llm_model`` / ``llm_params``. The default
+# MODEL is a product
 # choice — it lives here as a visible, testable constant instead of a
 # literal buried in ``run()``. max_tokens/temperature mirror the
 # ``LLMParams`` defaults in m2 schemas (cross-feature import forbidden by
@@ -76,9 +88,37 @@ DEFAULT_LLM_MODEL: Final = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS: Final = 4096
 DEFAULT_TEMPERATURE: Final = 0.7
 # P-19 (fix-batch 2026-08-31) — hard ceiling on a template's
-# ``config.llm.max_tokens``, independent of what the template stores.
+# ``config.llm_params.max_tokens``, independent of what the template stores.
 # Story 9.4 (FinOps) owns real budget caps ; this is a Sprint-1 safety net.
 MAX_TOKENS_HARD_CAP: Final = 16_000
+
+# Story 3.5 T9.2 — Push Memory (AC1).
+# Size of the candidate pool fetched from the provider BEFORE threshold
+# filtering and budget packing (mirror the ANN oversampling posture of
+# Story 3.4's `fetch_k_for`, applied here to the top-level candidate count
+# rather than an internal rerank oversample).
+PUSH_MEMORY_CANDIDATE_TOP_K: Final = 20
+# 15% of the run's effective `max_tokens`, i.e. the value really sent to
+# the provider : `config.llm_params.max_tokens` (or `DEFAULT_MAX_TOKENS`),
+# clamped by `MAX_TOKENS_HARD_CAP`. Resolved ONCE in `run()` by
+# `_resolve_max_tokens`, cf Dev Notes § Décision budget.
+PUSH_MEMORY_TOKEN_BUDGET_RATIO: Final = 0.15
+# P2 (revue 3.5) : hard bound on the Push Memory lookup. `timeout_seconds`
+# only ever reached `_complete`, so the enrichment could add the provider's
+# own default (30 s on the embedder) plus two unbounded DB round-trips on
+# top of a run the caller asked to cap at, say, 5 s. Capped by the run's
+# own budget below : an enrichment must never outlast the whole run.
+PUSH_MEMORY_LOOKUP_TIMEOUT_S: Final = 5.0
+# P3 (revue 3.5) : same envelope as the HTTP search route's `q` field
+# (`memory_manager.schemas.CONTENT_MAX_CHARS`). Duplicated as a literal
+# rather than imported : the `features-isolated` contract forbids
+# `playground` importing `memory_manager`. Keep in sync manually, same
+# posture as the `LLMParams` defaults above.
+PUSH_MEMORY_MAX_QUERY_CHARS: Final = 32_000
+# P8 (revue 3.5) : the blocks are joined with this and it is also what
+# separates the last block from the prompt, so it is real injected text.
+# Counted in BOTH the budget and `tokens_used`, which used to ignore it.
+_PUSH_MEMORY_BLOCK_SEPARATOR: Final = "\n\n"
 
 
 # H-03 (fix-batch 2026-09-02): a template's ``system_prompt`` can amplify
@@ -90,6 +130,14 @@ MAX_TOKENS_HARD_CAP: Final = 16_000
 # this happens BEFORE any LLM call: a cost/memory-DoS vector reachable
 # without a valid provider API key. Both constants are Sprint-1 safety
 # nets, not real budget caps (Story 9.4 owns those).
+#
+# P14 (revue 3.5) : this ceiling is enforced on the SUBSTITUTED prompt,
+# before Push Memory prepends anything, so the string that finally reaches
+# the provider can exceed it by up to the injection budget (at most
+# `int(MAX_TOKENS_HARD_CAP * 0.15) * 4` = 9_600 chars). Bounded and
+# deliberate : the injection budget is itself capped, and lowering this
+# constant to compensate would shrink the legitimate `system_prompt` for
+# every template, Push Memory or not.
 _MAX_RESOLVED_PROMPT_CHARS: Final = 65_536
 _MAX_FORMAT_SPEC_NUMBER: Final = 10_000
 _DIGITS_RE = re.compile(r"\d+")
@@ -142,6 +190,35 @@ class _SafeFormatter(string.Formatter):
         return formatted
 
 
+def _llm_params_cfg(config_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Read the template's LLM hyperparameters out of its ``config`` JSONB.
+
+    BS1 (revue Story 3.5) : this used to read ``config["llm"]``, a key NO
+    write path in this repo has ever produced. ``agent_templates.config`` is
+    written by exactly two places, and neither emits it :
+
+    * ``ArchetypeDefinition.to_template_config()`` (creation) emits
+      ``prompt_base`` / ``role`` / ``input_contract`` / ``output_contract`` ;
+    * ``AgentConfig.to_mapping()`` (every update) emits ``llm_model`` (a
+      top-level string) and ``llm_params`` (``{temperature, max_tokens}``),
+      and is documented as "the ONE place that (re)serializes back to a
+      plain JSONB-ready dict".
+
+    Consequence of the old key : ``max_tokens`` silently fell back to
+    ``DEFAULT_MAX_TOKENS`` for EVERY template, so a template updated with
+    ``llm_params.max_tokens = 32000`` was still run at 4096, and the Push
+    Memory budget (AC1, 15% of the effective ``max_tokens``) was frozen at
+    ``int(4096 * 0.15) * 4 = 2456`` characters for everyone. The divergence
+    stayed invisible because the Playground unit tests fabricated the very
+    shape the code expected instead of the shape the writers produce.
+
+    Defensive ``isinstance`` : the column is free-form JSONB, so a
+    hand-seeded row can hold a scalar or a list under ``llm_params``.
+    """
+    raw = config_snapshot.get("llm_params")
+    return raw if isinstance(raw, dict) else {}
+
+
 def _best_effort_json(raw_output: str) -> dict[str, Any] | None:
     """Parse ``raw_output`` as a JSON object, best-effort (Sprint 1 — full JSON
     Schema validation against the output_contract deferred Story 4.x). Returns
@@ -187,6 +264,7 @@ class PlaygroundService:
         template_repo: AgentTemplateRepository,
         assignment_repo: AgentTemplateToolRepository,
         llm_router: LLMRouter,
+        push_memory_provider: PushMemoryProvider | None = None,
     ) -> None:
         # P-24 (fix-batch 2026-08-31) — a ``tool_repo`` param used to be
         # accepted here and stored unused ; Sprint 1 never resolves tool
@@ -195,6 +273,11 @@ class PlaygroundService:
         self._template_repo = template_repo
         self._assignment_repo = assignment_repo
         self._llm_router = llm_router
+        # Story 3.5 T9.1 — optional : an environment where
+        # `app.state.push_memory_provider` is not wired (e.g. a unit test
+        # constructing the service at 3 arguments) must keep working
+        # without Push Memory (non-regression, AC1 last point).
+        self._push_memory_provider = push_memory_provider
 
     async def run(
         self,
@@ -237,7 +320,9 @@ class PlaygroundService:
 
         # 1. Load the template snapshot in memory — NO INSERT into
         #    agent_instances (AC2 isolation). 404 if the template is missing.
-        config_snapshot, assigned_tools = await self._load_config_and_tools(template_id, tenant_id)
+        config_snapshot, assigned_tools, archetype = await self._load_config_and_tools(
+            template_id, tenant_id
+        )
         # 2. Resolve how many assigned tools this run activates (validates
         #    enabled_tool_ids against the template's assignments).
         tools_activated_count = self._count_activated_tools(
@@ -246,6 +331,19 @@ class PlaygroundService:
         # 3. Resolve the system prompt from the caller's arguments (sanitized
         #    422 on any resolution failure — audit A-01 / CR P-02).
         prompt_resolved = self._resolve_prompt(config_snapshot, arguments, template_id)
+        # 3.5 (Story 3.5, AC1/AC2) — resolve `max_tokens` ONCE : the same
+        # value feeds both the Push Memory budget and the actual LLM call
+        # below, so the two can never silently disagree. Then inject any
+        # relevant memorized chunks in front of the resolved prompt.
+        max_tokens = self._resolve_max_tokens(_llm_params_cfg(config_snapshot), template_id)
+        prompt_resolved, push_memory_usage = await self._inject_push_memory(
+            config_snapshot=config_snapshot,
+            archetype=archetype,
+            prompt_resolved=prompt_resolved,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            template_id=template_id,
+        )
         # 4. Call the LLM, capturing the outcome (never raising inline) so the
         #    audit is published exactly once regardless of success/failure.
         outcome = await self._complete(
@@ -254,7 +352,16 @@ class PlaygroundService:
             arguments=arguments,
             timeout_seconds=timeout_seconds,
             template_id=template_id,
+            max_tokens=max_tokens,
         )
+        # P9 (revue 3.5) : AFTER `_complete`, not before. `_complete` still
+        # raises inline for an invalid stored `temperature` (422), and the
+        # counters used to have already booked chunks injected into a prompt
+        # that was never sent, with no audit event to correlate against
+        # (that path publishes none either). Both signals now agree.
+        if push_memory_usage is not None:
+            PLAYGROUND_PUSH_MEMORY_CHUNKS_INJECTED_TOTAL.inc(push_memory_usage.chunks_injected)
+            PLAYGROUND_PUSH_MEMORY_TOKENS_USED_TOTAL.inc(push_memory_usage.tokens_used)
 
         duration_ms_total = int((time.monotonic() - start) * 1000)
 
@@ -285,6 +392,12 @@ class PlaygroundService:
                 provider_used=outcome.provider_used,
                 status=outcome.status,
                 tenant_id=tenant_id,
+                push_memory_chunks_injected=(
+                    push_memory_usage.chunks_injected if push_memory_usage is not None else 0
+                ),
+                push_memory_tokens_used=(
+                    push_memory_usage.tokens_used if push_memory_usage is not None else 0
+                ),
             )
         )
 
@@ -320,22 +433,25 @@ class PlaygroundService:
             provider_used=outcome.provider_used,
             tool_invocations=[],  # Sprint 1 — D80 defer Story 4.x
             duration_ms_total=duration_ms_total,
+            push_memory=push_memory_usage,
         )
 
     # ─── run helpers (A-09 decomposition) ─────────────────────────
 
     async def _load_config_and_tools(
         self, template_id: UUID, tenant_id: UUID | None
-    ) -> tuple[dict[str, Any], list[tuple[Any, Any]]]:
-        """Load the template config snapshot + its tool assignments in a single
-        session. 404 ``NotFoundError`` if the template is missing."""
+    ) -> tuple[dict[str, Any], list[tuple[Any, Any]], str]:
+        """Load the template config snapshot + its tool assignments + its
+        archetype (Story 3.5 T9.3 : same query, no extra DB round-trip) in a
+        single session. 404 ``NotFoundError`` if the template is missing."""
         async with self._template_repo.with_tenant(tenant_id) as session:
             template = await self._template_repo.require_by_id_in_session(session, template_id)
             config_snapshot: dict[str, Any] = dict(template.config or {})
+            archetype: str = str(template.archetype)
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
                 session, template_id
             )
-        return config_snapshot, assigned_tools
+        return config_snapshot, assigned_tools, archetype
 
     @staticmethod
     def _count_activated_tools(
@@ -398,52 +514,30 @@ class PlaygroundService:
                 context={"template_id": str(template_id)},
             ) from exc
 
-    async def _complete(
-        self,
-        *,
-        config_snapshot: dict[str, Any],
-        prompt_resolved: str,
-        arguments: dict[str, Any],
-        timeout_seconds: float,
-        template_id: UUID,
-    ) -> _LLMOutcome:
-        """Call ``LLMRouter.complete`` and capture the outcome. On any provider
-        failure (H-02 fix-batch 2026-09-02: not just ``LLMError``, see the
-        ``except Exception`` clause below) the outcome carries
-        ``status="llm_error"`` (zeroed usage, requested model, no provider)
-        plus the :class:`DependencyError` for the caller to re-raise after
-        the single audit publish — so the failure is always audited exactly
-        once (Sprint 1: no formal tool_use — D80 Story 4.x). On cancellation
-        the outcome carries ``status="cancelled"`` with ``None`` usage
-        (IG-01 / H-04, genuinely unknown, not zero)."""
-        llm_cfg: dict[str, Any] = config_snapshot.get("llm", {}) or {}
-        model: str = str(llm_cfg.get("model", DEFAULT_LLM_MODEL))
-        # P-10 (fix-batch 2026-08-31) — a template's ``config.llm`` blob is
-        # free-form JSONB, not request-validated. A stored non-numeric value
-        # (e.g. ``max_tokens: "unbounded"``) must surface as a sanitized 422,
-        # not an uncaught ValueError/TypeError → 500.
+    @staticmethod
+    def _resolve_max_tokens(llm_params_cfg: dict[str, Any], template_id: UUID) -> int:
+        """Parse, validate and clamp ``config.llm_params.max_tokens`` (Story 3.5
+        T9.4 — extracted from ``_complete`` so ``run()`` resolves this value
+        exactly ONCE, before both the Push Memory budget calculation and the
+        actual LLM call. Resolving it twice would risk the two silently
+        disagreeing — a request where the Push Memory budget saw a
+        ``max_tokens`` different from the one really sent to the LLM would
+        be a silent bug)."""
+        # P-10 (fix-batch 2026-08-31) — a template's ``config.llm_params``
+        # blob is free-form JSONB, not request-validated (the Pydantic
+        # ``LLMParams`` twin only guards the HTTP write path). A stored
+        # non-numeric value (e.g. ``max_tokens: "unbounded"``) must surface
+        # as a sanitized 422, not an uncaught ValueError/TypeError → 500.
         try:
-            max_tokens = int(llm_cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
+            max_tokens = int(llm_params_cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
         except (TypeError, ValueError) as exc:
             raise ValidationError(
-                detail="agent template config.llm.max_tokens is not a valid integer",
-                context={"template_id": str(template_id), "field": "config.llm.max_tokens"},
+                detail="agent template config.llm_params.max_tokens is not a valid integer",
+                context={
+                    "template_id": str(template_id),
+                    "field": "config.llm_params.max_tokens",
+                },
             ) from exc
-        try:
-            temperature = float(llm_cfg.get("temperature", DEFAULT_TEMPERATURE))
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(
-                detail="agent template config.llm.temperature is not a valid number",
-                context={"template_id": str(template_id), "field": "config.llm.temperature"},
-            ) from exc
-        # P-25 (fix-batch 2026-08-31, reviewed — kept as-is) : an
-        # out-of-provider-range ``temperature`` (e.g. 5.0) is not clamped
-        # here. Unlike ``max_tokens`` (a pure cost/resource ceiling, safe to
-        # silently cap), temperature changes the LLM's actual sampling
-        # behavior — silently altering it would hide a real template
-        # authoring mistake instead of surfacing one. The provider SDK
-        # already rejects it (400 → ``LLMError`` → ``DependencyError`` 503
-        # below), which is the correct failure mode : visible, not silent.
         # P-19 (fix-batch 2026-08-31) — an unbounded template-level
         # max_tokens is a cost-DoS vector : every Playground run pays for it.
         # Story 9.4 (FinOps budget caps) will own this properly ; this is a
@@ -456,6 +550,208 @@ class PlaygroundService:
                 cap=MAX_TOKENS_HARD_CAP,
             )
             max_tokens = MAX_TOKENS_HARD_CAP
+        return max_tokens
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Characters/4 heuristic — no tokenizer dependency exists in this
+        repo today (``grep -r tiktoken`` = 0 hit). Approximate by design ;
+        documented as such wherever it is exposed (``PushMemoryUsage.
+        tokens_used``, the Prometheus counter). To refine if a real token
+        counter is introduced elsewhere in the repo (no story plans one
+        today)."""
+        return max(1, len(text) // 4)
+
+    async def _inject_push_memory(
+        self,
+        *,
+        config_snapshot: dict[str, Any],
+        archetype: str,
+        prompt_resolved: str,
+        max_tokens: int,
+        timeout_seconds: float,
+        template_id: UUID,
+    ) -> tuple[str, PushMemoryUsage | None]:
+        """Prepend relevant memorized chunks to ``prompt_resolved`` (Story
+        3.5 AC1/AC2, FR20).
+
+        Returns ``(prompt_resolved, None)`` UNCHANGED when Push Memory is not
+        wired, not configured for this template, or opted-out (a Contrôleur
+        without ``optin``) — AC3's ``push_memory: null`` in the response
+        means "not even attempted". Returns
+        ``(new_prompt, PushMemoryUsage(...))`` (possibly ``chunks_injected=0``
+        if nothing cleared the similarity threshold) once a lookup was
+        actually attempted, distinguishing "tried, found nothing" from
+        "never tried" all the way to the response (AC3).
+        """
+        # P5 (revue 3.5) : `config` is free-form JSONB and only the `PUT`
+        # route validates it, so a seeded row can hold a scalar or a list
+        # here. `.get()` on those raised `AttributeError` OUTSIDE the try
+        # below, i.e. a raw 500 outside RFC 7807, on a path whose stated
+        # invariant is that it never fails the run.
+        raw_cfg = config_snapshot.get("push_memory")
+        push_memory_cfg: dict[str, Any] = raw_cfg if isinstance(raw_cfg, dict) else {}
+        namespace = push_memory_cfg.get("namespace")
+        # P6 (revue 3.5) : `is True`, not `bool(...)`. `bool("false")` is
+        # `True`, so a stored `optin: "false"` lifted the Contrôleur opt-out,
+        # the exact inverse of AC2.
+        optin = push_memory_cfg.get("optin") is True
+
+        # P3 (revue 3.5) : the query must respect the same envelope as the
+        # HTTP search route. `_resolve_prompt` returns `""` by design when
+        # the template has no `system_prompt` (P-12), and allows up to
+        # `_MAX_RESOLVED_PROMPT_CHARS` (65_536), i.e. twice what
+        # `SearchMemoryRequest.q` accepts. Both ends were rejected by
+        # `ensure_embeddable_text` on the HTTP route, so both produced a 400
+        # from the embedder here and degraded every single run to `{0, 0}`.
+        # A blank prompt counts as NOT attempted (nothing to search on),
+        # same bucket as an unconfigured namespace.
+        query = prompt_resolved.strip()[:PUSH_MEMORY_MAX_QUERY_CHARS]
+
+        if (
+            self._push_memory_provider is None
+            or not namespace
+            or not query
+            or (archetype == "controleur" and not optin)
+        ):
+            return prompt_resolved, None
+
+        # P2 (revue 3.5) : never spend more on the enrichment than the
+        # caller allowed for the whole run.
+        lookup_timeout = min(PUSH_MEMORY_LOOKUP_TIMEOUT_S, timeout_seconds)
+        try:
+            chunks = await asyncio.wait_for(
+                self._push_memory_provider.relevant_chunks(
+                    namespace=namespace,
+                    query=query,
+                    similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
+                    top_k=PUSH_MEMORY_CANDIDATE_TOP_K,
+                ),
+                timeout=lookup_timeout,
+            )
+        except TimeoutError:
+            # Its own log event, not folded into the generic warning below:
+            # a slow provider and a broken one call for different actions,
+            # and `wait_for` has already cancelled the inner coroutine.
+            _log.warning(
+                "playground_push_memory_timeout",
+                namespace=namespace,
+                template_id=str(template_id),
+                timeout_s=lookup_timeout,
+            )
+            chunks = []
+        except Exception as exc:
+            # Mirror ``_publish_audit_event``'s justification below : Push
+            # Memory is an enrichment, not part of AC1-AC6 Playground core —
+            # a failure here must never fail or mask the run's actual
+            # result. Treated as zero chunks found (NOT ``None`` : the
+            # attempt did happen, cf AC3 ``null`` vs ``{0, 0}`` distinction).
+            _log.warning(
+                "playground_push_memory_failed",
+                namespace=namespace,
+                template_id=str(template_id),
+                error_type=type(exc).__name__,
+            )
+            chunks = []
+
+        # AC1 — budget: 15% of the effective completion `max_tokens`,
+        # translated to a character budget via the same char/4 heuristic.
+        budget_chars = int(max_tokens * PUSH_MEMORY_TOKEN_BUDGET_RATIO) * 4
+        blocks: list[str] = []
+        running_chars = 0
+        # Chunks already arrive in descending-score order (the provider
+        # doesn't reorder). Greedy packing in that order, stopping at the
+        # first chunk that would overflow the budget — NOT skipping ahead to
+        # a smaller one — keeps relevance order intact and the behavior
+        # simple and deterministic to test.
+        for chunk in chunks:
+            # P1 (revue 3.5) : the namespace reaches this attribute from
+            # free-form config and `CreateNamespaceRequest.name` constrains
+            # only its length, so a name like `a" injecte="x` used to close
+            # the attribute and inject arbitrary pseudo-attributes into the
+            # marker the model is meant to trust. The chunk CONTENT is
+            # deliberately left unescaped (story § Limite assumée).
+            # P10 (revue 3.5) : the chunk's OWN namespace, not the requested
+            # one. They are the same today ; the field existed on the view
+            # and was never read, so a provider returning a chunk from
+            # elsewhere would have produced a lying `source`.
+            source = html.escape(f"{chunk.namespace}/{chunk.chunk_id}", quote=True)
+            block = f'<contexte_memorise source="{source}">{chunk.content}</contexte_memorise>'
+            # P8 : the separator that will follow this block is injected
+            # text too, so it is charged to the budget here.
+            cost = len(block) + len(_PUSH_MEMORY_BLOCK_SEPARATOR)
+            if running_chars + cost > budget_chars:
+                break
+            blocks.append(block)
+            running_chars += cost
+
+        if not blocks:
+            return prompt_resolved, PushMemoryUsage(chunks_injected=0, tokens_used=0)
+
+        # P8 : estimate on exactly the text that gets injected, separators
+        # included. Summing per block under-counted by `2 * len(blocks)`
+        # characters AND applied `_estimate_tokens`' `max(1, ...)` floor once
+        # per block, and this number is the only consumption figure AC3
+        # exposes (response, audit event, Prometheus counter).
+        injected = _PUSH_MEMORY_BLOCK_SEPARATOR.join(blocks) + _PUSH_MEMORY_BLOCK_SEPARATOR
+        return (
+            injected + prompt_resolved,
+            PushMemoryUsage(
+                chunks_injected=len(blocks),
+                tokens_used=self._estimate_tokens(injected),
+            ),
+        )
+
+    async def _complete(
+        self,
+        *,
+        config_snapshot: dict[str, Any],
+        prompt_resolved: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        template_id: UUID,
+        max_tokens: int,
+    ) -> _LLMOutcome:
+        """Call ``LLMRouter.complete`` and capture the outcome. On any provider
+        failure (H-02 fix-batch 2026-09-02: not just ``LLMError``, see the
+        ``except Exception`` clause below) the outcome carries
+        ``status="llm_error"`` (zeroed usage, requested model, no provider)
+        plus the :class:`DependencyError` for the caller to re-raise after
+        the single audit publish — so the failure is always audited exactly
+        once (Sprint 1: no formal tool_use — D80 Story 4.x). On cancellation
+        the outcome carries ``status="cancelled"`` with ``None`` usage
+        (IG-01 / H-04, genuinely unknown, not zero).
+
+        ``max_tokens`` (Story 3.5 T9.4) is resolved by the caller — ``run()``
+        — via :meth:`_resolve_max_tokens`, not recomputed here, so the value
+        that gated the Push Memory budget is guaranteed to be the same value
+        sent to the provider."""
+        # BS1 (revue Story 3.5) : ``llm_model`` is a TOP-LEVEL string and
+        # ``temperature`` lives under ``llm_params``, cf ``_llm_params_cfg``.
+        # Both used to be read from the phantom ``config.llm`` mapping, so a
+        # template's configured model and temperature were silently ignored
+        # and every run used the two defaults below.
+        model: str = str(config_snapshot.get("llm_model") or DEFAULT_LLM_MODEL)
+        try:
+            temperature = float(
+                _llm_params_cfg(config_snapshot).get("temperature", DEFAULT_TEMPERATURE)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                detail="agent template config.llm_params.temperature is not a valid number",
+                context={
+                    "template_id": str(template_id),
+                    "field": "config.llm_params.temperature",
+                },
+            ) from exc
+        # P-25 (fix-batch 2026-08-31, reviewed — kept as-is) : an
+        # out-of-provider-range ``temperature`` (e.g. 5.0) is not clamped
+        # here. Unlike ``max_tokens`` (a pure cost/resource ceiling, safe to
+        # silently cap), temperature changes the LLM's actual sampling
+        # behavior — silently altering it would hide a real template
+        # authoring mistake instead of surfacing one. The provider SDK
+        # already rejects it (400 → ``LLMError`` → ``DependencyError`` 503
+        # below), which is the correct failure mode : visible, not silent.
 
         # P-09 (fix-batch 2026-08-31, reviewed not patched) — ``arguments``
         # is ``RunPlaygroundRequest.arguments: dict[str, Any]``, populated by
@@ -560,6 +856,8 @@ class PlaygroundService:
         provider_used: str,
         status: Literal["success", "llm_error", "tool_error", "cancelled"],
         tenant_id: UUID | None,
+        push_memory_chunks_injected: int = 0,
+        push_memory_tokens_used: int = 0,
     ) -> None:
         """Publish ``playground.run.completed`` (AC5).
 
@@ -594,6 +892,8 @@ class PlaygroundService:
                     status=status,
                     actor="system",
                     tenant_id=tenant_id,
+                    push_memory_chunks_injected=push_memory_chunks_injected,
+                    push_memory_tokens_used=push_memory_tokens_used,
                 )
                 # TODO Story 9.1 — migrate to AuditEventRepo.record() — audit-event bypass cleanup (Epic 1 retro 2026-05-08).
                 event_id = await publish(

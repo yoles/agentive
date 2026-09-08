@@ -25,7 +25,12 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agentive_backend.features.memory_manager.push_memory import (
+    MemoryManagerPushMemoryProvider,
+)
+from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.shared.llm.types import Completion
+from agentive_backend.shared.repositories import ChunkEmbeddingRepo, MemoryChunkRepo, NamespaceRepo
 
 from .conftest import e2e_auth_headers as _auth_headers
 from .conftest import make_e2e_app as _make_app
@@ -49,6 +54,32 @@ def _stub_llm_router(
         )
     )
     return router
+
+
+async def _create_namespace(session_factory: async_sessionmaker[AsyncSession], *, name: str) -> Any:
+    """Namespace created directly via the repo — mirror
+    ``tests/integration/memory_manager/test_api.py``'s own helper : namespace
+    CRUD is a Story 3.2 concern, orthogonal to what this Push Memory e2e
+    test (Story 3.5) actually exercises."""
+    repo = NamespaceRepo(session_factory=session_factory)
+    return await repo.create(name=name, ns_type="metier")
+
+
+def _wire_push_memory_provider(
+    app: Any, *, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Mirror ``app/lifespan.py`` T11.1's wiring exactly, against the same
+    ``MockEmbedder`` the app already uses (set by ``make_e2e_app``) so a
+    chunk and a query embed identically to the SAME test data this test
+    just wrote."""
+    app.state.push_memory_provider = MemoryManagerPushMemoryProvider(
+        memory_manager_service=MemoryManagerService(
+            memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
+            chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
+            namespace_repo=NamespaceRepo(session_factory=session_factory),
+            embedder=app.state.embedder,
+        )
+    )
 
 
 async def _create_template(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
@@ -268,3 +299,104 @@ async def test_playground_run_403_when_flag_disabled(
         assert resp.status_code == 403, resp.text
         body = resp.json()
         assert body.get("flag") == "AGENTIVE_ALLOW_MCP_REGISTRATION"
+
+
+@pytest.mark.integration
+async def test_playground_run_injects_memorized_chunk_end_to_end(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 3.5 AC1/AC3, T12.6 — a real namespace + a real chunk, written
+    through the actual ``POST /memory/chunks`` endpoint, over the deterministic
+    ``MockEmbedder`` (identical text embeds identically, cf
+    ``tests/integration/memory_manager/test_api.py``'s
+    ``test_search_happy_path_ranks_exact_match_first``), get proactively
+    injected into a Playground run's prompt end-to-end : real Postgres ANN
+    search, real threshold filter, real HTTP response shape."""
+    remembered = "apples and oranges"
+    await _create_namespace(app_session_factory, name="e2e-push-memory")
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.llm_router = _stub_llm_router()
+    app.state.mcp_sandbox_backend = "setrlimit"
+    _wire_push_memory_provider(app, session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        chunk_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": remembered, "namespace": "e2e-push-memory"},
+        )
+        assert chunk_resp.status_code == 201, chunk_resp.text
+
+        tpl = await _create_template(client, "playground-push-memory")
+        template_id = tpl["template_id"]
+        # system_prompt IS the remembered content, verbatim — under the
+        # deterministic MockEmbedder this guarantees a near-1.0 similarity
+        # (same text embeds identically), comfortably above the 0.85
+        # threshold, with zero flakiness.
+        put_resp = await client.put(
+            f"/api/v1/agents/templates/{template_id}",
+            headers=_auth_headers(),
+            json={
+                "system_prompt": remembered,
+                "push_memory": {"namespace": "e2e-push-memory", "optin": False},
+            },
+        )
+        assert put_resp.status_code == 200, put_resp.text
+
+        resp = await client.post(
+            f"/api/v1/playground/agents/{template_id}/run",
+            headers=_auth_headers(),
+            json={"arguments": {}},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["push_memory"] is not None
+        assert body["push_memory"]["chunks_injected"] == 1
+        assert body["push_memory"]["tokens_used"] > 0
+        assert 'source="e2e-push-memory/' in body["prompt_resolved"]
+        assert body["prompt_resolved"].endswith(remembered)
+
+
+@pytest.mark.integration
+async def test_playground_run_without_push_memory_wired_returns_null(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1 last point / non-regression — a template configuring
+    ``push_memory.namespace`` still returns ``push_memory: null`` when
+    ``app.state.push_memory_provider`` isn't wired (this suite's other
+    tests never set it) : this closes the same gap the unit-level
+    ``test_push_memory_provider_none_is_non_regression`` covers, at the
+    HTTP + real-DB layer.
+
+    P15 (revue 3.5) : no namespace is created here on purpose. This test
+    exercises the path where the provider is not wired at all, so the lookup
+    never happens and a real namespace would be dead setup, suggesting a
+    coverage this test does not provide."""
+    app = _make_app(session_factory=app_session_factory)
+    app.state.llm_router = _stub_llm_router()
+    app.state.mcp_sandbox_backend = "setrlimit"
+    # Deliberately NOT calling _wire_push_memory_provider here.
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        tpl = await _create_template(client, "playground-push-memory-unwired")
+        template_id = tpl["template_id"]
+        put_resp = await client.put(
+            f"/api/v1/agents/templates/{template_id}",
+            headers=_auth_headers(),
+            json={
+                "system_prompt": "hello",
+                "push_memory": {"namespace": "e2e-push-memory-unwired", "optin": False},
+            },
+        )
+        assert put_resp.status_code == 200, put_resp.text
+
+        resp = await client.post(
+            f"/api/v1/playground/agents/{template_id}/run",
+            headers=_auth_headers(),
+            json={"arguments": {}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["push_memory"] is None

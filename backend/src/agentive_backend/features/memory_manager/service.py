@@ -300,6 +300,7 @@ class MemoryManagerService:
         acting_department: str | None = None,
         include_archived: bool = False,
         rerank: bool = True,
+        require_shared_namespace: bool = False,
     ) -> list[MemorySearchResultView]:
         """ANN search over a namespace's chunks — Story 3.1 AC2, 3.3 AC2, 3.4 AC2.
 
@@ -314,13 +315,20 @@ class MemoryManagerService:
         Story 3.4 — so the pre-3.4 ordering and the pre-3.4 ANN cost are
         both preserved by construction.
 
+        ``require_shared_namespace`` (Story 3.5, revue IG1) is for callers
+        that have NO department identity to present at all, as opposed to
+        a caller that presents none because none applies. See
+        :meth:`_check_department_access` for why the two are not the same
+        thing.
+
         Raises
         ------
         NotFoundError
             ``namespace_name`` does not exist.
         ForbiddenError
             ``acting_department`` (Story 3.2 AC2) differs from the
-            namespace's department.
+            namespace's department, or ``require_shared_namespace`` is set
+            and the namespace carries one.
         """
         start = time.monotonic()
         namespace = await self._namespace_repo.require_by_name(namespace_name, tenant_id=tenant_id)
@@ -329,6 +337,7 @@ class MemoryManagerService:
             acting_department=acting_department,
             operation="search",
             tenant_id=tenant_id,
+            require_shared_namespace=require_shared_namespace,
         )
         _warn_if_backend_not_cloud(namespace_name, namespace.embedding_backend)
 
@@ -745,6 +754,7 @@ class MemoryManagerService:
         acting_department: str | None,
         operation: Literal["create_chunk", "search"],
         tenant_id: UUID | None,
+        require_shared_namespace: bool = False,
     ) -> None:
         """Story 3.2 AC2 — deny cross-department read/write, audit the denial.
 
@@ -764,7 +774,39 @@ class MemoryManagerService:
         typo'd case or a stray trailing space must not turn into a spurious
         403 plus a persisted audit event for what is really the same
         department.
+
+        ``require_shared_namespace`` (Story 3.5, revue IG1) closes the door
+        that the ``acting_department is None`` early return leaves open for
+        a caller that has no department identity to present AT ALL, as
+        opposed to an HTTP caller that simply sent no header. The header
+        callers are people, bounded by a request they made themselves ; a
+        header-less internal reader (Push Memory) injects a namespace's
+        content into a prompt that is then echoed back to whoever triggered
+        the run, so "no identity" must mean "shared namespaces only", not
+        "everything". Otherwise pointing a template at another department's
+        namespace would be a one-line bypass of AC2. Fail closed until
+        Growth RBAC (Sprint 4) gives internal readers a real identity.
+
+        No ``NamespaceAccessDeniedEvent`` on that branch, deliberately :
+        the header path fires once per HTTP request, whereas this one
+        would fire on EVERY run of a misconfigured template, i.e. an
+        unbounded stream of outbox rows for a single config mistake. A
+        warning log is the proportionate signal.
         """
+        if require_shared_namespace and namespace.department is not None:
+            _log.warning(
+                "memory_manager.department_scoped_namespace_refused",
+                namespace=namespace.name,
+                namespace_department=namespace.department,
+                operation=operation,
+            )
+            raise ForbiddenError(
+                detail=(
+                    f"Namespace {namespace.name!r} is department-scoped and cannot be "
+                    "read by a caller with no department identity."
+                ),
+                context={"namespace": namespace.name, "department": namespace.department},
+            )
         if acting_department is None:
             return
         if namespace.department is None:

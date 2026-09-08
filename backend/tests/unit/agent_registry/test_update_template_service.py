@@ -21,6 +21,7 @@ from agentive_backend.features.agent_registry.schemas import (
     ContractDefinition,
     ErrorPolicy,
     LLMParams,
+    PushMemoryConfig,
     UpdateTemplateRequest,
 )
 from agentive_backend.features.agent_registry.service import AgentTemplateService
@@ -147,6 +148,35 @@ async def test_update_template_with_system_prompt_bumps_version_and_inserts_prom
     assert response.config["error_policy"]["max_retries"] == 5
     # Champ absent du payload reste intact
     assert response.config["prompt_base"] == "old base"
+
+
+@pytest.mark.asyncio
+async def test_update_template_push_memory_merged_without_bump(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Story 3.5 T5.1 — `push_memory` suit la même route que `llm_params`/
+    `error_policy` : merge dans `config`, PAS de bump de version (seul
+    `system_prompt` bump)."""
+    template = SimpleNamespace(
+        id=uuid4(),
+        name="Chercheur mémoire",
+        archetype="chercheur",
+        version=1,
+        config={"prompt_base": "base"},
+    )
+    service, trepo, prepo, _session = _make_service(template=template)
+
+    payload = UpdateTemplateRequest(
+        push_memory=PushMemoryConfig(namespace="team-alpha", optin=True)
+    )
+    response = await service.update_template(template.id, payload)
+
+    assert response.version == 1
+    prepo.create_in_session.assert_not_awaited()
+    trepo.update_config_in_session.assert_awaited_once()
+    trepo.update_in_session.assert_not_awaited()
+    assert response.config["push_memory"] == {"namespace": "team-alpha", "optin": True}
+    assert response.config["prompt_base"] == "base"
 
 
 @pytest.mark.asyncio
