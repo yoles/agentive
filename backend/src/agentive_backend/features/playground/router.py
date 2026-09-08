@@ -3,7 +3,10 @@
 Single endpoint :
 * ``POST /playground/agents/{template_id}/run`` — run an agent in
   isolation (no agent_instance row, no memory_chunks writes, no events
-  beyond ``playground.run.completed``).
+  beyond ``playground.run.completed``). If the template has
+  ``config.push_memory.namespace`` configured (Story 3.5, FR20), relevant
+  memorized chunks are proactively injected into the resolved prompt before
+  the LLM call — optional, never blocks or fails the run.
 
 Gated by ``AGENTIVE_ALLOW_MCP_REGISTRATION`` (P-23 Story 2.5 alignment :
 the Playground may dispatch tool calls via ``call_tool`` whose
@@ -63,10 +66,16 @@ def _build_service(request: Request) -> PlaygroundService:
             detail="PlaygroundService wiring violation: repos must share session_factory.",
             context={"missing": ["shared_session_factory"]},
         )
+    # Story 3.5 T11.2 — Push Memory is an optional enrichment, not a hard
+    # prerequisite of the Playground (unlike `session_factory`/`llm_router`
+    # above) : no `DependencyError` if `app.state.push_memory_provider`
+    # isn't wired, the service just runs without it (AC1 last point).
+    push_memory_provider = getattr(request.app.state, "push_memory_provider", None)
     return PlaygroundService(
         template_repo=template_repo,
         assignment_repo=assignment_repo,
         llm_router=llm_router,
+        push_memory_provider=push_memory_provider,
     )
 
 

@@ -95,6 +95,20 @@ class TokenUsage(BaseModel):
     output_tokens: int = Field(ge=0)
 
 
+class PushMemoryUsage(BaseModel):
+    """Push Memory injection outcome for one run (Story 3.5 AC3, FR20).
+
+    Present in :class:`RunPlaygroundResponse` only once a lookup was
+    actually attempted — see that field's docstring for the ``None`` vs
+    ``{0, 0}`` distinction.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    chunks_injected: int = Field(ge=0)
+    tokens_used: int = Field(ge=0)
+
+
 class RunPlaygroundResponse(BaseModel):
     """Response of ``POST .../run`` — Story 2.7 AC3.
 
@@ -107,6 +121,13 @@ class RunPlaygroundResponse(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    # Story 3.5 (P14, revue) : this is what was ACTUALLY sent to the LLM as
+    # `system`, so since Push Memory it carries the injected
+    # `<contexte_memorise>` blocks in front of the substituted
+    # `system_prompt`, separated by a blank line. The Prompt tab therefore
+    # shows the memorized context too, which is the intent (the operator
+    # must see what the model saw), but it is no longer the template's
+    # prompt alone.
     prompt_resolved: str
     raw_output: str
     parsed_output: dict[str, Any] | None
@@ -116,6 +137,11 @@ class RunPlaygroundResponse(BaseModel):
     provider_used: str
     tool_invocations: list[ToolInvocationLog]
     duration_ms_total: int = Field(ge=0)
+    # Story 3.5 AC3 — `None` means Push Memory was never attempted for this
+    # run (disabled, opt-out not lifted, no namespace configured, or the
+    # provider isn't wired) ; `PushMemoryUsage(chunks_injected=0, ...)` means
+    # it WAS attempted and found nothing above the similarity threshold.
+    push_memory: PushMemoryUsage | None = None
 
     @field_serializer("cost_estimate_usd")
     def _serialize_decimal(self, v: Decimal | None) -> str | None:
@@ -123,6 +149,7 @@ class RunPlaygroundResponse(BaseModel):
 
 
 __all__ = [
+    "PushMemoryUsage",
     "RunPlaygroundRequest",
     "RunPlaygroundResponse",
     "TokenUsage",

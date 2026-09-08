@@ -416,6 +416,9 @@ class AgentTemplateService:
                 error_policy=(
                     payload.error_policy.to_domain() if payload.error_policy is not None else None
                 ),
+                push_memory=(
+                    payload.push_memory.to_domain() if payload.push_memory is not None else None
+                ),
             )
 
             revision = aggregate.revise(merged_config)

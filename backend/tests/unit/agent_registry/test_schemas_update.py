@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
+from agentive_backend.features.agent_registry.domain import value_objects as vo
 from agentive_backend.features.agent_registry.schemas import (
     ContractDefinition,
     ErrorPolicy,
     LLMParams,
+    PushMemoryConfig,
     UpdateTemplateRequest,
 )
 
@@ -98,8 +100,70 @@ def test_update_request_all_none_rejected_p03() -> None:
                 "llm_params": None,
                 "provider_chain": None,
                 "error_policy": None,
+                "push_memory": None,
             }
         )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PushMemoryConfig (Story 3.5 AC2, FR20)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def test_update_request_accepts_push_memory_alone() -> None:
+    """T4.3 — un payload qui ne pose QUE `push_memory` ne doit pas être
+    rejeté comme payload vide (P-03)."""
+    payload = UpdateTemplateRequest.model_validate(
+        {"push_memory": {"namespace": "team-alpha", "optin": True}}
+    )
+    assert payload.push_memory is not None
+    assert payload.push_memory.namespace == "team-alpha"
+    assert payload.push_memory.optin is True
+
+
+def test_push_memory_config_empty_namespace_rejected() -> None:
+    """`namespace` vide (`""`) rejeté 422 (`min_length=1`)."""
+    with pytest.raises(PydanticValidationError):
+        PushMemoryConfig.model_validate({"namespace": "", "optin": False})
+
+
+def test_push_memory_config_requires_both_fields() -> None:
+    """IG2 : le bloc est remplacé en entier, donc il doit être énoncé en
+    entier. Un champ omis n'est PAS "inchangé" : il retombe sur la valeur
+    "éteint", ce qui désactivait la feature en répondant 200."""
+    for payload in ({}, {"namespace": "team-alpha"}, {"optin": True}):
+        with pytest.raises(PydanticValidationError) as exc:
+            PushMemoryConfig.model_validate(payload)
+        assert any(err["type"] == "missing" for err in exc.value.errors())
+
+
+def test_push_memory_config_optin_without_namespace_rejected() -> None:
+    """IG2 : le payload exact de la revue : `optin` seul, sur un template
+    déjà configuré, effaçait son `namespace` en silence. S'abonner à rien
+    n'est pas un état exprimable."""
+    with pytest.raises(PydanticValidationError) as exc:
+        PushMemoryConfig.model_validate({"namespace": None, "optin": True})
+    assert "namespace is required" in str(exc.value)
+
+
+def test_push_memory_config_explicit_off_switch() -> None:
+    """IG2 : l'extinction reste exprimable, explicitement : les deux champs
+    à leur valeur "éteint". `PushMemorySettings.to_mapping()` n'émet alors
+    aucune clé, donc `config.push_memory` disparaît du JSONB."""
+    config = PushMemoryConfig.model_validate({"namespace": None, "optin": False})
+    assert config.to_domain().to_mapping() == {}
+
+
+def test_push_memory_config_to_domain() -> None:
+    config = PushMemoryConfig(namespace="team-alpha", optin=True)
+    domain = config.to_domain()
+    assert domain == vo.PushMemorySettings(namespace="team-alpha", optin=True)
+
+
+def test_push_memory_config_extra_field_forbidden() -> None:
+    with pytest.raises(PydanticValidationError) as exc:
+        PushMemoryConfig.model_validate({"namespace": "x", "optin": False, "rogue_field": "oops"})
+    assert any(err["type"] == "extra_forbidden" for err in exc.value.errors())
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -259,6 +259,34 @@ class ProviderChain:
         return [str(p) for p in self.providers]
 
 
+# ─── PushMemorySettings ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class PushMemorySettings:
+    """Push Memory configuration for a template (Story 3.5 AC1/AC2, FR20).
+
+    Absent = disabled — same posture as ``decay_policy`` absent meaning "no
+    decay" (Story 3.4). No cross-field validation needed, mirrors
+    :class:`ErrorPolicy`, the simplest existing VO in this file.
+    """
+
+    namespace: str | None = None
+    optin: bool = False
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any] | None) -> PushMemorySettings:
+        raw = raw or {}
+        return cls(namespace=raw.get("namespace"), optin=bool(raw.get("optin", False)))
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Emit nothing for a template that never configured Push Memory —
+        mirrors :meth:`ErrorPolicy.to_mapping`'s progressive-build semantics."""
+        if self.namespace is None and self.optin is False:
+            return {}
+        return {"namespace": self.namespace, "optin": self.optin}
+
+
 # ─── AgentConfig — composite VO, single parse/serialize point ──────
 
 
@@ -282,6 +310,7 @@ class AgentConfig:
     llm_params: LLMParams | None = None
     provider_chain: ProviderChain | None = None
     error_policy: ErrorPolicy | None = None
+    push_memory: PushMemorySettings | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> AgentConfig:
@@ -320,6 +349,11 @@ class AgentConfig:
             error_policy=(
                 ErrorPolicy.from_mapping(raw["error_policy"]) if "error_policy" in raw else None
             ),
+            push_memory=(
+                PushMemorySettings.from_mapping(raw["push_memory"])
+                if "push_memory" in raw
+                else None
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -348,6 +382,8 @@ class AgentConfig:
             out["provider_chain"] = self.provider_chain.to_mapping()
         if self.error_policy is not None:
             out["error_policy"] = self.error_policy.to_mapping()
+        if self.push_memory is not None:
+            out["push_memory"] = self.push_memory.to_mapping()
         return out
 
     def merge_updates(
@@ -360,6 +396,7 @@ class AgentConfig:
         llm_params: LLMParams | None = None,
         provider_chain: ProviderChain | None = None,
         error_policy: ErrorPolicy | None = None,
+        push_memory: PushMemorySettings | None = None,
     ) -> AgentConfig:
         """Return a new ``AgentConfig`` with only the non-``None`` kwargs
         overridden — mirrors ``UpdateTemplateRequest``'s PATCH-like semantics
@@ -380,6 +417,7 @@ class AgentConfig:
             llm_params=self.llm_params if llm_params is None else llm_params,
             provider_chain=self.provider_chain if provider_chain is None else provider_chain,
             error_policy=self.error_policy if error_policy is None else error_policy,
+            push_memory=self.push_memory if push_memory is None else push_memory,
         )
 
 
@@ -394,5 +432,6 @@ __all__ = [
     "OnTimeoutPolicy",
     "ProviderChain",
     "ProviderId",
+    "PushMemorySettings",
     "Version",
 ]

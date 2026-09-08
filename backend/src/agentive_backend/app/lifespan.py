@@ -15,6 +15,10 @@ import bcrypt
 from fastapi import FastAPI
 
 from agentive_backend.features.agent_registry import load_registry
+from agentive_backend.features.memory_manager.push_memory import (
+    MemoryManagerPushMemoryProvider,
+)
+from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
@@ -34,6 +38,7 @@ from agentive_backend.shared.llm import (
 )
 from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
+from agentive_backend.shared.repositories import ChunkEmbeddingRepo, MemoryChunkRepo, NamespaceRepo
 
 log = get_logger(__name__)
 
@@ -374,6 +379,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Story 3.1 T1.5 — memory manager embedding backend, wired once at boot
     # (same lifetime as llm_router).
     app.state.embedder = _build_embedder()
+
+    # Story 3.5 T11.1 — Push Memory : a full MemoryManagerService, built
+    # here (not via `memory_manager/router.py._build_service`, request-
+    # scoped) because `app` may import several features (Contract 2),
+    # unlike `features.playground` which may not import
+    # `features.memory_manager` directly (Contract 1). Mirrors the import
+    # already at the top of this module for `MemoryArchivalWorker`.
+    app.state.push_memory_provider = MemoryManagerPushMemoryProvider(
+        memory_manager_service=MemoryManagerService(
+            memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
+            chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
+            namespace_repo=NamespaceRepo(session_factory=session_factory),
+            embedder=app.state.embedder,
+        )
+    )
 
     # Background tasks need an explicit correlation_id — there is no HTTP
     # request to inherit from, so the middleware never runs at startup.

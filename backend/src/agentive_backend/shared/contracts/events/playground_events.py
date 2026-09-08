@@ -64,6 +64,10 @@ class PlaygroundRunCompletedEvent(BaseModel):
     status: Literal["success", "llm_error", "tool_error", "cancelled"]
     actor: str = Field(default="system", description="user_id or 'system' (D1 defer Story 9.1)")
     tenant_id: UUID | None = None
+    # Story 3.5 AC3 — additive fields, default 0 : no schema migration for
+    # this event, no existing consumer (there is none today) breaks.
+    push_memory_chunks_injected: int = Field(default=0, ge=0)
+    push_memory_tokens_used: int = Field(default=0, ge=0)
 
     model_config = ConfigDict(extra="forbid")
 

@@ -18,6 +18,7 @@ from agentive_backend.features.agent_registry.domain.value_objects import (
     OnTimeoutPolicy,
     ProviderChain,
     ProviderId,
+    PushMemorySettings,
     Version,
 )
 
@@ -138,6 +139,37 @@ def test_provider_chain_from_none_is_empty() -> None:
     assert ProviderChain.from_mapping(None).providers == ()
 
 
+# ─── PushMemorySettings ───────────────────────────────────────────
+
+
+def test_push_memory_settings_defaults_disabled() -> None:
+    settings = PushMemorySettings()
+    assert settings.namespace is None
+    assert settings.optin is False
+
+
+def test_push_memory_settings_from_none_is_disabled_default() -> None:
+    assert PushMemorySettings.from_mapping(None) == PushMemorySettings()
+    assert PushMemorySettings.from_mapping({}) == PushMemorySettings()
+
+
+def test_push_memory_settings_round_trip() -> None:
+    raw = {"namespace": "team-alpha", "optin": True}
+    assert PushMemorySettings.from_mapping(raw).to_mapping() == raw
+
+
+def test_push_memory_settings_never_configured_emits_no_key() -> None:
+    """T3.3 — a template that never configured Push Memory must not emit an
+    empty ``push_memory`` key on serialization: absent stays absent, never
+    defaulted-in.
+
+    P16 (revue 3.5) : this docstring used to claim the ``ErrorPolicy`` mirror
+    was NOT followed here, while ``PushMemorySettings.to_mapping``'s own
+    docstring claims it IS. The code follows it (T3.3) ; the contradiction was
+    in this docstring."""
+    assert PushMemorySettings().to_mapping() == {}
+
+
 # ─── Contract ─────────────────────────────────────────────────────
 
 
@@ -169,6 +201,7 @@ def _full_config_dict() -> dict:
             "max_retries": 3,
             "backoff_strategy": "exponential",
         },
+        "push_memory": {"namespace": "team-alpha", "optin": True},
     }
 
 
@@ -229,3 +262,14 @@ def test_agent_config_merge_updates_leaves_prompt_base_and_role_untouched() -> N
     assert merged.prompt_base == "keep"
     assert merged.role == "keep-role"
     assert merged.llm_model == "gpt-4o"
+
+
+def test_agent_config_merge_updates_push_memory_does_not_touch_other_fields() -> None:
+    base = AgentConfig.from_mapping({"prompt_base": "base", "llm_model": "gpt-4o"})
+    merged = base.merge_updates(push_memory=PushMemorySettings(namespace="team-alpha", optin=True))
+    out = merged.to_mapping()
+    assert out["prompt_base"] == "base"
+    assert out["llm_model"] == "gpt-4o"
+    assert out["push_memory"] == {"namespace": "team-alpha", "optin": True}
+    # Original is untouched (frozen VO — merge returns a new instance).
+    assert base.push_memory is None

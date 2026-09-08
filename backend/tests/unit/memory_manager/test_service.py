@@ -573,6 +573,52 @@ async def test_search_allows_cross_department_when_namespace_has_no_department()
 
 
 @pytest.mark.asyncio
+async def test_search_require_shared_namespace_refuses_a_department_scoped_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IG1 (revue Story 3.5) : a caller with NO department identity at all
+    (Push Memory) may only read shared namespaces. Absent this flag, the
+    ``acting_department is None`` early return let it read every department's
+    namespaces, which is exactly what AC2 forbids over HTTP.
+
+    No ``NamespaceAccessDeniedEvent`` here, deliberately: this path fires on
+    every run of a misconfigured template, so it would emit an unbounded
+    stream of outbox rows for one config mistake.
+    """
+    captured = _patch_event_bus(monkeypatch)
+    namespace = _make_namespace(department="Dev")
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(namespace=namespace)
+
+    with pytest.raises(ForbiddenError):
+        await service.search(
+            namespace_name=namespace.name,
+            query="q",
+            top_k=5,
+            require_shared_namespace=True,
+        )
+
+    embedding_repo.search_ann.assert_not_awaited()
+    assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_search_require_shared_namespace_allows_a_shared_one() -> None:
+    """IG1 : the flag is fail-closed on department-scoped namespaces only.
+    A namespace with no department stays readable, which is the nominal
+    Push Memory case."""
+    namespace = _make_namespace(department=None)
+    service, _ns, _chunk_repo, embedding_repo, _embedder = _make_service(
+        namespace=namespace, search_rows=[]
+    )
+
+    await service.search(
+        namespace_name=namespace.name, query="q", top_k=5, require_shared_namespace=True
+    )
+
+    embedding_repo.search_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_search_allows_when_no_acting_department_declared() -> None:
     """Backward compatibility — every existing Story 3.1 call site (no
     ``X-Acting-Department`` header) must keep working unrestricted."""
