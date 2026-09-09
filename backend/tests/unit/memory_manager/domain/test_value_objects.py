@@ -17,6 +17,7 @@ from agentive_backend.features.memory_manager.domain.value_objects import (
     DecayFunction,
     DecayPolicy,
     DomainValidationError,
+    EmbeddingBackend,
     NamespaceType,
     RetentionPolicy,
 )
@@ -39,6 +40,26 @@ def test_namespace_type_matches_the_db_check_values() -> None:
 def test_namespace_type_rejects_unknown() -> None:
     with pytest.raises(ValueError, match="banana"):
         NamespaceType("banana")
+
+
+# ─── EmbeddingBackend ─────────────────────────────────────────────
+
+
+def test_embedding_backend_matches_the_three_wired_values() -> None:
+    assert {b.value for b in EmbeddingBackend} == {"local", "cloud", "voyage"}
+
+
+def test_embedding_backend_default_is_cloud_by_convention() -> None:
+    # No `default_for_type`-style table for `EmbeddingBackend` (T1.2) — the
+    # single global default is a plain enum member, mirrored by the DB
+    # column's `server_default="cloud"` and `NamespaceRepo.create`'s own
+    # `embedding_backend: str = "cloud"` default.
+    assert EmbeddingBackend.CLOUD.value == "cloud"
+
+
+def test_embedding_backend_rejects_unknown() -> None:
+    with pytest.raises(ValueError, match="banana"):
+        EmbeddingBackend("banana")
 
 
 # ─── RetentionPolicy — construction & round-trip ──────────────────

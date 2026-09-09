@@ -21,7 +21,21 @@ from agentive_backend.features.memory_manager.push_memory import (
 from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
 from agentive_backend.infra.db.session import get_session_factory
-from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
+from agentive_backend.infra.llm import (
+    AnthropicProvider,
+    FastEmbedProvider,
+    OpenAIProvider,
+    VoyageProvider,
+)
+from agentive_backend.infra.llm.fastembed_adapter import (
+    EMBEDDING_MODEL_NAME as FASTEMBED_EMBEDDING_MODEL_NAME,
+)
+from agentive_backend.infra.llm.openai_adapter import (
+    EMBEDDING_MODEL_NAME as OPENAI_EMBEDDING_MODEL_NAME,
+)
+from agentive_backend.infra.llm.voyage_adapter import (
+    EMBEDDING_MODEL_NAME as VOYAGE_EMBEDDING_MODEL_NAME,
+)
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.events import (
     SystemShutdownEvent,
@@ -32,6 +46,7 @@ from agentive_backend.shared.event_bus import OutboxWorker, publish_and_commit
 from agentive_backend.shared.llm import (
     Completion,
     Embedder,
+    EmbeddingRouter,
     FallbackCallback,
     FallbackContext,
     LLMRouter,
@@ -240,14 +255,38 @@ def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRout
     )
 
 
-def _build_embedder() -> Embedder:
-    """Build the singleton :class:`Embedder` for the process (Story 3.1 T1.5).
+def _build_embedding_router() -> EmbeddingRouter:
+    """Build the singleton :class:`EmbeddingRouter` for the process
+    (Story 3.6 T6.1) — replaces the single-provider :func:`_build_embedder`
+    it superseded (Story 3.1 T1.5).
 
-    Single-provider, no fallback chain (T1.3 anti-scope — Story 3.6
-    Embedding Router owns multi-provider routing). Mirrors
-    :func:`_build_llm_router`'s "never boot in production without a key,
-    fall back to a mock in dev/test" decision — just without the chain.
+    Decision matrix
+    ---------------
+    * ``cloud`` (OpenAI) — mandatory, unchanged decision from the old
+      ``_build_embedder``: no key + production → :class:`RuntimeError`; no
+      key + dev/test → :class:`MockEmbedder`. This is the one backend
+      :class:`EmbeddingRouter.resolve` degrades any unknown/unwired backend
+      to (T4.2), so it must always be present in ``providers``.
+    * ``local`` (FastEmbed) — always ATTEMPTED, no API key needed, but the
+      load can fail (network unreachable to the HuggingFace Hub, or the
+      first-run download not yet cached — T2.1 loads eagerly at
+      construction). Decision: catch that failure, log it, and simply leave
+      ``"local"`` out of ``providers`` in EVERY environment (dev AND
+      production) — the same "optional backend that may not be wired"
+      posture as ``voyage`` below, not a boot-blocking failure. Namespaces
+      configured for ``local`` fall back to ``cloud`` (with a warning) via
+      :meth:`EmbeddingRouter.resolve` until the model is reachable; crashing
+      the WHOLE process — search and chunk writes on every other namespace
+      included — over one optional backend would be a strictly worse
+      failure mode than serving without it.
+    * ``voyage`` — built only when ``VOYAGE_API_KEY`` is configured;
+      absent, the backend simply does not exist in ``providers`` (same
+      "optional, silently unavailable" contract as ``local``'s failure
+      path above).
     """
+    providers: dict[str, Embedder] = {}
+    model_by_backend: dict[str, str] = {}
+
     # `.strip()`: a whitespace-only secret is truthy, and used to let the
     # production boot succeed with a key that fails 401 on every request
     # instead of refusing to start. The `is None` / falsy test also narrows
@@ -261,14 +300,36 @@ def _build_embedder() -> Embedder:
                 "the memory manager embedding backend requires it."
             )
         log.warning(
-            "embedder.built_with_mock",
+            "embedding_router.cloud_built_with_mock",
             reason="no_openai_api_key_configured",
             environment=settings.environment,
         )
-        return MockEmbedder()
+        providers["cloud"] = MockEmbedder()
+    else:
+        providers["cloud"] = OpenAIProvider(api_key=openai_key)
+    model_by_backend["cloud"] = OPENAI_EMBEDDING_MODEL_NAME
 
-    log.info("embedder.built", provider="openai", environment=settings.environment)
-    return OpenAIProvider(api_key=openai_key)
+    try:
+        providers["local"] = FastEmbedProvider()
+    except Exception:
+        log.exception(
+            "embedding_router.local_backend_unavailable",
+            reason="fastembed_model_load_failed",
+        )
+    else:
+        model_by_backend["local"] = FASTEMBED_EMBEDDING_MODEL_NAME
+
+    voyage_key = settings.voyage_api_key
+    if voyage_key is not None and voyage_key.get_secret_value().strip():
+        providers["voyage"] = VoyageProvider(api_key=voyage_key.get_secret_value())
+        model_by_backend["voyage"] = VOYAGE_EMBEDDING_MODEL_NAME
+
+    log.info(
+        "embedding_router.built",
+        backends=sorted(providers),
+        environment=settings.environment,
+    )
+    return EmbeddingRouter(providers=providers, model_by_backend=model_by_backend)
 
 
 @asynccontextmanager
@@ -376,9 +437,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     llm_router = _build_llm_router(on_fallback=_publish_fallback)
     app.state.llm_router = llm_router
 
-    # Story 3.1 T1.5 — memory manager embedding backend, wired once at boot
-    # (same lifetime as llm_router).
-    app.state.embedder = _build_embedder()
+    # Story 3.1 T1.5 / Story 3.6 T6.2 — memory manager embedding backend,
+    # wired once at boot (same lifetime as llm_router). `embedding_router`
+    # replaces the single-provider `embedder` attribute.
+    app.state.embedding_router = _build_embedding_router()
 
     # Story 3.5 T11.1 — Push Memory : a full MemoryManagerService, built
     # here (not via `memory_manager/router.py._build_service`, request-
@@ -391,7 +453,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
             chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
             namespace_repo=NamespaceRepo(session_factory=session_factory),
-            embedder=app.state.embedder,
+            embedding_router=app.state.embedding_router,
         )
     )
 

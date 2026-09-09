@@ -10,8 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { useCreateNamespace, useNamespaces } from "./hooks";
-import { listNamespaces } from "./api";
+import { useCreateNamespace, useNamespaceChunks, useNamespaces, usePurgeChunk } from "./hooks";
+import { listChunks, listNamespaces } from "./api";
 
 function jsonResponse(body: unknown, init: ResponseInit = { status: 200 }) {
   return new Response(JSON.stringify(body), {
@@ -116,6 +116,72 @@ describe("Memory Manager namespaces hooks", () => {
       const calls = invalidateSpy.mock.calls.map(
         ([opts]) => (opts as { queryKey: unknown[] }).queryKey,
       );
+      expect(calls).toContainEqual(["memory-namespaces"]);
+    });
+  });
+
+  it("listChunks GETs /api/v1/memory/chunks with query params (Story 3.6 AC5)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    await listChunks({
+      namespace: "dev-notes",
+      includeArchived: true,
+      contentContains: "invoice",
+      createdAfter: "2026-01-01T00:00:00.000Z",
+      limit: 10,
+      offset: 5,
+    });
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url), "http://test");
+    expect(parsed.pathname).toBe("/api/v1/memory/chunks");
+    expect(parsed.searchParams.get("namespace")).toBe("dev-notes");
+    expect(parsed.searchParams.get("include_archived")).toBe("true");
+    expect(parsed.searchParams.get("content_contains")).toBe("invoice");
+    expect(parsed.searchParams.get("created_after")).toBe("2026-01-01T00:00:00.000Z");
+    expect(parsed.searchParams.get("limit")).toBe("10");
+    expect(parsed.searchParams.get("offset")).toBe("5");
+  });
+
+  it("useNamespaceChunks surfaces the chunk list for a namespace", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse([
+        {
+          chunk_id: "44444444-4444-4444-4444-444444444444",
+          namespace: "dev-notes",
+          content: "hello",
+          created_at: new Date().toISOString(),
+          expires_at: null,
+          archived_at: null,
+        },
+      ]),
+    );
+    const { wrapper } = makeWrapper();
+    const { result } = renderHook(() => useNamespaceChunks("dev-notes"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.[0].content).toBe("hello");
+  });
+
+  it("usePurgeChunk DELETEs the chunk and invalidates both query families (Story 3.6 AC1)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(undefined, { status: 204 }));
+    const { queryClient, wrapper } = makeWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => usePurgeChunk("dev-notes"), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync("55555555-5555-5555-5555-555555555555");
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(
+      "/api/v1/memory/chunks/55555555-5555-5555-5555-555555555555",
+    );
+    expect((init as RequestInit).method).toBe("DELETE");
+
+    await waitFor(() => {
+      const calls = invalidateSpy.mock.calls.map(
+        ([opts]) => (opts as { queryKey: unknown[] }).queryKey,
+      );
+      expect(calls).toContainEqual(["memory-chunks", "dev-notes"]);
       expect(calls).toContainEqual(["memory-namespaces"]);
     });
   });

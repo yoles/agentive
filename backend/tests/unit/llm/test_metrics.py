@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from prometheus_client import REGISTRY
 
 from agentive_backend.shared.llm.metrics import (
+    EMBEDDING_COST_USD_TOTAL,
+    EMBEDDING_MODEL_PRICING,
     LLM_COST_USD_TOTAL,
     LLM_FALLBACK_TRIGGERED_TOTAL,
     LLM_REQUEST_LATENCY_SECONDS,
@@ -24,6 +28,10 @@ def test_all_five_metrics_registered() -> None:
     assert "agentive_llm_fallback_triggered" in names
     assert "agentive_llm_cost_usd" in names
     assert "agentive_llm_requests_in_flight" in names
+
+
+def test_embedding_cost_counter_registered() -> None:
+    assert "agentive_embedding_cost_usd" in _metric_names()
 
 
 def test_request_latency_labels() -> None:
@@ -52,6 +60,22 @@ def test_fallback_counter_labels() -> None:
 
 def test_cost_counter_labels() -> None:
     LLM_COST_USD_TOTAL.labels(provider="anthropic", model="claude-haiku-4-5").inc(0.001)
+
+
+def test_embedding_cost_counter_labels() -> None:
+    EMBEDDING_COST_USD_TOTAL.labels(backend="cloud", model="text-embedding-3-small").inc(0.001)
+
+
+def test_embedding_model_pricing_local_backend_is_free() -> None:
+    assert EMBEDDING_MODEL_PRICING["bge-small-en-v1.5"] == Decimal("0")
+
+
+def test_embedding_model_pricing_covers_the_three_wired_models() -> None:
+    assert set(EMBEDDING_MODEL_PRICING) == {
+        "text-embedding-3-small",
+        "voyage-3-lite",
+        "bge-small-en-v1.5",
+    }
 
 
 def test_in_flight_gauge_returns_to_zero_after_inc_dec() -> None:

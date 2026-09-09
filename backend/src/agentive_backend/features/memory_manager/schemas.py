@@ -20,6 +20,7 @@ from agentive_backend.features.memory_manager.domain.value_objects import (
     SECONDS_MAX,
     SECONDS_MIN,
     DecayFunction,
+    EmbeddingBackend,
 )
 from agentive_backend.shared.repositories.namespace_repo import NamespaceType
 
@@ -214,9 +215,15 @@ class DecayPolicyOverride(BaseModel):
 class CreateNamespaceRequest(BaseModel):
     """Body of ``POST /api/v1/memory/namespaces`` (Story 3.2 AC1).
 
-    ``embedding_backend`` is NOT exposed here — always hardcoded to
-    ``"cloud"`` server-side (same anti-scope as Story 3.1 T1.6, no other
-    backend is wired before Story 3.6).
+    ``embedding_backend`` (Story 3.6 AC2/AC3) picks which
+    :class:`~agentive_backend.shared.llm.embedding_router.EmbeddingRouter`
+    backend embeds this namespace's chunks — ``cloud`` (default,
+    unchanged), ``local`` (FastEmbed), or ``voyage``. Set ONCE here: there
+    is deliberately no way to change it later (see
+    :class:`UpdateNamespaceRequest`'s docstring) — a namespace that already
+    has chunks would have them go invisible to search if the backend
+    changed underneath them (§ Symétrie write/read, this story's Dev
+    Notes).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -228,6 +235,7 @@ class CreateNamespaceRequest(BaseModel):
     retention_policy: RetentionPolicyOverride | None = None
     # Story 3.4 AC1 — omitted means "no decay" (see `DecayPolicyOverride`).
     decay_policy: DecayPolicyOverride | None = None
+    embedding_backend: EmbeddingBackend = EmbeddingBackend.CLOUD
 
     @field_validator("name", mode="after")
     @classmethod
@@ -266,6 +274,15 @@ class UpdateNamespaceRequest(BaseModel):
     ambiguity buys nothing. `retention_policy` is deliberately NOT mutable
     here: changing a TTL retroactively decides the fate of chunks already
     written, which is a Story 3.3 concern, not this one.
+
+    ``embedding_backend`` (Story 3.6) is likewise NOT mutable here, on
+    purpose — and unlike ``retention_policy``, not just "not yet": changing
+    it on a namespace that already has chunks would make those chunks
+    invisible to :meth:`~agentive_backend.features.memory_manager.service.MemoryManagerService.search`
+    (§ Symétrie write/read, Dev Notes) — a bug, not a missing feature. With
+    ``extra="forbid"`` a body attempting to set it already fails 422 with
+    no code change needed here; a new namespace is the only path to a
+    different backend.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -376,6 +393,25 @@ class MemorySearchResultView(BaseModel):
     expires_at: datetime | None = None
 
 
+class MemoryChunkListItemView(BaseModel):
+    """One item of ``GET /api/v1/memory/chunks`` — Story 3.6 T9.3 (AC5).
+
+    Supports the admin "Config > Namespaces > detail" chunk table
+    (``frontend/src/app/routes/config/namespaces/$name.tsx``) — the source
+    a purge action (AC1's ``DELETE`` per selected row) reads ``chunk_id``
+    from.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_id: UUID
+    namespace: str
+    content: str
+    created_at: datetime
+    expires_at: datetime | None = None
+    archived_at: datetime | None = None
+
+
 __all__ = [
     "CONTENT_MAX_CHARS",
     "TTL_MAX_SECONDS",
@@ -383,6 +419,7 @@ __all__ = [
     "CreateNamespaceRequest",
     "DecayPolicyOverride",
     "MemoryChunkCreateView",
+    "MemoryChunkListItemView",
     "MemorySearchResultView",
     "NamespaceCreateView",
     "NamespaceListItemView",

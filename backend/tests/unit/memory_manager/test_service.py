@@ -17,17 +17,20 @@ from agentive_backend.features.memory_manager import service as service_module
 from agentive_backend.features.memory_manager.domain.value_objects import (
     DecayFunction,
     DecayPolicy,
+    EmbeddingBackend,
 )
-from agentive_backend.features.memory_manager.service import (
-    EMBEDDING_MODEL,
-    MemoryManagerService,
-)
+from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.shared.exceptions import (
     DependencyError,
     ForbiddenError,
     InternalError,
     NotFoundError,
 )
+
+# Story 3.6 — `EMBEDDING_MODEL` no longer lives on the service (T7.4); the
+# model name is now whatever `EmbeddingRouter.embed()` resolves to. Tests
+# use this local constant purely for readability/fake-router return values.
+_CLOUD_MODEL = "text-embedding-3-small"
 
 
 def _make_namespace(
@@ -69,9 +72,11 @@ def _make_chunk(
     expires_at: datetime | None = None,
     archived_at: datetime | None = None,
     created_at: datetime | None = None,
+    namespace_id: object = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
+        namespace_id=namespace_id or uuid4(),
         content=content,
         ttl_seconds=ttl_seconds,
         expires_at=expires_at,
@@ -105,19 +110,20 @@ def _make_service(
     chunk_embedding_repo.upsert = AsyncMock(return_value=None)
     chunk_embedding_repo.search_ann = AsyncMock(return_value=search_rows or [])
 
-    embedder = AsyncMock()
-    embedder.embed = AsyncMock(return_value=[[0.1, 0.2, 0.3]])
-    # Deterministic default so tests that don't care about `source` get a
-    # real string rather than an auto-vivified child Mock.
-    embedder.provider_name = "fake"
+    # Fake `EmbeddingRouter` — `embed()` returns the same 3-tuple contract
+    # (vectors, model_name, provider_name) the real router does (T4.3).
+    # Deterministic `"fake"` provider name so tests that don't care about
+    # `source` get a real string rather than an auto-vivified child Mock.
+    embedding_router = AsyncMock()
+    embedding_router.embed = AsyncMock(return_value=([[0.1, 0.2, 0.3]], _CLOUD_MODEL, "fake"))
 
     service = MemoryManagerService(
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=chunk_embedding_repo,
         namespace_repo=namespace_repo,
-        embedder=embedder,
+        embedding_router=embedding_router,
     )
-    return service, namespace_repo, memory_chunk_repo, chunk_embedding_repo, embedder
+    return service, namespace_repo, memory_chunk_repo, chunk_embedding_repo, embedding_router
 
 
 # ─── create_chunk ────────────────────────────────────────────────
@@ -127,7 +133,7 @@ def _make_service(
 async def test_create_chunk_no_ttl_no_policy_never_expires() -> None:
     namespace = _make_namespace(retention_policy={})
     chunk = _make_chunk(ttl_seconds=None, expires_at=None)
-    service, _ns_repo, chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns_repo, chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=namespace, created_chunk=chunk
     )
 
@@ -138,9 +144,9 @@ async def test_create_chunk_no_ttl_no_policy_never_expires() -> None:
     assert result.expires_at is None
     create_kwargs = chunk_repo.create.await_args.kwargs
     assert create_kwargs["expires_at"] is None
-    embedder.embed.assert_awaited_once_with(["hello"], model=EMBEDDING_MODEL)
+    embedding_router.embed.assert_awaited_once_with(["hello"], backend="cloud")
     embedding_repo.upsert.assert_awaited_once()
-    assert result.embedding_model == EMBEDDING_MODEL
+    assert result.embedding_model == _CLOUD_MODEL
     assert result.namespace == namespace.name
     assert result.chunk_id == chunk.id
 
@@ -191,7 +197,7 @@ async def test_create_chunk_falls_back_to_policy_default_ttl_when_no_override() 
 
 @pytest.mark.asyncio
 async def test_create_chunk_unknown_namespace_raises_not_found() -> None:
-    service, _ns_repo, chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns_repo, chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=None, namespace_not_found=True
     )
 
@@ -200,7 +206,7 @@ async def test_create_chunk_unknown_namespace_raises_not_found() -> None:
 
     chunk_repo.create.assert_not_awaited()
     embedding_repo.upsert.assert_not_awaited()
-    embedder.embed.assert_not_awaited()
+    embedding_router.embed.assert_not_awaited()
 
 
 # ─── search ──────────────────────────────────────────────────────
@@ -211,7 +217,7 @@ async def test_search_maps_repo_rows_to_dto() -> None:
     namespace = _make_namespace()
     chunk_a = _make_chunk(content="alpha")
     chunk_b = _make_chunk(content="beta")
-    service, _ns_repo, _chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns_repo, _chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=namespace,
         search_rows=[(chunk_a, 0.9), (chunk_b, 0.5)],
     )
@@ -221,9 +227,9 @@ async def test_search_maps_repo_rows_to_dto() -> None:
     assert [r.content for r in results] == ["alpha", "beta"]
     assert [r.score for r in results] == [0.9, 0.5]
     assert all(r.namespace == namespace.name for r in results)
-    embedder.embed.assert_awaited_once_with(["q"], model=EMBEDDING_MODEL)
+    embedding_router.embed.assert_awaited_once_with(["q"], backend="cloud")
     search_kwargs = embedding_repo.search_ann.await_args.kwargs
-    assert search_kwargs["model"] == EMBEDDING_MODEL
+    assert search_kwargs["model"] == _CLOUD_MODEL
     assert search_kwargs["namespace_id"] == namespace.id
     assert search_kwargs["top_k"] == 5
     assert search_kwargs["include_archived"] is False
@@ -262,7 +268,7 @@ async def test_search_result_exposes_archived_at() -> None:
 
 @pytest.mark.asyncio
 async def test_search_unknown_namespace_raises_not_found() -> None:
-    service, _ns_repo, _chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns_repo, _chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=None, namespace_not_found=True
     )
 
@@ -270,7 +276,7 @@ async def test_search_unknown_namespace_raises_not_found() -> None:
         await service.search(namespace_name="ghost", query="q", top_k=5)
 
     embedding_repo.search_ann.assert_not_awaited()
-    embedder.embed.assert_not_awaited()
+    embedding_router.embed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -318,10 +324,10 @@ async def test_create_chunk_malformed_retention_policy_raises_rfc7807(bad_policy
 async def test_create_chunk_empty_embedding_result_raises_503() -> None:
     """P5: the `Embedder` protocol pins ordering but never cardinality."""
     namespace = _make_namespace()
-    service, _ns, _chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns, _chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=namespace, created_chunk=_make_chunk()
     )
-    embedder.embed = AsyncMock(return_value=[])
+    embedding_router.embed = AsyncMock(return_value=([], _CLOUD_MODEL, "fake"))
 
     with pytest.raises(DependencyError) as exc:
         await service.create_chunk(namespace_name=namespace.name, content="hello", ttl_seconds=None)
@@ -333,8 +339,8 @@ async def test_create_chunk_empty_embedding_result_raises_503() -> None:
 @pytest.mark.asyncio
 async def test_search_empty_embedding_result_raises_503() -> None:
     namespace = _make_namespace()
-    service, _ns, _chunk_repo, embedding_repo, embedder = _make_service(namespace=namespace)
-    embedder.embed = AsyncMock(return_value=[])
+    service, _ns, _chunk_repo, embedding_repo, embedding_router = _make_service(namespace=namespace)
+    embedding_router.embed = AsyncMock(return_value=([], _CLOUD_MODEL, "fake"))
 
     with pytest.raises(DependencyError):
         await service.search(namespace_name=namespace.name, query="hello", top_k=5)
@@ -343,18 +349,17 @@ async def test_search_empty_embedding_result_raises_503() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_warns_when_namespace_backend_is_not_cloud() -> None:
-    """P10: the warning used to fire only on the write path, while search
-    forces the very same cloud model."""
+async def test_search_resolves_the_backend_from_the_namespace() -> None:
+    """Story 3.6 T7.3 — `search()` derives its `EmbeddingRouter.embed(backend=...)`
+    argument from `namespace.embedding_backend`, not a hardcoded `"cloud"`
+    (supersedes the removed `_warn_if_backend_not_cloud`, T7.5: this is now
+    real routing, not a warning)."""
     namespace = _make_namespace(embedding_backend="local")
-    service, _ns, _chunk_repo, _emb, _embedder = _make_service(namespace=namespace)
+    service, _ns, _chunk_repo, _emb, embedding_router = _make_service(namespace=namespace)
 
-    with patch.object(service_module._log, "warning") as warn:
-        await service.search(namespace_name=namespace.name, query="hello", top_k=5)
+    await service.search(namespace_name=namespace.name, query="hello", top_k=5)
 
-    warn.assert_called_once()
-    assert warn.call_args.args[0] == "memory_manager.embedding_backend_not_cloud"
-    assert warn.call_args.kwargs["embedding_backend"] == "local"
+    embedding_router.embed.assert_awaited_once_with(["hello"], backend="local")
 
 
 # ─── Code review Story 3.1 — intent gaps ──────────────────────
@@ -366,8 +371,8 @@ async def test_create_chunk_embeds_before_writing_the_chunk_row() -> None:
     (429/timeout/5xx) must leave nothing behind, not a chunk with no
     embedding."""
     namespace = _make_namespace()
-    service, _ns, chunk_repo, embedding_repo, embedder = _make_service(namespace=namespace)
-    embedder.embed = AsyncMock(side_effect=RuntimeError("provider rate-limited"))
+    service, _ns, chunk_repo, embedding_repo, embedding_router = _make_service(namespace=namespace)
+    embedding_router.embed = AsyncMock(side_effect=RuntimeError("provider rate-limited"))
 
     with pytest.raises(RuntimeError):
         await service.create_chunk(namespace_name=namespace.name, content="hello", ttl_seconds=None)
@@ -412,14 +417,17 @@ async def test_create_chunk_compensation_failure_does_not_mask_the_original_erro
 
 
 @pytest.mark.asyncio
-async def test_create_chunk_passes_embedder_provider_name_as_source() -> None:
-    """IG3 — the embedding row must record which embedder produced it, so a
-    mock-derived vector is distinguishable from a real one after the fact."""
+async def test_create_chunk_passes_the_routers_provider_name_as_source() -> None:
+    """IG3 — the embedding row must record which provider produced it, so a
+    mock-derived vector is distinguishable from a real one after the fact.
+    Story 3.6 T4.3 moved this from `getattr(embedder, "provider_name")` to
+    `EmbeddingRouter.embed()`'s own 3rd return value — the router is what
+    resolved which underlying provider served the call."""
     namespace = _make_namespace()
-    service, _ns, _chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns, _chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=namespace, created_chunk=_make_chunk()
     )
-    embedder.provider_name = "mock"
+    embedding_router.embed = AsyncMock(return_value=([[0.1, 0.2, 0.3]], _CLOUD_MODEL, "mock"))
 
     await service.create_chunk(namespace_name=namespace.name, content="hello", ttl_seconds=None)
 
@@ -427,14 +435,15 @@ async def test_create_chunk_passes_embedder_provider_name_as_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_chunk_source_is_none_when_embedder_has_no_provider_name() -> None:
+async def test_create_chunk_source_is_none_when_the_router_reports_none() -> None:
     """IG3 — a bare-minimum `Embedder` conformer (the protocol does not
-    require `provider_name`) must not crash the write path."""
+    require `provider_name`) must not crash the write path;
+    `EmbeddingRouter.embed()` itself falls back to `None` via `getattr`."""
     namespace = _make_namespace()
-    service, _ns, _chunk_repo, embedding_repo, embedder = _make_service(
+    service, _ns, _chunk_repo, embedding_repo, embedding_router = _make_service(
         namespace=namespace, created_chunk=_make_chunk()
     )
-    del embedder.provider_name
+    embedding_router.embed = AsyncMock(return_value=([[0.1, 0.2, 0.3]], _CLOUD_MODEL, None))
 
     await service.create_chunk(namespace_name=namespace.name, content="hello", ttl_seconds=None)
 
@@ -496,7 +505,7 @@ async def test_search_denies_cross_department_access(monkeypatch: pytest.MonkeyP
 async def test_create_chunk_denies_cross_department_access(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _patch_event_bus(monkeypatch)
     namespace = _make_namespace(department="Dev")
-    service, _ns, chunk_repo, _embedding_repo, embedder = _make_service(namespace=namespace)
+    service, _ns, chunk_repo, _embedding_repo, embedding_router = _make_service(namespace=namespace)
 
     with pytest.raises(ForbiddenError):
         await service.create_chunk(
@@ -507,7 +516,7 @@ async def test_create_chunk_denies_cross_department_access(monkeypatch: pytest.M
         )
 
     chunk_repo.create.assert_not_awaited()
-    embedder.embed.assert_not_awaited()
+    embedding_router.embed.assert_not_awaited()
     assert captured["event"].operation == "create_chunk"  # type: ignore[attr-defined]
 
 
@@ -688,7 +697,7 @@ async def test_create_namespace_uses_type_default_retention(
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.create_namespace(name="dev-notes", ns_type="metier", department="Dev")
@@ -719,7 +728,7 @@ async def test_create_namespace_override_replaces_type_default(
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     override = RetentionPolicy(default_ttl_seconds=3600)
@@ -748,7 +757,7 @@ async def test_create_namespace_propagates_conflict_error(
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     with pytest.raises(ConflictError):
@@ -769,11 +778,62 @@ async def test_create_namespace_unknown_type_raises_validation_error() -> None:
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=AsyncMock(),
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     with pytest.raises(ValidationError):
         await service.create_namespace(name="ns", ns_type="bogus")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_defaults_embedding_backend_to_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 3.6 T7.6 — omitting `embedding_backend` keeps pre-3.6 behaviour."""
+    _patch_event_bus(monkeypatch)
+    namespace_repo = MagicMock()
+    _configure_with_tenant(namespace_repo, MagicMock())
+    namespace_repo.create_in_session = AsyncMock(return_value=_make_namespace(name="ns-default"))
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+
+    await service.create_namespace(name="ns-default", ns_type="metier")
+
+    assert namespace_repo.create_in_session.await_args.kwargs["embedding_backend"] == "cloud"
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_forwards_an_explicit_embedding_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 3.6 AC2 — `embedding_backend=local` is persisted as its raw
+    string value (`NamespaceRepo.create_in_session` takes `str`, not the
+    domain enum)."""
+    _patch_event_bus(monkeypatch)
+    namespace_repo = MagicMock()
+    _configure_with_tenant(namespace_repo, MagicMock())
+    namespace_repo.create_in_session = AsyncMock(
+        return_value=_make_namespace(name="ns-local", embedding_backend="local")
+    )
+
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+
+    result = await service.create_namespace(
+        name="ns-local", ns_type="metier", embedding_backend=EmbeddingBackend.LOCAL
+    )
+
+    assert namespace_repo.create_in_session.await_args.kwargs["embedding_backend"] == "local"
+    assert result.embedding_backend == "local"
 
 
 # ─── Story 3.2 AC3 — list_namespaces ───────────────────────────────
@@ -792,7 +852,7 @@ async def test_list_namespaces_zips_chunk_counts() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -818,7 +878,7 @@ async def test_list_namespaces_tolerates_malformed_retention_policy() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -853,7 +913,7 @@ async def test_list_namespaces_tolerates_non_int_ttl() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -885,7 +945,7 @@ async def test_list_namespaces_warns_when_hitting_the_safety_cap() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     with patch.object(service_module._log, "warning") as warn:
@@ -906,7 +966,7 @@ async def test_list_namespaces_does_not_warn_below_the_safety_cap() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     with patch.object(service_module._log, "warning") as warn:
@@ -1094,7 +1154,7 @@ async def test_create_namespace_defaults_to_no_decay() -> None:
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
     with (
         patch.object(service_module, "publish", AsyncMock(return_value=uuid4())),
@@ -1118,7 +1178,7 @@ async def test_create_namespace_persists_an_explicit_decay_override() -> None:
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
     override = DecayPolicy(function=DecayFunction.LINEAR, horizon_seconds=86_400)
     with (
@@ -1146,7 +1206,7 @@ async def test_list_namespaces_exposes_decay_policy() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -1167,7 +1227,7 @@ async def test_list_namespaces_flags_a_malformed_decay_policy() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -1197,7 +1257,7 @@ async def test_list_namespaces_keeps_the_two_policy_flags_independent() -> None:
         memory_chunk_repo=memory_chunk_repo,
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
 
     result = await service.list_namespaces()
@@ -1217,7 +1277,7 @@ def _decay_update_service() -> tuple[MemoryManagerService, MagicMock]:
         memory_chunk_repo=AsyncMock(),
         chunk_embedding_repo=AsyncMock(),
         namespace_repo=namespace_repo,
-        embedder=AsyncMock(),
+        embedding_router=AsyncMock(),
     )
     return service, namespace_repo
 
@@ -1316,3 +1376,303 @@ async def test_update_namespace_decay_policy_publishes_in_the_write_transaction(
         "factor": 0.25,
         "threshold_seconds": 60,
     }
+
+
+# ─── purge_chunk — Story 3.6 AC1 ───────────────────────────────────
+
+
+def _purge_service(
+    *,
+    chunk: SimpleNamespace | None,
+    namespace: SimpleNamespace | None = None,
+    mark_archived_rowcount: int = 1,
+) -> tuple[MemoryManagerService, AsyncMock, AsyncMock]:
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.get_by_id = AsyncMock(return_value=chunk)
+    memory_chunk_repo.mark_archived_in_session = AsyncMock(return_value=mark_archived_rowcount)
+    _configure_with_tenant(memory_chunk_repo, MagicMock())
+
+    namespace_repo = AsyncMock()
+    namespace_repo.get_by_id = AsyncMock(return_value=namespace)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+    return service, memory_chunk_repo, namespace_repo
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_soft_deletes_and_publishes_manual_purge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_event_bus(monkeypatch)
+    chunk = _make_chunk()
+    namespace = _make_namespace(name="ns-purge")
+    service, chunk_repo, _ns_repo = _purge_service(chunk=chunk, namespace=namespace)
+
+    await service.purge_chunk(chunk.id)
+
+    chunk_repo.mark_archived_in_session.assert_awaited_once()
+    assert chunk_repo.mark_archived_in_session.await_args.args[1] == [chunk.id]
+    assert captured["event_type"] == "memory_manager.chunk.archived"
+    event = captured["event"]
+    assert event.reason == "manual_purge"  # type: ignore[attr-defined]
+    assert event.chunk_id == chunk.id  # type: ignore[attr-defined]
+    assert event.namespace == "ns-purge"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_unknown_chunk_raises_not_found() -> None:
+    service, chunk_repo, _ns_repo = _purge_service(chunk=None)
+
+    with pytest.raises(NotFoundError):
+        await service.purge_chunk(uuid4())
+
+    chunk_repo.mark_archived_in_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_already_archived_raises_not_found() -> None:
+    """AC1 — idempotence stricte: a second purge/DELETE is 404, never 204."""
+    chunk = _make_chunk(archived_at=datetime.now(UTC))
+    service, chunk_repo, _ns_repo = _purge_service(chunk=chunk)
+
+    with pytest.raises(NotFoundError):
+        await service.purge_chunk(chunk.id)
+
+    chunk_repo.mark_archived_in_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_race_with_concurrent_archival_raises_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent purge/archival between the read and the UPDATE surfaces
+    as `updated == 0` — the same idempotence contract, discovered a few
+    milliseconds later."""
+    _patch_event_bus(monkeypatch)
+    chunk = _make_chunk()
+    service, _chunk_repo, _ns_repo = _purge_service(chunk=chunk, mark_archived_rowcount=0)
+
+    with pytest.raises(NotFoundError):
+        await service.purge_chunk(chunk.id)
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_uses_mark_archived_never_hard_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1 — soft-delete via the same primitive Story 3.3's worker uses,
+    never `delete_by_id` (reserved for a failed embedding write's
+    compensating action)."""
+    _patch_event_bus(monkeypatch)
+    chunk = _make_chunk()
+    service, chunk_repo, _ns_repo = _purge_service(chunk=chunk)
+
+    await service.purge_chunk(chunk.id)
+
+    chunk_repo.delete_by_id.assert_not_awaited()
+
+
+# ─── list_chunks — Story 3.6 AC5 ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_maps_repo_rows_to_view() -> None:
+    namespace = _make_namespace(name="ns-list")
+    chunk = _make_chunk(content="alpha")
+    namespace_repo = AsyncMock()
+    namespace_repo.require_by_name = AsyncMock(return_value=namespace)
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.list_by_namespace = AsyncMock(return_value=[chunk])
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+
+    result = await service.list_chunks(namespace_name="ns-list")
+
+    assert len(result) == 1
+    assert result[0].chunk_id == chunk.id
+    assert result[0].namespace == "ns-list"
+    assert result[0].content == "alpha"
+    assert memory_chunk_repo.list_by_namespace.await_args.kwargs["include_archived"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_forwards_filters_to_the_repo() -> None:
+    namespace = _make_namespace(name="ns-list")
+    namespace_repo = AsyncMock()
+    namespace_repo.require_by_name = AsyncMock(return_value=namespace)
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.list_by_namespace = AsyncMock(return_value=[])
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+
+    after = datetime(2026, 1, 1, tzinfo=UTC)
+    before = datetime(2026, 6, 1, tzinfo=UTC)
+    await service.list_chunks(
+        namespace_name="ns-list",
+        include_archived=True,
+        content_contains="invoice",
+        created_after=after,
+        created_before=before,
+        limit=10,
+        offset=20,
+    )
+
+    call = memory_chunk_repo.list_by_namespace.await_args
+    assert call.args[0] == namespace.id
+    assert call.kwargs["include_archived"] is True
+    assert call.kwargs["content_contains"] == "invoice"
+    assert call.kwargs["created_after"] == after
+    assert call.kwargs["created_before"] == before
+    assert call.kwargs["limit"] == 10
+    assert call.kwargs["offset"] == 20
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_unknown_namespace_raises_not_found() -> None:
+    namespace_repo = AsyncMock()
+    namespace_repo.require_by_name = AsyncMock(
+        side_effect=NotFoundError(detail="Namespace 'ghost' not found", context={})
+    )
+    service = MemoryManagerService(
+        memory_chunk_repo=AsyncMock(),
+        chunk_embedding_repo=AsyncMock(),
+        namespace_repo=namespace_repo,
+        embedding_router=AsyncMock(),
+    )
+
+    with pytest.raises(NotFoundError):
+        await service.list_chunks(namespace_name="ghost")
+
+
+# ─── T13.5 — write/read backend symmetry (THE trap of this story) ─
+
+
+@pytest.mark.asyncio
+async def test_write_read_symmetry_local_namespace_finds_its_own_chunks() -> None:
+    """Story 3.6 T13.5 — the nominal case: a namespace embeds and searches
+    with the SAME backend. The fake `search_ann` below actually enforces
+    `WHERE model = :model` (mirroring the real SQL predicate) — an
+    AsyncMock that ignores its `model` kwarg would pass even a broken
+    `search()`, which is exactly what makes this regression test worth
+    having."""
+    namespace = _make_namespace(name="ns-local", embedding_backend="local")
+    written: dict[str, list[float]] = {}
+
+    async def _embed(
+        texts: list[str], *, backend: str, timeout_s: float = 30.0
+    ) -> tuple[list[list[float]], str, str]:
+        assert backend == "local"
+        return [[0.42]], "bge-small-en-v1.5", "fastembed"
+
+    async def _upsert(
+        *, chunk_id: object, model: str, embedding: list[float], **_kw: object
+    ) -> None:
+        written[model] = embedding
+
+    async def _search_ann(
+        query_vector: list[float], *, model: str, **_kw: object
+    ) -> list[tuple[SimpleNamespace, float]]:
+        if written.get(model) != query_vector:
+            return []
+        return [(_make_chunk(content="found"), 1.0)]
+
+    namespace_repo = AsyncMock()
+    namespace_repo.require_by_name = AsyncMock(return_value=namespace)
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.create = AsyncMock(return_value=_make_chunk())
+    chunk_embedding_repo = AsyncMock()
+    chunk_embedding_repo.upsert = AsyncMock(side_effect=_upsert)
+    chunk_embedding_repo.search_ann = AsyncMock(side_effect=_search_ann)
+    embedding_router = AsyncMock()
+    embedding_router.embed = AsyncMock(side_effect=_embed)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=chunk_embedding_repo,
+        namespace_repo=namespace_repo,
+        embedding_router=embedding_router,
+    )
+
+    await service.create_chunk(namespace_name="ns-local", content="hello", ttl_seconds=None)
+    results = await service.search(namespace_name="ns-local", query="hello", top_k=5)
+
+    assert [r.content for r in results] == ["found"]
+
+
+@pytest.mark.asyncio
+async def test_write_read_symmetry_mismatched_backend_returns_nothing_explicitly() -> None:
+    """The dangerous half of T13.5: a chunk written under one backend and
+    searched as though the namespace were configured for a DIFFERENT one
+    (simulated here by swapping `namespace_repo.require_by_name`'s return
+    value between the write and the read, mirroring the story's own
+    prescription) comes back as an EMPTY list, not an exception —
+    indistinguishable from "no relevant match" unless this test documents
+    the trap explicitly (Dev Notes § Symétrie write/read)."""
+    # What was actually PERSISTED (via `chunk_embedding_repo.upsert`), keyed
+    # by model — distinct from `_embed`'s own return value so a query
+    # embedding computed under the "wrong" model is never mistaken for a
+    # write. Both models happen to produce the numerically identical
+    # `[0.42]` vector here on purpose: the only thing that must matter is
+    # the model NAME (`search_ann`'s `WHERE model = :model`), not the
+    # vector's value.
+    written: dict[str, list[float]] = {}
+
+    async def _embed(
+        texts: list[str], *, backend: str, timeout_s: float = 30.0
+    ) -> tuple[list[list[float]], str, str]:
+        model = {"local": "bge-small-en-v1.5", "cloud": "text-embedding-3-small"}[backend]
+        return [[0.42]], model, "fake"
+
+    async def _upsert(
+        *, chunk_id: object, model: str, embedding: list[float], **_kw: object
+    ) -> None:
+        written[model] = embedding
+
+    async def _search_ann(
+        query_vector: list[float], *, model: str, **_kw: object
+    ) -> list[tuple[SimpleNamespace, float]]:
+        if written.get(model) != query_vector:
+            return []
+        return [(_make_chunk(content="found"), 1.0)]
+
+    write_namespace = _make_namespace(name="ns-mixed", embedding_backend="local")
+    read_namespace = _make_namespace(name="ns-mixed", embedding_backend="cloud")
+
+    namespace_repo = AsyncMock()
+    memory_chunk_repo = AsyncMock()
+    memory_chunk_repo.create = AsyncMock(return_value=_make_chunk())
+    chunk_embedding_repo = AsyncMock()
+    chunk_embedding_repo.upsert = AsyncMock(side_effect=_upsert)
+    chunk_embedding_repo.search_ann = AsyncMock(side_effect=_search_ann)
+    embedding_router = AsyncMock()
+    embedding_router.embed = AsyncMock(side_effect=_embed)
+
+    service = MemoryManagerService(
+        memory_chunk_repo=memory_chunk_repo,
+        chunk_embedding_repo=chunk_embedding_repo,
+        namespace_repo=namespace_repo,
+        embedding_router=embedding_router,
+    )
+
+    namespace_repo.require_by_name = AsyncMock(return_value=write_namespace)
+    await service.create_chunk(namespace_name="ns-mixed", content="hello", ttl_seconds=None)
+
+    namespace_repo.require_by_name = AsyncMock(return_value=read_namespace)
+    results = await service.search(namespace_name="ns-mixed", query="hello", top_k=5)
+
+    assert results == []

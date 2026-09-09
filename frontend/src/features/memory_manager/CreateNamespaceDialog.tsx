@@ -27,7 +27,7 @@ import {
   SelectValue,
 } from "@/shared/components/ui/select";
 import { useCreateNamespace } from "./hooks";
-import type { NamespaceType } from "./types";
+import type { EmbeddingBackend, NamespaceType } from "./types";
 
 type Props = {
   open: boolean;
@@ -41,11 +41,19 @@ const NAMESPACE_TYPE_LABELS: Record<NamespaceType, string> = {
   contextuelle: "Contextuelle",
 };
 
+// Story 3.6 AC2/AC3 — `cloud` first/default: unchanged pre-3.6 behaviour.
+const EMBEDDING_BACKEND_LABELS: Record<EmbeddingBackend, string> = {
+  cloud: "Cloud (OpenAI, par défaut)",
+  local: "Local (FastEmbed)",
+  voyage: "Voyage",
+};
+
 export function CreateNamespaceDialog({ open, onOpenChange }: Props) {
   const [name, setName] = useState("");
   const [type, setType] = useState<NamespaceType>("metier");
   const [department, setDepartment] = useState("");
   const [project, setProject] = useState("");
+  const [embeddingBackend, setEmbeddingBackend] = useState<EmbeddingBackend>("cloud");
   const createMutation = useCreateNamespace();
 
   function reset() {
@@ -53,6 +61,7 @@ export function CreateNamespaceDialog({ open, onOpenChange }: Props) {
     setType("metier");
     setDepartment("");
     setProject("");
+    setEmbeddingBackend("cloud");
   }
 
   /** Escape/overlay-dismiss go through `Dialog`'s `onOpenChange`, which
@@ -75,6 +84,7 @@ export function CreateNamespaceDialog({ open, onOpenChange }: Props) {
         type,
         department: department.trim() || null,
         project: project.trim() || null,
+        embedding_backend: embeddingBackend,
       });
       toast.success(`Namespace "${name.trim()}" créé.`);
       reset();
@@ -135,6 +145,30 @@ export function CreateNamespaceDialog({ open, onOpenChange }: Props) {
                 {(Object.keys(NAMESPACE_TYPE_LABELS) as NamespaceType[]).map((t) => (
                   <SelectItem key={t} value={t}>
                     {NAMESPACE_TYPE_LABELS[t]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label htmlFor="namespace-embedding-backend" className="text-sm font-medium">
+              Backend d'embedding
+            </label>
+            <Select
+              value={embeddingBackend}
+              onValueChange={(value) => setEmbeddingBackend(value as EmbeddingBackend)}
+            >
+              <SelectTrigger
+                id="namespace-embedding-backend"
+                data-testid="create-namespace-embedding-backend"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(EMBEDDING_BACKEND_LABELS) as EmbeddingBackend[]).map((backend) => (
+                  <SelectItem key={backend} value={backend}>
+                    {EMBEDDING_BACKEND_LABELS[backend]}
                   </SelectItem>
                 ))}
               </SelectContent>

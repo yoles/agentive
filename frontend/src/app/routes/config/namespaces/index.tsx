@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/shared/components/ui/button";
@@ -95,7 +95,16 @@ export function NamespacesPage() {
                       className="border-b last:border-b-0"
                       data-testid={`namespace-row-${ns.namespace_id}`}
                     >
-                      <td className="py-3 font-medium">{ns.name}</td>
+                      <td className="py-3 font-medium">
+                        <Link
+                          to="/config/namespaces/$name"
+                          params={{ name: ns.name }}
+                          className="text-primary underline-offset-2 hover:underline"
+                          data-testid={`namespace-link-${ns.namespace_id}`}
+                        >
+                          {ns.name}
+                        </Link>
+                      </td>
                       <td className="py-3 text-muted-foreground">{ns.project ?? "—"}</td>
                       <td className="py-3">
                         {ns.retention_policy_valid ? (

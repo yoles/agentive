@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Final, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -44,6 +44,14 @@ MODEL_PRICING: dict[str, tuple[Decimal, Decimal]] = {
 # Reasoning + GPT-5 family — the API rejected `max_tokens` and demands
 # `max_completion_tokens` instead.
 _NEW_MAX_TOKENS_PREFIXES: tuple[str, ...] = ("o1", "o3", "o4", "gpt-5")
+
+# Story 3.6 T6.1 — the "cloud" backend's canonical model, formerly a
+# `MemoryManagerService`-local constant (`EMBEDDING_MODEL`, Story 3.1)
+# hardcoded there because only one backend existed. Moved here, alongside
+# `FastEmbedProvider.EMBEDDING_MODEL_NAME` / `VoyageProvider.EMBEDDING_MODEL_NAME`,
+# now that `EmbeddingRouter` (T4) needs one canonical name per backend.
+# Matches the partial HNSW index `chunk_embeddings_openai_hnsw` (Story 3.1).
+EMBEDDING_MODEL_NAME: Final[str] = "text-embedding-3-small"
 
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": "stop",

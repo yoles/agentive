@@ -136,7 +136,24 @@ def test_create_namespace_rejects_unstorable_name(value: str) -> None:
 
 def test_create_namespace_rejects_unknown_fields() -> None:
     with pytest.raises(PydanticValidationError):
-        CreateNamespaceRequest(name="ns", type="client", embedding_backend="local")  # type: ignore[call-arg]
+        CreateNamespaceRequest(name="ns", type="client", something_else="nope")  # type: ignore[call-arg]
+
+
+def test_create_namespace_accepts_embedding_backend() -> None:
+    """Story 3.6 AC2/AC3 — `embedding_backend` is now a real field (it used
+    to be rejected by `extra="forbid"`, Story 3.1-3.5)."""
+    req = CreateNamespaceRequest(name="ns", type="client", embedding_backend="local")  # type: ignore[arg-type]
+    assert req.embedding_backend.value == "local"
+
+
+def test_create_namespace_defaults_embedding_backend_to_cloud() -> None:
+    req = CreateNamespaceRequest(name="ns", type="client")  # type: ignore[arg-type]
+    assert req.embedding_backend.value == "cloud"
+
+
+def test_create_namespace_rejects_unknown_embedding_backend() -> None:
+    with pytest.raises(PydanticValidationError):
+        CreateNamespaceRequest(name="ns", type="client", embedding_backend="quantum")  # type: ignore[arg-type]
 
 
 def test_create_namespace_accepts_explicit_retention_policy_override() -> None:
@@ -350,3 +367,12 @@ def test_update_namespace_request_rejects_an_incoherent_policy() -> None:
         UpdateNamespaceRequest.model_validate(
             {"decay_policy": {"function": "exponential", "horizon_seconds": 60}}
         )
+
+
+def test_update_namespace_request_forbids_embedding_backend() -> None:
+    """Story 3.6 T9.2 — `embedding_backend` is immutable after creation
+    (changing it on a namespace with existing chunks would make them
+    invisible to search, § Symétrie write/read). `extra="forbid"` already
+    rejects it with no dedicated field needed."""
+    with pytest.raises(PydanticValidationError):
+        UpdateNamespaceRequest.model_validate({"decay_policy": None, "embedding_backend": "local"})

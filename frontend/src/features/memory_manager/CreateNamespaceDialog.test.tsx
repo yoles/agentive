@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { CreateNamespaceDialog } from "./CreateNamespaceDialog";
@@ -65,5 +65,41 @@ describe("CreateNamespaceDialog", () => {
     });
 
     expect(screen.getByTestId("create-namespace-name")).toHaveValue("");
+  });
+
+  it("defaults embedding_backend to 'cloud' and submits it (Story 3.6 AC2/AC3)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          namespace_id: "1",
+          name: "dev-notes",
+          type: "metier",
+          department: null,
+          project: null,
+          retention_policy: { default_ttl_seconds: null, archive_after_seconds: null },
+          decay_policy: {},
+          embedding_backend: "cloud",
+          created_at: new Date().toISOString(),
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const Wrapper = makeWrapper();
+    render(<CreateNamespaceDialog open={true} onOpenChange={() => {}} />, {
+      wrapper: Wrapper,
+    });
+
+    fireEvent.change(screen.getByTestId("create-namespace-name"), {
+      target: { value: "dev-notes" },
+    });
+    fireEvent.click(screen.getByTestId("create-namespace-submit"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toMatchObject({
+      embedding_backend: "cloud",
+    });
   });
 });

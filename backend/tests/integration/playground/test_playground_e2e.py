@@ -69,7 +69,7 @@ def _wire_push_memory_provider(
     app: Any, *, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     """Mirror ``app/lifespan.py`` T11.1's wiring exactly, against the same
-    ``MockEmbedder`` the app already uses (set by ``make_e2e_app``) so a
+    ``EmbeddingRouter`` the app already uses (set by ``make_e2e_app``) so a
     chunk and a query embed identically to the SAME test data this test
     just wrote."""
     app.state.push_memory_provider = MemoryManagerPushMemoryProvider(
@@ -77,7 +77,7 @@ def _wire_push_memory_provider(
             memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
             chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
             namespace_repo=NamespaceRepo(session_factory=session_factory),
-            embedder=app.state.embedder,
+            embedding_router=app.state.embedding_router,
         )
     )
 

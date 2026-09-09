@@ -156,6 +156,12 @@ forbidden_modules =
 # vendor SDKs directly. Justifies NFR12 (graceful degradation), NFR20
 # (multi-provider) and NFR9 (no API keys in logs/traces) — see
 # `docs/decisions/llm-abstraction.md`.
+#
+# `fastembed`/`voyageai` (Story 3.6, Embedding Router) added alongside the
+# chat SDKs: same rationale — a feature routes through
+# `agentive_backend.shared.llm.embedding_router.EmbeddingRouter`, never a
+# vendor embedding SDK directly. Both adapters live in `infra/llm/` by
+# convention already; this locks it as a checked contract instead.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:no-direct-llm-sdk-from-features]
 name = Feature modules and api/* must not import LangChain LLM SDKs directly
@@ -169,3 +175,5 @@ forbidden_modules =
     langchain_core
     anthropic
     openai
+    fastembed
+    voyageai

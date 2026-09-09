@@ -13,7 +13,10 @@ by default in ``make_e2e_app`` so no OPENAI_API_KEY is needed.
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+import math
+from typing import Any, ClassVar
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -34,6 +37,7 @@ async def _create_namespace(
     name: str,
     retention_policy: dict[str, Any] | None = None,
     decay_policy: dict[str, Any] | None = None,
+    embedding_backend: str = "cloud",
 ) -> Any:
     repo = NamespaceRepo(session_factory=session_factory)
     return await repo.create(
@@ -41,7 +45,41 @@ async def _create_namespace(
         ns_type="metier",
         retention_policy=retention_policy,
         decay_policy=decay_policy,
+        embedding_backend=embedding_backend,
     )
+
+
+def _deterministic_vector(text_: str, *, dims: int) -> list[float]:
+    """Same hash-derived, unit-norm approach as
+    ``agentive_backend.shared.llm.testing.MockEmbedder.vector_for``,
+    parameterized by dimension — Story 3.6 T13.6 needs a SECOND
+    deterministic embedder (384-dim, ``local``) distinct from
+    ``MockEmbedder``'s hardcoded 1536-dim ``cloud`` vectors, without
+    downloading the real ``fastembed`` ONNX model in CI."""
+    digest = hashlib.sha256(text_.encode("utf-8")).digest()
+    raw: list[float] = []
+    counter = 0
+    while len(raw) < dims:
+        block = hashlib.sha256(digest + counter.to_bytes(4, "big")).digest()
+        raw.extend(b / 255.0 - 0.5 for b in block)
+        counter += 1
+    raw = raw[:dims]
+    norm = math.sqrt(sum(v * v for v in raw)) or 1.0
+    return [v / norm for v in raw]
+
+
+class _FakeLocalEmbedder:
+    """Test-only ``local`` backend conformer — 384-dim, mirrors
+    ``bge-small-en-v1.5``'s partial HNSW index dimension without the real
+    model (T13.6: "ne pas télécharger le vrai FastEmbed en CI d'intégration
+    si le modèle doit être téléchargé")."""
+
+    provider_name: ClassVar[str] = "fastembed"
+
+    async def embed(
+        self, texts: list[str], *, model: str, timeout_s: float = 30.0
+    ) -> list[list[float]]:
+        return [_deterministic_vector(t, dims=384) for t in texts]
 
 
 @pytest.mark.asyncio
@@ -281,7 +319,12 @@ async def test_create_chunk_leaves_no_orphan_row_when_embedder_fails(
 
     namespace = await _create_namespace(app_session_factory, name="ig1-e2e-ns")
     app = _make_app(session_factory=app_session_factory)
-    app.state.embedder.embed = AsyncMock(side_effect=RuntimeError("provider down"))
+    # Story 3.6 — `app.state.embedder` is now `app.state.embedding_router`;
+    # patching its `embed()` directly (rather than reaching into the
+    # `EmbeddingRouter`'s private `_providers["cloud"]`) exercises the same
+    # "the embedding call fails" scenario at the boundary the service
+    # actually calls.
+    app.state.embedding_router.embed = AsyncMock(side_effect=RuntimeError("provider down"))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1417,3 +1460,349 @@ async def test_patch_namespace_rejects_an_incoherent_policy_with_422(
         )
 
     assert resp.status_code == 422, resp.text
+
+
+# ─── Story 3.6 AC1 — DELETE /memory/chunks/{chunk_id} ─────────────
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_returns_204_and_is_idempotent(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="purge-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "to purge", "namespace": "purge-ns"},
+        )
+        chunk_id = create_resp.json()["chunk_id"]
+
+        delete_resp = await client.delete(
+            f"/api/v1/memory/chunks/{chunk_id}", headers=_auth_headers()
+        )
+        assert delete_resp.status_code == 204, delete_resp.text
+        assert delete_resp.content == b""
+
+        # AC1 — a second DELETE on the same chunk is 404, never 204 again
+        # (mirror `delete_template_tool`, Story 2.5 decision #10).
+        second_delete_resp = await client.delete(
+            f"/api/v1/memory/chunks/{chunk_id}", headers=_auth_headers()
+        )
+        assert second_delete_resp.status_code == 404, second_delete_resp.text
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_unknown_id_returns_404(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.delete(f"/api/v1/memory/chunks/{uuid4()}", headers=_auth_headers())
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_malformed_uuid_returns_422(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.delete("/api/v1/memory/chunks/not-a-uuid", headers=_auth_headers())
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_excludes_it_from_search_results(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="purge-search-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "purged content unique phrase", "namespace": "purge-search-ns"},
+        )
+        chunk_id = create_resp.json()["chunk_id"]
+        await client.delete(f"/api/v1/memory/chunks/{chunk_id}", headers=_auth_headers())
+
+        search_resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={
+                "q": "purged content unique phrase",
+                "namespace": "purge-search-ns",
+                "top_k": 5,
+            },
+        )
+    assert search_resp.status_code == 200, search_resp.text
+    assert search_resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_purge_chunk_still_visible_with_include_archived(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 3.3 AC2's `include_archived` flag applies to a manual purge
+    exactly as it does to automatic archival — same `archived_at` column,
+    same filter."""
+    await _create_namespace(app_session_factory, name="purge-archived-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "archived but findable", "namespace": "purge-archived-ns"},
+        )
+        chunk_id = create_resp.json()["chunk_id"]
+        await client.delete(f"/api/v1/memory/chunks/{chunk_id}", headers=_auth_headers())
+
+        search_resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={
+                "q": "archived but findable",
+                "namespace": "purge-archived-ns",
+                "top_k": 5,
+                "include_archived": True,
+            },
+        )
+    assert search_resp.status_code == 200, search_resp.text
+    results = search_resp.json()
+    assert len(results) == 1
+    assert results[0]["chunk_id"] == chunk_id
+    assert results[0]["archived_at"] is not None
+
+
+# ─── Story 3.6 AC2/AC3 — Embedding Router ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_with_local_embedding_backend(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/namespaces",
+            headers=_auth_headers(),
+            json={"name": "local-backend-ns", "type": "metier", "embedding_backend": "local"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["embedding_backend"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_create_namespace_defaults_embedding_backend_to_cloud(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/namespaces",
+            headers=_auth_headers(),
+            json={"name": "default-backend-ns", "type": "metier"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["embedding_backend"] == "cloud"
+
+
+@pytest.mark.asyncio
+async def test_local_backend_write_then_search_round_trip(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 3.6 T13.6 — the write/read symmetry (Dev Notes' central
+    pitfall) exercised end to end through Postgres + the real
+    `chunk_embeddings_bge_hnsw` partial index, with a deterministic FAKE
+    `local` embedder (never the real ONNX model in CI, T13.6)."""
+    from agentive_backend.shared.llm.embedding_router import EmbeddingRouter
+    from agentive_backend.shared.llm.testing import MockEmbedder
+
+    await _create_namespace(app_session_factory, name="local-e2e-ns", embedding_backend="local")
+    app = _make_app(session_factory=app_session_factory)
+    app.state.embedding_router = EmbeddingRouter(
+        providers={"cloud": MockEmbedder(), "local": _FakeLocalEmbedder()},
+        model_by_backend={"cloud": "text-embedding-3-small", "local": "bge-small-en-v1.5"},
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "hello from the local backend", "namespace": "local-e2e-ns"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["embedding_model"] == "bge-small-en-v1.5"
+
+        search_resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "hello from the local backend", "namespace": "local-e2e-ns", "top_k": 5},
+        )
+
+    assert search_resp.status_code == 200, search_resp.text
+    results = search_resp.json()
+    assert len(results) == 1
+    assert results[0]["content"] == "hello from the local backend"
+
+
+@pytest.mark.asyncio
+async def test_local_backend_unwired_degrades_to_cloud(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """T4.2 — a namespace configured for `local` when the app only wired
+    `cloud` (e.g. FastEmbed failed to load at boot, `app/lifespan.py`
+    T6.1) still works: `EmbeddingRouter.resolve` degrades instead of
+    raising."""
+    await _create_namespace(app_session_factory, name="degrade-ns", embedding_backend="local")
+    app = _make_app(session_factory=app_session_factory)
+    # `make_e2e_app` only wires `"cloud"` by default — no override needed to
+    # exercise the degrade path.
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "degrades to cloud", "namespace": "degrade-ns"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["embedding_model"] == "text-embedding-3-small"
+
+
+# ─── Story 3.6 AC5 — GET /memory/chunks ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_returns_created_chunks(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="list-chunks-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "first chunk", "namespace": "list-chunks-ns"},
+        )
+        await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "second chunk", "namespace": "list-chunks-ns"},
+        )
+
+        resp = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={"namespace": "list-chunks-ns"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    contents = {item["content"] for item in resp.json()}
+    assert contents == {"first chunk", "second chunk"}
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_excludes_purged_by_default(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="list-purged-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "will be purged", "namespace": "list-purged-ns"},
+        )
+        chunk_id = create_resp.json()["chunk_id"]
+        await client.delete(f"/api/v1/memory/chunks/{chunk_id}", headers=_auth_headers())
+
+        default_resp = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={"namespace": "list-purged-ns"},
+        )
+        include_archived_resp = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={"namespace": "list-purged-ns", "include_archived": "true"},
+        )
+
+    assert default_resp.json() == []
+    assert len(include_archived_resp.json()) == 1
+    assert include_archived_resp.json()[0]["chunk_id"] == chunk_id
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_content_contains_filter(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="list-filter-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "invoice number 42", "namespace": "list-filter-ns"},
+        )
+        await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "unrelated note", "namespace": "list-filter-ns"},
+        )
+
+        resp = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={"namespace": "list-filter-ns", "content_contains": "invoice"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["content"] == "invoice number 42"
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_unknown_namespace_returns_404(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={"namespace": "does-not-exist"},
+        )
+
+    assert resp.status_code == 404, resp.text

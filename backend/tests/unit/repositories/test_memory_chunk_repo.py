@@ -49,6 +49,46 @@ async def test_list_by_namespace_emits_select_with_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_by_namespace_default_includes_archived() -> None:
+    """Story 3.6 T7.8 — pre-3.6 callers got every chunk, archived or not;
+    the new filter kwargs must not change that default."""
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+    await repo.list_by_namespace(uuid4())
+    sql_text = str(session.execute.await_args.args[0])
+    assert "archived_at is null" not in sql_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_by_namespace_include_archived_false_filters() -> None:
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+    await repo.list_by_namespace(uuid4(), include_archived=False)
+    sql_text = str(session.execute.await_args.args[0])
+    assert "archived_at" in sql_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_by_namespace_content_contains_filters() -> None:
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+    await repo.list_by_namespace(uuid4(), content_contains="invoice")
+    sql_text = str(session.execute.await_args.args[0])
+    assert "like" in sql_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_by_namespace_date_range_filters() -> None:
+    factory, session = make_session_factory_mock()
+    repo = MemoryChunkRepo(session_factory=factory)
+    after = datetime(2026, 1, 1, tzinfo=UTC)
+    before = datetime(2026, 6, 1, tzinfo=UTC)
+    await repo.list_by_namespace(uuid4(), created_after=after, created_before=before)
+    sql_text = str(session.execute.await_args.args[0])
+    assert "created_at" in sql_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_create_passes_expires_at_through_to_the_row() -> None:
     """Story 3.1 T2.2 — `create()` used to accept `ttl_seconds` but never
     write `expires_at`; this is the gap-closing regression guard."""
