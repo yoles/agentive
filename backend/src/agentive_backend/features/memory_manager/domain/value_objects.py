@@ -50,6 +50,33 @@ class NamespaceType(StrEnum):
     CONTEXTUELLE = "contextuelle"
 
 
+# ─── EmbeddingBackend ─────────────────────────────────────────────
+
+
+class EmbeddingBackend(StrEnum):
+    """The 3 embedding backends a namespace can pick (Story 3.6 AC2/AC3).
+
+    Unlike :class:`NamespaceType`, this has a single global default
+    (:attr:`CLOUD`) rather than a per-type table, already carried by the DB
+    column's ``server_default="cloud"`` and by ``NamespaceRepo.create``'s own
+    default — so there is no ``_DEFAULT_..._BY_TYPE``-style table to keep in
+    sync here.
+
+    No DB ``CHECK`` constraint mirrors this enum (unlike ``NamespaceType``'s
+    ``ck_namespace_type``), on purpose: AR19 wants future backends addable
+    without a migration. The HTTP boundary (Pydantic, ``schemas.py``) is the
+    only validation gate; a corrupt/unknown value already in the DB (hand-
+    seeded namespace) degrades to ``cloud`` at read time
+    (:meth:`~agentive_backend.shared.llm.embedding_router.EmbeddingRouter.resolve`)
+    rather than raising, same posture as a malformed ``RetentionPolicy`` /
+    ``DecayPolicy``.
+    """
+
+    LOCAL = "local"
+    CLOUD = "cloud"
+    VOYAGE = "voyage"
+
+
 # ─── RetentionPolicy ──────────────────────────────────────────────
 
 # Floor is 1, not 0: a zero-second lifetime is never a real retention
@@ -376,6 +403,7 @@ __all__ = [
     "DecayFunction",
     "DecayPolicy",
     "DomainValidationError",
+    "EmbeddingBackend",
     "NamespaceType",
     "RetentionPolicy",
 ]

@@ -9,11 +9,14 @@ dependencies = [
     "bcrypt>=4.3",
     "cryptography>=46.0.7",
     "fastapi>=0.136.0",
-    # NOTE: `fastembed` (local embedding backend) n'a pas de wheel prebuild Python 3.14
-    # (dépendance transitoire `py-rust-stemmers` sans wheel cp314). Ajouté dans Story 3.6
-    # quand l'Embedding Router est implémenté. Utiliser une image Python avec Rust toolchain
-    # ou pin une version compatible à ce moment-là.
-    # "fastembed>=0.3",
+    # Story 3.6 T5.1 — le blocage documenté ci-dessus (pas de wheel cp314 pour
+    # la dépendance transitoire `py-rust-stemmers`) est LEVÉ : vérifié en
+    # direct le 2026-09-08 via `pip download --python-version 3.14
+    # --only-binary=:all: --platform manylinux_2_28_x86_64` (résolution PyPI
+    # pure, sans toolchain Rust) — `fastembed==0.8.0` et toute sa chaîne
+    # (onnxruntime, tokenizers, py-rust-stemmers, mmh3, pillow, numpy) ont des
+    # wheels cp314/abi3 manylinux disponibles.
+    "fastembed>=0.8",
     "langchain-anthropic>=1.4.1",
     "langchain-openai>=1.1.14",
     # ━━━ LangGraph version policy (Story 1.2 / Architecture G3) ━━━
@@ -61,6 +64,9 @@ dependencies = [
     "sse-starlette>=3.3.4",
     "structlog>=25.5.0",
     "uvicorn[standard]>=0.44.0",
+    # Story 3.6 T5.1 — Embedding Router "voyage" backend (optional, cf. Dev
+    # Notes § Scope Voyage). Wheel cp314 vérifié disponible le 2026-09-08.
+    "voyageai>=0.5",
 ]
 
 [project.scripts]

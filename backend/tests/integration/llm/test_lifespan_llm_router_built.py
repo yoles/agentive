@@ -101,46 +101,123 @@ def test_no_keys_in_production_raises(fresh_settings) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# `_build_embedder` (Story 3.1 T1.5): same decision matrix as
-# `_build_llm_router`, minus the fallback chain. Added by the Story 3.1
-# code review (P12): the function can refuse the production boot and had
-# no test at all, every suite short-circuiting it via `app.state.embedder`.
+# `_build_embedding_router` (Story 3.1 T1.5, renamed + extended Story 3.6
+# T6.1): same decision matrix for the mandatory `cloud` backend as
+# `_build_llm_router`, minus the fallback chain, PLUS `local` (always
+# attempted, degrades silently on failure) and `voyage` (only if
+# `VOYAGE_API_KEY` is set). Added by the Story 3.1 code review (P12): the
+# function can refuse the production boot and had no test at all, every
+# suite short-circuiting it via `app.state.embedder`
+# (now `app.state.embedding_router`).
+#
+# `fastembed.TextEmbedding` is mocked in every test below (same convention
+# as `test_fastembed_adapter.py`) so this suite never depends on network
+# access to the HuggingFace Hub — `_build_embedding_router` always attempts
+# the `local` backend regardless of which key is under test.
 # ─────────────────────────────────────────────────────────────
 
 
-def test_build_embedder_with_openai_key_yields_openai_provider(fresh_settings) -> None:
+def test_build_embedding_router_with_openai_key_wires_openai_as_cloud(fresh_settings) -> None:
     fresh_settings(
         anthropic=None,
         openai="sk-test-fake-key-1234567890abcdefghij123456",
         environment="development",
     )
-    from agentive_backend.app.lifespan import _build_embedder
+    from unittest.mock import patch
+
+    from agentive_backend.app.lifespan import _build_embedding_router
     from agentive_backend.infra.llm import OpenAIProvider
 
-    assert isinstance(_build_embedder(), OpenAIProvider)
+    with patch("agentive_backend.infra.llm.fastembed_adapter.TextEmbedding"):
+        router = _build_embedding_router()
+
+    embedder, model = router.resolve("cloud")
+    assert isinstance(embedder, OpenAIProvider)
+    assert model == "text-embedding-3-small"
 
 
-def test_build_embedder_without_key_in_test_env_yields_mock(fresh_settings) -> None:
+def test_build_embedding_router_without_key_in_test_env_yields_mock_cloud(fresh_settings) -> None:
     fresh_settings(anthropic=None, openai=None, environment="test")
-    from agentive_backend.app.lifespan import _build_embedder
+    from unittest.mock import patch
+
+    from agentive_backend.app.lifespan import _build_embedding_router
     from agentive_backend.shared.llm.testing import MockEmbedder
 
-    assert isinstance(_build_embedder(), MockEmbedder)
+    with patch("agentive_backend.infra.llm.fastembed_adapter.TextEmbedding"):
+        router = _build_embedding_router()
+
+    embedder, _model = router.resolve("cloud")
+    assert isinstance(embedder, MockEmbedder)
 
 
-def test_build_embedder_without_key_in_production_raises(fresh_settings) -> None:
+def test_build_embedding_router_without_key_in_production_raises(fresh_settings) -> None:
     fresh_settings(anthropic=None, openai=None, environment="production")
-    from agentive_backend.app.lifespan import _build_embedder
+    from agentive_backend.app.lifespan import _build_embedding_router
 
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
-        _build_embedder()
+        _build_embedding_router()
 
 
-def test_build_embedder_treats_whitespace_only_key_as_missing(fresh_settings) -> None:
-    """P12: a blank secret is truthy. Before the fix the production boot
-    succeeded and every `/memory/*` request then failed 401 at runtime."""
+def test_build_embedding_router_treats_whitespace_only_key_as_missing(fresh_settings) -> None:
+    """P12 (Story 3.1): a blank secret is truthy. Before the fix the
+    production boot succeeded and every `/memory/*` request then failed 401
+    at runtime."""
     fresh_settings(anthropic=None, openai="   ", environment="production")
-    from agentive_backend.app.lifespan import _build_embedder
+    from agentive_backend.app.lifespan import _build_embedding_router
 
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
-        _build_embedder()
+        _build_embedding_router()
+
+
+def test_build_embedding_router_always_wires_local_backend(fresh_settings) -> None:
+    """Story 3.6 T6.1 — `local` needs no API key, unlike `cloud`/`voyage`."""
+    fresh_settings(anthropic=None, openai=None, environment="test")
+    from unittest.mock import patch
+
+    from agentive_backend.app.lifespan import _build_embedding_router
+    from agentive_backend.infra.llm import FastEmbedProvider
+
+    with patch("agentive_backend.infra.llm.fastembed_adapter.TextEmbedding"):
+        router = _build_embedding_router()
+
+    embedder, model = router.resolve("local")
+    assert isinstance(embedder, FastEmbedProvider)
+    assert model == "bge-small-en-v1.5"
+
+
+def test_build_embedding_router_degrades_when_local_backend_fails_to_load(fresh_settings) -> None:
+    """T6.1 decision: a FastEmbed load failure (network unreachable, e.g.)
+    must not block the process boot — `"local"` is simply absent from
+    `providers`, and `resolve("local")` degrades to `"cloud"`."""
+    fresh_settings(anthropic=None, openai=None, environment="test")
+    from unittest.mock import patch
+
+    from agentive_backend.app.lifespan import _build_embedding_router
+    from agentive_backend.shared.llm.testing import MockEmbedder
+
+    with patch(
+        "agentive_backend.infra.llm.fastembed_adapter.TextEmbedding",
+        side_effect=RuntimeError("no network"),
+    ):
+        router = _build_embedding_router()
+
+    embedder, model = router.resolve("local")
+    assert isinstance(embedder, MockEmbedder)
+    assert model == "text-embedding-3-small"
+
+
+def test_build_embedding_router_skips_voyage_without_key(fresh_settings) -> None:
+    """Absent `VOYAGE_API_KEY`, `"voyage"` is simply never wired —
+    `resolve("voyage")` degrades to `"cloud"` (T4.2)."""
+    fresh_settings(anthropic=None, openai=None, environment="test")
+    from unittest.mock import patch
+
+    from agentive_backend.app.lifespan import _build_embedding_router
+    from agentive_backend.shared.llm.testing import MockEmbedder
+
+    with patch("agentive_backend.infra.llm.fastembed_adapter.TextEmbedding"):
+        router = _build_embedding_router()
+
+    embedder, model = router.resolve("voyage")
+    assert isinstance(embedder, MockEmbedder)
+    assert model == "text-embedding-3-small"

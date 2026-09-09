@@ -25,8 +25,12 @@ The service sits between the FastAPI router and the repositories:
    check exists yet — that's Story 3.2's RLS département, which will plug
    in here once ``tenant_id``/department scoping is real.
 
-Only the cloud backend (``text-embedding-3-small``) is wired — no
-multi-provider routing (Story 3.6 Embedding Router hybride owns that).
+Story 3.6 wires a real :class:`~agentive_backend.shared.llm.embedding_router.EmbeddingRouter`
+in place of the single ``cloud``-only ``Embedder`` — every ``embed()`` call
+below now resolves the ACTING namespace's ``embedding_backend`` first. See
+§ Symétrie write/read in this story's Dev Notes for why ``create_chunk``
+and ``search`` MUST derive the backend the same way, from the same
+freshly-read namespace.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agentive_backend.features.memory_manager.domain.value_objects import (
     DecayPolicy,
+    EmbeddingBackend,
     RetentionPolicy,
 )
 from agentive_backend.features.memory_manager.domain.value_objects import (
@@ -54,12 +59,14 @@ from agentive_backend.features.memory_manager.reranker import fetch_k_for
 from agentive_backend.features.memory_manager.reranker import rerank as rerank_rows
 from agentive_backend.features.memory_manager.schemas import (
     MemoryChunkCreateView,
+    MemoryChunkListItemView,
     MemorySearchResultView,
     NamespaceCreateView,
     NamespaceListItemView,
     NamespaceUpdateView,
 )
 from agentive_backend.shared.contracts.events import (
+    MemoryChunkArchivedEvent,
     NamespaceAccessDeniedEvent,
     NamespaceCreatedEvent,
     NamespaceDecayPolicyUpdatedEvent,
@@ -84,7 +91,7 @@ from agentive_backend.shared.repositories.namespace_repo import (
 
 if TYPE_CHECKING:
     from agentive_backend.infra.db.models import Namespace
-    from agentive_backend.shared.llm.embedder import Embedder
+    from agentive_backend.shared.llm.embedding_router import EmbeddingRouter
     from agentive_backend.shared.repositories import (
         ChunkEmbeddingRepo,
         MemoryChunkRepo,
@@ -92,12 +99,6 @@ if TYPE_CHECKING:
     )
 
 _log = get_logger(__name__)
-
-# Hardcoded Sprint 1 (T1.6) — the only model with a migrated partial HNSW
-# index that's actually usable today (`chunk_embeddings_openai_hnsw`).
-# `namespace.embedding_backend` is read (warning if != "cloud") but not
-# branched — Story 3.6 (Embedding Router) wires that dimension.
-EMBEDDING_MODEL = "text-embedding-3-small"
 
 # Story 3.4 T5.2 — `list_namespaces` now parses `retention_policy` and
 # `decay_policy` under separate guards, so the retention guard can no
@@ -118,32 +119,17 @@ def _normalize_department(value: str) -> str:
     return value.strip().casefold()
 
 
-def _warn_if_backend_not_cloud(namespace_name: str, embedding_backend: str) -> None:
-    """T1.6 — warn (never block) when a namespace asks for a backend we do
-    not wire yet. Applies to reads as much as writes: search forces the same
-    cloud model, and comparing a cloud query vector against embeddings
-    produced by another backend is exactly as wrong (code review Story 3.1,
-    P10: this used to fire only on the write path).
-    """
-    if embedding_backend != "cloud":
-        _log.warning(
-            "memory_manager.embedding_backend_not_cloud",
-            namespace=namespace_name,
-            embedding_backend=embedding_backend,
-        )
-
-
-def _first_vector(vectors: list[list[float]], *, namespace_name: str) -> list[float]:
+def _first_vector(vectors: list[list[float]], *, namespace_name: str, model: str) -> list[float]:
     """Return ``vectors[0]``, or raise 503 rather than ``IndexError``.
 
-    The :class:`Embedder` protocol documents ordering but never cardinality,
-    so an adapter returning ``[]`` used to surface as an unclassified 500
-    (code review Story 3.1, P5).
+    The :class:`~agentive_backend.shared.llm.embedder.Embedder` protocol
+    documents ordering but never cardinality, so an adapter returning ``[]``
+    used to surface as an unclassified 500 (code review Story 3.1, P5).
     """
     if not vectors:
         raise DependencyError(
             detail="Embedding backend returned no vector for the input text.",
-            context={"namespace": namespace_name, "model": EMBEDDING_MODEL},
+            context={"namespace": namespace_name, "model": model},
         )
     return vectors[0]
 
@@ -157,12 +143,12 @@ class MemoryManagerService:
         memory_chunk_repo: MemoryChunkRepo,
         chunk_embedding_repo: ChunkEmbeddingRepo,
         namespace_repo: NamespaceRepo,
-        embedder: Embedder,
+        embedding_router: EmbeddingRouter,
     ) -> None:
         self._memory_chunk_repo = memory_chunk_repo
         self._chunk_embedding_repo = chunk_embedding_repo
         self._namespace_repo = namespace_repo
-        self._embedder = embedder
+        self._embedding_router = embedding_router
 
     async def create_chunk(
         self,
@@ -191,7 +177,6 @@ class MemoryManagerService:
             operation="create_chunk",
             tenant_id=tenant_id,
         )
-        _warn_if_backend_not_cloud(namespace_name, namespace.embedding_backend)
 
         # T3.2 — `now` captured once, before the insert, fed to both the
         # domain rule and the repo write. The row's real `created_at`
@@ -244,9 +229,10 @@ class MemoryManagerService:
         # trip, so the residual risk is a DB-level failure (lost connection,
         # constraint violation), not provider flakiness — and it is
         # compensated below rather than left as an orphan.
-        vectors = await self._embedder.embed([content], model=EMBEDDING_MODEL)
-        embedding = _first_vector(vectors, namespace_name=namespace_name)
-        source = getattr(self._embedder, "provider_name", None)
+        vectors, model, source = await self._embedding_router.embed(
+            [content], backend=namespace.embedding_backend
+        )
+        embedding = _first_vector(vectors, namespace_name=namespace_name, model=model)
 
         chunk = await self._memory_chunk_repo.create(
             namespace_id=namespace.id,
@@ -258,7 +244,7 @@ class MemoryManagerService:
         try:
             await self._chunk_embedding_repo.upsert(
                 chunk_id=chunk.id,
-                model=EMBEDDING_MODEL,
+                model=model,
                 embedding=embedding,
                 tenant_id=tenant_id,
                 source=source,
@@ -286,7 +272,7 @@ class MemoryManagerService:
             content=chunk.content,
             ttl_seconds=effective_ttl_seconds,
             expires_at=chunk.expires_at,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_model=model,
             created_at=chunk.created_at,
         )
 
@@ -339,7 +325,6 @@ class MemoryManagerService:
             tenant_id=tenant_id,
             require_shared_namespace=require_shared_namespace,
         )
-        _warn_if_backend_not_cloud(namespace_name, namespace.embedding_backend)
 
         decay_policy, decay_policy_valid = self._decay_policy_for(namespace)
         # `rerank=False` opts out of the WHOLE decay path, not just the
@@ -356,7 +341,19 @@ class MemoryManagerService:
         # satisfied in the unit tests while being false end to end.
         fetch_k = fetch_k_for(top_k, effective_policy, rerank_enabled=rerank)
 
-        vectors = await self._embedder.embed([query], model=EMBEDDING_MODEL)
+        # ⚠️ Symétrie write/read (this story's most dangerous pitfall, see
+        # Dev Notes): `namespace.embedding_backend` is read from the SAME
+        # freshly-fetched `namespace` row `create_chunk` would use for this
+        # namespace — never a cached/stale value — so a query embedding is
+        # always produced by the same backend as the chunks it is compared
+        # against. `search_ann`'s `model=model` below is what makes a
+        # mismatch fail LOUDLY... except it doesn't: it returns an empty
+        # list, silently. This is the one place in the whole service where
+        # getting `backend` from anywhere other than `namespace` directly
+        # would be a correctness bug with no exception to catch it.
+        vectors, model, _source = await self._embedding_router.embed(
+            [query], backend=namespace.embedding_backend
+        )
         # ONE clock read for the whole request (T4.2). The same instant feeds
         # `search_ann`'s `expires_at` filter and the decay scoring: two
         # separate `datetime.now()` calls would let a chunk be kept by the
@@ -370,8 +367,8 @@ class MemoryManagerService:
         # expired chunk still passes the filter (code review Story 3.4, P6).
         now = datetime.now(UTC)
         rows = await self._chunk_embedding_repo.search_ann(
-            _first_vector(vectors, namespace_name=namespace_name),
-            model=EMBEDDING_MODEL,
+            _first_vector(vectors, namespace_name=namespace_name, model=model),
+            model=model,
             namespace_id=namespace.id,
             top_k=fetch_k,
             tenant_id=tenant_id,
@@ -459,6 +456,123 @@ class MemoryManagerService:
             for item in scored
         ]
 
+    async def purge_chunk(self, chunk_id: UUID, *, tenant_id: UUID | None = None) -> None:
+        """Manually purge (soft-delete) one chunk — Story 3.6 AC1.
+
+        Reuses :meth:`MemoryChunkRepo.mark_archived_in_session` — the SAME
+        primitive :class:`~agentive_backend.features.memory_manager.ttl.MemoryArchivalWorker`
+        uses (Story 3.3) — never ``delete_by_id``, which is a hard-delete
+        reserved for a failed embedding write's compensating action (see
+        this story's Dev Notes § Écarts avec la lettre de l'épic: there is
+        no separate ``memory_chunks_archived`` table to move a row into).
+
+        Idempotent by construction (mirrors ``delete_template_tool``, Story
+        2.5 decision #10): a second purge of the same chunk is a 404, never
+        a 204 twice.
+
+        Not subject to :meth:`_check_department_access` — a global
+        administration action, same posture as
+        ``create_namespace``/``list_namespaces`` (Dev Notes § Décision
+        cloisonnement).
+
+        Raises
+        ------
+        NotFoundError
+            ``chunk_id`` does not exist, or is already archived/purged.
+        """
+        chunk = await self._memory_chunk_repo.get_by_id(chunk_id, tenant_id=tenant_id)
+        if chunk is None or chunk.archived_at is not None:
+            raise NotFoundError(
+                detail=f"Memory chunk '{chunk_id}' not found",
+                context={"chunk_id": str(chunk_id)},
+            )
+        namespace = await self._namespace_repo.get_by_id(chunk.namespace_id, tenant_id=tenant_id)
+        namespace_name = namespace.name if namespace is not None else "unknown"
+
+        now = datetime.now(UTC)
+        # Same atomicity pattern as `create_namespace`/`update_namespace_decay_policy`
+        # — the UPDATE and the outbox publish share one transaction.
+        async with self._memory_chunk_repo.with_tenant(tenant_id) as session:
+            updated = await self._memory_chunk_repo.mark_archived_in_session(
+                session, [chunk_id], archived_at=now
+            )
+            if updated == 0:
+                # Raced with a concurrent purge/archival between the read
+                # above and this UPDATE — `mark_archived_in_session`'s own
+                # `AND archived_at IS NULL` guard means "already archived",
+                # i.e. exactly the idempotence contract AC1 asks for,
+                # surfaced a few milliseconds later than the read above.
+                raise NotFoundError(
+                    detail=f"Memory chunk '{chunk_id}' not found",
+                    context={"chunk_id": str(chunk_id)},
+                )
+            event = MemoryChunkArchivedEvent(
+                chunk_id=chunk_id,
+                namespace_id=chunk.namespace_id,
+                namespace=namespace_name,
+                reason="manual_purge",
+                tenant_id=tenant_id,
+            )
+            event_id = await publish(MemoryChunkArchivedEvent.event_type, event, session=session)
+            # commit happens at __aexit__ if no exception is raised.
+
+        await notify_best_effort(event_id, MemoryChunkArchivedEvent.event_type)
+
+        _log.info(
+            "memory_manager.chunk_purged_manual",
+            chunk_id=str(chunk_id),
+            namespace=namespace_name,
+        )
+
+    async def list_chunks(
+        self,
+        *,
+        namespace_name: str,
+        tenant_id: UUID | None = None,
+        include_archived: bool = False,
+        content_contains: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[MemoryChunkListItemView]:
+        """List a namespace's chunks for the admin UI — Story 3.6 AC5.
+
+        ``include_archived=False`` by default: the admin table is meant to
+        show what is actually live/searchable, mirroring
+        ``count_by_namespace_ids``'s own live-chunk filter rather than
+        ``MemoryChunkRepo.list_by_namespace``'s historical "everything"
+        default (kept unchanged for its other callers, see that method's
+        docstring).
+
+        Raises
+        ------
+        NotFoundError
+            ``namespace_name`` does not exist.
+        """
+        namespace = await self._namespace_repo.require_by_name(namespace_name, tenant_id=tenant_id)
+        chunks = await self._memory_chunk_repo.list_by_namespace(
+            namespace.id,
+            tenant_id=tenant_id,
+            include_archived=include_archived,
+            content_contains=content_contains,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+            offset=offset,
+        )
+        return [
+            MemoryChunkListItemView(
+                chunk_id=chunk.id,
+                namespace=namespace_name,
+                content=chunk.content,
+                created_at=chunk.created_at,
+                expires_at=chunk.expires_at,
+                archived_at=chunk.archived_at,
+            )
+            for chunk in chunks
+        ]
+
     def _decay_policy_for(self, namespace: Namespace) -> tuple[DecayPolicy, bool]:
         """Parse ``namespaces.decay_policy``, degrading instead of failing.
 
@@ -535,9 +649,17 @@ class MemoryManagerService:
         project: str | None = None,
         retention_policy_override: RetentionPolicy | None = None,
         decay_policy_override: DecayPolicy | None = None,
+        embedding_backend: EmbeddingBackend = EmbeddingBackend.CLOUD,
         tenant_id: UUID | None = None,
     ) -> NamespaceCreateView:
         """Create a namespace with a per-type default retention — Story 3.2 AC1.
+
+        ``embedding_backend`` (Story 3.6 AC2/AC3) is set ONCE, at creation,
+        and immutable thereafter (no ``PATCH`` support — see
+        ``UpdateNamespaceRequest``'s docstring): changing it on a namespace
+        that already has chunks would make them invisible to
+        :meth:`search`, which always derives its query embedding's backend
+        from the SAME namespace field (§ Symétrie write/read, Dev Notes).
 
         Not subject to ``_check_department_access`` — this is a global
         administration action (John, owner), not a memory read/write.
@@ -580,6 +702,7 @@ class MemoryManagerService:
                 project=project,
                 retention_policy=policy.to_mapping(),
                 decay_policy=decay_policy.to_mapping(),
+                embedding_backend=embedding_backend.value,
                 tenant_id=tenant_id,
             )
             event = NamespaceCreatedEvent(
@@ -844,4 +967,4 @@ class MemoryManagerService:
         )
 
 
-__all__ = ["EMBEDDING_MODEL", "MemoryManagerService"]
+__all__ = ["MemoryManagerService"]

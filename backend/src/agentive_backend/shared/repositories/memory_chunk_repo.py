@@ -33,10 +33,38 @@ class MemoryChunkRepo(BaseRepo):
         namespace_id: UUID,
         *,
         tenant_id: UUID | None = None,
+        include_archived: bool = True,
+        content_contains: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[MemoryChunk]:
+        """List a namespace's chunks, newest first — Story 3.6 T7.8 (AC5).
+
+        ``include_archived=True`` is the pre-3.6 default (this method had
+        no filter at all before), kept for every existing caller. The admin
+        chunk-listing UI (AC5) opts INTO the narrower ``include_archived=False``
+        explicitly, mirroring ``count_by_namespace_ids``'s own live-chunk
+        filter rather than inventing a second convention.
+
+        ``content_contains`` is a case-insensitive substring match
+        (``ILIKE``), ``autoescape=True`` so a caller-supplied ``%``/``_``
+        is matched literally rather than as a SQL wildcard — this is the
+        "tag" filter of AC5 (no real tag concept exists on ``MemoryChunk``,
+        see this story's Dev Notes § Interprétation "tag").
+        """
         async with self.with_tenant(tenant_id) as session:
-            stmt = select(MemoryChunk).where(MemoryChunk.namespace_id == namespace_id).limit(limit)
+            stmt = select(MemoryChunk).where(MemoryChunk.namespace_id == namespace_id)
+            if not include_archived:
+                stmt = stmt.where(MemoryChunk.archived_at.is_(None))
+            if content_contains:
+                stmt = stmt.where(MemoryChunk.content.icontains(content_contains, autoescape=True))
+            if created_after is not None:
+                stmt = stmt.where(MemoryChunk.created_at >= created_after)
+            if created_before is not None:
+                stmt = stmt.where(MemoryChunk.created_at <= created_before)
+            stmt = stmt.order_by(MemoryChunk.created_at.desc()).limit(limit).offset(offset)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 

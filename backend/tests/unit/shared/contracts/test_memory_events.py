@@ -99,11 +99,24 @@ def test_memory_chunk_archived_accepts_archive_after_seconds_reason() -> None:
     assert event.reason == "archive_after_seconds"
 
 
+def test_memory_chunk_archived_accepts_manual_purge_reason() -> None:
+    """Story 3.6 AC1 — `MemoryManagerService.purge_chunk` reuses this event
+    with a third `reason`, exactly as this event's own docstring
+    anticipated before Story 3.6 existed."""
+    event = MemoryChunkArchivedEvent(
+        chunk_id=uuid4(),
+        namespace_id=uuid4(),
+        namespace="dev-notes",
+        reason="manual_purge",
+    )
+    assert event.reason == "manual_purge"
+
+
 def test_memory_chunk_archived_rejects_invalid_reason() -> None:
     with pytest.raises(ValidationError):
         MemoryChunkArchivedEvent(
             chunk_id=uuid4(),
             namespace_id=uuid4(),
             namespace="dev-notes",
-            reason="manual_purge",  # type: ignore[arg-type]  # NOT in Literal (yet — 3.6)
+            reason="bogus_reason",  # type: ignore[arg-type]
         )

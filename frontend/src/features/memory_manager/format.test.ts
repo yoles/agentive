@@ -15,6 +15,8 @@ function makeNamespace(overrides: Partial<NamespaceListItem>): NamespaceListItem
     project: null,
     retention_policy: { default_ttl_seconds: null, archive_after_seconds: null },
     retention_policy_valid: true,
+    decay_policy: {},
+    decay_policy_valid: true,
     embedding_backend: "cloud",
     chunk_count: 0,
     created_at: new Date().toISOString(),

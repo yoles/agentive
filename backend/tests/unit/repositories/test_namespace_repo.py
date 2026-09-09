@@ -26,6 +26,29 @@ async def test_create_persists_namespace_with_defaults() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_persists_a_non_cloud_embedding_backend() -> None:
+    """Story 3.6 T13.4 — the signature already supported `embedding_backend`
+    (Story 3.1); this confirms `"local"`/`"voyage"` persist as plain
+    strings, no new repo code required."""
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.create(name="local-ns", ns_type="metier", embedding_backend="local")
+    ns = session.add.call_args.args[0]
+    assert ns.embedding_backend == "local"
+
+
+@pytest.mark.asyncio
+async def test_create_in_session_persists_a_non_cloud_embedding_backend() -> None:
+    factory, session = make_session_factory_mock()
+    repo = NamespaceRepo(session_factory=factory)
+    await repo.create_in_session(
+        session, name="voyage-ns", ns_type="metier", embedding_backend="voyage"
+    )
+    ns = session.add.call_args.args[0]
+    assert ns.embedding_backend == "voyage"
+
+
+@pytest.mark.asyncio
 async def test_list_by_type_emits_select_with_type_predicate() -> None:
     factory, session = make_session_factory_mock()
     repo = NamespaceRepo(session_factory=factory)

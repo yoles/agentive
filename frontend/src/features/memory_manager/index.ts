@@ -6,12 +6,17 @@
  */
 
 export { CreateNamespaceDialog } from "./CreateNamespaceDialog";
-export { createNamespace, listNamespaces } from "./api";
+export { PurgeChunksDialog } from "./PurgeChunksDialog";
+export { createNamespace, listChunks, listNamespaces, purgeChunk } from "./api";
 export { departmentLabel, formatRetention, groupByDepartmentThenType } from "./format";
-export { useCreateNamespace, useNamespaces } from "./hooks";
+export { useCreateNamespace, useNamespaceChunks, useNamespaces, usePurgeChunk } from "./hooks";
+export type { ListChunksParams } from "./api";
 export type { NamespaceGroup } from "./format";
 export type {
   CreateNamespaceRequest,
+  DecayPolicy,
+  EmbeddingBackend,
+  MemoryChunkListItem,
   Namespace,
   NamespaceListItem,
   NamespaceType,

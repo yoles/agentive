@@ -1,22 +1,29 @@
-"""``/api/v1/memory/*`` — Memory Manager endpoints (Stories 3.1, 3.2, 3.4).
+"""``/api/v1/memory/*`` — Memory Manager endpoints (Stories 3.1, 3.2, 3.4, 3.6).
 
-Four endpoints:
+Six endpoints:
 
 * ``POST /memory/chunks`` : write a chunk + its embedding (3.1 AC1).
+* ``DELETE /memory/chunks/{chunk_id}`` : manually purge (soft-delete) a
+  chunk (3.6 AC1).
+* ``GET /memory/chunks`` : list a namespace's chunks for the admin UI
+  (3.6 AC5).
 * ``POST /memory/search`` : ANN search over a namespace (3.1 AC2). AC2
   originally specified a GET with ``q`` as a query param; moved to POST with
   ``q`` in the body so the search text never lands in a URL (and therefore
   never in access logs / reverse proxy / APM, code review Story 3.1, BS4).
 * ``POST /memory/namespaces`` : create a namespace with a per-type default
-  retention (3.2 AC1) and an optional temporal decay policy (3.4 AC1).
+  retention (3.2 AC1), an optional temporal decay policy (3.4 AC1), and an
+  embedding backend (3.6 AC2/AC3).
 * ``GET /memory/namespaces`` : admin listing, all departments, with live
   chunk counts (3.2 AC3).
 
 ``POST /memory/chunks`` and ``POST /memory/search`` read the optional
 ``X-Acting-Department`` header (3.2 AC2) — see
 ``MemoryManagerService._check_department_access`` for what this does and
-does not guarantee. ``POST``/``GET /memory/namespaces`` ignore it (global
-administration actions, not subject to department scoping).
+does not guarantee. ``POST``/``GET /memory/namespaces``, ``DELETE
+/memory/chunks/{chunk_id}`` and ``GET /memory/chunks`` ignore it (global
+administration actions, not subject to department scoping — Story 3.6 Dev
+Notes § Décision cloisonnement).
 
 All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). The global
 ``AgentiveError`` handler converts domain errors to RFC 7807.
@@ -24,17 +31,22 @@ All endpoints sit behind ``AuthTokenMiddleware`` (Story 1.7). The global
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, status
+from datetime import datetime
+from uuid import UUID
+
+from fastapi import APIRouter, Query, Request, status
 
 from agentive_backend.features.memory_manager.domain.value_objects import (
     DecayPolicy,
     RetentionPolicy,
 )
 from agentive_backend.features.memory_manager.schemas import (
+    CONTENT_MAX_CHARS,
     CreateMemoryChunkRequest,
     CreateNamespaceRequest,
     DecayPolicyOverride,
     MemoryChunkCreateView,
+    MemoryChunkListItemView,
     MemorySearchResultView,
     NamespaceCreateView,
     NamespaceListItemView,
@@ -90,17 +102,17 @@ def _build_service(request: Request) -> MemoryManagerService:
             detail="Memory manager not initialised — check lifespan startup logs.",
             context={"missing": ["session_factory"]},
         )
-    embedder = getattr(request.app.state, "embedder", None)
-    if embedder is None:
+    embedding_router = getattr(request.app.state, "embedding_router", None)
+    if embedding_router is None:
         raise DependencyError(
             detail="Memory manager not initialised — check lifespan startup logs.",
-            context={"missing": ["embedder"]},
+            context={"missing": ["embedding_router"]},
         )
     return MemoryManagerService(
         memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
         chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
         namespace_repo=NamespaceRepo(session_factory=session_factory),
-        embedder=embedder,
+        embedding_router=embedding_router,
     )
 
 
@@ -139,6 +151,66 @@ async def create_memory_chunk(
         ttl_seconds=body.ttl,
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
         acting_department=_read_acting_department(request),
+    )
+
+
+@router.delete(
+    "/memory/chunks/{chunk_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Manually purge (soft-delete) a memory chunk (Story 3.6 AC1)",
+)
+async def purge_memory_chunk(request: Request, chunk_id: UUID) -> None:
+    """204 on success. Not subject to ``X-Acting-Department`` (global
+    administration action, same posture as namespace creation).
+
+    A second ``DELETE`` on the same ``chunk_id`` is a 404, never a 204
+    again — mirror ``delete_template_tool`` (Story 2.5 decision #10).
+
+    Errors:
+    * 404 : ``chunk_id`` does not exist, or is already archived/purged.
+    * 422 : ``chunk_id`` is not a well-formed UUID (automatic FastAPI path
+      validation).
+    """
+    service = _build_service(request)
+    await service.purge_chunk(chunk_id, tenant_id=None)  # Sprint 1 anti-scope.
+
+
+@router.get(
+    "/memory/chunks",
+    response_model=list[MemoryChunkListItemView],
+    summary="List a namespace's chunks for the admin UI (Story 3.6 AC5)",
+)
+async def list_memory_chunks(
+    request: Request,
+    namespace: str = Query(min_length=1, max_length=255),
+    include_archived: bool = Query(default=False),
+    content_contains: str | None = Query(default=None, max_length=CONTENT_MAX_CHARS),
+    created_after: datetime | None = Query(default=None),
+    created_before: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[MemoryChunkListItemView]:
+    """200 — empty list ``[]`` if the namespace has no matching chunk.
+
+    Backs ``Config > Namespaces > :name``'s chunk table (Story 3.6 AC5).
+    ``content_contains`` is the "tag" filter of AC5 — no real tag concept
+    exists on ``MemoryChunk`` (see this story's Dev Notes § Interprétation
+    "tag"), so it is a case-insensitive substring match on ``content``.
+
+    Errors:
+    * 404 : ``namespace`` does not exist.
+    * 422 : Pydantic query validation.
+    """
+    service = _build_service(request)
+    return await service.list_chunks(
+        namespace_name=namespace,
+        tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
+        include_archived=include_archived,
+        content_contains=content_contains,
+        created_after=created_after,
+        created_before=created_before,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -230,6 +302,10 @@ async def create_namespace(
     function-scoped and mutually exclusive — a parameter that does not
     belong to the declared ``function`` is a 422, never silently ignored.
 
+    ``embedding_backend`` (Story 3.6 AC2/AC3) defaults to ``cloud``
+    (unchanged behaviour) and is IMMUTABLE after creation — there is no
+    ``PATCH`` path for it (see ``UpdateNamespaceRequest``'s docstring).
+
     Errors:
     * 409 : ``name`` already exists.
     * 422 : Pydantic body validation (``type`` outside the 4-value enum,
@@ -251,6 +327,7 @@ async def create_namespace(
             )
         ),
         decay_policy_override=_to_decay_policy(body.decay_policy),
+        embedding_backend=body.embedding_backend,
         tenant_id=None,  # Sprint 1 anti-scope — single-tenant MVP.
     )
 
