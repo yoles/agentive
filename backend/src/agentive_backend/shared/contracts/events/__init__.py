@@ -41,7 +41,14 @@ from agentive_backend.shared.contracts.events.tool_events import (
     ToolInvokedEvent,
     ToolServerConnectedEvent,
 )
-from agentive_backend.shared.contracts.events.workflow_events import WorkflowCreatedEvent
+from agentive_backend.shared.contracts.events.workflow_events import (
+    WorkflowCreatedEvent,
+    WorkflowRunCompletedEvent,
+    WorkflowRunFailedEvent,
+    WorkflowRunResumedEvent,
+    WorkflowRunStartedEvent,
+    WorkflowRunStepCompletedEvent,
+)
 
 __all__ = [
     "AgentInstanceCreatedEvent",
@@ -61,4 +68,9 @@ __all__ = [
     "ToolInvokedEvent",
     "ToolServerConnectedEvent",
     "WorkflowCreatedEvent",
+    "WorkflowRunCompletedEvent",
+    "WorkflowRunFailedEvent",
+    "WorkflowRunResumedEvent",
+    "WorkflowRunStartedEvent",
+    "WorkflowRunStepCompletedEvent",
 ]

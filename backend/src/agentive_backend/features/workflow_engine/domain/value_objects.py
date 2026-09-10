@@ -8,7 +8,9 @@ anémique"). ``.import-linter`` compliance: no ``infra.*``/``sqlalchemy``/
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
+from typing import Annotated, Any, TypedDict
 from uuid import UUID
 
 
@@ -47,4 +49,28 @@ class WorkflowDag:
     edges: tuple[WorkflowEdge, ...]
 
 
-__all__ = ["DomainValidationError", "WorkflowDag", "WorkflowEdge", "WorkflowNode"]
+class WorkflowState(TypedDict, total=False):
+    """LangGraph state-channel schema for one workflow run (Story 4.2 T3.3).
+
+    ``node_outputs``/``node_metrics`` use the stdlib ``operator.or_`` reducer
+    (dict merge, Python 3.9+) — without it, a fan-out step where 2+ nodes
+    complete in the same LangGraph "superstep" would have their state
+    updates overwrite each other's key instead of merging (last-write-wins
+    is LangGraph's default with no reducer). Node ids are guaranteed unique
+    by construction (Story 4.1 AC1's duplicate-``node_id`` check), so this
+    is purely a merge concern, never a real key-collision to resolve.
+    """
+
+    task_input: dict[str, Any]
+    correlation_id: str
+    node_outputs: Annotated[dict[str, dict[str, Any] | None], operator.or_]
+    node_metrics: Annotated[dict[str, dict[str, Any]], operator.or_]
+
+
+__all__ = [
+    "DomainValidationError",
+    "WorkflowDag",
+    "WorkflowEdge",
+    "WorkflowNode",
+    "WorkflowState",
+]

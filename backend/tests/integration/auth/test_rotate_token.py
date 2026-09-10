@@ -141,38 +141,90 @@ async def test_concurrent_rotation_serialised_no_ghost_tokens() -> None:
             ),
         )
 
-        # Both calls SHOULD succeed (HTTP-level), but only one of the two
-        # returned tokens is the last winner.
-        # Note: the second call's auth check happens AFTER the first
-        # rotation completed, so the second call uses the NEW token created
-        # by the first rotation — wait, no: both call sites use Bearer
-        # "change_me" which is the original. The lock serializes them, so:
-        # - Call A acquires lock, generates token_A, replaces hash → returns token_A.
-        # - Call B is blocked at the lock; when A releases, the hash is now
-        #   token_A's hash. Call B's auth check ALREADY happened before
-        #   the lock (in the middleware, before the handler runs). So both
-        #   succeed at auth (with the original "change_me"), and both
-        #   produce a new token. The LAST one to acquire the lock wins.
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-        token_a = r1.json()["new_token"]
-        token_b = r2.json()["new_token"]
-        assert token_a != token_b
+        # Real ASGI concurrency gives NO ordering guarantee between two
+        # in-flight requests beyond genuine suspension points — plain ASGI
+        # middleware (Story 4.2: converted away from `BaseHTTPMiddleware`,
+        # which breaks SSE streaming — see `app/middleware.py` docstring)
+        # can let one request's handler run to completion, including its
+        # `app.state.auth_token_hash` mutation, before the other's auth
+        # check ever executes. So the race LOSER may now be rejected at
+        # the auth layer (401) instead of receiving a 200 with a token
+        # that silently never works (a genuine "ghost token", arguably a
+        # worse failure mode — fail loud beats fail confusing). Both
+        # outcomes uphold the actual safety property this test guards:
+        # AT MOST ONE of the two rotations' tokens is ever active.
+        results = [r1, r2]
+        succeeded = [r for r in results if r.status_code == 200]
+        rejected = [r for r in results if r.status_code == 401]
+        assert len(succeeded) + len(rejected) == 2, [r.status_code for r in results]
+        assert len(succeeded) >= 1, "at least one concurrent rotation must succeed"
 
-        # Exactly one of {token_a, token_b} now works on the protected route.
-        # Without the lock, the test would be racy — with the lock, the
-        # last rotation deterministically wins.
-        a_resp = await client.get(
-            "/api/v1/protected", headers={"Authorization": f"Bearer {token_a}"}
+        tokens = [r.json()["new_token"] for r in succeeded]
+        assert len(set(tokens)) == len(tokens), "no two successful rotations share a token"
+
+        # Exactly one token among the successful rotation(s) works afterward
+        # — the lock guarantees a single, deterministic last writer.
+        works = []
+        for token in tokens:
+            resp = await client.get(
+                "/api/v1/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            works.append(resp.status_code == 200)
+        assert sum(works) == 1, (
+            f"Expected exactly one token to be active after concurrent rotation: {works}"
         )
-        b_resp = await client.get(
-            "/api/v1/protected", headers={"Authorization": f"Bearer {token_b}"}
+
+        # `sum(works) == 1` is TRIVIALLY true in the single-success branch —
+        # one issued token, and of course it works. The anti-ghost-token
+        # invariant only bites when it is checked against the tokens that
+        # must NOT work, so assert those explicitly:
+        #  * the pre-rotation token is dead (a rotation really happened);
+        #  * a rejected rotation issued nothing at all (no ghost).
+        old_resp = await client.get(
+            "/api/v1/protected", headers={"Authorization": "Bearer change_me"}
         )
-        # Exactly one must work. We don't assert WHICH one (event-loop
-        # scheduling is implementation-defined), but the XOR must hold.
-        a_works = a_resp.status_code == 200
-        b_works = b_resp.status_code == 200
-        assert a_works ^ b_works, (
-            f"Expected exactly one token to work after concurrent rotation: "
-            f"token_a={a_resp.status_code}, token_b={b_resp.status_code}"
+        assert old_resp.status_code == 401, "the pre-rotation token must not survive"
+        for rejected_resp in rejected:
+            assert "new_token" not in rejected_resp.json(), (
+                "a rotation rejected at the auth layer must not hand back a token"
+            )
+
+
+@pytest.mark.asyncio
+async def test_sequential_rotations_leave_only_the_last_token_active() -> None:
+    """Deterministic companion to the concurrent test above.
+
+    Which of two racing rotations wins is decided by the ASGI scheduler, so
+    the concurrent test cannot GUARANTEE it exercises the both-succeeded
+    branch — on a run where one request is rejected, its central assertion
+    degenerates. This test pins the same "single last writer" property with
+    no race at all: every intermediate token must be dead, only the final one
+    alive. Together they cover the invariant under both schedulings.
+    """
+    app = _make_app("change_me")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        tokens = ["change_me"]
+        for _ in range(3):
+            resp = await client.post(
+                "/api/v1/admin/rotate-token",
+                headers={"Authorization": f"Bearer {tokens[-1]}"},
+            )
+            assert resp.status_code == 200, resp.text
+            tokens.append(resp.json()["new_token"])
+
+        assert len(set(tokens)) == len(tokens), "every rotation must mint a distinct token"
+
+        alive = []
+        for token in tokens:
+            resp = await client.get(
+                "/api/v1/protected", headers={"Authorization": f"Bearer {token}"}
+            )
+            alive.append(resp.status_code == 200)
+
+        assert alive == [False, False, False, True], (
+            f"only the last token may remain active, got {alive}"
         )

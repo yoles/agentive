@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agentive_backend.shared.llm.redaction import (
     redact_api_keys_processor,
     redact_secrets,
@@ -96,3 +98,50 @@ def test_processor_passes_through_non_string_values() -> None:
     assert out["ratio"] == 0.5
     assert out["enabled"] is True
     assert out["missing"] is None
+
+
+# ─── URL credentials (Story 4.2 review, finding #13) ───────────────────
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "connection failed: postgresql://agentive_app:sup3r-s3cret@db:5432/agentive",
+        "postgresql+psycopg://owner:p%40ss@localhost/agentive",
+        "could not connect to https://user:hunter2@api.example.com/v1/chat",
+    ],
+)
+def test_redacts_url_credentials(raw: str) -> None:
+    """Prefix patterns alone missed the single most common secret shape in
+    an exception message: a psycopg `OperationalError` embeds the full DSN,
+    password included. Story 4.2 persists `str(exc)` in
+    `workflow_runs.checkpoint.last_error` AND streams it to SSE clients."""
+    out = redact_secrets(raw)
+    assert "[REDACTED]" in out
+    for leaked in ("sup3r-s3cret", "p%40ss", "hunter2"):
+        assert leaked not in out
+
+
+def test_url_credential_redaction_keeps_the_diagnostic_part() -> None:
+    """Redaction must not destroy the reason the string was logged."""
+    out = redact_secrets("postgresql://app:pw@db.internal:5432/agentive — timeout")
+    assert "db.internal:5432/agentive" in out
+    assert "timeout" in out
+
+
+def test_url_credential_redaction_is_idempotent() -> None:
+    once = redact_secrets("postgresql://app:pw@db:5432/agentive")
+    assert redact_secrets(once) == once
+
+
+def test_url_without_credentials_is_untouched() -> None:
+    """No userinfo, nothing to redact — a plain URL must survive intact."""
+    clean = "GET https://api.anthropic.com/v1/messages returned 503"
+    assert redact_secrets(clean) == clean
+
+
+def test_host_port_is_not_mistaken_for_credentials() -> None:
+    """`db:5432` after `//` is host:port, not user:password — the `@`
+    terminator is what distinguishes them."""
+    clean = "cannot reach postgresql://db:5432/agentive"
+    assert redact_secrets(clean) == clean

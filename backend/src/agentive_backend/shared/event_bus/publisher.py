@@ -62,8 +62,7 @@ _log = get_logger(__name__)
 
 def _psycopg_dsn() -> str:
     """Strip the SQLAlchemy ``+psycopg`` dialect marker for raw psycopg use."""
-    raw = str(settings.database_url)
-    return raw.replace("postgresql+psycopg://", "postgresql://", 1)
+    return settings.psycopg_dsn
 
 
 def _resolve_correlation_id(explicit: UUID | None) -> UUID:

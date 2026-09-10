@@ -31,13 +31,28 @@ _API_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bpa-[A-Za-z0-9_\-]{30,}"),
 )
 
+# URL userinfo — `scheme://user:password@host`. API-key prefixes are not the
+# only secret shape that reaches an exception message: a psycopg
+# `OperationalError` routinely embeds the full DSN, password included, and
+# an httpx error embeds the request URL. Both end up in
+# `str(exc)` — which Story 4.2 persists as `workflow_runs.checkpoint
+# .last_error` AND streams to SSE clients (`WorkflowRunFailedEvent
+# .error_summary`), so a prefix-only redactor left credentials in plain
+# sight in two durable places.
+#
+# The username goes with the password: it is not a secret by itself, but
+# keeping it buys nothing and complicates the idempotency argument below.
+_URL_CREDENTIALS_PATTERN = re.compile(r"://[^:/?#\s@]+:[^@/\s]+@")
+
 _REDACTED = "[REDACTED]"
 
 
 def redact_secrets(text: str) -> str:
-    """Replace any API key-shaped substring with ``[REDACTED]``.
+    """Replace any API key-shaped substring or URL credentials with ``[REDACTED]``.
 
-    Idempotent: applying twice yields the same string. Safe on ``None``-ish
+    Idempotent: applying twice yields the same string — the URL substitution
+    leaves ``://[REDACTED]@``, which the pattern cannot match again (it
+    requires a ``:`` between the userinfo and the ``@``). Safe on ``None``-ish
     inputs (returns the input unchanged) — callers may pass arbitrary
     str(exception) outputs.
     """
@@ -46,7 +61,7 @@ def redact_secrets(text: str) -> str:
     out = text
     for pattern in _API_KEY_PATTERNS:
         out = pattern.sub(_REDACTED, out)
-    return out
+    return _URL_CREDENTIALS_PATTERN.sub(f"://{_REDACTED}@", out)
 
 
 def _redact_value(value: Any) -> Any:
