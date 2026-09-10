@@ -36,7 +36,6 @@ from agentive_backend.features.agent_registry.domain import (
     Archetype,
     ProviderChain,
     Version,
-    check_llm_diversity,
 )
 from agentive_backend.features.agent_registry.domain import (
     AgentTemplate as DomainAgentTemplate,
@@ -58,6 +57,7 @@ from agentive_backend.features.agent_registry.schemas import (
 from agentive_backend.features.agent_registry.schemas import (
     LLMParams as LLMParamsSchema,
 )
+from agentive_backend.shared.contracts.diversity import LLMSelection, check_llm_diversity
 from agentive_backend.shared.contracts.events import (
     AgentInstanceCreatedEvent,
     AgentTemplateCreatedEvent,
@@ -80,6 +80,22 @@ if TYPE_CHECKING:
     )
 
 _log = get_logger(__name__)
+
+
+def _to_llm_selection(config: AgentConfig) -> LLMSelection | None:
+    """Project ``AgentConfig`` onto the shared ``LLMSelection`` VO (Story 4.1 T1.4).
+
+    ``None`` if the template's LLM config is not yet set (Story 2.2 not yet
+    applied) — ``check_llm_diversity`` reads that as "incomplete", never a
+    fabricated default.
+    """
+    if config.llm_model is None or config.llm_params is None:
+        return None
+    return LLMSelection(
+        model=config.llm_model,
+        temperature=config.llm_params.temperature,
+        max_tokens=config.llm_params.max_tokens,
+    )
 
 
 def _to_llm_params_schema(config: AgentConfig) -> LLMParamsSchema | None:
@@ -336,7 +352,9 @@ class AgentTemplateService:
 
         controller_config = AgentConfig.from_mapping(controller.config)
         producer_config = AgentConfig.from_mapping(producer.config)
-        result = check_llm_diversity(controller_config, producer_config)
+        result = check_llm_diversity(
+            _to_llm_selection(controller_config), _to_llm_selection(producer_config)
+        )
 
         return DiversityCheckResponse(
             controller_archetype=controller.archetype,

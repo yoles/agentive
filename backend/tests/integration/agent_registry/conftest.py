@@ -32,6 +32,7 @@ from agentive_backend.features.agent_registry import router as agents_router
 from agentive_backend.features.memory_manager import router as memory_router
 from agentive_backend.features.playground import router as playground_router
 from agentive_backend.features.tool_hub import router as tools_router
+from agentive_backend.features.workflow_engine import router as workflows_router
 from agentive_backend.infra.llm.openai_adapter import (
     EMBEDDING_MODEL_NAME as OPENAI_EMBEDDING_MODEL_NAME,
 )
@@ -100,6 +101,9 @@ def make_e2e_app(
     app.include_router(playground_router, prefix="/api/v1")
     # Story 3.1 — m4 memory_manager router.
     app.include_router(memory_router, prefix="/api/v1")
+    # Story 4.1 — m3 workflow_engine router (cross-feature: e2e tests need
+    # templates created via agents_router as workflow DAG nodes).
+    app.include_router(workflows_router, prefix="/api/v1")
 
     @app.exception_handler(AgentiveError)
     async def _handle_agentive_error(  # pragma: no cover — verbatim of app.main handler
