@@ -29,11 +29,14 @@ from typing import ClassVar, Final
 
 from fastembed import TextEmbedding
 
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
+
 # Canonical name stored in `chunk_embeddings.model` — matches the partial
 # HNSW index already migrated by Story 3.1 (`architecture.md:603`). NOT the
 # same string as the HuggingFace repo id below: Story 3.1 picked the short
 # form for the column before this adapter existed.
 EMBEDDING_MODEL_NAME: Final[str] = "bge-small-en-v1.5"
+EMBEDDING_DIMENSIONS: Final[int] = 384
 
 # The HuggingFace Hub repo id `fastembed.TextEmbedding` actually loads.
 _HF_MODEL_NAME: Final[str] = "BAAI/bge-small-en-v1.5"
@@ -58,6 +61,7 @@ class FastEmbedProvider:
         *,
         model: str,  # noqa: ARG002 — required by the Embedder protocol contract
         timeout_s: float = 30.0,  # noqa: ARG002 — required by the Embedder protocol contract
+        purpose: EmbeddingPurpose | None = None,  # noqa: ARG002 — local model has no retrieval mode
     ) -> list[list[float]]:
         """Embed ``texts`` via the local ONNX model (Story 3.6 T2.2).
 
@@ -83,4 +87,4 @@ class FastEmbedProvider:
         return await asyncio.to_thread(_run)
 
 
-__all__ = ["EMBEDDING_MODEL_NAME", "FastEmbedProvider"]
+__all__ = ["EMBEDDING_DIMENSIONS", "EMBEDDING_MODEL_NAME", "FastEmbedProvider"]

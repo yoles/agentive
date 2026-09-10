@@ -12,10 +12,12 @@ import pytest
 from voyageai import error as voyage_error
 
 from agentive_backend.infra.llm.voyage_adapter import (
+    EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL_NAME,
     VoyageProvider,
     _classify_voyage_exception,
 )
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
 from agentive_backend.shared.llm.exceptions import (
     LLMProviderAuthError,
     LLMProviderBadRequestError,
@@ -27,6 +29,7 @@ from agentive_backend.shared.llm.exceptions import (
 
 def test_embedding_model_name() -> None:
     assert EMBEDDING_MODEL_NAME == "voyage-3-lite"
+    assert EMBEDDING_DIMENSIONS == 512
 
 
 def test_provider_name_is_voyage() -> None:
@@ -69,7 +72,24 @@ async def test_embed_returns_vectors_in_input_order() -> None:
 
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
     client_cls.assert_called_once_with(api_key="vk-test", timeout=12.0)
-    fake_client.embed.assert_called_once_with(["a", "b"], model=EMBEDDING_MODEL_NAME)
+    fake_client.embed.assert_called_once_with(
+        ["a", "b"], model=EMBEDDING_MODEL_NAME, input_type=None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purpose", ["document", "query"])
+async def test_embed_passes_purpose_through_as_input_type(purpose: EmbeddingPurpose) -> None:
+    fake_result = MagicMock()
+    fake_result.embeddings = [[0.1, 0.2]]
+    fake_client = MagicMock()
+    fake_client.embed.return_value = fake_result
+
+    with patch("agentive_backend.infra.llm.voyage_adapter.VoyageClient", return_value=fake_client):
+        provider = VoyageProvider(api_key="vk-test")
+        await provider.embed(["a"], model=EMBEDDING_MODEL_NAME, purpose=purpose)
+
+    fake_client.embed.assert_called_once_with(["a"], model=EMBEDDING_MODEL_NAME, input_type=purpose)
 
 
 @pytest.mark.asyncio

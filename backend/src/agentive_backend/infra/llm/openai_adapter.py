@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import SecretStr
 
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
 from agentive_backend.shared.llm.exceptions import (
     LLMError,
     LLMProviderAuthError,
@@ -52,6 +53,7 @@ _NEW_MAX_TOKENS_PREFIXES: tuple[str, ...] = ("o1", "o3", "o4", "gpt-5")
 # now that `EmbeddingRouter` (T4) needs one canonical name per backend.
 # Matches the partial HNSW index `chunk_embeddings_openai_hnsw` (Story 3.1).
 EMBEDDING_MODEL_NAME: Final[str] = "text-embedding-3-small"
+EMBEDDING_DIMENSIONS: Final[int] = 1536
 
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": "stop",
@@ -242,6 +244,7 @@ class OpenAIProvider:
         *,
         model: str,
         timeout_s: float = 30.0,
+        purpose: EmbeddingPurpose | None = None,  # noqa: ARG002 — OpenAI path remains unchanged
     ) -> list[list[float]]:
         """Embed ``texts`` via ``langchain_openai.OpenAIEmbeddings`` (Story 3.1 T1.2).
 

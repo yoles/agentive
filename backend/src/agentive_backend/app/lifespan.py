@@ -28,10 +28,19 @@ from agentive_backend.infra.llm import (
     VoyageProvider,
 )
 from agentive_backend.infra.llm.fastembed_adapter import (
+    EMBEDDING_DIMENSIONS as FASTEMBED_EMBEDDING_DIMENSIONS,
+)
+from agentive_backend.infra.llm.fastembed_adapter import (
     EMBEDDING_MODEL_NAME as FASTEMBED_EMBEDDING_MODEL_NAME,
 )
 from agentive_backend.infra.llm.openai_adapter import (
+    EMBEDDING_DIMENSIONS as OPENAI_EMBEDDING_DIMENSIONS,
+)
+from agentive_backend.infra.llm.openai_adapter import (
     EMBEDDING_MODEL_NAME as OPENAI_EMBEDDING_MODEL_NAME,
+)
+from agentive_backend.infra.llm.voyage_adapter import (
+    EMBEDDING_DIMENSIONS as VOYAGE_EMBEDDING_DIMENSIONS,
 )
 from agentive_backend.infra.llm.voyage_adapter import (
     EMBEDDING_MODEL_NAME as VOYAGE_EMBEDDING_MODEL_NAME,
@@ -264,28 +273,29 @@ def _build_embedding_router() -> EmbeddingRouter:
     ---------------
     * ``cloud`` (OpenAI) — mandatory, unchanged decision from the old
       ``_build_embedder``: no key + production → :class:`RuntimeError`; no
-      key + dev/test → :class:`MockEmbedder`. This is the one backend
-      :class:`EmbeddingRouter.resolve` degrades any unknown/unwired backend
-      to (T4.2), so it must always be present in ``providers``.
+      key + dev/test → :class:`MockEmbedder`.
     * ``local`` (FastEmbed) — always ATTEMPTED, no API key needed, but the
       load can fail (network unreachable to the HuggingFace Hub, or the
       first-run download not yet cached — T2.1 loads eagerly at
       construction). Decision: catch that failure, log it, and simply leave
       ``"local"`` out of ``providers`` in EVERY environment (dev AND
       production) — the same "optional backend that may not be wired"
-      posture as ``voyage`` below, not a boot-blocking failure. Namespaces
-      configured for ``local`` fall back to ``cloud`` (with a warning) via
-      :meth:`EmbeddingRouter.resolve` until the model is reachable; crashing
-      the WHOLE process — search and chunk writes on every other namespace
-      included — over one optional backend would be a strictly worse
-      failure mode than serving without it.
+      posture as ``voyage`` below, not a boot-blocking failure. Décision
+      John 2026-09-09 (Story 3.6 code review) : namespaces configured for
+      ``local`` get an explicit 503 from :meth:`EmbeddingRouter.resolve`
+      until the model is reachable — NOT a silent fallback to ``cloud``,
+      which would break write/read backend symmetry. Crashing the WHOLE
+      process — search and chunk writes on every other namespace included —
+      over one optional backend would still be a strictly worse failure
+      mode than serving every other namespace while this one 503s.
     * ``voyage`` — built only when ``VOYAGE_API_KEY`` is configured;
       absent, the backend simply does not exist in ``providers`` (same
-      "optional, silently unavailable" contract as ``local``'s failure
-      path above).
+      "optional, refuses explicitly rather than silently" contract as
+      ``local``'s failure path above).
     """
     providers: dict[str, Embedder] = {}
     model_by_backend: dict[str, str] = {}
+    dimensions_by_backend: dict[str, int] = {}
 
     # `.strip()`: a whitespace-only secret is truthy, and used to let the
     # production boot succeed with a key that fails 401 on every request
@@ -308,6 +318,7 @@ def _build_embedding_router() -> EmbeddingRouter:
     else:
         providers["cloud"] = OpenAIProvider(api_key=openai_key)
     model_by_backend["cloud"] = OPENAI_EMBEDDING_MODEL_NAME
+    dimensions_by_backend["cloud"] = OPENAI_EMBEDDING_DIMENSIONS
 
     try:
         providers["local"] = FastEmbedProvider()
@@ -318,18 +329,25 @@ def _build_embedding_router() -> EmbeddingRouter:
         )
     else:
         model_by_backend["local"] = FASTEMBED_EMBEDDING_MODEL_NAME
+        dimensions_by_backend["local"] = FASTEMBED_EMBEDDING_DIMENSIONS
 
     voyage_key = settings.voyage_api_key
-    if voyage_key is not None and voyage_key.get_secret_value().strip():
-        providers["voyage"] = VoyageProvider(api_key=voyage_key.get_secret_value())
+    normalized_voyage_key = voyage_key.get_secret_value().strip() if voyage_key is not None else ""
+    if normalized_voyage_key:
+        providers["voyage"] = VoyageProvider(api_key=normalized_voyage_key)
         model_by_backend["voyage"] = VOYAGE_EMBEDDING_MODEL_NAME
+        dimensions_by_backend["voyage"] = VOYAGE_EMBEDDING_DIMENSIONS
 
     log.info(
         "embedding_router.built",
         backends=sorted(providers),
         environment=settings.environment,
     )
-    return EmbeddingRouter(providers=providers, model_by_backend=model_by_backend)
+    return EmbeddingRouter(
+        providers=providers,
+        model_by_backend=model_by_backend,
+        dimensions_by_backend=dimensions_by_backend,
+    )
 
 
 @asynccontextmanager

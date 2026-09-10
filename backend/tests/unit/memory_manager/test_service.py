@@ -144,7 +144,9 @@ async def test_create_chunk_no_ttl_no_policy_never_expires() -> None:
     assert result.expires_at is None
     create_kwargs = chunk_repo.create.await_args.kwargs
     assert create_kwargs["expires_at"] is None
-    embedding_router.embed.assert_awaited_once_with(["hello"], backend="cloud")
+    embedding_router.embed.assert_awaited_once_with(
+        ["hello"], backend="cloud", purpose="document", namespace=namespace.name
+    )
     embedding_repo.upsert.assert_awaited_once()
     assert result.embedding_model == _CLOUD_MODEL
     assert result.namespace == namespace.name
@@ -227,7 +229,9 @@ async def test_search_maps_repo_rows_to_dto() -> None:
     assert [r.content for r in results] == ["alpha", "beta"]
     assert [r.score for r in results] == [0.9, 0.5]
     assert all(r.namespace == namespace.name for r in results)
-    embedding_router.embed.assert_awaited_once_with(["q"], backend="cloud")
+    embedding_router.embed.assert_awaited_once_with(
+        ["q"], backend="cloud", purpose="query", namespace=namespace.name
+    )
     search_kwargs = embedding_repo.search_ann.await_args.kwargs
     assert search_kwargs["model"] == _CLOUD_MODEL
     assert search_kwargs["namespace_id"] == namespace.id
@@ -359,7 +363,9 @@ async def test_search_resolves_the_backend_from_the_namespace() -> None:
 
     await service.search(namespace_name=namespace.name, query="hello", top_k=5)
 
-    embedding_router.embed.assert_awaited_once_with(["hello"], backend="local")
+    embedding_router.embed.assert_awaited_once_with(
+        ["hello"], backend="local", purpose="query", namespace=namespace.name
+    )
 
 
 # ─── Code review Story 3.1 — intent gaps ──────────────────────
@@ -473,6 +479,7 @@ def _patch_event_bus(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     async def _fake_publish(event_type: str, event: object, **_kw: object) -> object:
         captured["event_type"] = event_type
         captured["event"] = event
+        captured["publish_kwargs"] = _kw
         return uuid4()
 
     monkeypatch.setattr(service_module, "publish", _fake_publish)
@@ -1416,8 +1423,12 @@ async def test_purge_chunk_soft_deletes_and_publishes_manual_purge(
     await service.purge_chunk(chunk.id)
 
     chunk_repo.mark_archived_in_session.assert_awaited_once()
+    transaction_session = chunk_repo.mark_archived_in_session.await_args.args[0]
     assert chunk_repo.mark_archived_in_session.await_args.args[1] == [chunk.id]
     assert captured["event_type"] == "memory_manager.chunk.archived"
+    publish_kwargs = captured["publish_kwargs"]
+    assert isinstance(publish_kwargs, dict)
+    assert publish_kwargs["session"] is transaction_session
     event = captured["event"]
     assert event.reason == "manual_purge"  # type: ignore[attr-defined]
     assert event.chunk_id == chunk.id  # type: ignore[attr-defined]
@@ -1572,11 +1583,18 @@ async def test_write_read_symmetry_local_namespace_finds_its_own_chunks() -> Non
     having."""
     namespace = _make_namespace(name="ns-local", embedding_backend="local")
     written: dict[str, list[float]] = {}
+    embed_calls: list[tuple[str, str | None]] = []
 
     async def _embed(
-        texts: list[str], *, backend: str, timeout_s: float = 30.0
+        texts: list[str],
+        *,
+        backend: str,
+        timeout_s: float = 30.0,
+        purpose: str | None = None,
+        **_kw: object,
     ) -> tuple[list[list[float]], str, str]:
         assert backend == "local"
+        embed_calls.append((backend, purpose))
         return [[0.42]], "bge-small-en-v1.5", "fastembed"
 
     async def _upsert(
@@ -1612,6 +1630,7 @@ async def test_write_read_symmetry_local_namespace_finds_its_own_chunks() -> Non
     results = await service.search(namespace_name="ns-local", query="hello", top_k=5)
 
     assert [r.content for r in results] == ["found"]
+    assert embed_calls == [("local", "document"), ("local", "query")]
 
 
 @pytest.mark.asyncio
@@ -1631,10 +1650,17 @@ async def test_write_read_symmetry_mismatched_backend_returns_nothing_explicitly
     # the model NAME (`search_ann`'s `WHERE model = :model`), not the
     # vector's value.
     written: dict[str, list[float]] = {}
+    embed_calls: list[tuple[str, str | None]] = []
 
     async def _embed(
-        texts: list[str], *, backend: str, timeout_s: float = 30.0
+        texts: list[str],
+        *,
+        backend: str,
+        timeout_s: float = 30.0,
+        purpose: str | None = None,
+        **_kw: object,
     ) -> tuple[list[list[float]], str, str]:
+        embed_calls.append((backend, purpose))
         model = {"local": "bge-small-en-v1.5", "cloud": "text-embedding-3-small"}[backend]
         return [[0.42]], model, "fake"
 
@@ -1676,3 +1702,4 @@ async def test_write_read_symmetry_mismatched_backend_returns_nothing_explicitly
     results = await service.search(namespace_name="ns-mixed", query="hello", top_k=5)
 
     assert results == []
+    assert embed_calls == [("local", "document"), ("cloud", "query")]

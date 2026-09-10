@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 from uuid import uuid4
 
@@ -77,9 +78,30 @@ class _FakeLocalEmbedder:
     provider_name: ClassVar[str] = "fastembed"
 
     async def embed(
-        self, texts: list[str], *, model: str, timeout_s: float = 30.0
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        timeout_s: float = 30.0,
+        purpose: str | None = None,
     ) -> list[list[float]]:
         return [_deterministic_vector(t, dims=384) for t in texts]
+
+
+class _FakeVoyageEmbedder:
+    """Test-only Voyage backend with the production model's 512 dimensions."""
+
+    provider_name: ClassVar[str] = "voyage"
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        timeout_s: float = 30.0,
+        purpose: str | None = None,
+    ) -> list[list[float]]:
+        return [_deterministic_vector(t, dims=512) for t in texts]
 
 
 @pytest.mark.asyncio
@@ -1643,6 +1665,7 @@ async def test_local_backend_write_then_search_round_trip(
     app.state.embedding_router = EmbeddingRouter(
         providers={"cloud": MockEmbedder(), "local": _FakeLocalEmbedder()},
         model_by_backend={"cloud": "text-embedding-3-small", "local": "bge-small-en-v1.5"},
+        dimensions_by_backend={"cloud": 1536, "local": 384},
     )
 
     transport = httpx.ASGITransport(app=app)
@@ -1668,28 +1691,71 @@ async def test_local_backend_write_then_search_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_local_backend_unwired_degrades_to_cloud(
+async def test_voyage_backend_512_dimension_write_then_search_round_trip(
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """T4.2 — a namespace configured for `local` when the app only wired
-    `cloud` (e.g. FastEmbed failed to load at boot, `app/lifespan.py`
-    T6.1) still works: `EmbeddingRouter.resolve` degrades instead of
-    raising."""
+    """Exercise the Voyage model width through PostgreSQL and its HNSW index."""
+    from agentive_backend.shared.llm.embedding_router import EmbeddingRouter
+    from agentive_backend.shared.llm.testing import MockEmbedder
+
+    await _create_namespace(
+        app_session_factory,
+        name="voyage-e2e-ns",
+        embedding_backend="voyage",
+    )
+    app = _make_app(session_factory=app_session_factory)
+    app.state.embedding_router = EmbeddingRouter(
+        providers={"cloud": MockEmbedder(), "voyage": _FakeVoyageEmbedder()},
+        model_by_backend={
+            "cloud": "text-embedding-3-small",
+            "voyage": "voyage-3-lite",
+        },
+        dimensions_by_backend={"cloud": 1536, "voyage": 512},
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            json={"content": "hello from Voyage", "namespace": "voyage-e2e-ns"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["embedding_model"] == "voyage-3-lite"
+
+        search_resp = await client.post(
+            "/api/v1/memory/search",
+            headers=_auth_headers(),
+            json={"q": "hello from Voyage", "namespace": "voyage-e2e-ns", "top_k": 5},
+        )
+
+    assert search_resp.status_code == 200, search_resp.text
+    assert [item["content"] for item in search_resp.json()] == ["hello from Voyage"]
+
+
+@pytest.mark.asyncio
+async def test_local_backend_unwired_refuses_with_503(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 3.6 code review, Décision John 2026-09-09 — a namespace
+    configured for `local` when the app only wired `cloud` (e.g. FastEmbed
+    failed to load at boot, `app/lifespan.py` T6.1) must refuse explicitly:
+    `EmbeddingRouter.resolve` raises instead of silently degrading to
+    cloud, to preserve write/read backend symmetry."""
     await _create_namespace(app_session_factory, name="degrade-ns", embedding_backend="local")
     app = _make_app(session_factory=app_session_factory)
     # `make_e2e_app` only wires `"cloud"` by default — no override needed to
-    # exercise the degrade path.
+    # exercise the "backend not wired" path.
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/api/v1/memory/chunks",
             headers=_auth_headers(),
-            json={"content": "degrades to cloud", "namespace": "degrade-ns"},
+            json={"content": "should not silently use cloud", "namespace": "degrade-ns"},
         )
 
-    assert resp.status_code == 201, resp.text
-    assert resp.json()["embedding_model"] == "text-embedding-3-small"
+    assert resp.status_code == 503, resp.text
 
 
 # ─── Story 3.6 AC5 — GET /memory/chunks ────────────────────────────
@@ -1771,24 +1837,82 @@ async def test_list_chunks_content_contains_filter(
         await client.post(
             "/api/v1/memory/chunks",
             headers=_auth_headers(),
-            json={"content": "invoice number 42", "namespace": "list-filter-ns"},
+            json={"content": "INVOICE 100%_READY", "namespace": "list-filter-ns"},
         )
         await client.post(
             "/api/v1/memory/chunks",
             headers=_auth_headers(),
-            json={"content": "unrelated note", "namespace": "list-filter-ns"},
+            json={"content": "invoice 100XXready", "namespace": "list-filter-ns"},
         )
 
         resp = await client.get(
             "/api/v1/memory/chunks",
             headers=_auth_headers(),
-            params={"namespace": "list-filter-ns", "content_contains": "invoice"},
+            params={"namespace": "list-filter-ns", "content_contains": "invoice 100%_ready"},
         )
 
     assert resp.status_code == 200, resp.text
     items = resp.json()
     assert len(items) == 1
-    assert items[0]["content"] == "invoice number 42"
+    assert items[0]["content"] == "INVOICE 100%_READY"
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_date_window_and_pagination_are_deterministic(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_namespace(app_session_factory, name="list-window-ns")
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        chunk_ids: list[str] = []
+        for index in range(4):
+            created = await client.post(
+                "/api/v1/memory/chunks",
+                headers=_auth_headers(),
+                json={"content": f"chunk-{index}", "namespace": "list-window-ns"},
+            )
+            assert created.status_code == 201, created.text
+            chunk_ids.append(created.json()["chunk_id"])
+
+        timestamps = (
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+            datetime(2026, 1, 3, tzinfo=UTC),
+        )
+        async with app_session_factory() as session:
+            for chunk_id, created_at in zip(chunk_ids, timestamps, strict=True):
+                await session.execute(
+                    text("UPDATE memory_chunks SET created_at = :created_at WHERE id = :id"),
+                    {"created_at": created_at, "id": chunk_id},
+                )
+            await session.commit()
+
+        params = {
+            "namespace": "list-window-ns",
+            "created_after": timestamps[1].isoformat(),
+            "created_before": timestamps[3].isoformat(),
+            "limit": 2,
+        }
+        first_page = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params=params,
+        )
+        second_page = await client.get(
+            "/api/v1/memory/chunks",
+            headers=_auth_headers(),
+            params={**params, "offset": 2},
+        )
+
+    assert first_page.status_code == 200, first_page.text
+    assert second_page.status_code == 200, second_page.text
+    tie_ids = sorted(chunk_ids[1:3], reverse=True)
+    expected_ids = [chunk_ids[3], *tie_ids]
+    assert [item["chunk_id"] for item in first_page.json()] == expected_ids[:2]
+    assert [item["chunk_id"] for item in second_page.json()] == expected_ids[2:]
 
 
 @pytest.mark.asyncio

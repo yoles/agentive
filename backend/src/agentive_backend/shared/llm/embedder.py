@@ -16,7 +16,9 @@ class.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+
+EmbeddingPurpose = Literal["document", "query"]
 
 
 @runtime_checkable
@@ -29,6 +31,7 @@ class Embedder(Protocol):
         *,
         model: str,
         timeout_s: float = 30.0,
+        purpose: EmbeddingPurpose | None = None,
     ) -> list[list[float]]:
         """Return one embedding vector per input text, same order as ``texts``.
 
@@ -40,4 +43,4 @@ class Embedder(Protocol):
         ...
 
 
-__all__ = ["Embedder"]
+__all__ = ["Embedder", "EmbeddingPurpose"]
