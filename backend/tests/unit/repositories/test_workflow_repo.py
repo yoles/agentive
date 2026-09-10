@@ -23,6 +23,24 @@ async def test_workflow_create_adds_orm_row() -> None:
 
 
 @pytest.mark.asyncio
+async def test_workflow_create_in_session_adds_row_without_commit() -> None:
+    """Story 4.1 T2.3 — create_in_session ajoute la row dans la session du
+    caller (no commit), mirror AgentTemplateRepo.create_in_session."""
+    _, session = make_session_factory_mock()
+    repo = WorkflowRepo(session_factory=lambda: None)
+    await repo.create_in_session(session, name="ingest", dag={"nodes": []})
+    session.add.assert_called_once()
+    session.flush.assert_awaited_once()
+    session.refresh.assert_awaited_once()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
+    workflow = session.add.call_args.args[0]
+    assert workflow.name == "ingest"
+    assert workflow.status == "active"
+    assert workflow.version == 1
+
+
+@pytest.mark.asyncio
 async def test_workflow_run_update_status_returns_int_from_rowcount() -> None:
     factory, session = make_session_factory_mock()
     # Make execute return a result whose rowcount is 1.

@@ -13,7 +13,7 @@ import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentive_backend.features.agent_registry.domain.diversity import (
+from agentive_backend.shared.contracts.diversity import (
     INCOMPLETE_CONFIG_REASON,
     SAME_CONFIG_REASON,
 )

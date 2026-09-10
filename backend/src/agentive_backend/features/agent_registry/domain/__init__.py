@@ -12,9 +12,10 @@ schemas, the imperative service code, and the ORM:
 * :mod:`.aggregates` — Palier 2 : ``AgentTemplate.revise()`` encapsulates the
   "system_prompt change ⇒ version bump + prompt revision" rule, unit-testable
   without a DB.
-* :mod:`.diversity` — Story 2.8, FR15 : ``check_llm_diversity`` compares a
-  Contrôleur and a Producteur ``AgentConfig`` and returns a three-state
-  ``DiversityCheckResult`` (diverse / identical / config incomplete).
+``check_llm_diversity`` (Story 2.8, FR15) moved to
+``agentive_backend.shared.contracts.diversity`` in Story 4.1 (D84 point 2) —
+``features.workflow_engine`` needs it too and ``.import-linter`` Contract 1
+forbids a feature-to-feature import.
 
 Wiring status
 -------------
@@ -34,10 +35,6 @@ from __future__ import annotations
 from agentive_backend.features.agent_registry.domain.aggregates import (
     AgentTemplate,
     PromptRevision,
-)
-from agentive_backend.features.agent_registry.domain.diversity import (
-    DiversityCheckResult,
-    check_llm_diversity,
 )
 from agentive_backend.features.agent_registry.domain.value_objects import (
     AgentConfig,
@@ -59,7 +56,6 @@ __all__ = [
     "Archetype",
     "BackoffStrategy",
     "Contract",
-    "DiversityCheckResult",
     "DomainValidationError",
     "ErrorPolicy",
     "LLMParams",
@@ -68,5 +64,4 @@ __all__ = [
     "ProviderChain",
     "ProviderId",
     "Version",
-    "check_llm_diversity",
 ]

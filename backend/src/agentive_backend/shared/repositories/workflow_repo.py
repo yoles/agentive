@@ -43,18 +43,50 @@ class WorkflowRepo(BaseRepo):
         status: str = "active",
         tenant_id: UUID | None = None,
     ) -> Workflow:
+        """Convenience wrapper — self-managed transaction.
+
+        Use :meth:`create_in_session` from inside an existing transaction
+        when you need to compose the INSERT with another write (e.g.
+        publishing an outbox event atomically, Story 4.1 T2).
+        """
         async with self.with_tenant(tenant_id) as session:
-            workflow = Workflow(
+            return await self.create_in_session(
+                session,
                 name=name,
-                version=version,
                 dag=dag,
+                version=version,
                 status=status,
                 tenant_id=tenant_id,
             )
-            session.add(workflow)
-            await session.flush()
-            await session.refresh(workflow)
-            return workflow
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        name: str,
+        dag: dict[str, Any],
+        version: int = 1,
+        status: str = "active",
+        tenant_id: UUID | None = None,
+    ) -> Workflow:
+        """INSERT inside the caller's transaction — caller owns commit.
+
+        Story 4.1 T2 — mirror exact of ``AgentTemplateRepo.create_in_session``.
+        Used by ``WorkflowService.create_workflow`` to publish
+        ``workflow_engine.workflow.created`` in the same transaction as the
+        row INSERT (atomicity with the outbox pattern, Story 1.4).
+        """
+        workflow = Workflow(
+            name=name,
+            version=version,
+            dag=dag,
+            status=status,
+            tenant_id=tenant_id,
+        )
+        session.add(workflow)
+        await session.flush()
+        await session.refresh(workflow)
+        return workflow
 
 
 class WorkflowRunRepo(BaseRepo):

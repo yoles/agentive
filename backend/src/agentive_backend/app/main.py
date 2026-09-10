@@ -211,11 +211,13 @@ def create_app() -> FastAPI:
     from agentive_backend.features.memory_manager import router as memory_router
     from agentive_backend.features.playground import router as playground_router
     from agentive_backend.features.tool_hub import router as tools_router
+    from agentive_backend.features.workflow_engine import router as workflows_router
 
     app.include_router(agents_router, prefix="/api/v1")
     app.include_router(tools_router, prefix="/api/v1")
     app.include_router(playground_router, prefix="/api/v1")
     app.include_router(memory_router, prefix="/api/v1")
+    app.include_router(workflows_router, prefix="/api/v1")
 
     return app
 
