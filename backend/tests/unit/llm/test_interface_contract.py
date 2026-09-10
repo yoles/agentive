@@ -84,13 +84,14 @@ def test_embed_method_is_async_with_canonical_signature() -> None:
     assert inspect.iscoroutinefunction(Embedder.embed)
 
     parameters = list(sig.parameters.keys())
-    assert parameters == ["self", "texts", "model", "timeout_s"]
+    assert parameters == ["self", "texts", "model", "timeout_s", "purpose"]
     assert sig.parameters["timeout_s"].default == 30.0
+    assert sig.parameters["purpose"].default is None
 
 
 def test_embedder_protocol_runtime_checkable() -> None:
     class _Conforming:
-        async def embed(self, texts, *, model, timeout_s=30.0):  # type: ignore[no-untyped-def]
+        async def embed(self, texts, *, model, timeout_s=30.0, purpose=None):  # type: ignore[no-untyped-def]
             raise NotImplementedError
 
     assert isinstance(_Conforming(), Embedder)

@@ -64,7 +64,8 @@ class MemoryChunkRepo(BaseRepo):
                 stmt = stmt.where(MemoryChunk.created_at >= created_after)
             if created_before is not None:
                 stmt = stmt.where(MemoryChunk.created_at <= created_before)
-            stmt = stmt.order_by(MemoryChunk.created_at.desc()).limit(limit).offset(offset)
+            stmt = stmt.order_by(MemoryChunk.created_at.desc(), MemoryChunk.id.desc())
+            stmt = stmt.limit(limit).offset(offset)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 

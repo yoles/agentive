@@ -14,6 +14,7 @@ import math
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
 from agentive_backend.shared.llm.types import ChatMessage, Completion
 
 
@@ -129,8 +130,11 @@ class MockEmbedder:
         *,
         model: str,
         timeout_s: float = 30.0,
+        purpose: EmbeddingPurpose | None = None,
     ) -> list[list[float]]:
-        self._calls.append({"texts": list(texts), "model": model, "timeout_s": timeout_s})
+        self._calls.append(
+            {"texts": list(texts), "model": model, "timeout_s": timeout_s, "purpose": purpose}
+        )
         return [self.vector_for(text) for text in texts]
 
     @staticmethod

@@ -173,7 +173,7 @@ class ChunkEmbedding(Base):
         primary_key=True,
     )
     model: Mapped[str] = mapped_column(String(100), primary_key=True)
-    # Vector dimension varies by model (bge-small 384, openai-3-small 1536, voyage-3-lite 1024)
+    # Vector dimension varies by model (bge-small 384, openai-3-small 1536, voyage-3-lite 512)
     # Stored as generic Vector; partial HNSW indexes per model created in migration
     embedding: Mapped[list[float]] = mapped_column(Vector(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(

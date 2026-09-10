@@ -86,6 +86,7 @@ def make_e2e_app(
     app.state.embedding_router = EmbeddingRouter(
         providers={"cloud": MockEmbedder()},
         model_by_backend={"cloud": OPENAI_EMBEDDING_MODEL_NAME},
+        dimensions_by_backend={"cloud": 1536},
     )
 
     app.add_middleware(AuthTokenMiddleware)

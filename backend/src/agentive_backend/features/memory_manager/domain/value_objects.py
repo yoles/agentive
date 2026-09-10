@@ -66,10 +66,12 @@ class EmbeddingBackend(StrEnum):
     ``ck_namespace_type``), on purpose: AR19 wants future backends addable
     without a migration. The HTTP boundary (Pydantic, ``schemas.py``) is the
     only validation gate; a corrupt/unknown value already in the DB (hand-
-    seeded namespace) degrades to ``cloud`` at read time
+    seeded namespace) raises a 503-ready error at read time
     (:meth:`~agentive_backend.shared.llm.embedding_router.EmbeddingRouter.resolve`)
-    rather than raising, same posture as a malformed ``RetentionPolicy`` /
-    ``DecayPolicy``.
+    rather than degrading to ``cloud`` — unlike a malformed
+    ``RetentionPolicy``/``DecayPolicy``, silently persisting a cloud vector
+    under another model's namespace would break write/read symmetry
+    (Décision John 2026-09-09, Story 3.6 code review).
     """
 
     LOCAL = "local"

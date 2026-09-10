@@ -22,6 +22,7 @@ from typing import ClassVar, Final, cast
 from voyageai import error as voyage_error
 from voyageai.client import Client as VoyageClient
 
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
 from agentive_backend.shared.llm.exceptions import (
     LLMError,
     LLMProviderAuthError,
@@ -33,6 +34,7 @@ from agentive_backend.shared.llm.exceptions import (
 from agentive_backend.shared.llm.redaction import redact_secrets
 
 EMBEDDING_MODEL_NAME: Final[str] = "voyage-3-lite"
+EMBEDDING_DIMENSIONS: Final[int] = 512
 
 
 def _classify_voyage_exception(exc: Exception) -> LLMError | None:
@@ -76,6 +78,7 @@ class VoyageProvider:
         *,
         model: str,
         timeout_s: float = 30.0,
+        purpose: EmbeddingPurpose | None = None,
     ) -> list[list[float]]:
         """Embed ``texts`` via ``voyageai.Client.embed`` (Story 3.6 T3.2).
 
@@ -90,11 +93,18 @@ class VoyageProvider:
         like :class:`~agentive_backend.infra.llm.openai_adapter.OpenAIProvider.embed`
         building a fresh ``OpenAIEmbeddings`` per call, a fresh ``Client``
         is built here per call carrying that call's ``timeout_s``.
+
+        ``purpose`` maps directly onto Voyage's own ``input_type``
+        parameter — the SDK already uses the literal strings ``"document"``
+        / ``"query"`` (Story 3.6 code review, Décision John 2026-09-09), so
+        no translation table is needed, only a pass-through. ``None`` is
+        forwarded as-is: Voyage treats a missing ``input_type`` as a plain,
+        purpose-agnostic embedding, same as omitting the argument entirely.
         """
 
         def _run() -> list[list[float]]:
             client = VoyageClient(api_key=self._api_key, timeout=timeout_s)
-            result = client.embed(list(texts), model=model)
+            result = client.embed(list(texts), model=model, input_type=purpose)
             # `EmbeddingsObject.embeddings` is typed `list[list[float]] |
             # list[list[int]]` (int only for a quantized `output_dtype` we
             # never request) — cast rather than let `warn_return_any`-style
@@ -110,4 +120,4 @@ class VoyageProvider:
             raise translated from exc
 
 
-__all__ = ["EMBEDDING_MODEL_NAME", "VoyageProvider"]
+__all__ = ["EMBEDDING_DIMENSIONS", "EMBEDDING_MODEL_NAME", "VoyageProvider"]

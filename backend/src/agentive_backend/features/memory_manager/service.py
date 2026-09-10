@@ -230,7 +230,10 @@ class MemoryManagerService:
         # constraint violation), not provider flakiness — and it is
         # compensated below rather than left as an orphan.
         vectors, model, source = await self._embedding_router.embed(
-            [content], backend=namespace.embedding_backend
+            [content],
+            backend=namespace.embedding_backend,
+            purpose="document",
+            namespace=namespace_name,
         )
         embedding = _first_vector(vectors, namespace_name=namespace_name, model=model)
 
@@ -352,7 +355,10 @@ class MemoryManagerService:
         # getting `backend` from anywhere other than `namespace` directly
         # would be a correctness bug with no exception to catch it.
         vectors, model, _source = await self._embedding_router.embed(
-            [query], backend=namespace.embedding_backend
+            [query],
+            backend=namespace.embedding_backend,
+            purpose="query",
+            namespace=namespace_name,
         )
         # ONE clock read for the whole request (T4.2). The same instant feeds
         # `search_ann`'s `expires_at` filter and the decay scoring: two
