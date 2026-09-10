@@ -126,6 +126,24 @@ class Settings(BaseSettings):
         )
 
     @property
+    def psycopg_dsn(self) -> str:
+        """:attr:`database_url` as a plain ``postgresql://`` DSN.
+
+        For the consumers that speak raw psycopg rather than SQLAlchemy —
+        ``LISTEN/NOTIFY`` in the outbox publisher, and LangGraph's
+        ``PostgresSaver``/``AsyncPostgresSaver`` (Story 4.2). See
+        :func:`to_psycopg_dsn`.
+        """
+        return to_psycopg_dsn(str(self.database_url))
+
+    @property
+    def psycopg_dsn_owner(self) -> str:
+        """:attr:`database_url_owner` as a plain ``postgresql://`` DSN —
+        the ``agentive_owner`` counterpart of :attr:`psycopg_dsn`, used by
+        migrations that must issue DDL."""
+        return to_psycopg_dsn(str(self.database_url_owner))
+
+    @property
     def is_production(self) -> bool:
         return self.environment == "production"
 
@@ -201,6 +219,37 @@ class Settings(BaseSettings):
                     " print(Fernet.generate_key().decode())'`."
                 ) from exc
         return self
+
+
+# SQLAlchemy dialect markers that a raw psycopg / LangGraph consumer must not
+# see. `postgresql://` is listed so an already-converted DSN round-trips.
+_SQLALCHEMY_DIALECT_PREFIXES = (
+    "postgresql+psycopg://",
+    "postgresql+psycopg2://",
+    "postgresql://",
+)
+
+
+def to_psycopg_dsn(url: str) -> str:
+    """Strip SQLAlchemy's dialect marker so raw psycopg / LangGraph can connect.
+
+    Single home for a conversion that was open-coded in five places (app
+    lifespan, outbox publisher, the T1.2 checkpointer migration, and two test
+    fixtures). Each copy was a bare ``.replace(...)``, which is a SILENT no-op
+    on any unexpected scheme: a mistyped or future DSN would sail through
+    unconverted and only surface as a connection error somewhere far away.
+    This raises instead.
+
+    Raises:
+        ValueError: ``url`` does not carry a recognised PostgreSQL scheme.
+    """
+    for prefix in _SQLALCHEMY_DIALECT_PREFIXES:
+        if url.startswith(prefix):
+            return "postgresql://" + url[len(prefix) :]
+    raise ValueError(
+        f"not a recognised PostgreSQL DSN: {url.split('://', 1)[0]!r} "
+        f"(expected one of {_SQLALCHEMY_DIALECT_PREFIXES})"
+    )
 
 
 @lru_cache(maxsize=1)

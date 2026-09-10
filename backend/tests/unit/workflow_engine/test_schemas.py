@@ -61,3 +61,32 @@ def test_edge_node_ids_at_max_length_are_accepted() -> None:
     edge = WorkflowEdgeRequest(from_node_id="x" * 100, to_node_id="y" * 100)
     assert len(edge.from_node_id) == 100
     assert len(edge.to_node_id) == 100
+
+
+# ─── Lot 3 — finding #24 : node ids LangGraph reserves ─────────────────
+
+
+@pytest.mark.parametrize("reserved", ["__start__", "__end__", "__interrupt__", "__x__"])
+def test_reserved_node_id_is_refused_at_creation(reserved: str) -> None:
+    """LangGraph's `StateGraph.add_node` REFUSES these names. Accepted at
+    creation (4.1 only bounded the length), such a workflow blew up at
+    `build_state_graph` time instead — i.e. at RUN time, on a background
+    task, for every run of that workflow forever."""
+    with pytest.raises(ValidationError, match="reserved"):
+        WorkflowNodeRequest(node_id=reserved, agent_template_id=uuid4())
+
+
+@pytest.mark.parametrize("field", ["from_node_id", "to_node_id"])
+def test_reserved_edge_endpoint_is_refused(field: str) -> None:
+    """Otherwise these surfaced as the much vaguer "edge references
+    undeclared node"."""
+    kwargs = {"from_node_id": "a", "to_node_id": "b", field: "__end__"}
+    with pytest.raises(ValidationError, match="reserved"):
+        WorkflowEdgeRequest(**kwargs)
+
+
+@pytest.mark.parametrize("ordinary", ["__init", "start__", "_private", "a__b", "__"])
+def test_ordinary_node_ids_with_underscores_are_still_accepted(ordinary: str) -> None:
+    """The guard targets dunder-WRAPPED names only — it must not become a
+    blanket ban on underscores."""
+    assert WorkflowNodeRequest(node_id=ordinary, agent_template_id=uuid4()).node_id == ordinary

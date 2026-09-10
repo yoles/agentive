@@ -13,6 +13,9 @@ from typing import Any
 
 import bcrypt
 from fastapi import FastAPI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from agentive_backend.features.agent_registry import load_registry
 from agentive_backend.features.memory_manager.push_memory import (
@@ -20,6 +23,11 @@ from agentive_backend.features.memory_manager.push_memory import (
 )
 from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
+from agentive_backend.features.workflow_engine.recovery import WorkflowRecoveryWorker
+from agentive_backend.features.workflow_engine.service import (
+    WorkflowExecutionService,
+    cancel_inflight_runs,
+)
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.infra.llm import (
     AnthropicProvider,
@@ -62,9 +70,35 @@ from agentive_backend.shared.llm import (
 )
 from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
-from agentive_backend.shared.repositories import ChunkEmbeddingRepo, MemoryChunkRepo, NamespaceRepo
+from agentive_backend.shared.repositories import (
+    AgentTemplateRepo,
+    ChunkEmbeddingRepo,
+    MemoryChunkRepo,
+    NamespaceRepo,
+    WorkflowRepo,
+    WorkflowRunRepo,
+)
 
 log = get_logger(__name__)
+
+# LangGraph checkpointer pool (Story 4.2 T9.1, review finding #8). Small on
+# purpose: checkpoint writes are short and serialized per run, so this sizes
+# for concurrent RUNS, not for request throughput. `max_lifetime` recycles
+# connections so a long-lived process never accumulates stale sockets behind
+# a load balancer or a Postgres `idle_session_timeout`.
+_CHECKPOINT_POOL_MIN_SIZE = 1
+_CHECKPOINT_POOL_MAX_SIZE = 10
+_CHECKPOINT_POOL_MAX_LIFETIME_S = 30 * 60.0
+_CHECKPOINT_POOL_OPEN_TIMEOUT_S = 10.0
+
+
+def _workflow_checkpoint_dsn() -> str:
+    """Canonical ``postgresql://`` DSN for the runtime :class:`AsyncPostgresSaver`
+    (Story 4.2 T9.1) — mirror ``spike/m3_langgraph.py::_checkpoint_dsn``, but
+    on ``settings.database_url`` (``agentive_app`` role, DML-only grants)
+    rather than the owner DSN the T1.2 migration used for ``CREATE TABLE``.
+    """
+    return settings.psycopg_dsn
 
 
 # bcrypt hash version prefixes — 2a/2b/2y are all valid bcrypt outputs from
@@ -507,6 +541,83 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise
     app.state.memory_archival_worker = memory_archival_worker
 
+    # Story 4.2 T9.1 — LangGraph checkpointer, opened ONCE for the app's
+    # lifetime (mirror `session_factory`/`llm_router`, not per-request).
+    # `agentive_app` role (DML-only grants, T1.2 migration) — `CREATE TABLE`
+    # already ran there under `agentive_owner`; T9.2 deliberately does NOT
+    # call `checkpointer.setup()` again here (least-privilege posture).
+    # `AsyncExitStack` closes it in the shutdown sequence below.
+    #
+    # A POOL, not `AsyncPostgresSaver.from_conn_string`. T9.1's single
+    # long-lived connection had no recovery path whatsoever: one network
+    # blip, one Postgres restart, one `idle_in_transaction_session_timeout`,
+    # and EVERY subsequent run in the process failed to checkpoint until an
+    # operator restarted it — the checkpointer being the one resource the
+    # whole crash-recovery story rests on. `AsyncConnectionPool` reconnects
+    # on its own, and `AsyncPostgresSaver` accepts one directly (its `conn`
+    # parameter is typed `AsyncConnection | AsyncConnectionPool`).
+    # `kwargs` mirrors `from_conn_string`'s own connection settings exactly —
+    # `autocommit`/`prepare_threshold`/`row_factory` are load-bearing for the
+    # saver, not stylistic.
+    workflow_exit_stack = contextlib.AsyncExitStack()
+    try:
+        workflow_pool: AsyncConnectionPool[Any] = AsyncConnectionPool(
+            conninfo=_workflow_checkpoint_dsn(),
+            min_size=_CHECKPOINT_POOL_MIN_SIZE,
+            max_size=_CHECKPOINT_POOL_MAX_SIZE,
+            max_lifetime=_CHECKPOINT_POOL_MAX_LIFETIME_S,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row,
+            },
+            open=False,
+        )
+        await workflow_exit_stack.enter_async_context(workflow_pool)
+        # Fail fast at boot rather than on the first run: `open()` alone is
+        # lazy, `wait()` proves the credentials and the network actually work.
+        await workflow_pool.wait(timeout=_CHECKPOINT_POOL_OPEN_TIMEOUT_S)
+        workflow_checkpointer = AsyncPostgresSaver(workflow_pool)
+    except Exception:
+        log.exception("agentive_workflow_checkpointer_start_failed")
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.workflow_checkpointer = workflow_checkpointer
+
+    # Story 4.2 T9.3 — one shared `WorkflowExecutionService` for BOTH the
+    # recovery worker and the router (`router.py` reads it straight from
+    # `app.state` instead of reconstructing its repos per request).
+    workflow_execution_service = WorkflowExecutionService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        llm_router=llm_router,
+        checkpointer=workflow_checkpointer,
+    )
+    app.state.workflow_execution_service = workflow_execution_service
+
+    workflow_recovery_worker = WorkflowRecoveryWorker(
+        workflow_execution_service=workflow_execution_service,
+        session_factory=session_factory,
+    )
+    try:
+        await workflow_recovery_worker.start()
+    except Exception:
+        log.exception("agentive_workflow_recovery_worker_start_failed")
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        with contextlib.suppress(Exception):
+            await workflow_exit_stack.aclose()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.workflow_recovery_worker = workflow_recovery_worker
+
     # Best-effort startup event — a transient DB hiccup must not prevent the
     # app from serving traffic (the worker will replay any orphaned writes
     # next time the publish path succeeds).
@@ -559,6 +670,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         timeout=5.0,
                     )
 
+            # Story 4.2 T5.4 — still NO drain of workflow_engine's own
+            # `_background_tasks` (fire-and-forget `start_run`/resume tasks):
+            # an in-flight run interrupted by shutdown IS the AC3 scenario,
+            # and waiting for every run to finish would violate NFR3 (a
+            # restart must not be blocked by a long-running run).
+            #
+            # But "no drain" is not "no handling". These three steps are
+            # ORDER-CRITICAL:
+            #   1. stop the recovery worker first, so it cannot claim a new
+            #      orphan while we are tearing the checkpointer down;
+            #   2. CANCEL the in-flight run tasks — `CancelledError` derives
+            #      from `BaseException`, so `_execute`'s `except Exception`
+            #      lets it through and the run stays `running`, claimable by
+            #      the next process's sweep;
+            #   3. only then close the checkpointer.
+            # Skipping step 2 (the previous behaviour) meant `aclose()` shut
+            # the connection under those tasks, each raised a plain
+            # `Exception`, and `_mark_failed` buried the run in the terminal
+            # `error` status that no recovery sweep ever revisits — the exact
+            # opposite of what this comment used to promise.
+            with contextlib.suppress(Exception):
+                await workflow_recovery_worker.stop()
+            with contextlib.suppress(Exception):
+                cancelled = await cancel_inflight_runs()
+                if cancelled:
+                    log.info("agentive_cancelled_inflight_runs", count=cancelled)
+            with contextlib.suppress(Exception):
+                await workflow_exit_stack.aclose()
             with contextlib.suppress(Exception):
                 await memory_archival_worker.stop()
             with contextlib.suppress(Exception):

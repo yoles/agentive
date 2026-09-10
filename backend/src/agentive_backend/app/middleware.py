@@ -1,16 +1,27 @@
-"""HTTP middlewares : correlation_id + auth token."""
+"""HTTP middlewares : correlation_id + auth token.
+
+Both are pure ASGI middleware (``__call__(scope, receive, send)``), NOT
+``starlette.middleware.base.BaseHTTPMiddleware``. ``BaseHTTPMiddleware``
+buffers a downstream response's ENTIRE body before forwarding any of it to
+the client — fine for ordinary JSON responses, but it silently breaks any
+incrementally-streamed response (Story 4.2 T8.2's SSE run-events endpoint):
+confirmed via T10.6 that an SSE generator wrapped by
+``BaseHTTPMiddleware``-based middleware delivers NOTHING to the client until
+the generator fully completes, not as each event is yielded. Since these two
+middlewares wrap every request in the app, keeping them on
+``BaseHTTPMiddleware`` would make that SSE endpoint non-functional in
+production, not just in tests.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable
 
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agentive_backend.shared.auth import verify_token
 from agentive_backend.shared.correlation import (
@@ -68,7 +79,7 @@ def _parse_incoming_correlation_id(raw: str | None) -> str | None:
         return None
 
 
-class CorrelationIdMiddleware(BaseHTTPMiddleware):
+class CorrelationIdMiddleware:
     """Inject a validated correlation_id into every request + response.
 
     Resolution order :
@@ -83,17 +94,26 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
     events bus + OTel spans can pick it up transparently.
     """
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
         incoming = request.headers.get(CORRELATION_HEADER)
         cid = _parse_incoming_correlation_id(incoming) or new_correlation_id()
         set_correlation_id(cid)
-        response = await call_next(request)
-        response.headers[CORRELATION_HEADER] = cid
-        return response
+
+        async def send_with_correlation_header(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [*message.get("headers", []), (CORRELATION_HEADER.encode(), cid.encode())]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_correlation_header)
 
 
 async def _publish_token_used_event(
@@ -122,7 +142,7 @@ async def _publish_token_used_event(
         _log.exception("auth.audit_event_publish_failed", endpoint=path)
 
 
-class AuthTokenMiddleware(BaseHTTPMiddleware):
+class AuthTokenMiddleware:
     """Bearer token auth — validates ``Authorization: Bearer <token>`` on
     all ``/api/v1/*`` routes.
 
@@ -140,22 +160,29 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
     single-threaded asyncio event loop.
     """
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+
         # P2 — CORS preflight requests (OPTIONS with Access-Control-Request-*)
         # are sent by browsers WITHOUT credentials per the CORS spec, so
         # AuthTokenMiddleware would 401 every preflight and break every
         # browser-based call to /api/v1/*. Skip auth on OPTIONS so the inner
         # CORSMiddleware can handle the preflight short-circuit.
         if request.method == "OPTIONS":
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # Public routes bypass auth entirely.
         if request.url.path in _PUBLIC_ROUTES:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # P1 — middleware may run in test apps that did not execute the
         # full lifespan, so ``app.state.auth_token_hash`` could be missing.
@@ -163,7 +190,7 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
         stored_hash: str | None = getattr(request.app.state, "auth_token_hash", None)
         if stored_hash is None:
             _log.error("auth.middleware_state_not_initialised")
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=503,
                 content={
                     "type": "/errors/auth/not-configured",
@@ -173,13 +200,15 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
                 },
                 media_type="application/problem+json",
             )
+            await response(scope, receive, send)
+            return
 
         # ── Extract Bearer token (P7: case-insensitive scheme per RFC 7235) ─
         auth_header = request.headers.get("Authorization", "")
         scheme, _, raw_token = auth_header.partition(" ")
         # P11 — also reject `Bearer ` (empty token after stripping).
         if scheme.lower() != "bearer" or not raw_token.strip():
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={
                     "type": "/errors/auth/missing-token",
@@ -190,10 +219,12 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
                 media_type="application/problem+json",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+            await response(scope, receive, send)
+            return
 
         # ── Validate token ────────────────────────────────────────────────
         if not verify_token(raw_token, stored_hash):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={
                     "type": "/errors/auth/invalid-token",
@@ -204,10 +235,12 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
                 media_type="application/problem+json",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+            await response(scope, receive, send)
+            return
 
         # ── Audit event (fire-and-forget) ─────────────────────────────────
-        # Capture values before calling call_next — the request may be
-        # mutated or GC'd while the background task is pending.
+        # Capture values before calling the downstream app — the request may
+        # be mutated or GC'd while the background task is pending.
         path = request.url.path
         method = request.method
         # P1 — defensive: if session_factory is missing (test app), skip the
@@ -226,4 +259,4 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
