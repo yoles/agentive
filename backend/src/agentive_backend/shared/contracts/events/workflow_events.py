@@ -19,6 +19,11 @@ Events shipped to date:
   a routing decision point could not be resolved deterministically (DSL
   silent, no rule cleared the confidence threshold) and escalated to the
   lightweight LLM.
+* ``workflow_engine.workflow_run.mise_en_place_bypassed`` (Story 4.5 AC3) —
+  the caller started a run with ``force=true`` while one or more pre-workflow
+  checks were failing. The first event in this repo representing an explicit
+  user bypass with a stated reason (grep-confirmed at story time — no prior
+  ``_bypassed``/``_forced`` event existed).
 
 Naming note (D91 point 3): the epic's literal AC3 wording ("workflow_resumed")
 does not fit ``shared/event_bus/naming.py``'s strict 3-segment
@@ -155,10 +160,32 @@ class WorkflowRunRoutingEscalatedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
+class WorkflowRunMiseEnPlaceBypassedEvent(BaseModel):
+    """Published when a run starts with ``force=true`` despite one or more
+    failing Mise en Place checks (Story 4.5 AC3) — audit trail for an
+    explicit human bypass (NFR8).
+
+    ``actor``, mirror :class:`WorkflowCreatedEvent`/:class:`WorkflowRunStartedEvent`
+    — defaults to ``"system"`` under the same Sprint-1 convention (no
+    authenticated-actor propagation anywhere yet), but this is precisely the
+    event where a real actor will matter most once available.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.mise_en_place_bypassed"
+
+    run_id: UUID
+    workflow_id: UUID
+    reason: str = Field(min_length=1, max_length=2000)
+    failed_checks: list[str] = Field(default_factory=list)
+    actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
 __all__ = [
     "WorkflowCreatedEvent",
     "WorkflowRunCompletedEvent",
     "WorkflowRunFailedEvent",
+    "WorkflowRunMiseEnPlaceBypassedEvent",
     "WorkflowRunResumedEvent",
     "WorkflowRunRoutingEscalatedEvent",
     "WorkflowRunStartedEvent",

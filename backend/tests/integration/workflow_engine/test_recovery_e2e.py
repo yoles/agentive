@@ -42,7 +42,7 @@ from agentive_backend.shared.llm.testing import MockProvider
 from agentive_backend.shared.llm.types import Completion
 from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
 
-from .conftest import _workflow_checkpoint_dsn
+from .conftest import _workflow_checkpoint_dsn, always_pass_mise_en_place_service
 
 pytestmark = pytest.mark.integration
 
@@ -138,6 +138,7 @@ async def test_resume_after_sigkill_does_not_replay_node_a(
             llm_router=llm_router,
             checkpointer=checkpointer,
             routing_rules=load_routing_rules(),
+            mise_en_place_service=always_pass_mise_en_place_service(),
         )
         worker = WorkflowRecoveryWorker(
             workflow_execution_service=execution_service,

@@ -72,6 +72,35 @@ async def outbox_worker(
     await worker.stop()
 
 
+class _AlwaysPassMiseEnPlaceService:
+    """Stub :class:`~.mise_en_place.MiseEnPlaceService` for e2e tests that
+    exercise execution/recovery/routing machinery unrelated to Story 4.5 —
+    always returns an all-passing report so ``start_run`` behaves exactly as
+    it did before that story landed (no real MCP/namespace/budget/provider
+    I/O). Story 4.5's own e2e coverage
+    (``tests/integration/workflow_engine/test_mise_en_place_e2e.py``) wires
+    the real :class:`~.mise_en_place.MiseEnPlaceService` instead.
+    """
+
+    async def run_checks(self, **_kwargs: Any) -> Any:
+        from agentive_backend.features.workflow_engine.domain.mise_en_place import (
+            CHECK_CODES,
+            CheckResult,
+            build_report,
+        )
+
+        return build_report(
+            [
+                CheckResult(code=code, passed=True, detail="stubbed for integration test")
+                for code in CHECK_CODES
+            ]
+        )
+
+
+def always_pass_mise_en_place_service() -> _AlwaysPassMiseEnPlaceService:
+    return _AlwaysPassMiseEnPlaceService()
+
+
 def wire_execution_service(app: Any) -> None:
     """Mirror ``app.lifespan``'s T9.3 wiring on a hand-built test app.
 
@@ -105,4 +134,5 @@ def wire_execution_service(app: Any) -> None:
         llm_router=app.state.llm_router,
         checkpointer=app.state.workflow_checkpointer,
         routing_rules=app.state.routing_rules,
+        mise_en_place_service=always_pass_mise_en_place_service(),
     )

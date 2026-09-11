@@ -6,7 +6,12 @@ import re
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from agentive_backend.features.workflow_engine.domain.mise_en_place import (
+    CHECK_CODES,
+    CheckCode,
+)
 
 # Defensive caps — no DAG-builder UI exists yet (Story 4.1 anti-scope) and no
 # workflow this MVP targets needs more; mirrors the `tool_ids` precedent in
@@ -110,11 +115,82 @@ class StartRunRequest(BaseModel):
 
     ``input`` is free-form JSON — the workflow's initial ``task_input``,
     passed to the first node(s) unmodified.
+
+    ``force``/``reason`` (Story 4.5 AC3) — explicit bypass of a failing Mise
+    en Place pre-workflow check. ``extra="forbid"`` means these are real,
+    intentional fields rather than passthrough, so the informal "--force"
+    notation of the epic maps onto the one vector this REST-only repo has
+    (Dev Notes § Divergences assumées).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     input: dict[str, Any] = Field(default_factory=dict)
+    force: bool = False
+    reason: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _reason_requires_force(self) -> StartRunRequest:
+        """AC3 — ``force=true`` with a blank/absent ``reason`` is a 422,
+        unconditionally (whether or not any check actually fails): a bypass
+        with no stated reason defeats the audit trail this field exists
+        for (NFR8).
+
+        The converse is rejected too (review P21): a ``reason`` sent WITHOUT
+        ``force`` used to be accepted and then silently discarded — never
+        persisted, never published, never echoed back. An operator who
+        mistypes the bypass and believes they filed a justification is worse
+        off than one who gets a 422, so the useless combination is refused
+        rather than swallowed.
+        """
+        if self.force and not (self.reason or "").strip():
+            raise ValueError("reason is required when force=true")
+        if not self.force and (self.reason or "").strip():
+            raise ValueError("reason is only meaningful with force=true")
+        return self
+
+
+class MiseEnPlaceCheckOut(BaseModel):
+    """One of the four pre-workflow checks (Story 4.5 AC1), as returned/persisted.
+
+    Distinct from the domain ``CheckResult`` dataclass (mirror the
+    ``ProbablePathResult``/``DryRunResponse`` split of Story 4.4) — this is
+    the API/JSONB-facing shape, the domain class stays framework-free.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The domain ``Literal`` itself, not a copy of its four strings — the
+    #: closed set has one definition (``domain.mise_en_place.CheckCode``) and
+    #: adding a fifth check cannot leave this schema silently behind
+    #: (review P19).
+    code: CheckCode
+    passed: bool
+    detail: str
+    suggested_action: str | None = None
+    #: Whether an identical retry could succeed without a configuration
+    #: change (review BS5). Drives the refusal's HTTP status — 503 only when
+    #: EVERY failing check is retryable, else 422 — and lets a client decide
+    #: whether backing off is worth anything.
+    retryable: bool = False
+
+
+class MiseEnPlaceReportOut(BaseModel):
+    """The persisted/returned Mise en Place report (Story 4.5 AC1/AC3) —
+    always exactly four :class:`MiseEnPlaceCheckOut`, one per check code,
+    whatever the outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Exactly one entry per check code — the cardinality the docstring above
+    #: promises, enforced rather than described (review P8). Mirrors the
+    #: identical guard in ``domain.mise_en_place.build_report``.
+    checks: list[MiseEnPlaceCheckOut] = Field(
+        min_length=len(CHECK_CODES), max_length=len(CHECK_CODES)
+    )
+    all_passed: bool
+    bypassed: bool = False
+    bypass_reason: str | None = None
 
 
 class StartRunResponse(BaseModel):
@@ -130,6 +206,11 @@ class StartRunResponse(BaseModel):
     It is re-evaluated here rather than trusted from creation because
     ``agent_templates`` rows are mutable — a workflow validated as diverse
     can be running two identical models by the time anyone starts it.
+
+    ``mise_en_place`` (Story 4.5 AC1) — the same report persisted to
+    ``workflow_runs.mise_en_place``, always present (a 201 is only reached
+    once the hook ran, whether every check passed or a failure was bypassed
+    via ``force``).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -137,6 +218,7 @@ class StartRunResponse(BaseModel):
     run_id: UUID
     status: Literal["running"] = "running"
     warnings: list[DiversityWarning] = Field(default_factory=list)
+    mise_en_place: MiseEnPlaceReportOut
 
 
 class RoutingStatsResponse(BaseModel):
@@ -305,6 +387,8 @@ __all__ = [
     "DryRunRequest",
     "DryRunResponse",
     "DryRunRisk",
+    "MiseEnPlaceCheckOut",
+    "MiseEnPlaceReportOut",
     "ProviderTokenEstimate",
     "RoutingStatsResponse",
     "StartRunRequest",

@@ -240,14 +240,26 @@ async def start_workflow_run(
     * 404 — ``workflow_id`` unknown (URL's primary resource, unlike 4.1's
       ``POST /workflows`` where an invalid id lives in the body — cf Dev
       Notes § "404 vs 422").
-    * 422 — the workflow exists but ``status != "active"``.
-    * 503 — lifespan state missing (session factory / llm_router / checkpointer).
+    * 422 — the workflow exists but ``status != "active"``; ``force=true``
+      with a blank/absent or over-long (>2000 chars) ``reason``; or a
+      ``reason`` supplied WITHOUT ``force=true``, which would otherwise be
+      accepted and silently discarded (Story 4.5 AC3, review P7/P21).
+      A Mise en Place check failed without ``force`` and at least one of the
+      failures is PERMANENT — a missing API key, an absent namespace, a
+      budget overrun, a tool no longer exposed (Story 4.5 AC2, review BS5):
+      retrying cannot help, so this is a 422 rather than a 503.
+    * 503 — lifespan state missing (session factory / llm_router / checkpointer),
+      or a Mise en Place check failed without ``force`` and EVERY failure is
+      transient (an MCP server that is down, a check that timed out), i.e.
+      an identical retry may genuinely succeed (Story 4.5 AC2, review BS5).
     """
     service = _build_execution_service(request)
     return await service.start_run(
         workflow_id=workflow_id,
         run_input=body.input,
         tenant_id=None,  # Story 4.2 anti-scope — single-tenant MVP.
+        force=body.force,
+        reason=body.reason,
     )
 
 

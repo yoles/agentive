@@ -212,6 +212,7 @@ def test_execution_service_comes_from_app_state() -> None:
         llm_router=SimpleNamespace(),  # type: ignore[arg-type]
         checkpointer=SimpleNamespace(),  # type: ignore[arg-type]
         routing_rules=(),
+        mise_en_place_service=SimpleNamespace(),  # type: ignore[arg-type]
     )
     request = _request(
         workflow_execution_service=shared,

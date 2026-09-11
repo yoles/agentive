@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from agentive_backend.features.workflow_engine.domain.mise_en_place import CHECK_CODES
 from agentive_backend.features.workflow_engine.schemas import (
     _MAX_EDGES,
     _MAX_NODES,
@@ -19,7 +20,10 @@ from agentive_backend.features.workflow_engine.schemas import (
     DryRunRequest,
     DryRunResponse,
     DryRunRisk,
+    MiseEnPlaceCheckOut,
+    MiseEnPlaceReportOut,
     ProviderTokenEstimate,
+    StartRunRequest,
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
 )
@@ -216,3 +220,109 @@ def test_dry_run_response_allows_none_cost_estimate() -> None:
     )
     assert response.cost_estimate_usd is None
     assert response.probable_path_cost_usd is None
+
+
+# ─── StartRunRequest force/reason (Story 4.5 AC3, T5.2) ────────────────
+
+
+def test_start_run_request_defaults_to_no_bypass() -> None:
+    request = StartRunRequest()
+    assert request.force is False
+    assert request.reason is None
+
+
+def test_start_run_request_force_without_reason_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reason is required when force=true"):
+        StartRunRequest(force=True)
+
+
+def test_start_run_request_force_with_blank_reason_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reason is required when force=true"):
+        StartRunRequest(force=True, reason="   ")
+
+
+def test_start_run_request_force_with_reason_is_accepted() -> None:
+    request = StartRunRequest(force=True, reason="incident P1, deadline serrée")
+    assert request.force is True
+    assert request.reason == "incident P1, deadline serrée"
+
+
+def test_start_run_request_reason_without_force_is_rejected() -> None:
+    """`reason` alone used to be accepted and then silently discarded —
+    never persisted, never published, never echoed back. An operator who
+    mistypes the bypass and believes they filed a justification is worse off
+    than one who gets a 422 (review P21)."""
+    with pytest.raises(ValidationError):
+        StartRunRequest(reason="just a note")
+
+
+def test_start_run_request_blank_reason_without_force_is_accepted() -> None:
+    """Only a MEANINGFUL reason conflicts with `force=false`; `None` and
+    whitespace stay the ordinary no-bypass request."""
+    assert StartRunRequest().reason is None
+    assert StartRunRequest(reason="   ").force is False
+
+
+# ─── Mise en Place schemas (Story 4.5 T5.1, T5.4) ──────────────────────
+
+
+def _four_checks() -> list[MiseEnPlaceCheckOut]:
+    """One entry per check code — the cardinality `MiseEnPlaceReportOut` now
+    enforces (review P8)."""
+    return [
+        MiseEnPlaceCheckOut(code=code, passed=True, detail=f"{code} ok") for code in CHECK_CODES
+    ]
+
+
+@pytest.mark.parametrize(
+    "model,kwargs",
+    [
+        (StartRunRequest, {"unexpected": 1}),
+        (
+            MiseEnPlaceCheckOut,
+            {"code": "budget_available", "passed": True, "detail": "ok", "unexpected": 1},
+        ),
+        (
+            MiseEnPlaceReportOut,
+            {"checks": _four_checks(), "all_passed": True, "unexpected": 1},
+        ),
+    ],
+)
+def test_mise_en_place_schemas_forbid_extra_fields(model: type, kwargs: dict) -> None:
+    with pytest.raises(ValidationError):
+        model(**kwargs)
+
+
+def test_mise_en_place_check_out_code_is_a_closed_set() -> None:
+    with pytest.raises(ValidationError):
+        MiseEnPlaceCheckOut(code="not_a_real_code", passed=True, detail="x")  # type: ignore[arg-type]
+
+
+def test_mise_en_place_report_out_round_trips_full_shape() -> None:
+    """An ACTUAL round-trip: dump to JSON-compatible primitives and validate
+    them back (review P22). The previous version only re-read attributes off
+    the object it had just built, which is why it never caught that the
+    persisted shape and this model had drifted apart (review P13)."""
+    checks = list(_four_checks())
+    checks[2] = MiseEnPlaceCheckOut(
+        code="budget_available",
+        passed=False,
+        detail="over cap",
+        suggested_action="Ajuster AGENTIVE_DRY_RUN_BUDGET_CAP_USD ou réduire le scope du workflow",
+    )
+    report = MiseEnPlaceReportOut(
+        checks=checks, all_passed=False, bypassed=True, bypass_reason="incident P1"
+    )
+
+    payload = report.model_dump(mode="json")
+    assert MiseEnPlaceReportOut.model_validate(payload) == report
+    # This is exactly what `start_run` writes to `workflow_runs.mise_en_place`,
+    # so the persisted document must carry `all_passed` for SQL audit queries.
+    assert payload["all_passed"] is False
+    assert payload["bypass_reason"] == "incident P1"
+    assert len(payload["checks"]) == len(CHECK_CODES)
+
+
+def test_mise_en_place_report_out_rejects_a_partial_report() -> None:
+    with pytest.raises(ValidationError):
+        MiseEnPlaceReportOut(checks=_four_checks()[:2], all_passed=True)

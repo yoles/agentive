@@ -181,6 +181,43 @@ class Settings(BaseSettings):
         """An empty/whitespace env var means "unset", not "invalid decimal"."""
         return None if isinstance(value, str) and not value.strip() else value
 
+    # ─── Workflow Engine — Mise en Place automatique (Story 4.5) ───
+    # Per-server MCP ping timeout for the `mcp_tools_reachable` check —
+    # deliberately SHORTER than `infra/mcp/client.py`'s
+    # `DEFAULT_DISCOVERY_TIMEOUT_S=10.0` (used at server REGISTRATION time,
+    # a context where the user is watching one server come up). Here it
+    # gates a synchronous step of `POST /workflows/{id}/runs`, potentially
+    # pinging several servers in parallel — one bad server must not freeze
+    # every workflow launch for 10s+.
+    #
+    # No second budget-cap field here (Dev Notes § Budget) —
+    # `dry_run_budget_cap_usd` above is reused as-is: one global threshold,
+    # never a second source of truth for the same number (D84 lesson).
+    # `le=30.0`: an upper bound is part of the point. Without one, a
+    # mistyped `...TIMEOUT_S=600` freezes every workflow launch for ten
+    # minutes — precisely the failure the paragraph above claims to prevent
+    # (review P6).
+    mise_en_place_tool_ping_timeout_s: float = Field(
+        default=3.0,
+        gt=0.0,
+        le=30.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_MISE_EN_PLACE_TOOL_PING_TIMEOUT_S",
+    )
+    # Wall-clock ceiling for ONE Mise en Place check (review P6). The ping
+    # timeout above only bounds `discover_tools`; the namespace lookups and
+    # the Dry Run reused by `budget_available` had no bound at all, so a slow
+    # database could hang `POST /runs` indefinitely. Applied per check rather
+    # than to the whole hook so that one stuck check still yields a report
+    # carrying the other three real outcomes.
+    mise_en_place_check_timeout_s: float = Field(
+        default=15.0,
+        gt=0.0,
+        le=120.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_MISE_EN_PLACE_CHECK_TIMEOUT_S",
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

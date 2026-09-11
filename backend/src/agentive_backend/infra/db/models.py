@@ -225,6 +225,15 @@ class WorkflowRun(Base):
     last_checkpoint_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
+    # Story 4.5 AC1 — the pre-workflow Mise en Place report (4 `CheckResult`
+    # entries + bypass metadata) for runs that STARTED. A refused launch
+    # (AC2: a failing check without `force`) creates no `workflow_runs` row
+    # at all, so it leaves no report here — the report reaches the caller in
+    # the 503 body only. AC1's "persisted whether the workflow starts or
+    # not" cannot hold on a column of this table and AC2 is the stronger
+    # requirement; tracing refused launches needs a separate home (open
+    # question, review BS2). `None` only for runs predating this story.
+    mise_en_place: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class AgentTemplate(Base):

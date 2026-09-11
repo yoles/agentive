@@ -42,6 +42,21 @@ from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo
 _COMMIT_POLL_TIMEOUT_S = 10.0
 _COMMIT_POLL_INTERVAL_S = 0.05
 
+
+class _UnusedMiseEnPlaceService:
+    """Placeholder for :class:`WorkflowExecutionService`'s required
+    ``mise_en_place_service`` constructor arg (Story 4.5 T3.8). This script
+    calls ``service._drive_run(...)`` directly (below) — never
+    ``start_run`` — so the Mise en Place hook is never reached. Duplicated
+    locally rather than imported from ``.conftest``: this file runs as a
+    standalone ``python _crash_run_subprocess.py`` subprocess with no
+    package context for a relative import.
+    """
+
+    async def run_checks(self, **_kwargs: Any) -> Any:
+        raise AssertionError("not expected to be called — this script drives `_drive_run` directly")
+
+
 # Node `b`'s completion is deliberately delayed: with an instant mock LLM,
 # node `b` could finish (and commit) before the crash-detection poller even
 # notices node `a`'s commit, racing the SIGKILL. This guarantees the kill
@@ -155,6 +170,7 @@ async def main() -> None:
             llm_router=llm_router,
             checkpointer=checkpointer,
             routing_rules=load_routing_rules(),
+            mise_en_place_service=_UnusedMiseEnPlaceService(),  # type: ignore[arg-type]
         )
         templates = {"a": tpl_a, "b": tpl_b}
         # Reference kept (RUF006) so the task isn't GC'd mid-flight — never

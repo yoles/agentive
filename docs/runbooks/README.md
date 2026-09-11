@@ -10,6 +10,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 - [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)
 - [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
 - [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)
+- [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) — Hook pré-workflow (4 checks, blocage/bypass `force`) (Story 4.5)
 - [`observability.md`](./observability.md) — Guide pratique observabilité : logs JSON, RFC 7807, correlation_id, redaction (Story 1.9)
 - [`repositories-usage.md`](./repositories-usage.md) — Utilisation Repository Pattern + RLS (Story 1.5)
 

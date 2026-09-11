@@ -205,6 +205,7 @@ class WorkflowRunRepo(BaseRepo):
         correlation_id: UUID,
         status: str = "running",
         checkpoint: dict[str, Any] | None = None,
+        mise_en_place: dict[str, Any] | None = None,
         tenant_id: UUID | None = None,
     ) -> WorkflowRun:
         """INSERT inside the caller's transaction — caller owns commit.
@@ -219,12 +220,19 @@ class WorkflowRunRepo(BaseRepo):
         crashes before LangGraph's first checkpoint can still be restarted
         from ``START`` (AC3) — ``_sync_checkpoint`` replaces the whole dict
         once the first node lands.
+
+        ``mise_en_place`` (Story 4.5 AC1/AC3, T4.3) — the pre-workflow report
+        (``dataclasses.asdict`` of a ``MiseEnPlaceReport``), or ``None`` for
+        callers that predate that story. Optional keyword, default-``None``,
+        so the sole existing caller (``WorkflowExecutionService.start_run``,
+        confirmed by grep — no other call site) stays source-compatible.
         """
         run = WorkflowRun(
             workflow_id=workflow_id,
             correlation_id=correlation_id,
             status=status,
             checkpoint=checkpoint,
+            mise_en_place=mise_en_place,
             tenant_id=tenant_id,
         )
         session.add(run)

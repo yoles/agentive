@@ -19,6 +19,11 @@ SQLAlchemy) for the pure-logic modules, mirror of ``agent_registry/domain/``:
   :func:`compute_probable_path` (structural + historical, never re-evaluates
   a branching condition — that needs a node's real ``own_output``, which
   does not exist pre-execution) and :func:`average_node_tokens`.
+* :mod:`.mise_en_place` (Story 4.5) — pure report assembly for the
+  pre-workflow hook: :class:`CheckResult`/:class:`MiseEnPlaceReport` and
+  :func:`build_report`. The four checks themselves are I/O-bound and live in
+  the sibling ``features/workflow_engine/mise_en_place.py`` orchestrator, not
+  here.
 
 Story 4.2's LangGraph-coupled modules (``graph_builder``, ``agent_node``)
 live in the sibling :mod:`..engine` package, NOT here — see its docstring.
@@ -48,6 +53,12 @@ from agentive_backend.features.workflow_engine.domain.dry_run import (
     compute_probable_path,
     find_root_nodes,
 )
+from agentive_backend.features.workflow_engine.domain.mise_en_place import (
+    CheckCode,
+    CheckResult,
+    MiseEnPlaceReport,
+    build_report,
+)
 from agentive_backend.features.workflow_engine.domain.routing_rules import (
     RoutingContext,
     RoutingDecision,
@@ -69,7 +80,10 @@ from agentive_backend.features.workflow_engine.domain.value_objects import (
 
 __all__ = [
     "END_SENTINEL",
+    "CheckCode",
+    "CheckResult",
     "DomainValidationError",
+    "MiseEnPlaceReport",
     "NodeMetricSample",
     "ParsedCondition",
     "ProbablePathResult",
@@ -86,6 +100,7 @@ __all__ = [
     "WorkflowNode",
     "WorkflowState",
     "average_node_tokens",
+    "build_report",
     "classify_decision_points",
     "compute_confidence",
     "compute_probable_path",

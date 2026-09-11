@@ -30,6 +30,7 @@ from agentive_backend.features.workflow_engine.domain import (
     WorkflowEdge,
     WorkflowNode,
     WorkflowState,
+    build_report,
     detect_cycle,
     find_dangling_edges,
     find_duplicate_node_ids,
@@ -48,6 +49,8 @@ from agentive_backend.features.workflow_engine.metrics import (
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowResponse,
     DiversityWarning,
+    MiseEnPlaceCheckOut,
+    MiseEnPlaceReportOut,
     StartRunResponse,
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
@@ -58,13 +61,19 @@ from agentive_backend.shared.contracts.events import (
     WorkflowCreatedEvent,
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
+    WorkflowRunMiseEnPlaceBypassedEvent,
     WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
 )
 from agentive_backend.shared.correlation import require_correlation_id
 from agentive_backend.shared.event_bus import notify_best_effort, publish
-from agentive_backend.shared.exceptions import InternalError, ValidationError
+from agentive_backend.shared.exceptions import (
+    BusinessRuleError,
+    DependencyError,
+    InternalError,
+    ValidationError,
+)
 from agentive_backend.shared.llm.redaction import redact_secrets
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
@@ -74,6 +83,8 @@ if TYPE_CHECKING:
 
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+    from agentive_backend.features.workflow_engine.domain.mise_en_place import MiseEnPlaceReport
+    from agentive_backend.features.workflow_engine.mise_en_place import MiseEnPlaceService
     from agentive_backend.infra.db.models import AgentTemplate, Workflow
     from agentive_backend.shared.llm.router import LLMRouter
 
@@ -124,6 +135,12 @@ async def cancel_inflight_runs(*, timeout_s: float = _CANCEL_TIMEOUT_S) -> int:
 # Key under which `_sync_checkpoint` records the config fingerprint of every
 # template the run is currently executing with (review, intent gap 5).
 TEMPLATE_FINGERPRINTS_KEY = "template_fingerprints"
+
+# Must stay <= `WorkflowRunMiseEnPlaceBypassedEvent.reason`'s `max_length`
+# and `StartRunRequest.reason`'s: `start_run` is reachable directly (not only
+# through the HTTP schema), so the cap is enforced at all three layers rather
+# than trusted from the outermost one (review P7).
+_MAX_BYPASS_REASON_LEN = 2000
 
 
 def _template_fingerprints(templates: Mapping[str, AgentTemplate]) -> dict[str, str]:
@@ -523,6 +540,28 @@ async def _load_templates(
     return templates
 
 
+def _mise_en_place_out(report: MiseEnPlaceReport) -> MiseEnPlaceReportOut:
+    """Domain ``MiseEnPlaceReport`` -> API ``MiseEnPlaceReportOut`` (Story 4.5
+    T5.1) — mirror the ``ProbablePathResult``/``DryRunResponse`` split of
+    Story 4.4: the domain dataclass stays framework-free, this is the
+    API/JSONB-facing shape."""
+    return MiseEnPlaceReportOut(
+        checks=[
+            MiseEnPlaceCheckOut(
+                code=check.code,
+                passed=check.passed,
+                detail=check.detail,
+                suggested_action=check.suggested_action,
+                retryable=check.retryable,
+            )
+            for check in report.checks
+        ],
+        all_passed=report.all_passed,
+        bypassed=report.bypassed,
+        bypass_reason=report.bypass_reason,
+    )
+
+
 def _aggregate_routing(routing_decisions: Mapping[str, Any]) -> dict[str, Any]:
     """``{deterministic, llm_escalated, tokens, cost_usd}`` from the run's
     ``routing_decisions`` state channel (Story 4.3 AC3 T9.4).
@@ -652,12 +691,16 @@ class WorkflowExecutionService:
         llm_router: LLMRouter,
         checkpointer: AsyncPostgresSaver,
         routing_rules: Sequence[RoutingRule],
+        mise_en_place_service: MiseEnPlaceService,
     ) -> None:
         self._workflow_repo = workflow_repo
         self._workflow_run_repo = workflow_run_repo
         self._template_repo = template_repo
         self._llm_router = llm_router
         self._checkpointer = checkpointer
+        # Story 4.5 T3.8 — the pre-workflow hook `start_run` calls between
+        # the diversity check and the row INSERT (AC1/AC2/AC3).
+        self._mise_en_place_service = mise_en_place_service
         # Story 4.3 T9.1/T9.3 — loaded once at boot (`app.lifespan`), never
         # per-run. REQUIRED, not defaulted to `()`: forgetting `routing_settings`
         # is already a hard `ValueError` in `build_state_graph`, while an empty
@@ -679,17 +722,29 @@ class WorkflowExecutionService:
         workflow_id: UUID,
         run_input: dict[str, Any],
         tenant_id: UUID | None = None,
+        force: bool = False,
+        reason: str | None = None,
     ) -> StartRunResponse:
         """Create a ``running`` ``workflow_runs`` row and spawn its execution
         as a background task (AC1). Returns immediately — the HTTP request
         never blocks on the run's progress.
+
+        ``force``/``reason`` (Story 4.5 AC3) — bypass a failing Mise en
+        Place pre-workflow check. Defensive re-validation of "``reason``
+        required when ``force``" lives HERE too (not only in
+        ``StartRunRequest``'s Pydantic validator), since this method is a
+        real API surface a caller can reach directly.
 
         Raises:
             NotFoundError: ``workflow_id`` does not reference an existing
                 workflow (404 — the URL's primary resource, cf Dev Notes
                 § "404 vs 422").
             ValidationError: the workflow exists but ``status != "active"``
-                (422).
+                (422), OR ``force=True`` with a blank/absent ``reason``
+                (422, AC3 — checked unconditionally, whether or not any
+                Mise en Place check actually fails).
+            DependencyError: a Mise en Place check failed and ``force`` was
+                not set (503, AC2) — no ``workflow_runs`` row is created.
         """
         workflow = await self._workflow_repo.require_by_id(workflow_id, tenant_id=tenant_id)
         if workflow.status != "active":
@@ -717,6 +772,111 @@ class WorkflowExecutionService:
                 pairs=[(w.producer_node_id, w.controller_node_id) for w in warnings],
             )
 
+        # Story 4.5 AC1-AC3 — Mise en Place pre-workflow hook. Runs BEFORE
+        # the `workflow_runs` row exists (préambule point 2): `workflow`,
+        # `templates` and `correlation_id` are already resolved above, and
+        # nothing is persisted yet — the necessary condition for AC2's "the
+        # workflow does not start" to hold structurally rather than by
+        # convention (a row created first would already be `running` by the
+        # time a check failed).
+        bypass_reason: str | None = None
+        if force:
+            candidate = (reason or "").strip()
+            if not candidate:
+                raise ValidationError(
+                    detail="reason is required when force=true",
+                    context={"workflow_id": str(workflow_id)},
+                )
+            # Length is validated HERE too, not only in `StartRunRequest`
+            # (review P7). `WorkflowRunMiseEnPlaceBypassedEvent.reason` caps
+            # at 2000; a direct caller of this method — the very case this
+            # defensive re-validation exists for — could otherwise insert
+            # the row, publish `started`, and only then have Pydantic raise
+            # INSIDE the transaction: rollback plus an untyped 500 rather
+            # than a clean 422.
+            if len(candidate) > _MAX_BYPASS_REASON_LEN:
+                raise ValidationError(
+                    detail=(
+                        f"reason must be at most {_MAX_BYPASS_REASON_LEN} characters "
+                        f"(got {len(candidate)})"
+                    ),
+                    context={"workflow_id": str(workflow_id)},
+                )
+            bypass_reason = redact_secrets(candidate)
+
+        report = await self._mise_en_place_service.run_checks(
+            workflow_id=workflow_id,
+            templates=templates,
+            task_input=run_input,
+            tenant_id=tenant_id,
+        )
+
+        bypassed = False
+        if not report.all_passed:
+            if not force:
+                failed_checks = [check.code for check in report.checks if not check.passed]
+                # AC2 asks the error body for `{"detail": <résumé>, ...}` —
+                # `app.main`'s RFC 7807 handler merges `context` at the
+                # TOP level and silently DROPS any context key that
+                # collides with a reserved field (`type`/`title`/`status`/
+                # `correlation_id`/`detail`), logging a warning instead.
+                # `context["detail"]` would therefore never reach the
+                # response body. The readable summary goes on
+                # `AgentiveError.detail` itself instead — same JSON key,
+                # same content, but the one the handler actually renders.
+                # `suggested_actions`, plural: it is a LIST, and naming a
+                # list with the same singular key the per-check field uses
+                # forced clients to handle two types under one name
+                # (review P15). Omitted entirely when empty rather than
+                # rendered as `[]`, which promised a remediation and
+                # delivered none.
+                suggested_actions = [
+                    check.suggested_action
+                    for check in report.checks
+                    if not check.passed and check.suggested_action
+                ]
+                context: dict[str, Any] = {
+                    "failed_checks": failed_checks,
+                    "mise_en_place": _mise_en_place_out(report).model_dump(mode="json"),
+                }
+                if suggested_actions:
+                    context["suggested_actions"] = suggested_actions
+                # 503 ONLY when an identical retry could plausibly succeed
+                # on its own — an MCP server that is down, a check that timed
+                # out (review BS5). A missing API key, an absent namespace or
+                # a budget overrun will still be there on the next attempt,
+                # and 503 tells clients, proxies and gateways to retry: it
+                # turned a permanently misconfigured workflow into an
+                # infinite automatic retry loop. Those get 422, the same
+                # code `status != "active"` already returns a few lines
+                # above for the same reason — the request cannot succeed
+                # until a human changes something.
+                error_cls = (
+                    DependencyError
+                    if all(check.retryable for check in report.checks if not check.passed)
+                    else BusinessRuleError
+                )
+                raise error_cls(
+                    detail="; ".join(
+                        f"{check.code}: {check.detail}"
+                        for check in report.checks
+                        if not check.passed
+                    ),
+                    context=context,
+                )
+            # `force=True`, so `bypass_reason` was validated non-blank above
+            # (it is only ever left `None` when `force` is falsy). A real
+            # raise, not an `assert`: `python -O` strips asserts, and this
+            # one guards the audit trail's only non-empty-reason guarantee
+            # (review P16).
+            if bypass_reason is None:  # pragma: no cover — unreachable
+                raise InternalError(detail="bypass reason missing while force=true")
+            report = build_report(report.checks, bypassed=True, bypass_reason=bypass_reason)
+            bypassed = True
+        # else: every check passed. `force=True` here is a no-op (AC3's
+        # "no-op silencieux") — `report` stays unbypassed and no audit event
+        # is published, since nothing was actually bypassed.
+
         event_type = WorkflowRunStartedEvent.event_type
         async with self._workflow_run_repo.with_tenant(tenant_id) as session:
             run = await self._workflow_run_repo.create_in_session(
@@ -733,6 +893,13 @@ class WorkflowExecutionService:
                     "task_input": run_input,
                     TEMPLATE_FINGERPRINTS_KEY: _template_fingerprints(templates),
                 },
+                # The SAME shape the API returns, not `asdict(report)`
+                # (review P13). `all_passed` is a computed `@property`, so
+                # `asdict` dropped it — leaving the JSONB unvalidatable by
+                # `MiseEnPlaceReportOut`, the model that documents itself as
+                # the persisted shape, and un-queryable via
+                # `mise_en_place->>'all_passed'`. One shape, both surfaces.
+                mise_en_place=_mise_en_place_out(report).model_dump(mode="json"),
             )
             event = WorkflowRunStartedEvent(
                 run_id=run.id, workflow_id=workflow_id, tenant_id=tenant_id
@@ -740,9 +907,32 @@ class WorkflowExecutionService:
             event_id = await publish(
                 event_type, event, session=session, correlation_id=correlation_id
             )
+            bypass_event_id: UUID | None = None
+            if bypassed and bypass_reason is not None:
+                bypass_event = WorkflowRunMiseEnPlaceBypassedEvent(
+                    run_id=run.id,
+                    workflow_id=workflow_id,
+                    reason=bypass_reason,
+                    failed_checks=[check.code for check in report.checks if not check.passed],
+                    tenant_id=tenant_id,
+                )
+                bypass_event_id = await publish(
+                    WorkflowRunMiseEnPlaceBypassedEvent.event_type,
+                    bypass_event,
+                    session=session,
+                    correlation_id=correlation_id,
+                )
             # commit happens at __aexit__ if no exception is raised.
 
         await notify_best_effort(event_id, event_type)
+        if bypass_event_id is not None:
+            # Notified like `started`, instead of waiting for the outbox
+            # poll (review P11). An explicit human bypass is the event an
+            # audit consumer most needs promptly — it had the longest
+            # latency of the two published here.
+            await notify_best_effort(
+                bypass_event_id, WorkflowRunMiseEnPlaceBypassedEvent.event_type
+            )
 
         task = asyncio.create_task(
             self._drive_run(run.id, workflow, templates, run_input, correlation_id=correlation_id),
@@ -757,7 +947,12 @@ class WorkflowExecutionService:
             workflow_id=str(workflow_id),
             node_count=len(templates),
         )
-        return StartRunResponse(run_id=run.id, status="running", warnings=warnings)
+        return StartRunResponse(
+            run_id=run.id,
+            status="running",
+            warnings=warnings,
+            mise_en_place=_mise_en_place_out(report),
+        )
 
     async def _drive_run(
         self,

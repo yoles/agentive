@@ -19,6 +19,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agentive_backend.features.workflow_engine.domain.mise_en_place import (
+    CheckResult,
+    MiseEnPlaceReport,
+    build_report,
+)
 from agentive_backend.features.workflow_engine.schemas import (
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
@@ -28,7 +33,13 @@ from agentive_backend.features.workflow_engine.service import (
     WorkflowService,
 )
 from agentive_backend.shared.correlation import set_correlation_id
-from agentive_backend.shared.exceptions import InternalError, NotFoundError, ValidationError
+from agentive_backend.shared.exceptions import (
+    BusinessRuleError,
+    DependencyError,
+    InternalError,
+    NotFoundError,
+    ValidationError,
+)
 
 
 @pytest.fixture
@@ -600,8 +611,34 @@ def _workflow_run(
     )
 
 
+def _all_passed_mise_en_place_report() -> MiseEnPlaceReport:
+    """The default Mise en Place outcome for tests that don't care about
+    Story 4.5 — every check passes, so `start_run`'s pre-existing behavior
+    (create the row, publish `started`, no bypass event) is unaffected."""
+    return build_report(
+        [
+            CheckResult(code=code, passed=True, detail="ok")  # type: ignore[arg-type]
+            for code in (
+                "mcp_tools_reachable",
+                "memory_namespaces_accessible",
+                "budget_available",
+                "llm_providers_configured",
+            )
+        ]
+    )
+
+
 def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, AsyncMock, AsyncMock]:
-    """Returns (service, workflow_repo, workflow_run_repo, template_repo)."""
+    """Returns (service, workflow_repo, workflow_run_repo, template_repo).
+
+    Story 4.5 — the constructed service's ``_mise_en_place_service`` is an
+    ``AsyncMock`` whose ``run_checks`` returns an all-passing report by
+    default (every pre-existing test in this module exercises `start_run`
+    without caring about Mise en Place). Tests that DO care reach it via
+    ``service._mise_en_place_service`` — same convention already used for
+    ``service._drive_run`` elsewhere in this file — rather than widening
+    this helper's return tuple and touching every one of its ~40 call sites.
+    """
     session_mock = AsyncMock()
     session_mock.flush = AsyncMock()
     session_mock.refresh = AsyncMock()
@@ -621,6 +658,9 @@ def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, Asyn
     workflow_run_repo.update_status = AsyncMock(return_value=1)
     template_repo = AsyncMock()
 
+    mise_en_place_service = AsyncMock()
+    mise_en_place_service.run_checks = AsyncMock(return_value=_all_passed_mise_en_place_report())
+
     service = WorkflowExecutionService(
         workflow_repo=workflow_repo,
         workflow_run_repo=workflow_run_repo,
@@ -630,6 +670,7 @@ def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, Asyn
         # Explicitly empty: these tests inject `routing_decisions` straight
         # into the fake graph's updates, so no rule ever needs to evaluate.
         routing_rules=(),
+        mise_en_place_service=mise_en_place_service,
     )
     return service, workflow_repo, workflow_run_repo, template_repo
 
@@ -727,6 +768,237 @@ async def test_start_run_preloads_templates_per_dag_node(event_publish_mock: Asy
     # Config fingerprints are stamped alongside so a resume can tell whether
     # the templates changed across the crash gap (intent gap 5).
     assert set(create_kwargs["checkpoint"]["template_fingerprints"]) == {"a"}
+
+
+# ─── start_run — Mise en Place hook (Story 4.5 AC1-AC3) ────────────────
+
+
+def _failing_mise_en_place_report(
+    *, failed_code: str = "budget_available", retryable: bool = False
+) -> MiseEnPlaceReport:
+    codes = (
+        "mcp_tools_reachable",
+        "memory_namespaces_accessible",
+        "budget_available",
+        "llm_providers_configured",
+    )
+    checks = [
+        CheckResult(
+            code=code,  # type: ignore[arg-type]
+            passed=code != failed_code,
+            detail=f"{code} {'ok' if code != failed_code else 'failed'}",
+            suggested_action=None if code != failed_code else f"fix {code}",
+            retryable=retryable and code == failed_code,
+        )
+        for code in codes
+    ]
+    return build_report(checks)
+
+
+@pytest.mark.asyncio
+async def test_start_run_persists_mise_en_place_report_on_success(
+    event_publish_mock: AsyncMock,
+) -> None:
+    set_correlation_id(str(uuid4()))
+    workflow_id = uuid4()
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    run = _workflow_run(workflow_id=workflow_id)
+    workflow_run_repo.create_in_session.return_value = run
+    service._drive_run = AsyncMock()  # type: ignore[method-assign]
+
+    response = await service.start_run(workflow_id=workflow_id, run_input={})
+
+    # The persisted document is the SAME shape the API returns (review
+    # P13): `all_passed` is a real stored key, so an audit query can filter
+    # on `mise_en_place->>'all_passed'` instead of recomputing it.
+    create_kwargs = workflow_run_repo.create_in_session.await_args.kwargs
+    persisted = create_kwargs["mise_en_place"]
+    assert len(persisted["checks"]) == 4
+    assert all(check["passed"] for check in persisted["checks"])
+    assert persisted["all_passed"] is True
+    assert persisted["bypassed"] is False
+    assert response.mise_en_place.all_passed is True
+    assert len(response.mise_en_place.checks) == 4
+
+
+@pytest.mark.asyncio
+async def test_start_run_blocks_when_mise_en_place_check_fails_without_force(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC2 — a failing check with no ``force`` refuses the launch, and NO
+    row/event is ever created (``assert_not_awaited``, mirror the pattern
+    already used for the unknown-workflow/inactive-workflow tests above).
+
+    A budget overrun is NOT retryable, so the refusal is a 422, not a 503
+    (review BS5)."""
+    set_correlation_id(str(uuid4()))
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=_failing_mise_en_place_report(failed_code="budget_available")
+    )
+
+    with pytest.raises(BusinessRuleError) as exc_info:
+        await service.start_run(workflow_id=uuid4(), run_input={})
+
+    assert exc_info.value.status == 422
+    assert exc_info.value.context["failed_checks"] == ["budget_available"]
+    # NOT `context["detail"]` — `app.main`'s RFC 7807 handler drops any
+    # context key colliding with a reserved field (`detail` included), so
+    # the readable summary must live on the exception's own `detail`.
+    assert "budget_available" in exc_info.value.detail
+    # Plural key (review P15): it is a list, and the singular name collided
+    # with the per-check `suggested_action: str | None`.
+    assert exc_info.value.context["suggested_actions"] == ["fix budget_available"]
+    workflow_run_repo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_run_blocks_with_503_when_every_failing_check_is_retryable(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """An MCP server that is down MAY come back on its own, so 503 (which
+    tells clients and proxies to retry) is honest there — and only there
+    (review BS5)."""
+    set_correlation_id(str(uuid4()))
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=_failing_mise_en_place_report(
+            failed_code="mcp_tools_reachable", retryable=True
+        )
+    )
+
+    with pytest.raises(DependencyError) as exc_info:
+        await service.start_run(workflow_id=uuid4(), run_input={})
+
+    assert exc_info.value.status == 503
+    workflow_run_repo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_run_blocks_with_422_when_any_failing_check_is_not_retryable(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Mixed failures: retrying cannot fix the permanent half, so advertising
+    "retry later" would be a lie. The permanent half decides."""
+    set_correlation_id(str(uuid4()))
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    mixed = build_report(
+        [
+            CheckResult(code="mcp_tools_reachable", passed=False, detail="down", retryable=True),
+            CheckResult(code="memory_namespaces_accessible", passed=True, detail="ok"),
+            CheckResult(code="budget_available", passed=True, detail="ok"),
+            CheckResult(
+                code="llm_providers_configured", passed=False, detail="no key", retryable=False
+            ),
+        ]
+    )
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=mixed
+    )
+
+    with pytest.raises(BusinessRuleError) as exc_info:
+        await service.start_run(workflow_id=uuid4(), run_input={})
+
+    assert exc_info.value.status == 422
+    workflow_run_repo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_run_force_without_reason_raises_422(event_publish_mock: AsyncMock) -> None:
+    """AC3 — ``force=true`` with a blank/absent ``reason`` is rejected
+    unconditionally, BEFORE the checks even run (defensive re-validation of
+    what ``StartRunRequest``'s Pydantic validator already guarantees at the
+    HTTP boundary — this method is a real surface a caller can reach
+    directly)."""
+    set_correlation_id(str(uuid4()))
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+
+    with pytest.raises(ValidationError, match="reason is required when force=true"):
+        await service.start_run(workflow_id=uuid4(), run_input={}, force=True)
+
+    service._mise_en_place_service.run_checks.assert_not_awaited()  # type: ignore[attr-defined]
+    workflow_run_repo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_run_bypasses_failing_check_with_force_and_reason(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC3 — ``force=true`` + a non-blank ``reason`` starts the run despite
+    the failing check, persists ``bypassed=true``/``bypass_reason``, and
+    publishes ``mise_en_place_bypassed`` alongside ``started`` in the same
+    transaction."""
+    set_correlation_id(str(uuid4()))
+    workflow_id = uuid4()
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    run = _workflow_run(workflow_id=workflow_id)
+    workflow_run_repo.create_in_session.return_value = run
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=_failing_mise_en_place_report(failed_code="mcp_tools_reachable")
+    )
+    service._drive_run = AsyncMock()  # type: ignore[method-assign]
+
+    response = await service.start_run(
+        workflow_id=workflow_id, run_input={}, force=True, reason="incident P1"
+    )
+
+    workflow_run_repo.create_in_session.assert_awaited_once()
+    create_kwargs = workflow_run_repo.create_in_session.await_args.kwargs
+    assert create_kwargs["mise_en_place"]["bypassed"] is True
+    assert create_kwargs["mise_en_place"]["bypass_reason"] == "incident P1"
+
+    published_types = [call.args[0] for call in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.started" in published_types
+    assert "workflow_engine.workflow_run.mise_en_place_bypassed" in published_types
+
+    bypass_call = next(
+        call
+        for call in event_publish_mock.await_args_list
+        if call.args[0] == "workflow_engine.workflow_run.mise_en_place_bypassed"
+    )
+    bypass_event = bypass_call.args[1]
+    assert bypass_event.reason == "incident P1"
+    assert bypass_event.failed_checks == ["mcp_tools_reachable"]
+    assert bypass_event.run_id == run.id
+
+    assert response.mise_en_place.bypassed is True
+    assert response.mise_en_place.bypass_reason == "incident P1"
+
+
+@pytest.mark.asyncio
+async def test_start_run_force_with_all_checks_passing_publishes_no_bypass_event(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC3's "no-op silencieux" — nothing was actually bypassed, so no
+    ``mise_en_place_bypassed`` event is published even though ``force`` and
+    a ``reason`` were both provided."""
+    set_correlation_id(str(uuid4()))
+    workflow_id = uuid4()
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    run = _workflow_run(workflow_id=workflow_id)
+    workflow_run_repo.create_in_session.return_value = run
+    service._drive_run = AsyncMock()  # type: ignore[method-assign]
+
+    response = await service.start_run(
+        workflow_id=workflow_id, run_input={}, force=True, reason="just in case"
+    )
+
+    published_types = [call.args[0] for call in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.mise_en_place_bypassed" not in published_types
+    assert response.mise_en_place.bypassed is False
+    create_kwargs = workflow_run_repo.create_in_session.await_args.kwargs
+    assert create_kwargs["mise_en_place"]["bypassed"] is False
 
 
 # ─── _execute (via _drive_run) — AC2/AC4 ────────────────────────────

@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
+from pydantic import SecretStr
 
 from agentive_backend.features.agent_registry import load_registry
 from agentive_backend.features.memory_manager.push_memory import (
@@ -23,6 +24,11 @@ from agentive_backend.features.memory_manager.push_memory import (
 )
 from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
+from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
+from agentive_backend.features.workflow_engine.mise_en_place import (
+    MiseEnPlaceService,
+    MiseEnPlaceSettings,
+)
 from agentive_backend.features.workflow_engine.recovery import WorkflowRecoveryWorker
 from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import (
@@ -74,9 +80,11 @@ from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
 from agentive_backend.shared.repositories import (
     AgentTemplateRepo,
+    AgentTemplateToolRepo,
     ChunkEmbeddingRepo,
     MemoryChunkRepo,
     NamespaceRepo,
+    ToolServerRepo,
     WorkflowRepo,
     WorkflowRunRepo,
 )
@@ -218,6 +226,37 @@ def _enforce_mcp_sandbox_policy(backend: str) -> None:
     )
 
 
+def _api_key_configured(key: SecretStr | None) -> bool:
+    """Whether a provider's API key is usable — present AND non-empty.
+
+    `AGENTIVE_ANTHROPIC_API_KEY=` (exported but blank, a common CI/compose
+    accident) yields ``SecretStr('')``, not ``None``, so an
+    ``is not None`` test alone reports a key that no provider can
+    authenticate with. Single predicate on purpose: :func:`_build_llm_router`
+    uses it to decide whether to fall back to :class:`MockProvider`, and
+    Story 4.5's ``MiseEnPlaceSettings`` uses it for the
+    ``llm_providers_configured`` check — the two MUST agree, or the
+    pre-workflow gate clears a launch the router cannot serve.
+    """
+    return key is not None and bool(key.get_secret_value())
+
+
+def _mock_llm_provider_active() -> bool:
+    """Whether this process runs on the :class:`MockProvider` fallback.
+
+    True exactly when :func:`_build_llm_router` takes its "no key at all"
+    branch — which, since that branch refuses to boot in production, can
+    only happen in dev/test. Every run then completes against the mock, so
+    Story 4.5's ``llm_providers_configured`` check MUST pass: a missing key
+    predicts no failure here, and blocking the launch would be a false
+    positive that makes local development impossible without secrets
+    (review IG1).
+    """
+    return not _api_key_configured(settings.anthropic_api_key) and not _api_key_configured(
+        settings.openai_api_key
+    )
+
+
 def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRouter:
     """Build the singleton :class:`LLMRouter` for the process.
 
@@ -241,10 +280,10 @@ def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRout
     anthropic_key = settings.anthropic_api_key
     openai_key = settings.openai_api_key
 
-    has_anthropic = anthropic_key is not None and anthropic_key.get_secret_value()
-    has_openai = openai_key is not None and openai_key.get_secret_value()
+    has_anthropic = _api_key_configured(anthropic_key)
+    has_openai = _api_key_configured(openai_key)
 
-    if not has_anthropic and not has_openai:
+    if _mock_llm_provider_active():
         if settings.is_production:
             raise RuntimeError(
                 "Refusing to boot in production without any LLM provider "
@@ -609,6 +648,49 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise
     app.state.workflow_checkpointer = workflow_checkpointer
 
+    # Story 4.5 T7.1 — `MiseEnPlaceService`'s own `DryRunService` (the
+    # `budget_available` check reuses `DryRunService.dry_run()` as-is,
+    # Story 4.4). Mirrors `router.py::_build_dry_run_service` exactly (same
+    # repos, same `DryRunSettings` fields) rather than reading a shared
+    # instance from `app.state` — no such instance exists today, `DryRunService`
+    # has always been built per-request by the router (AC1's structural
+    # "zero LLM call" guarantee needs no shared state to preserve).
+    mise_en_place_dry_run_service = DryRunService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        settings=DryRunSettings(
+            history_limit=settings.dry_run_history_limit,
+            fallback_input_tokens=settings.dry_run_fallback_input_tokens,
+            fallback_output_tokens=settings.dry_run_fallback_output_tokens,
+            budget_cap_usd=settings.dry_run_budget_cap_usd,
+        ),
+    )
+    mise_en_place_service = MiseEnPlaceService(
+        template_tool_repo=AgentTemplateToolRepo(session_factory=session_factory),
+        tool_server_repo=ToolServerRepo(session_factory=session_factory),
+        namespace_repo=NamespaceRepo(session_factory=session_factory),
+        dry_run_service=mise_en_place_dry_run_service,
+        settings=MiseEnPlaceSettings(
+            tool_ping_timeout_s=settings.mise_en_place_tool_ping_timeout_s,
+            check_timeout_s=settings.mise_en_place_check_timeout_s,
+            # Same global threshold as Dry Run (Story 4.4) — never a second
+            # source of truth (Dev Notes § Budget).
+            budget_cap_usd=settings.dry_run_budget_cap_usd,
+            # Same predicate as `_build_llm_router` above, deliberately not a
+            # second `is not None` test: a blank key must not clear the
+            # `llm_providers_configured` gate for a provider the router will
+            # refuse to build (review P3).
+            anthropic_api_key_present=_api_key_configured(settings.anthropic_api_key),
+            openai_api_key_present=_api_key_configured(settings.openai_api_key),
+            # Resolved from the SAME predicate that decided whether the
+            # router above runs on `MockProvider` (review IG1) — the check
+            # must never refuse a launch the router is perfectly able to
+            # serve.
+            mock_llm_provider_active=_mock_llm_provider_active(),
+        ),
+    )
+
     # Story 4.2 T9.3 — one shared `WorkflowExecutionService` for BOTH the
     # recovery worker and the router (`router.py` reads it straight from
     # `app.state` instead of reconstructing its repos per request).
@@ -619,6 +701,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         llm_router=llm_router,
         checkpointer=workflow_checkpointer,
         routing_rules=app.state.routing_rules,
+        mise_en_place_service=mise_en_place_service,
     )
     app.state.workflow_execution_service = workflow_execution_service
 
