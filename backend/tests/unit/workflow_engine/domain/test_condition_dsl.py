@@ -241,3 +241,63 @@ def test_compatible_numeric_types_still_compare() -> None:
     """int/float mixing is legitimate and must keep working."""
     assert evaluate(parse("output.score >= 0.5"), 1) is True
     assert evaluate(parse("output.score < 10"), 9.5) is True
+
+
+# ─── Story 4.3 T2.1/T11.2 — `context.*` namespace ────────────────────────
+
+
+def test_parse_rejects_context_namespace_by_default() -> None:
+    """4.1/4.2 non-regression: every existing call site keeps rejecting
+    `context.*` without passing `allowed_namespaces` explicitly."""
+    with pytest.raises(DomainValidationError):
+        parse("context.candidate_count >= 3")
+
+
+def test_parse_accepts_context_namespace_when_allowed() -> None:
+    parsed = parse("context.candidate_count >= 3", allowed_namespaces=("output", "context"))
+    assert parsed.namespace == "context"
+    assert parsed.field == "candidate_count"
+    assert parsed.operator == ">="
+    assert parsed.literal == 3
+
+
+def test_parse_still_accepts_output_namespace_when_context_also_allowed() -> None:
+    parsed = parse("output.status == 'ok'", allowed_namespaces=("output", "context"))
+    assert parsed.namespace == "output"
+
+
+def test_parse_default_namespace_is_output_for_backward_compatible_construction() -> None:
+    """`ParsedCondition.namespace` defaults to `'output'` — every 4.1/4.2
+    call site constructing it with partial kwargs keeps working."""
+    from agentive_backend.features.workflow_engine.domain.condition_dsl import ParsedCondition
+
+    parsed = ParsedCondition(field="status", operator="==", literal="ok")
+    assert parsed.namespace == "output"
+
+
+def test_parse_rejects_unknown_namespace_even_when_context_allowed() -> None:
+    """`match=` is the point of this test, not decoration: while the regex
+    hard-coded `(output|context)`, `foo.bar` failed on the SYNTAX branch and
+    this test passed without the allowlist check ever running — it would have
+    stayed green with that check deleted."""
+    with pytest.raises(DomainValidationError, match="namespace 'foo' not allowed"):
+        parse("foo.bar == 1", allowed_namespaces=("output", "context"))
+
+
+def test_parse_rejects_unknown_namespace_by_default() -> None:
+    with pytest.raises(DomainValidationError, match="namespace 'foo' not allowed"):
+        parse("foo.bar == 1")
+
+
+def test_parse_rejects_context_namespace_by_default_with_the_namespace_message() -> None:
+    """Proof of non-regression for 4.1/4.2 that names its own reason: the
+    default allowlist is what refuses `context.*`, not the grammar."""
+    with pytest.raises(DomainValidationError, match="namespace 'context' not allowed"):
+        parse("context.candidate_count >= 3")
+
+
+def test_parse_still_reports_a_syntax_error_for_a_malformed_condition() -> None:
+    """Widening the namespace group must not turn genuine syntax errors into
+    namespace errors."""
+    with pytest.raises(DomainValidationError, match="invalid branching condition syntax"):
+        parse("output.status 'ok'")

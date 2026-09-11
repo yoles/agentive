@@ -15,6 +15,10 @@ Events shipped to date:
   ``END`` on every branch.
 * ``workflow_engine.workflow_run.failed`` (Story 4.2 AC4) — a node raised a
   non-recoverable error, terminating the run.
+* ``workflow_engine.workflow_run.routing_escalated`` (Story 4.3 AC2/AC3) —
+  a routing decision point could not be resolved deterministically (DSL
+  silent, no rule cleared the confidence threshold) and escalated to the
+  lightweight LLM.
 
 Naming note (D91 point 3): the epic's literal AC3 wording ("workflow_resumed")
 does not fit ``shared/event_bus/naming.py``'s strict 3-segment
@@ -119,11 +123,44 @@ class WorkflowRunFailedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
+class WorkflowRunRoutingEscalatedEvent(BaseModel):
+    """Published when a routing decision point escalates to the lightweight
+    LLM (Story 4.3 AC2/AC3 — T7.1).
+
+    Streamed as-is to SSE clients by the Story 4.2 endpoint's
+    ``_RUN_EVENT_PATTERN`` (``workflow_engine\\.workflow_run\\.\\w+``) —
+    deliberately NOT added to ``router.py``'s ``_TERMINAL_EVENT_SUFFIXES``
+    (T7.4), and deliberately WITHOUT ``own_output`` in the payload (T7.3): a
+    node's output can be arbitrarily large, and the SSE queue is bounded
+    with drop journalisé — a fat payload here would turn an escalation burst
+    into dropped frames. ``context`` carries only the scalar counts of
+    :class:`~agentive_backend.features.workflow_engine.domain.routing_rules.RoutingContext`
+    (never ``own_output``), which is exactly the raw material the Growth-phase
+    rule-learning innovation (MVP #1, anti-scope here) needs.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.routing_escalated"
+
+    run_id: UUID
+    workflow_id: UUID
+    node_id: str = Field(min_length=1, max_length=100)
+    candidates: list[str] = Field(default_factory=list)
+    decision_target: list[str] = Field(default_factory=list)
+    confidence_best: float | None = None
+    rule_id_best: str | None = None
+    reason: str = Field(max_length=500)
+    llm_model: str = Field(min_length=1)
+    llm_latency_ms: int = Field(ge=0)
+    context: dict[str, object] = Field(default_factory=dict)
+    tenant_id: UUID | None = None
+
+
 __all__ = [
     "WorkflowCreatedEvent",
     "WorkflowRunCompletedEvent",
     "WorkflowRunFailedEvent",
     "WorkflowRunResumedEvent",
+    "WorkflowRunRoutingEscalatedEvent",
     "WorkflowRunStartedEvent",
     "WorkflowRunStepCompletedEvent",
 ]

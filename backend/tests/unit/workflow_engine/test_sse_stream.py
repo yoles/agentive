@@ -19,7 +19,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from agentive_backend.features.workflow_engine.router import _state_event, _stream_run_events
+from agentive_backend.features.workflow_engine.router import (
+    _RUN_EVENT_PATTERN,
+    _TERMINAL_EVENT_SUFFIXES,
+    _state_event,
+    _stream_run_events,
+)
 from agentive_backend.shared.event_bus import Event
 
 # NOT `import ...workflow_engine.router as router_module`: the package's
@@ -285,3 +290,19 @@ async def test_subscription_is_released_even_when_the_client_walks_away(
     await stream.aclose()
 
     assert captured_handler["sub"].unsubscribed is True
+
+
+# ─── Story 4.3 T7.4 — routing_escalated must not close the stream ───────
+
+
+def test_routing_escalated_is_not_a_terminal_event_suffix() -> None:
+    """A new `workflow_engine.workflow_run.*` event that DID get added to
+    `_TERMINAL_EVENT_SUFFIXES` would close the SSE stream at the first
+    escalation instead of just forwarding the frame."""
+    assert "routing_escalated" not in _TERMINAL_EVENT_SUFFIXES
+
+
+def test_routing_escalated_event_type_matches_the_run_event_pattern() -> None:
+    """It must still match the subscription pattern so it reaches the SSE
+    client at all (T7's whole point: streamed "for free")."""
+    assert _RUN_EVENT_PATTERN.fullmatch("workflow_engine.workflow_run.routing_escalated")

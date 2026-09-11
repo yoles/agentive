@@ -22,6 +22,63 @@ def _request(**state: Any) -> Any:
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(**state)))
 
 
+# ─── Story 4.3 T10.4 — route-collision lock ──────────────────────────────
+
+
+def _resolve_endpoint_name(path: str) -> str | None:
+    """Name of the endpoint FastAPI would dispatch ``GET path`` to."""
+    from fastapi import FastAPI
+    from starlette.routing import Match
+
+    from agentive_backend.features.workflow_engine.router import router as workflows_router
+
+    app = FastAPI()
+    app.include_router(workflows_router, prefix="/api/v1")
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "headers": [],
+        "query_string": b"",
+        "root_path": "",
+    }
+    for route in app.router.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            name: str | None = getattr(route, "name", None)
+            return name
+    return None
+
+
+def test_routing_stats_route_does_not_capture_the_run_events_route() -> None:
+    """T10.4 was checked off without this lock. FastAPI dispatches on
+    DECLARATION ORDER, and `/workflows/{workflow_id}/routing-stats` is
+    declared BEFORE `/workflows/runs/{run_id}/events` under the same prefix.
+    The two happen not to overlap (3 path segments vs 4), but nothing
+    expressed that — so re-declaring either one with a different arity, or
+    adding `/workflows/{workflow_id}/{action}`, would silently reroute a
+    live SSE endpoint.
+    """
+    run_id = "0199d0a1-0000-7000-8000-000000000000"
+    workflow_id = "0199d0a1-1111-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") == (
+        "stream_workflow_run_events"
+    )
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+
+
+def test_a_workflow_literally_named_runs_does_not_steal_the_events_route() -> None:
+    """The inverse direction of the same collision: `runs` is a valid UUID
+    path position for `{workflow_id}`, so the events route must stay
+    reachable regardless."""
+    assert _resolve_endpoint_name("/api/v1/workflows/runs/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+
+
 def test_missing_session_factory_raises_503() -> None:
     with pytest.raises(DependencyError) as exc:
         _build_workflow_service(_request())
@@ -53,12 +110,14 @@ def test_execution_service_comes_from_app_state() -> None:
         template_repo=SimpleNamespace(),  # type: ignore[arg-type]
         llm_router=SimpleNamespace(),  # type: ignore[arg-type]
         checkpointer=SimpleNamespace(),  # type: ignore[arg-type]
+        routing_rules=(),
     )
     request = _request(
         workflow_execution_service=shared,
         session_factory=object(),
         llm_router=object(),
         workflow_checkpointer=object(),
+        routing_rules=object(),
     )
 
     assert _build_execution_service(request) is shared
@@ -74,4 +133,8 @@ def test_unwired_execution_service_reports_the_missing_lifespan_resources() -> N
     with pytest.raises(DependencyError) as exc:
         _build_execution_service(_request(session_factory=object()))
     assert exc.value.status == 503
-    assert exc.value.context["missing"] == ["llm_router", "workflow_checkpointer"]
+    assert exc.value.context["missing"] == [
+        "llm_router",
+        "workflow_checkpointer",
+        "routing_rules",
+    ]

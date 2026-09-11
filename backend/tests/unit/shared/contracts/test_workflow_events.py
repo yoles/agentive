@@ -13,6 +13,7 @@ from agentive_backend.shared.contracts.events import (
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
     WorkflowRunResumedEvent,
+    WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
 )
@@ -118,3 +119,77 @@ def test_workflow_run_failed_event_allows_an_unknown_failed_node() -> None:
         run_id=uuid4(), workflow_id=uuid4(), failed_node_id=None, error_summary="boom"
     )
     assert event.failed_node_id is None
+
+
+# ─── Story 4.3 T7.2 — routing_escalated event ───────────────────────────
+
+
+def test_workflow_run_routing_escalated_event_type_and_defaults() -> None:
+    assert (
+        WorkflowRunRoutingEscalatedEvent.event_type
+        == "workflow_engine.workflow_run.routing_escalated"
+    )
+    event = WorkflowRunRoutingEscalatedEvent(
+        run_id=uuid4(),
+        workflow_id=uuid4(),
+        node_id="a",
+        llm_model="claude-haiku-4-5",
+        llm_latency_ms=42,
+        reason="best guess",
+    )
+    assert event.candidates == []
+    assert event.decision_target == []
+    assert event.confidence_best is None
+    assert event.rule_id_best is None
+    assert event.context == {}
+    assert event.tenant_id is None
+
+
+def test_workflow_run_routing_escalated_event_full_payload() -> None:
+    event = WorkflowRunRoutingEscalatedEvent(
+        run_id=uuid4(),
+        workflow_id=uuid4(),
+        node_id="a",
+        candidates=["b", "c"],
+        decision_target=["b"],
+        confidence_best=0.5,
+        rule_id_best="weak-rule",
+        reason="the LLM picked b",
+        llm_model="claude-haiku-4-5",
+        llm_latency_ms=120,
+        context={"candidate_count": 2, "has_parsable_output": True},
+    )
+    assert event.candidates == ["b", "c"]
+    assert event.decision_target == ["b"]
+    assert event.confidence_best == 0.5
+    assert event.rule_id_best == "weak-rule"
+
+
+def test_workflow_run_routing_escalated_event_enforces_reason_length_cap() -> None:
+    """`max_length=500` mirrors `hybrid_router._REASON_MAX_CHARS`."""
+    WorkflowRunRoutingEscalatedEvent(
+        run_id=uuid4(),
+        workflow_id=uuid4(),
+        node_id="a",
+        reason="x" * 500,
+        llm_model="claude-haiku-4-5",
+        llm_latency_ms=1,
+    )
+    with pytest.raises(PydanticValidationError):
+        WorkflowRunRoutingEscalatedEvent(
+            run_id=uuid4(),
+            workflow_id=uuid4(),
+            node_id="a",
+            reason="x" * 501,
+            llm_model="claude-haiku-4-5",
+            llm_latency_ms=1,
+        )
+
+
+def test_workflow_run_routing_escalated_event_never_carries_own_output() -> None:
+    """T7.3 — the event schema simply has no field for a node's raw output;
+    this test pins the field set so a future change cannot reintroduce one
+    without a reviewer noticing."""
+    fields = set(WorkflowRunRoutingEscalatedEvent.model_fields)
+    assert "own_output" not in fields
+    assert "node_output" not in fields

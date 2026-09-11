@@ -46,6 +46,7 @@ from agentive_backend.shared.contracts.events.workflow_events import (
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
     WorkflowRunResumedEvent,
+    WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "WorkflowRunCompletedEvent",
     "WorkflowRunFailedEvent",
     "WorkflowRunResumedEvent",
+    "WorkflowRunRoutingEscalatedEvent",
     "WorkflowRunStartedEvent",
     "WorkflowRunStepCompletedEvent",
 ]

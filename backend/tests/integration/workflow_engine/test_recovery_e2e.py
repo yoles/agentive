@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentive_backend.features.workflow_engine.recovery import WorkflowRecoveryWorker
+from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import WorkflowExecutionService
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.testing import MockProvider
@@ -136,6 +137,7 @@ async def test_resume_after_sigkill_does_not_replay_node_a(
             template_repo=template_repo,
             llm_router=llm_router,
             checkpointer=checkpointer,
+            routing_rules=load_routing_rules(),
         )
         worker = WorkflowRecoveryWorker(
             workflow_execution_service=execution_service,

@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, case, cast, func, literal, select, update
+from sqlalchemy import Integer, Numeric, case, cast, func, literal, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -377,3 +377,47 @@ class WorkflowRunRepo(BaseRepo):
             )
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    async def aggregate_routing_modes(
+        self, workflow_id: UUID, *, tenant_id: UUID | None = None
+    ) -> tuple[int, int, int]:
+        """``(runs_counted, deterministic, llm_escalated)`` across every run
+        of ``workflow_id`` (Story 4.3 AC3 T10.1).
+
+        Tolerant of rows that predate this story (``metrics`` has no
+        ``routing`` key at all — every Story 4.1/4.2 run already in the
+        database) AND of a corrupted/non-numeric value under that key: either
+        case counts as ``0`` for that row rather than aborting the whole
+        aggregate (the cast is per-row, so ONE bad row would otherwise poison
+        the count for every other run of the same workflow — mirror
+        ``_recovery_attempts_expr``'s existing guard on this exact hazard).
+
+        ``jsonb_typeof`` alone is NOT that guarantee: it answers ``'number'``
+        for ``1.5`` exactly as for ``1``, and ``'1.5'::int`` raises
+        ``invalid input syntax for type integer``. The cast therefore goes
+        through ``numeric`` + ``floor`` — which accepts every JSON number —
+        so the type guard and the cast agree on what they accept. Without it
+        a single fractional value made ``GET /routing-stats`` return 500 for
+        the entire workflow, which is precisely the poisoning this guard is
+        here to prevent.
+        """
+
+        def _routing_count(key: str) -> Any:
+            path = WorkflowRun.metrics[("routing", key)]
+            return case(
+                (
+                    func.jsonb_typeof(path) == "number",
+                    cast(func.floor(cast(path.astext, Numeric)), Integer),
+                ),
+                else_=literal(0),
+            )
+
+        async with self.with_tenant(tenant_id) as session:
+            stmt = select(
+                func.count(),
+                func.coalesce(func.sum(_routing_count("deterministic")), literal(0)),
+                func.coalesce(func.sum(_routing_count("llm_escalated")), literal(0)),
+            ).where(WorkflowRun.workflow_id == workflow_id)
+            result = await session.execute(stmt)
+            row = result.one()
+            return int(row[0]), int(row[1]), int(row[2])

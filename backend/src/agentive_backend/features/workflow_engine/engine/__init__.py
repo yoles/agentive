@@ -15,6 +15,11 @@ rather than by re-describing the package.
 
 * :mod:`.graph_builder` — compiles a persisted DAG into a LangGraph ``StateGraph``.
 * :mod:`.agent_node` — one node's LLM completion.
+* :mod:`.hybrid_router` — the routing decision itself (Story 4.3): the 4.1/4.2
+  branching DSL, then declarative rules, then LLM escalation. Deliberately
+  NOT re-exported below: ``hybrid_router`` and ``routing_catalog`` are
+  feature-internal, and only result types cross the package boundary
+  (``architecture.md#Public API par feature``).
 """
 
 from __future__ import annotations
