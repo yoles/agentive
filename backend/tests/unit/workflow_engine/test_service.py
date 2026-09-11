@@ -32,6 +32,7 @@ from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
     WorkflowService,
 )
+from agentive_backend.shared.contracts.events import WorkflowRunMiseEnPlaceRefusedEvent
 from agentive_backend.shared.correlation import set_correlation_id
 from agentive_backend.shared.exceptions import (
     BusinessRuleError,
@@ -52,6 +53,20 @@ def event_publish_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
     monkeypatch.setattr(svc_module, "publish", pub_mock)
     monkeypatch.setattr(svc_module, "notify_best_effort", notify_mock)
     yield pub_mock
+
+
+@pytest.fixture
+def event_publish_and_commit_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
+    """Patch ``service.publish_and_commit`` — the refused-launch audit trace
+    (Story 4.5 AC2, review BS2) owns its session and commits on its own, so
+    it does NOT go through ``publish``. Kept as a separate fixture on
+    purpose: every `assert_not_awaited()` on ``event_publish_mock`` keeps
+    meaning "no ``started`` event was published"."""
+    mock = AsyncMock(return_value=uuid4())
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    monkeypatch.setattr(svc_module, "publish_and_commit", mock)
+    yield mock
 
 
 def _template(
@@ -853,6 +868,62 @@ async def test_start_run_blocks_when_mise_en_place_check_fails_without_force(
     assert exc_info.value.context["suggested_actions"] == ["fix budget_available"]
     workflow_run_repo.create_in_session.assert_not_awaited()
     event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_run_when_refused_should_publish_an_audit_event(
+    event_publish_mock: AsyncMock,
+    event_publish_and_commit_mock: AsyncMock,
+) -> None:
+    """A refused launch creates no row, so its report has nowhere to be
+    persisted (AC2) — it is traced in the outbox instead, or it vanishes
+    the moment the error is returned (review BS2)."""
+    set_correlation_id(str(uuid4()))
+    workflow_id = uuid4()
+    service, workflow_repo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=_failing_mise_en_place_report(failed_code="budget_available")
+    )
+
+    with pytest.raises(BusinessRuleError):
+        await service.start_run(workflow_id=workflow_id, run_input={})
+
+    # Still no row and no `started` event — the audit trace must not
+    # resurrect any part of the launch (AC2).
+    workflow_run_repo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()  # no `started` event
+
+    event_publish_and_commit_mock.assert_awaited_once()
+    args = event_publish_and_commit_mock.await_args.args
+    assert args[1] == WorkflowRunMiseEnPlaceRefusedEvent.event_type
+    payload = args[2]
+    assert payload.workflow_id == workflow_id
+    assert payload.failed_checks == ["budget_available"]
+    assert payload.retryable is False
+    assert payload.mise_en_place["all_passed"] is False
+    # No `run_id` on this event — there is no run, and the shape says so.
+    assert not hasattr(payload, "run_id")
+
+
+@pytest.mark.asyncio
+async def test_start_run_when_refusal_audit_fails_should_still_raise_the_real_error(
+    event_publish_and_commit_mock: AsyncMock,
+) -> None:
+    """Best-effort audit: replacing a precise "your budget is exceeded" with
+    an opaque database error would trade a useful answer for a useless one."""
+    set_correlation_id(str(uuid4()))
+    service, workflow_repo, _run_repo, _trepo = _make_execution_service()
+    workflow_repo.require_by_id.return_value = _workflow(status="active")
+    service._mise_en_place_service.run_checks = AsyncMock(  # type: ignore[attr-defined]
+        return_value=_failing_mise_en_place_report(failed_code="budget_available")
+    )
+    event_publish_and_commit_mock.side_effect = RuntimeError("outbox down")
+
+    with pytest.raises(BusinessRuleError) as exc_info:
+        await service.start_run(workflow_id=uuid4(), run_input={})
+
+    assert "budget_available" in exc_info.value.detail
 
 
 @pytest.mark.asyncio

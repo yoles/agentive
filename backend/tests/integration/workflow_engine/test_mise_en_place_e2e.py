@@ -11,7 +11,9 @@ which makes it the wrong fixture for testing the hook itself.
 
 Scenarios (T8.5):
 1. A workflow with a real, unreachable MCP tool assigned → 503, NO
-   ``workflow_runs`` row is created.
+   ``workflow_runs`` row is created — but a ``mise_en_place_refused`` event
+   IS written to ``outbox_events`` (review BS2): with no row to hold the
+   report, the outbox is the only place a refused launch leaves a trace.
 2. Same workflow with ``force=true`` + ``reason`` → the run starts,
    ``mise_en_place.bypassed=true`` is persisted, and
    ``mise_en_place_bypassed`` lands in ``outbox_events``.
@@ -252,6 +254,33 @@ async def test_start_run_blocked_by_unreachable_mcp_tool(
             {"wid": workflow_id},
         )
         assert int(count.scalar_one()) == 0
+
+        # ...but the refusal IS traced in the outbox (review BS2): with no
+        # row to persist the report on, the trace would otherwise vanish the
+        # moment the 503 was returned. Keyed on `workflow_id` — this event
+        # deliberately carries no `run_id`, because there is no run.
+        events = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT event_type, payload FROM outbox_events "
+                        "WHERE payload->>'workflow_id' = :wid"
+                    ),
+                    {"wid": workflow_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        refusals = [e for e in events if e["event_type"].endswith("mise_en_place_refused")]
+        assert len(refusals) == 1
+        payload = refusals[0]["payload"]
+        assert payload["failed_checks"] == ["mcp_tools_reachable"]
+        assert payload["retryable"] is True
+        assert payload["mise_en_place"]["all_passed"] is False
+        assert "run_id" not in payload
+        # And no `started` event leaked out for a launch that never happened.
+        assert not any(e["event_type"].endswith("run.started") for e in events)
 
 
 @pytest.mark.asyncio

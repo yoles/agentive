@@ -7,8 +7,9 @@ Create Date: 2026-09-11
 Story 4.5 AC1: the Mise en Place hook persists a report (4 `CheckResult`
 entries + bypass metadata) for every `POST /workflows/{workflow_id}/runs`
 call THAT STARTS A RUN. A refused launch (AC2) creates no `workflow_runs`
-row, so it writes nothing here — the report only reaches the caller in the
-503 body. Unlike Story 4.4 (Dry Run — deliberately no migration, pure
+row, so it writes nothing here — it is traced in the outbox instead, as
+`workflow_engine.workflow_run.mise_en_place_refused` carrying the same
+report (review BS2). Unlike Story 4.4 (Dry Run — deliberately no migration, pure
 read), this story writes a new fact, so it needs somewhere to put it:
 `WorkflowRun` (`infra/db/models.py`) carried no such column.
 """

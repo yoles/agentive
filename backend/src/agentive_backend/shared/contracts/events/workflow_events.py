@@ -24,6 +24,12 @@ Events shipped to date:
   checks were failing. The first event in this repo representing an explicit
   user bypass with a stated reason (grep-confirmed at story time — no prior
   ``_bypassed``/``_forced`` event existed).
+* ``workflow_engine.workflow_run.mise_en_place_refused`` (Story 4.5 AC2,
+  review BS2) — the symmetric case: a launch REFUSED because a check failed
+  and no ``force`` was given. It exists because AC2 forbids creating a
+  ``workflow_runs`` row for a refused launch, so the report has nowhere to
+  be persisted on that table; the outbox is where the refusal is traced
+  instead. Carries no ``run_id`` — there is no run.
 
 Naming note (D91 point 3): the epic's literal AC3 wording ("workflow_resumed")
 does not fit ``shared/event_bus/naming.py``'s strict 3-segment
@@ -35,7 +41,7 @@ in Story 4.1.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -181,11 +187,48 @@ class WorkflowRunMiseEnPlaceBypassedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
+class WorkflowRunMiseEnPlaceRefusedEvent(BaseModel):
+    """Published when a launch is REFUSED because a Mise en Place check
+    failed and the caller did not pass ``force`` (Story 4.5 AC2, review BS2).
+
+    Why an event and not a row: AC2 requires that no ``workflow_runs`` row
+    exist for a refused launch, so the report has nowhere to live on that
+    table — AC1's "persisted whether the workflow starts or not" cannot hold
+    there, and AC2 is the stronger requirement. Inventing a ``refused`` run
+    row would leak a phantom run into run listings, the recovery worker's
+    stale sweep, and routing stats. The outbox already carries the audit
+    trail Trace Explorer consumes (NFR8/NFR15), and this story already
+    publishes its sibling ``mise_en_place_bypassed`` there — a refusal is
+    exactly as much an auditable decision as a bypass.
+
+    Deliberately carries NO ``run_id``: there is no run, and the shape says
+    so rather than fabricating one.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.mise_en_place_refused"
+
+    workflow_id: UUID
+    #: Codes of the checks that failed, i.e. why the launch was refused.
+    failed_checks: list[str] = Field(default_factory=list)
+    #: Human-readable summary — the same text the caller received in the
+    #: RFC 7807 `detail`.
+    detail: str = Field(default="", max_length=4000)
+    #: Whether EVERY failing check was transient (review BS5) — mirrors the
+    #: status the caller got: `True` → 503, `False` → 422.
+    retryable: bool = False
+    #: The full report as persisted-shaped JSON, so a consumer sees exactly
+    #: what a started run's `workflow_runs.mise_en_place` would have held.
+    mise_en_place: dict[str, Any] = Field(default_factory=dict)
+    actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
 __all__ = [
     "WorkflowCreatedEvent",
     "WorkflowRunCompletedEvent",
     "WorkflowRunFailedEvent",
     "WorkflowRunMiseEnPlaceBypassedEvent",
+    "WorkflowRunMiseEnPlaceRefusedEvent",
     "WorkflowRunResumedEvent",
     "WorkflowRunRoutingEscalatedEvent",
     "WorkflowRunStartedEvent",

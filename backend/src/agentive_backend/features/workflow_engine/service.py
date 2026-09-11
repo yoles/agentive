@@ -62,12 +62,13 @@ from agentive_backend.shared.contracts.events import (
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
     WorkflowRunMiseEnPlaceBypassedEvent,
+    WorkflowRunMiseEnPlaceRefusedEvent,
     WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
 )
 from agentive_backend.shared.correlation import require_correlation_id
-from agentive_backend.shared.event_bus import notify_best_effort, publish
+from agentive_backend.shared.event_bus import notify_best_effort, publish, publish_and_commit
 from agentive_backend.shared.exceptions import (
     BusinessRuleError,
     DependencyError,
@@ -851,19 +852,21 @@ class WorkflowExecutionService:
                 # code `status != "active"` already returns a few lines
                 # above for the same reason — the request cannot succeed
                 # until a human changes something.
-                error_cls = (
-                    DependencyError
-                    if all(check.retryable for check in report.checks if not check.passed)
-                    else BusinessRuleError
+                retryable = all(check.retryable for check in report.checks if not check.passed)
+                error_cls = DependencyError if retryable else BusinessRuleError
+                summary = "; ".join(
+                    f"{check.code}: {check.detail}" for check in report.checks if not check.passed
                 )
-                raise error_cls(
-                    detail="; ".join(
-                        f"{check.code}: {check.detail}"
-                        for check in report.checks
-                        if not check.passed
-                    ),
-                    context=context,
+                await self._audit_mise_en_place_refusal(
+                    workflow_id=workflow_id,
+                    tenant_id=tenant_id,
+                    correlation_id=correlation_id,
+                    failed_checks=failed_checks,
+                    summary=summary,
+                    retryable=retryable,
+                    report=report,
                 )
+                raise error_cls(detail=summary, context=context)
             # `force=True`, so `bypass_reason` was validated non-blank above
             # (it is only ever left `None` when `force` is falsy). A real
             # raise, not an `assert`: `python -O` strips asserts, and this
@@ -953,6 +956,57 @@ class WorkflowExecutionService:
             warnings=warnings,
             mise_en_place=_mise_en_place_out(report),
         )
+
+    async def _audit_mise_en_place_refusal(
+        self,
+        *,
+        workflow_id: UUID,
+        tenant_id: UUID | None,
+        correlation_id: UUID,
+        # `Sequence[str]`, not `list[str]`: `list` is invariant, and the
+        # caller holds a `list[CheckCode]` (a list of `Literal`s).
+        failed_checks: Sequence[str],
+        summary: str,
+        retryable: bool,
+        report: MiseEnPlaceReport,
+    ) -> None:
+        """Trace a REFUSED launch in the outbox (AC2, review BS2).
+
+        A refused launch creates no ``workflow_runs`` row — AC2 requires
+        exactly that — so its report has nowhere to be persisted on that
+        table and used to vanish the moment the 503/422 was returned. It is
+        traced here instead, on the same bus that already carries
+        ``mise_en_place_bypassed``: a refusal is as auditable a decision as
+        a bypass (NFR8/NFR15).
+
+        BEST-EFFORT on purpose. If this write fails, the refusal is still
+        raised: the caller already receives the full report in the error
+        body, and replacing a precise "your MCP server is down" with an
+        opaque database error would trade a useful answer for a useless
+        one. The failure is logged at ERROR so an operator can see the
+        audit gap.
+        """
+        try:
+            async with self._workflow_run_repo.with_tenant(tenant_id) as session:
+                await publish_and_commit(
+                    session,
+                    WorkflowRunMiseEnPlaceRefusedEvent.event_type,
+                    WorkflowRunMiseEnPlaceRefusedEvent(
+                        workflow_id=workflow_id,
+                        failed_checks=list(failed_checks),
+                        detail=summary[:4000],
+                        retryable=retryable,
+                        mise_en_place=_mise_en_place_out(report).model_dump(mode="json"),
+                        tenant_id=tenant_id,
+                    ),
+                    correlation_id=correlation_id,
+                )
+        except Exception:
+            _log.exception(
+                "workflow_engine.mise_en_place_refusal_audit_failed",
+                workflow_id=str(workflow_id),
+                failed_checks=list(failed_checks),
+            )
 
     async def _drive_run(
         self,

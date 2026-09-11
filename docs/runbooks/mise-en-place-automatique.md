@@ -63,8 +63,34 @@ check passed:
 }
 ```
 
-**Blocked (AC2)** — no `workflow_runs` row is created, no event is
-published. The RFC 7807 body's `detail` carries a human-readable summary of
+**Blocked (AC2)** — no `workflow_runs` row is created and no
+`workflow_run.started` event is published. The refusal IS traced, as a
+`workflow_engine.workflow_run.mise_en_place_refused` event in
+`outbox_events` carrying `workflow_id`, `failed_checks`, `retryable` and the
+full report (review BS2). It has **no `run_id`** — there is no run, and the
+payload says so rather than fabricating one. Query it by `workflow_id`:
+
+```sql
+SELECT payload FROM outbox_events
+WHERE event_type = 'workflow_engine.workflow_run.mise_en_place_refused'
+  AND payload->>'workflow_id' = :workflow_id;
+```
+
+This exists because AC1 ("un rapport est persisté, que le workflow démarre
+ou non") and AC2 ("AUCUNE row n'est créée") contradict each other: the
+column lives on `workflow_runs`, so a refused launch has nowhere to persist
+its report. AC2 is the stronger requirement — inventing a `refused` run row
+would leak a phantom run into run listings, the recovery worker's stale
+sweep and routing stats — so the outbox carries the trace instead, next to
+the `mise_en_place_bypassed` event this story already publishes.
+
+The audit write is **best-effort**: if it fails, the refusal is still
+returned (the caller already has the full report in the error body, and
+replacing a precise "your MCP server is down" with an opaque database error
+would be a downgrade). The failure is logged at ERROR as
+`workflow_engine.mise_en_place_refusal_audit_failed`.
+
+The RFC 7807 body's `detail` carries a human-readable summary of
 every failing check (`app.main`'s handler drops any `context` key that
 collides with a reserved field, `detail` included — the summary lives on
 the exception's own `detail`, not nested).
