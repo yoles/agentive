@@ -79,6 +79,87 @@ def test_a_workflow_literally_named_runs_does_not_steal_the_events_route() -> No
     )
 
 
+# ─── Story 4.4 T5.3 — dry-run route-collision lock ───────────────────────
+
+
+def _resolve_post_endpoint_name(path: str) -> str | None:
+    """Same as :func:`_resolve_endpoint_name` but for ``POST`` — `dry-run`
+    is declared as a POST route, unlike `routing-stats`/`events` (GET)."""
+    from fastapi import FastAPI
+    from starlette.routing import Match
+
+    from agentive_backend.features.workflow_engine.router import router as workflows_router
+
+    app = FastAPI()
+    app.include_router(workflows_router, prefix="/api/v1")
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [],
+        "query_string": b"",
+        "root_path": "",
+    }
+    for route in app.router.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            name: str | None = getattr(route, "name", None)
+            return name
+    return None
+
+
+def test_dry_run_route_does_not_collide_with_runs_route() -> None:
+    """`POST /workflows/{workflow_id}/dry-run` and
+    `POST /workflows/{workflow_id}/runs` are distinct literal segments
+    after the same `{workflow_id}` prefix — neither must capture the
+    other."""
+    workflow_id = "0199d0a1-2222-7000-8000-000000000000"
+
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/dry-run") == (
+        "dry_run_workflow"
+    )
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/runs") == (
+        "start_workflow_run"
+    )
+
+
+def test_a_workflow_literally_named_dry_run_does_not_steal_the_runs_route() -> None:
+    assert _resolve_post_endpoint_name("/api/v1/workflows/dry-run/runs") == ("start_workflow_run")
+
+
+def test_dry_run_route_does_not_collide_with_routing_stats_route() -> None:
+    """Review fix P12 — T5.3 names `routing-stats` AND `runs/{run_id}/events`
+    as the two routes to check `dry-run` against, and `router.py`'s module
+    docstring claims `test_router_dependencies.py` "locks that". Only the
+    `runs` pair was actually asserted. `routing-stats` sits at the same
+    depth as `dry-run` under the same `{workflow_id}` prefix, so it is the
+    closest neighbour of the three."""
+    workflow_id = "0199d0a1-3333-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+    # Same path, different verb: `dry-run` is POST-only and must not answer
+    # GET, nor may `routing-stats` (GET-only) answer the POST.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/routing-stats") is None
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/dry-run") is None
+
+
+def test_dry_run_route_does_not_collide_with_run_events_route() -> None:
+    """Review fix P12 — the third pair T5.3 names. `runs/{run_id}/events` is
+    4 segments deep against `dry-run`'s 3, so they cannot overlap; this
+    locks it rather than leaving it to inspection, which is precisely what
+    the module docstring already promised."""
+    run_id = "0199d0a1-4444-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") == (
+        "stream_workflow_run_events"
+    )
+    # A workflow literally named `runs` must not let `dry-run` swallow the
+    # events stream, nor vice versa.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") is None
+
+
 def test_missing_session_factory_raises_503() -> None:
     with pytest.raises(DependencyError) as exc:
         _build_workflow_service(_request())
@@ -91,6 +172,26 @@ def test_fully_wired_state_builds_the_service() -> None:
 
     service = _build_workflow_service(_request(session_factory=object()))
     assert isinstance(service, WorkflowService)
+
+
+# ─── Story 4.4 — `_build_dry_run_service` dependency guard ───────────────
+
+
+def test_dry_run_service_missing_session_factory_raises_503() -> None:
+    from agentive_backend.features.workflow_engine.router import _build_dry_run_service
+
+    with pytest.raises(DependencyError) as exc:
+        _build_dry_run_service(_request())
+    assert exc.value.status == 503
+    assert exc.value.context["missing"] == ["session_factory"]
+
+
+def test_dry_run_service_fully_wired_state_builds_the_service() -> None:
+    from agentive_backend.features.workflow_engine.dry_run import DryRunService
+    from agentive_backend.features.workflow_engine.router import _build_dry_run_service
+
+    service = _build_dry_run_service(_request(session_factory=object()))
+    assert isinstance(service, DryRunService)
 
 
 # ─── Lot 3 — finding #37 : the shared execution service ────────────────

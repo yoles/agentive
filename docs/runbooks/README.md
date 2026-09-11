@@ -4,6 +4,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 
 ## Disponibles
 
+- [`dry-run-predictif.md`](./dry-run-predictif.md) — Dry Run predictif : probable_path, estimation coût/tokens, budget cap (Story 4.4)
 - [`event-bus-debug.md`](./event-bus-debug.md) — Debug du bus d'événements LISTEN/NOTIFY (Story 1.4)
 - [`hybrid-orchestration.md`](./hybrid-orchestration.md) — Orchestration hybride DSL → règles → LLM, seuil, `routing-stats` (Story 4.3)
 - [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)

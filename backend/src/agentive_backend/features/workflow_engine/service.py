@@ -483,6 +483,46 @@ def _dag_from_stored(payload: dict[str, Any]) -> WorkflowDag:
     )
 
 
+async def _load_templates(
+    template_repo: AgentTemplateRepo, dag_payload: dict[str, Any], *, tenant_id: UUID | None
+) -> dict[str, AgentTemplate]:
+    """Preload every node's :class:`AgentTemplate` — one query per node
+    (dette assumée, mirror 4.1/4.8's N sequential queries; cf Dev Notes §
+    "Résolution batch").
+
+    Module-level (Story 4.4 T3.1 — promoted from a ``WorkflowExecutionService``
+    private method, same behavior, no logic change) so :class:`.dry_run.DryRunService`
+    can reuse it without duplicating the loop: one implementation, two callers,
+    mirror the ``resolve_deterministic_targets`` extraction of Story 4.3 T4.1.
+
+    A missing template here is an INTERNAL INCONSISTENCY, not a client
+    error: Story 4.1 validated every ``agent_template_id`` at creation and
+    no delete endpoint exists, so reaching this branch means the stored
+    DAG references a row that vanished. ``require_by_id`` reported that as
+    a 404 on ``POST /workflows/{workflow_id}/runs``, whose 404 already
+    means "unknown workflow_id" — telling the caller their perfectly valid
+    workflow id was wrong, and inviting them to retry forever. 500 instead:
+    the id in the URL is fine, the server's data is not.
+    """
+    templates: dict[str, AgentTemplate] = {}
+    for node in dag_payload.get("nodes", []):
+        template_id = UUID(node["agent_template_id"])
+        template = await template_repo.get_by_id(template_id, tenant_id=tenant_id)
+        if template is None:
+            raise InternalError(
+                detail=(
+                    "workflow references an agent template that no longer exists "
+                    "— stored DAG is inconsistent"
+                ),
+                context={
+                    "node_id": str(node["node_id"]),
+                    "agent_template_id": str(template_id),
+                },
+            )
+        templates[node["node_id"]] = template
+    return templates
+
+
 def _aggregate_routing(routing_decisions: Mapping[str, Any]) -> dict[str, Any]:
     """``{deterministic, llm_escalated, tokens, cost_usd}`` from the run's
     ``routing_decisions`` state channel (Story 4.3 AC3 T9.4).
@@ -658,7 +698,7 @@ class WorkflowExecutionService:
                 context={"workflow_id": str(workflow_id), "status": workflow.status},
             )
 
-        templates = await self._load_templates(workflow.dag, tenant_id=tenant_id)
+        templates = await _load_templates(self._template_repo, workflow.dag, tenant_id=tenant_id)
         correlation_id = UUID(require_correlation_id())
 
         # Second evaluation point for Contrôleur/Producteur LLM diversity —
@@ -718,40 +758,6 @@ class WorkflowExecutionService:
             node_count=len(templates),
         )
         return StartRunResponse(run_id=run.id, status="running", warnings=warnings)
-
-    async def _load_templates(
-        self, dag_payload: dict[str, Any], *, tenant_id: UUID | None
-    ) -> dict[str, AgentTemplate]:
-        """Preload every node's :class:`AgentTemplate` — one query per node
-        (dette assumée, mirror 4.1/4.8's N sequential queries; cf Dev Notes §
-        "Résolution batch").
-
-        A missing template here is an INTERNAL INCONSISTENCY, not a client
-        error: Story 4.1 validated every ``agent_template_id`` at creation and
-        no delete endpoint exists, so reaching this branch means the stored
-        DAG references a row that vanished. ``require_by_id`` reported that as
-        a 404 on ``POST /workflows/{workflow_id}/runs``, whose 404 already
-        means "unknown workflow_id" — telling the caller their perfectly valid
-        workflow id was wrong, and inviting them to retry forever. 500 instead:
-        the id in the URL is fine, the server's data is not.
-        """
-        templates: dict[str, AgentTemplate] = {}
-        for node in dag_payload.get("nodes", []):
-            template_id = UUID(node["agent_template_id"])
-            template = await self._template_repo.get_by_id(template_id, tenant_id=tenant_id)
-            if template is None:
-                raise InternalError(
-                    detail=(
-                        "workflow references an agent template that no longer exists "
-                        "— stored DAG is inconsistent"
-                    ),
-                    context={
-                        "node_id": str(node["node_id"]),
-                        "agent_template_id": str(template_id),
-                    },
-                )
-            templates[node["node_id"]] = template
-        return templates
 
     async def _drive_run(
         self,

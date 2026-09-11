@@ -18,12 +18,13 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Final, cast
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import SecretStr
 
+from agentive_backend.infra.llm.pricing import ANTHROPIC_MODEL_PRICING, ModelPricing
 from agentive_backend.shared.llm.exceptions import (
     LLMError,
     LLMProviderAuthError,
@@ -35,27 +36,13 @@ from agentive_backend.shared.llm.exceptions import (
 from agentive_backend.shared.llm.redaction import redact_secrets
 from agentive_backend.shared.llm.types import ChatMessage, Completion, FinishReason
 
-# Snapshot 2026-05 — verify against
-# https://docs.anthropic.com/claude/docs/models-overview#model-pricing
-# Tuple = (input USD per 1M tokens, output USD per 1M tokens).
-#
-# Long-form aliases — Anthropic returns dated identifiers in
-# ``response_metadata.model_name`` (e.g. ``claude-sonnet-4-6-20250508``).
-# Both forms must be priced or _compute_cost silently returns None for
-# the long form, under-reporting LLM_COST_USD_TOTAL — exactly the case
-# Story 9.4 budget caps need (review fix-batch P1).
-_OPUS_PRICE = (Decimal("15.00"), Decimal("75.00"))
-_SONNET_PRICE = (Decimal("3.00"), Decimal("15.00"))
-_HAIKU_PRICE = (Decimal("0.80"), Decimal("4.00"))
-
-MODEL_PRICING: dict[str, tuple[Decimal, Decimal]] = {
-    "claude-opus-4-7": _OPUS_PRICE,
-    "claude-opus-4-7-20250508": _OPUS_PRICE,
-    "claude-sonnet-4-6": _SONNET_PRICE,
-    "claude-sonnet-4-6-20250508": _SONNET_PRICE,
-    "claude-haiku-4-5": _HAIKU_PRICE,
-    "claude-haiku-4-5-20251001": _HAIKU_PRICE,
-}
+# Re-exported under the historical name — `infra/llm/pricing.py` is now the
+# single source of truth (Story 4.4 T3.5, so `features/*` can read pricing
+# without pulling langchain in transitively past Contract 5). Kept as
+# `MODEL_PRICING` here for every existing call site/test in this module.
+# A read-only view, so this alias cannot become a back door for mutating
+# the table every other reader shares (review fix P21).
+MODEL_PRICING: Final[ModelPricing] = ANTHROPIC_MODEL_PRICING
 
 # Anthropic stop_reason → our normalized FinishReason.
 _FINISH_REASON_MAP: dict[str, FinishReason] = {

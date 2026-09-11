@@ -380,9 +380,21 @@ class WorkflowRecoveryWorker:
         )
 
     async def _load_templates(self, dag_payload: dict[str, Any]) -> dict[str, AgentTemplate]:
-        """Mirror ``WorkflowExecutionService._load_templates`` — duplicated
-        rather than shared, this worker intentionally builds its own repos
-        rather than reusing the execution service's (cf class docstring)."""
+        """Mirror ``service._load_templates`` — duplicated rather than
+        shared, this worker intentionally builds its own repos rather than
+        reusing the execution service's (cf class docstring).
+
+        The name it mirrors moved: Story 4.4 T3.1 promoted
+        ``WorkflowExecutionService._load_templates`` to a module-level
+        function in ``service.py`` so ``DryRunService`` could reuse it, and
+        this docstring kept pointing at a method that no longer exists
+        (review fix P14). Note this copy is NOT identical to that one — it
+        calls ``require_by_id`` (404 on a missing template) where the shared
+        function raises ``InternalError`` (500). Deliberate: a recovery
+        worker has no HTTP caller to mislead. Folding the third copy into
+        the shared function would change that behaviour, so it stays out of
+        this story's scope.
+        """
         templates: dict[str, AgentTemplate] = {}
         for node in dag_payload.get("nodes", []):
             template_id = UUID(node["agent_template_id"])

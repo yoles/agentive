@@ -6,12 +6,20 @@ All other modules must import `settings` from here.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote_plus
 
 from cryptography.fernet import Fernet, InvalidToken
-from pydantic import Field, PostgresDsn, SecretStr, computed_field, model_validator
+from pydantic import (
+    Field,
+    PostgresDsn,
+    SecretStr,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Sentinel strings used in `.env.example` — any match forbids production use.
@@ -122,6 +130,56 @@ class Settings(BaseSettings):
     routing_escalation_max_tokens: int = Field(
         default=256, ge=1, le=4096, alias="AGENTIVE_ROUTING_ESCALATION_MAX_TOKENS"
     )
+
+    # ─── Workflow Engine — Dry Run predictif (Story 4.4) ───
+    # Deployment-level tuning for `dry_run.py`'s estimation. Same posture as
+    # the `AGENTIVE_ROUTING_*` block above: `Settings` is the single source
+    # of truth, never a `config.yaml`-style secondary source (D84 lesson,
+    # applied again).
+    dry_run_history_limit: int = Field(
+        default=20, ge=1, le=100, alias="AGENTIVE_DRY_RUN_HISTORY_LIMIT"
+    )
+    # `le` is not decorative: these two feed `Decimal(tokens) / 1_000_000 *
+    # price`, then `.quantize(Decimal("0.000001"))`. Past ~1e22 tokens that
+    # quantize exceeds the default decimal context's 28-digit precision and
+    # raises `InvalidOperation` — a 500 on every priced Dry Run, caused by an
+    # env var. A ceiling two orders of magnitude above the largest real
+    # context window keeps the arithmetic in range while still allowing any
+    # plausible tuning (review fix P1/P2).
+    dry_run_fallback_input_tokens: int = Field(
+        default=500, ge=1, le=100_000_000, alias="AGENTIVE_DRY_RUN_FALLBACK_INPUT_TOKENS"
+    )
+    dry_run_fallback_output_tokens: int = Field(
+        default=500, ge=1, le=100_000_000, alias="AGENTIVE_DRY_RUN_FALLBACK_OUTPUT_TOKENS"
+    )
+    # `None` (default) disables the check entirely — a Sprint-1 safety net,
+    # not Story 9.4's real per-department/per-workflow budget caps (see
+    # Story 4.4 Dev Notes § Budget cap).
+    #
+    # Three guards, each earned by a review finding (P1):
+    # * `_blank_budget_cap_to_none` below — `AGENTIVE_DRY_RUN_BUDGET_CAP_USD=`
+    #   (the natural way to "turn it off" in a copied `.env`) parsed as `""`,
+    #   which is neither a valid `Decimal` nor `None`. `Settings` then failed
+    #   to instantiate at import time, taking the WHOLE backend down over an
+    #   optional knob. `.env.example` documented "vide = désactivé"; now it
+    #   is true.
+    # * `ge=0` — a negative cap is below every possible estimate, so
+    #   `budget_cap_exceeded` fires on every workflow forever: the risk
+    #   becomes permanent noise and stops being a signal.
+    # * `allow_inf_nan=False` — same reasoning as
+    #   `routing_confidence_threshold` above, but worse here: `ge` does not
+    #   reject NaN, and unlike a float comparison, `Decimal('1') >
+    #   Decimal('NaN')` RAISES `InvalidOperation` rather than returning
+    #   False. A NaN cap booted cleanly and 500'd every priced Dry Run.
+    dry_run_budget_cap_usd: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] | None = Field(
+        default=None, alias="AGENTIVE_DRY_RUN_BUDGET_CAP_USD"
+    )
+
+    @field_validator("dry_run_budget_cap_usd", mode="before")
+    @classmethod
+    def _blank_budget_cap_to_none(cls, value: object) -> object:
+        """An empty/whitespace env var means "unset", not "invalid decimal"."""
+        return None if isinstance(value, str) and not value.strip() else value
 
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
