@@ -165,10 +165,147 @@ class RoutingStatsResponse(BaseModel):
     deterministic_pct: float | None = None
 
 
+class DryRunRequest(BaseModel):
+    """Body of ``POST /api/v1/workflows/{workflow_id}/dry-run`` (Story 4.4 AC1).
+
+    Mirror of :class:`StartRunRequest` — the same ``task_input`` the workflow
+    would receive on a real run. Never persisted: a Dry Run creates no
+    ``workflow_runs`` row.
+
+    **``input`` does not influence the estimate** (review fix P16). It is
+    accepted so a caller can send the exact body it would POST to
+    ``/runs``, but the estimation is structural + historical by design
+    (Dev Notes § Algorithme ``probable_path``): with zero real LLM call
+    there is no way to learn what THIS input would produce. A 10-character
+    input and a 200 KB one therefore return identical token figures. Stated
+    here because this is the public contract — burying it in the service
+    docstring left every API consumer to discover it by experiment.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProviderTokenEstimate(BaseModel):
+    """Token/cost estimate aggregated for one resolved LLM provider
+    (Story 4.4 AC1) — one entry per key of
+    :attr:`DryRunResponse.token_estimate_per_provider`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    #: ``str``, never ``Decimal`` — mirror ``RoutingDecision.llm_cost_usd``
+    #: (Story 4.3): this value crosses a JSON boundary, whose serializer
+    #: raises on a raw ``Decimal``. ``None`` when no model in this provider
+    #: group resolved a price (never a fabricated ``"0"``).
+    cost_usd: str | None = None
+
+
+class DryRunAgentInvolvement(BaseModel):
+    """One node structurally reachable by the Dry Run (Story 4.4 AC1) —
+    a superset of the nodes on ``probable_path``: a node that might run
+    must be priced even when it is not on the single representative path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    agent_template_id: UUID
+    on_probable_path: bool
+
+
+class DryRunRisk(BaseModel):
+    """One identified risk (Story 4.4 AC1/AC3). ``code`` is a CLOSED set —
+    exactly the risk types this story computes (no "recrutement dynamique"
+    code: no dynamic-recruitment mechanism exists in this repo, see Story
+    4.4 Dev Notes § Divergences assumées).
+
+    Three of the six codes were added by the review (IG1/IG2/IG4). The
+    original three left the response unable to say that an estimate was
+    PARTIAL: a node whose model carried no price was dropped from the
+    figures entirely, `no_execution_history` only ever fired for a workflow
+    that had never run at all, and a historical fan-out decision was
+    silently narrowed to one branch. Every one of those made the response
+    look more complete than it was — the opposite of what a number meant
+    for budgeting should do. Story 9.4 consumes these to know whether it
+    can trust a total before blocking on it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal[
+        # A decision point with no usable historical majority — the path
+        # guesses at this node.
+        "routing_decision_uncertain",
+        # The winning historical decision named several targets: the engine
+        # would fan out here, `probable_path` can only show one of them.
+        "routing_decision_multi_target",
+        # The workflow has never run: every figure is heuristic.
+        "no_execution_history",
+        # THIS node had no usable history, even though the workflow has run
+        # (a node added since, or one only reached on a rare branch).
+        "node_estimate_from_fallback",
+        # This node's model is absent from every pricing table, so its
+        # tokens AND cost are missing from the totals.
+        "model_price_unresolved",
+        # `cost_estimate_usd` is over the configured cap (AC3).
+        "budget_cap_exceeded",
+    ]
+    node_id: str | None = None
+    detail: str
+    #: The two figures AC3 asks `budget_cap_exceeded` to carry ("le montant
+    #: estimé et le seuil dépassé"), as machine-readable fields rather than
+    #: prose (review, BS1). T4.1 specified this model as
+    #: ``{code, node_id, detail}``, which left nowhere to put them — so they
+    #: went into the English `detail` string, and the Epic 6 Dialog this
+    #: contract exists to prepare would have had to parse it back out. Same
+    #: `str`-not-`Decimal` convention as everywhere else in this response:
+    #: the JSON serializer raises on a raw `Decimal`.
+    #:
+    #: Populated only for `budget_cap_exceeded`; `None` on every other code.
+    #: `detail` still states both, for a human reading the raw response.
+    estimated_usd: str | None = None
+    threshold_usd: str | None = None
+
+
+class DryRunResponse(BaseModel):
+    """Response of ``POST /api/v1/workflows/{workflow_id}/dry-run`` — 200 OK
+    (Story 4.4 AC1). Never 201: unlike ``POST /workflows`` and
+    ``POST /workflows/{id}/runs``, this endpoint creates no resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: UUID
+    probable_path: list[str]
+    agents_involved: list[DryRunAgentInvolvement]
+    token_estimate_per_provider: dict[str, ProviderTokenEstimate]
+    #: UPPER BOUND: every node in ``agents_involved``, including branches
+    #: that are mutually exclusive at runtime. A 5-way exclusive decision
+    #: bills all five here while a real run pays one — deliberate, since
+    #: excluding them would understate what the workflow CAN cost.
+    #: ``None`` when NO node resolved a price — never a fabricated ``"0"``
+    #: (Story 4.4 Dev Notes § Pièges connus #3).
+    cost_estimate_usd: str | None
+    #: EXPECTED cost: only the nodes on ``probable_path``. Added by the
+    #: review (IG7) because the upper bound alone is neither the expected
+    #: spend nor an announced bound, which makes it hard to act on for a
+    #: `[Lancer]`/`[Annuler]` decision. Both are reported so the caller
+    #: picks; `on_probable_path` already made the split available per node.
+    #: ``None`` on the same terms as ``cost_estimate_usd``.
+    probable_path_cost_usd: str | None = None
+    identified_risks: list[DryRunRisk]
+
+
 __all__ = [
     "CreateWorkflowRequest",
     "CreateWorkflowResponse",
     "DiversityWarning",
+    "DryRunAgentInvolvement",
+    "DryRunRequest",
+    "DryRunResponse",
+    "DryRunRisk",
+    "ProviderTokenEstimate",
     "RoutingStatsResponse",
     "StartRunRequest",
     "StartRunResponse",

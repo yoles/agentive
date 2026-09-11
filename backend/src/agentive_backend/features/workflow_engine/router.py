@@ -1,4 +1,4 @@
-"""``/api/v1/workflows`` — Workflow Engine endpoints (Story 4.1, 4.2, 4.3).
+"""``/api/v1/workflows`` — Workflow Engine endpoints (Story 4.1, 4.2, 4.3, 4.4).
 
 * ``POST /workflows`` — create a workflow from a client-submitted DAG
   (``{name, nodes, edges}``). Validates structural integrity, branching
@@ -8,15 +8,18 @@
 * ``POST /workflows/{workflow_id}/runs`` — start a run of an existing,
   active workflow (Story 4.2 AC1). Returns immediately — execution happens
   in a fire-and-forget background task.
+* ``POST /workflows/{workflow_id}/dry-run`` — predictive path/cost estimate
+  for a workflow, WITHOUT executing it or calling any LLM (Story 4.4 AC1).
 * ``GET /workflows/{workflow_id}/routing-stats`` — hybrid-routing decisions
   aggregated in SQL over every run of the workflow (Story 4.3 AC3).
 * ``GET /workflows/runs/{run_id}/events`` — SSE stream of a run's state
   transitions (Story 4.2 AC1).
 
-Declaration order matters: ``routing-stats`` is declared BEFORE the run-events
-route under the same prefix. The two do not overlap (3 path segments vs 4),
-and ``test_router_dependencies.py`` locks that rather than leaving it to
-inspection.
+Declaration order matters: ``routing-stats``/``dry-run`` are declared BEFORE
+the run-events route under the same prefix. None of the three overlap (3
+path segments vs 4, and ``dry-run``/``routing-stats`` are distinct literal
+segments), and ``test_router_dependencies.py`` locks that rather than
+leaving it to inspection.
 
 Sits behind ``AuthTokenMiddleware`` (Story 1.7). ``AgentiveError`` is raised
 for domain failures and converted to RFC 7807 by the global handler in
@@ -35,9 +38,12 @@ from uuid import UUID
 from fastapi import APIRouter, Request, status
 from sse_starlette.sse import EventSourceResponse
 
+from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowRequest,
     CreateWorkflowResponse,
+    DryRunRequest,
+    DryRunResponse,
     RoutingStatsResponse,
     StartRunRequest,
     StartRunResponse,
@@ -46,6 +52,7 @@ from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
     WorkflowService,
 )
+from agentive_backend.shared.config import settings
 from agentive_backend.shared.event_bus import subscribe
 from agentive_backend.shared.exceptions import DependencyError, NotFoundError
 from agentive_backend.shared.logging import get_logger
@@ -121,6 +128,41 @@ def _build_workflow_service(request: Request) -> WorkflowService:
     return WorkflowService(
         workflow_repo=WorkflowRepo(session_factory=session_factory),
         template_repo=AgentTemplateRepo(session_factory=session_factory),
+    )
+
+
+def _build_dry_run_service(request: Request) -> DryRunService:
+    """Return a :class:`DryRunService` wired from ``app.state`` (Story 4.4).
+
+    Mirrors :func:`_build_workflow_service`, NOT :func:`_build_execution_service`
+    below: only ``session_factory`` is needed — no ``llm_router``/
+    ``workflow_checkpointer``/``routing_rules`` (AC1's structural "zero LLM
+    call" guarantee — this service is never given the means to call one).
+
+    ``DryRunSettings`` is built here, in the assembly layer, because the
+    golden rule forbids reading ``settings`` from inside the domain/service
+    modules themselves (mirror ``RoutingSettings``, Story 4.3 T5.1). That
+    it happens per request is incidental, not a feature: ``settings`` is a
+    process-wide singleton populated from the environment at startup, so a
+    rebuild yields the same values every time — the comment here used to
+    claim freshness this buys nothing toward (review fix P18).
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise DependencyError(
+            detail="Workflow engine not initialised — check lifespan startup logs.",
+            context={"missing": ["session_factory"]},
+        )
+    return DryRunService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        settings=DryRunSettings(
+            history_limit=settings.dry_run_history_limit,
+            fallback_input_tokens=settings.dry_run_fallback_input_tokens,
+            fallback_output_tokens=settings.dry_run_fallback_output_tokens,
+            budget_cap_usd=settings.dry_run_budget_cap_usd,
+        ),
     )
 
 
@@ -206,6 +248,33 @@ async def start_workflow_run(
         workflow_id=workflow_id,
         run_input=body.input,
         tenant_id=None,  # Story 4.2 anti-scope — single-tenant MVP.
+    )
+
+
+@router.post(
+    "/workflows/{workflow_id}/dry-run",
+    response_model=DryRunResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Dry Run predictif d'un workflow (Story 4.4 AC1)",
+)
+async def dry_run_workflow(
+    workflow_id: UUID, request: Request, body: DryRunRequest
+) -> DryRunResponse:
+    """200 OK, not 201: unlike ``POST /workflows`` and
+    ``POST /workflows/{id}/runs``, this endpoint creates no resource — it
+    is a pure estimation (no ``workflow_runs`` row, ZERO real LLM call —
+    ``DryRunService`` is never given an ``LLMRouter``, cf Dev Notes).
+
+    Errors:
+    * 404 — ``workflow_id`` unknown (URL's primary resource, mirror 4.2/4.3).
+    * 422 — the workflow exists but ``status != "active"``.
+    * 503 — lifespan state missing (session factory).
+    """
+    service = _build_dry_run_service(request)
+    return await service.dry_run(
+        workflow_id=workflow_id,
+        task_input=body.input,
+        tenant_id=None,  # Story 4.4 anti-scope — single-tenant MVP (Story 4.9).
     )
 
 

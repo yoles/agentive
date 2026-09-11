@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import SecretStr
 
+from agentive_backend.infra.llm.pricing import OPENAI_MODEL_PRICING, ModelPricing
 from agentive_backend.shared.llm.embedder import EmbeddingPurpose
 from agentive_backend.shared.llm.exceptions import (
     LLMError,
@@ -32,15 +33,13 @@ from agentive_backend.shared.llm.exceptions import (
 from agentive_backend.shared.llm.redaction import redact_secrets
 from agentive_backend.shared.llm.types import ChatMessage, Completion, FinishReason
 
-# Snapshot 2026-05 — verify against
-# https://platform.openai.com/docs/pricing
-# Tuple = (input USD per 1M tokens, output USD per 1M tokens).
-MODEL_PRICING: dict[str, tuple[Decimal, Decimal]] = {
-    "gpt-5": (Decimal("10.00"), Decimal("30.00")),
-    "gpt-5-mini": (Decimal("1.50"), Decimal("6.00")),
-    "gpt-4.1": (Decimal("2.00"), Decimal("8.00")),
-    "o4-mini": (Decimal("3.00"), Decimal("12.00")),
-}
+# Re-exported under the historical name — `infra/llm/pricing.py` is now the
+# single source of truth (Story 4.4 T3.5, so `features/*` can read pricing
+# without pulling langchain in transitively past Contract 5). Kept as
+# `MODEL_PRICING` here for every existing call site/test in this module.
+# A read-only view, so this alias cannot become a back door for mutating
+# the table every other reader shares (review fix P21).
+MODEL_PRICING: Final[ModelPricing] = OPENAI_MODEL_PRICING
 
 # Reasoning + GPT-5 family — the API rejected `max_tokens` and demands
 # `max_completion_tokens` instead.
