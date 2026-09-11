@@ -130,6 +130,28 @@ inside `mise_en_place.checks[]` is the singular `suggested_action`, a string.
 The key is OMITTED entirely when no failing check carries an action, rather
 than rendered as an empty array that promises a remediation and gives none.
 
+### Ce que `mcp_tools_reachable` exécute réellement
+
+Le check appelle `discover_tools` sur chaque serveur MCP distinct assigné —
+et pour un transport `stdio`, cela **lance la commande stockée dans
+`tool_servers.connection_config`**. Deux conséquences à connaître :
+
+- **Le sandbox s'applique** (revue IG2). La Story 2.6 n'enveloppait que
+  `call_tool` ; `discover_tools` spawnait la commande sans confinement. Les
+  deux passent désormais par bwrap (ou le bootstrap setrlimit en repli), avec
+  le même filtrage de `env` via `profile.env_passthrough`. Un serveur
+  incapable de répondre à `list_tools` sous le sandbox n'aurait de toute
+  façon jamais pu servir un `call_tool`.
+- **Le déclencheur a changé de population.** L'enregistrement d'un serveur est
+  gaté par `AGENTIVE_ALLOW_MCP_REGISTRATION` (403 par défaut) ; `POST
+  /workflows/{id}/runs` ne l'est pas. Depuis cette story, tout appelant
+  autorisé à lancer un workflow provoque l'exécution des commandes déjà
+  enregistrées — au rythme d'une par lancement, plafonnée à 8 probes
+  simultanées et bornée par `AGENTIVE_MISE_EN_PLACE_TOOL_PING_TIMEOUT_S`.
+  Les commandes restent celles qu'un administrateur a validées à
+  l'enregistrement ; ce n'est donc pas une nouvelle surface d'injection, mais
+  bien une nouvelle fréquence et une nouvelle population de déclencheurs.
+
 ### Running without provider keys (dev / CI)
 
 When NO provider key is configured, `app.lifespan` deliberately wires a

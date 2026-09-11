@@ -76,6 +76,8 @@ async def discover_tools(
     transport: Literal["stdio", "sse"],
     connection_config: dict[str, Any],
     timeout: float = DEFAULT_DISCOVERY_TIMEOUT_S,
+    profile: SandboxProfile | None = None,
+    backend: SandboxBackend | None = None,
 ) -> list[ToolInfo]:
     """Discover the tools exposed by a remote MCP server.
 
@@ -83,6 +85,18 @@ async def discover_tools(
     :class:`mcp.ClientSession`, calls ``list_tools()``, and closes the
     connection. Sprint 1 = ephemeral connection (no persistent pool ;
     deferred to Story 2.6).
+
+    For ``transport="stdio"`` the subprocess is SANDBOXED, exactly as
+    :func:`call_tool` sandboxes its own spawn (review IG2). Story 2.6 wrapped
+    only ``call_tool``, which left discovery executing a user-supplied
+    ``command`` unconfined — the same RCE surface ``mcp_allow_registration``
+    gates registration behind, reachable through every caller of this
+    function. A server that cannot answer ``list_tools`` under the sandbox
+    could not serve a single ``call_tool`` either, so applying the same
+    confinement to both loses no legitimate capability. ``env`` is filtered
+    through ``profile.env_passthrough`` for the same reason it is in
+    ``call_tool``: an unfiltered ``connection_config["env"]`` leaks
+    secret-bearing keys into the subprocess.
 
     Parameters
     ----------
@@ -118,7 +132,12 @@ async def discover_tools(
     cm = asyncio.timeout(timeout)
     try:
         async with cm:
-            return await _discover_inner(transport=transport, connection_config=connection_config)
+            return await _discover_inner(
+                transport=transport,
+                connection_config=connection_config,
+                profile=profile,
+                backend=backend,
+            )
     except TimeoutError as exc:
         raise MCPDiscoveryTimeoutError(timeout=timeout) from exc
     except BaseExceptionGroup as exc_group:
@@ -131,6 +150,8 @@ async def _discover_inner(
     *,
     transport: Literal["stdio", "sse"],
     connection_config: dict[str, Any],
+    profile: SandboxProfile | None = None,
+    backend: SandboxBackend | None = None,
 ) -> list[ToolInfo]:
     """Inner discovery loop without the timeout wrapper. Kept separate so
     the wait_for stack-trace points to a clean signature."""
@@ -155,7 +176,30 @@ async def _discover_inner(
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
         ):
             raise ValueError("stdio connection_config 'env' keys and values must all be strings")
-        params = StdioServerParameters(command=command, args=list(args), env=env)
+        # Same confinement as `_call_tool_inner` (review IG2): filter `env`
+        # through the profile's passthrough allowlist, then re-route the
+        # spawn through bwrap (or the setrlimit bootstrap fallback) by
+        # asking the SDK to launch the sandbox with the real command as its
+        # tail args.
+        effective_profile = profile or SandboxProfile()
+        effective_env: dict[str, str] | None
+        if env is not None:
+            effective_env = {k: v for k, v in env.items() if k in effective_profile.env_passthrough}
+        else:
+            effective_env = None
+        sandbox_argv_prefix = _sandbox_argv_prefix(
+            profile=effective_profile, backend=backend, parent_env=effective_env
+        )
+        if sandbox_argv_prefix:
+            wrapped_command = sandbox_argv_prefix[0]
+            wrapped_args = [*sandbox_argv_prefix[1:], command, *list(args)]
+        else:
+            wrapped_command = command
+            wrapped_args = list(args)
+
+        params = StdioServerParameters(
+            command=wrapped_command, args=wrapped_args, env=effective_env
+        )
         async with stdio_client(params) as (read, write):
             return await _list_tools_via_session(read, write)
     elif transport == "sse":
