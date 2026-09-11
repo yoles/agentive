@@ -15,10 +15,12 @@ import pytest
 
 from agentive_backend.features.workflow_engine.engine.agent_node import NODE_TIMEOUT_S
 from agentive_backend.features.workflow_engine.recovery import (
+    _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
     DEFAULT_STALE_THRESHOLD_S,
     MAX_RECOVERY_ATTEMPTS,
     WorkflowRecoveryWorker,
 )
+from agentive_backend.shared.config import Settings
 
 
 @pytest.fixture
@@ -202,6 +204,34 @@ def test_stale_threshold_exceeds_the_worst_case_single_node_duration() -> None:
     `2 * NODE_TIMEOUT_S` before it checkpoints. A threshold at or below that
     classifies live runs as orphaned and duplicates them."""
     assert DEFAULT_STALE_THRESHOLD_S > NODE_TIMEOUT_S * 2
+
+
+def test_stale_threshold_covers_a_decision_point_node_with_its_escalation() -> None:
+    """Story 4.3 point 9 — the regression this story called its least visible.
+
+    A routing decision point pays its own `NODE_TIMEOUT_S` AND an escalation
+    call, each per provider on a 2-provider chain. The previous assertion
+    (`> NODE_TIMEOUT_S * 2`, i.e. `> 120`) held just as well at 300.0 as at
+    375.0, so nothing in the suite would have noticed the escalation term
+    being dropped — while the symptom (healthy runs reclaimed in a loop by
+    the recovery worker until `MAX_RECOVERY_ATTEMPTS`, then abandoned
+    `failed`) looks like engine instability, not like a constant.
+    """
+    assert (
+        pytest.approx((NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * 2 * 2.5)
+        == DEFAULT_STALE_THRESHOLD_S
+    )
+
+
+def test_recovery_escalation_default_matches_the_settings_default() -> None:
+    """`recovery.py` hardcodes the escalation timeout instead of importing
+    `settings` (a static fallback for the constructor default, like
+    `NODE_TIMEOUT_S`). Duplicating a constant without a parity test is the
+    exact thing the 4.2 review reproached `PlaygroundService` for, and the
+    story's own trap #5 makes this test mandatory: if the two drift, the
+    recovery worker sizes its window against a timeout nobody uses.
+    """
+    assert Settings().routing_escalation_timeout_s == _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT
 
 
 @pytest.mark.asyncio

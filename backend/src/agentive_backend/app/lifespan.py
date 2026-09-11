@@ -24,6 +24,7 @@ from agentive_backend.features.memory_manager.push_memory import (
 from agentive_backend.features.memory_manager.service import MemoryManagerService
 from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
 from agentive_backend.features.workflow_engine.recovery import WorkflowRecoveryWorker
+from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
     cancel_inflight_runs,
@@ -68,6 +69,7 @@ from agentive_backend.shared.llm import (
     FallbackContext,
     LLMRouter,
 )
+from agentive_backend.shared.llm.router import DEFAULT_MODEL_FALLBACK_MAP
 from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
 from agentive_backend.shared.repositories import (
@@ -400,6 +402,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.archetype_registry = load_registry()
     log.info("archetype_registry_loaded", count=len(app.state.archetype_registry))
 
+    # Story 4.3 T9.1 — load the hybrid-routing rules catalog once at boot,
+    # mirror of `archetype_registry` above (same posture: a broken/missing
+    # YAML is a packaging/config error, so it fails BOOT, not a request —
+    # unlike `_build_embedding_router`'s degrade-quietly-optional-backend
+    # stance, which does not apply here).
+    app.state.routing_rules = load_routing_rules()
+    log.info("routing_rules_loaded", count=len(app.state.routing_rules))
+
+    # Same posture applied to the escalation MODEL: an id absent from the
+    # fallback map boots cleanly today and then kills every escalating run,
+    # much later, with an error that points at the LLM layer rather than at
+    # the misconfigured variable. A deployment knob that can only be wrong is
+    # worth validating where it is cheap to fix — at boot, naming the knob.
+    if settings.routing_escalation_model not in DEFAULT_MODEL_FALLBACK_MAP:
+        raise RuntimeError(
+            f"AGENTIVE_ROUTING_ESCALATION_MODEL={settings.routing_escalation_model!r} is not a "
+            f"known model — expected one of {sorted(DEFAULT_MODEL_FALLBACK_MAP)}"
+        )
+
     # Story 2.6 — detect sandbox backend once at boot. Stored on app.state
     # so the m5 service reads it without re-running ``shutil.which`` per call
     # (avoid TOCTOU + cheap to memoize). Warning logged inside the helper
@@ -597,6 +618,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         template_repo=AgentTemplateRepo(session_factory=session_factory),
         llm_router=llm_router,
         checkpointer=workflow_checkpointer,
+        routing_rules=app.state.routing_rules,
     )
     app.state.workflow_execution_service = workflow_execution_service
 

@@ -139,10 +139,37 @@ class StartRunResponse(BaseModel):
     warnings: list[DiversityWarning] = Field(default_factory=list)
 
 
+class RoutingStatsResponse(BaseModel):
+    """Response of ``GET /api/v1/workflows/{workflow_id}/routing-stats``
+    (Story 4.3 AC3 T10.2) — ``% routages déterministes vs LLM`` aggregated
+    across every run of the workflow.
+
+    ``deterministic_pct`` is ``None`` when ``deterministic + llm_escalated
+    == 0`` — a legitimate state (no decision point was ever reached, e.g. a
+    purely sequential workflow, or a workflow with zero runs), never a
+    division-by-zero to paper over.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: UUID
+    #: EVERY run of this workflow, whatever its status — including runs that
+    #: predate Story 4.3, runs still `running`, and runs that failed. It is
+    #: therefore NOT the denominator of `deterministic_pct`: a workflow can
+    #: legitimately report many runs counted and zero decisions. The ratio's
+    #: denominator is `deterministic + llm_escalated`, which counts DECISIONS,
+    #: not runs.
+    runs_counted: int = Field(ge=0)
+    deterministic: int = Field(ge=0)
+    llm_escalated: int = Field(ge=0)
+    deterministic_pct: float | None = None
+
+
 __all__ = [
     "CreateWorkflowRequest",
     "CreateWorkflowResponse",
     "DiversityWarning",
+    "RoutingStatsResponse",
     "StartRunRequest",
     "StartRunResponse",
     "WorkflowEdgeRequest",

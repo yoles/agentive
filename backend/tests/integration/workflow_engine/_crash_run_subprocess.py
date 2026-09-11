@@ -30,6 +30,7 @@ from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import WorkflowExecutionService
 from agentive_backend.infra.db.session import get_session_factory
 from agentive_backend.shared.config import settings
@@ -153,6 +154,7 @@ async def main() -> None:
             template_repo=template_repo,
             llm_router=llm_router,
             checkpointer=checkpointer,
+            routing_rules=load_routing_rules(),
         )
         templates = {"a": tpl_a, "b": tpl_b}
         # Reference kept (RUF006) so the task isn't GC'd mid-flight — never

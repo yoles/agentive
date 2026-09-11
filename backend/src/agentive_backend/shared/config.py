@@ -94,6 +94,35 @@ class Settings(BaseSettings):
     # Story 2.6. Default `false` = the endpoint returns 403.
     mcp_allow_registration: bool = Field(default=False, alias="AGENTIVE_ALLOW_MCP_REGISTRATION")
 
+    # ─── Workflow Engine — hybrid routing (Story 4.3) ───
+    # Deployment-level tuning for `engine/hybrid_router.py`'s DSL → rules →
+    # LLM escalation sequence. Lives in `Settings`, not the rules YAML
+    # catalog (T1.3) — two sources of truth for the same setting is the
+    # motif already corrected three times in this repo (D84, `config.llm`
+    # fantôme de 3.5, `embedding_backend`).
+    # `allow_inf_nan=False` is NOT decorative on these two floats: `ge`/`le`/`gt`
+    # do not reject NaN (every comparison against NaN is false, so no bound
+    # ever trips). A `NaN` threshold would boot cleanly and then make
+    # `match.confidence >= threshold` false forever — every decision escalating
+    # to the LLM, silently, with no error to trace. Same guard as
+    # `routing_catalog._RuleModel` applies to the catalog's own floats (T3.3).
+    routing_confidence_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_ROUTING_CONFIDENCE_THRESHOLD",
+    )
+    routing_escalation_model: str = Field(
+        default="claude-haiku-4-5", min_length=1, alias="AGENTIVE_ROUTING_ESCALATION_MODEL"
+    )
+    routing_escalation_timeout_s: float = Field(
+        default=15.0, gt=0.0, allow_inf_nan=False, alias="AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S"
+    )
+    routing_escalation_max_tokens: int = Field(
+        default=256, ge=1, le=4096, alias="AGENTIVE_ROUTING_ESCALATION_MAX_TOKENS"
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

@@ -8,7 +8,13 @@ SQLAlchemy) for the pure-logic modules, mirror of ``agent_registry/domain/``:
 * :mod:`.dag` — structural validations (duplicate node ids, dangling edges,
   cycle detection via ``graphlib.TopologicalSorter``).
 * :mod:`.condition_dsl` — restricted branching-condition parser + runtime
-  evaluator (``output.<field> <op> <literal>``, never ``eval``/``exec``).
+  evaluator (``<namespace>.<field> <op> <literal>``, never ``eval``/``exec``).
+* :mod:`.routing_rules` (Story 4.3) — declarative rule scoring for the
+  hybrid router: :class:`RoutingContext`/:class:`RoutingRule`/
+  :class:`RoutingDecision` and the pure ``compute_confidence``/
+  ``evaluate_rules`` functions. No YAML, no I/O — the catalog loader
+  (``features/workflow_engine/routing_catalog.py``) is a sibling of
+  ``domain/``, not part of it, because it imports Pydantic and ``yaml``.
 
 Story 4.2's LangGraph-coupled modules (``graph_builder``, ``agent_node``)
 live in the sibling :mod:`..engine` package, NOT here — see its docstring.
@@ -28,6 +34,17 @@ from agentive_backend.features.workflow_engine.domain.dag import (
     find_dangling_edges,
     find_duplicate_node_ids,
 )
+from agentive_backend.features.workflow_engine.domain.routing_rules import (
+    RoutingContext,
+    RoutingDecision,
+    RoutingEscalationError,
+    RoutingRule,
+    RuleMatch,
+    RulePenalty,
+    RuleVerdict,
+    compute_confidence,
+    evaluate_rules,
+)
 from agentive_backend.features.workflow_engine.domain.value_objects import (
     DomainValidationError,
     WorkflowDag,
@@ -39,12 +56,21 @@ from agentive_backend.features.workflow_engine.domain.value_objects import (
 __all__ = [
     "DomainValidationError",
     "ParsedCondition",
+    "RoutingContext",
+    "RoutingDecision",
+    "RoutingEscalationError",
+    "RoutingRule",
+    "RuleMatch",
+    "RulePenalty",
+    "RuleVerdict",
     "WorkflowDag",
     "WorkflowEdge",
     "WorkflowNode",
     "WorkflowState",
+    "compute_confidence",
     "detect_cycle",
     "evaluate",
+    "evaluate_rules",
     "find_dangling_edges",
     "find_duplicate_node_ids",
     "parse",

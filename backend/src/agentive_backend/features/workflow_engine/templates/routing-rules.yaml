@@ -1,0 +1,58 @@
+# Declarative routing rules — Story 4.3 AC1 (hybrid orchestration).
+#
+# The CONFIDENCE THRESHOLD does NOT live here — it is a deployment setting
+# (`Settings.routing_confidence_threshold`, `AGENTIVE_ROUTING_CONFIDENCE_THRESHOLD`).
+# Two sources of truth for the same knob is the exact motif already
+# corrected three times in this repo (D84, `config.llm` fantôme de 3.5,
+# `embedding_backend`) — this file owns the RULES, `Settings` owns the KNOB.
+#
+# Tie-break: when two rules score equally against the same decision, the
+# FIRST rule declared below wins (`domain/routing_rules.py::evaluate_rules`).
+#
+# Extension point for the Growth-phase "rule learning" innovation (MVP #1,
+# anti-scope for this story): a future learner proposes new entries here —
+# no code change required to add a rule, only a YAML edit.
+
+archetype_version: 1
+
+rules:
+  - rule_id: terminal-output-status
+    description: >-
+      Le node a déclaré son propre statut "done" — aucune condition de
+      sortie n'a tenu, mais l'auteur du node a explicitement signalé la fin
+      de sa branche. Pénalisé si le node a beaucoup de successeurs déclarés
+      (abandonner plus de cibles rend le verdict moins évident).
+    when:
+      - "output.status == 'done'"
+    verdict: terminate
+    base_confidence: 0.95
+    penalties:
+      - when:
+          - "context.candidate_count >= 3"
+        factor: 0.7
+
+  - rule_id: failed-output-status
+    description: >-
+      Symétrique de terminal-output-status : le node a déclaré son propre
+      échec. Poursuivre le DAG derrière un échec auto-déclaré n'est jamais
+      le comportement évident.
+    when:
+      - "output.status == 'failed'"
+    verdict: terminate
+    base_confidence: 0.95
+    penalties:
+      - when:
+          - "context.candidate_count >= 3"
+        factor: 0.7
+
+  - rule_id: no-parsable-output
+    description: >-
+      Le node n'a produit aucune sortie exploitable (best-effort JSON
+      parsing vide) — il n'existe aucune donnée sur laquelle router, et
+      demander à un LLM de deviner sans donnée serait du coût sans
+      information.
+    when:
+      - "context.has_parsable_output == false"
+    verdict: terminate
+    base_confidence: 0.9
+    penalties: []

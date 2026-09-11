@@ -147,6 +147,28 @@ def _resolve_llm_params(config: dict[str, Any], *, node_id: str) -> tuple[str, f
     return model, temperature, max_tokens
 
 
+#: Sole key of the envelope :func:`execute_agent_node` falls back to when
+#: :func:`_best_effort_json` cannot extract a JSON object from the completion.
+#: NAMED rather than inlined because it is a cross-module convention, not a
+#: local detail: it is the only signal downstream code has that a node
+#: produced no STRUCTURED output. Story 4.3's `no-parsable-output` routing
+#: rule was written against the belief that this case surfaced as
+#: ``node_outputs[node_id] is None`` — it never did, and the rule could
+#: therefore never fire (code review BS1).
+RAW_OUTPUT_KEY: Final = "_raw"
+
+
+def is_raw_fallback_output(node_output: object) -> bool:
+    """``True`` when ``node_output`` is the unparsable-output envelope.
+
+    The envelope is EXACTLY ``{RAW_OUTPUT_KEY: <completion text>}`` — a
+    one-key dict — so a node that legitimately emits a JSON object
+    containing a ``_raw`` field ALONGSIDE other fields is not mistaken for
+    one that failed to parse.
+    """
+    return isinstance(node_output, dict) and set(node_output) == {RAW_OUTPUT_KEY}
+
+
 def _best_effort_json(raw_output: str) -> dict[str, Any] | None:
     """Mirror ``PlaygroundService._best_effort_json`` — full JSON Schema
     validation against ``output_contract`` is deferred (Sprint 1 posture,
@@ -278,7 +300,7 @@ async def execute_agent_node(
 
     parsed_output = _best_effort_json(completion.text)
     node_output: dict[str, Any] = (
-        parsed_output if parsed_output is not None else {"_raw": completion.text}
+        parsed_output if parsed_output is not None else {RAW_OUTPUT_KEY: completion.text}
     )
 
     node_metric: dict[str, Any] = {

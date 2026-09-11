@@ -85,6 +85,7 @@ def wire_execution_service(app: Any) -> None:
     Call AFTER ``session_factory``/``workflow_checkpointer``/``llm_router``
     are on ``app.state``.
     """
+    from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
     from agentive_backend.features.workflow_engine.service import WorkflowExecutionService
     from agentive_backend.shared.repositories import (
         AgentTemplateRepo,
@@ -93,10 +94,15 @@ def wire_execution_service(app: Any) -> None:
     )
 
     session_factory = app.state.session_factory
+    # Story 4.3 T9.1 — mirror `app.lifespan`'s catalog load on this hand-built
+    # test app too, so `_build_execution_service`'s dependency-diagnostics
+    # list stays meaningful and a decision-point workflow actually routes.
+    app.state.routing_rules = load_routing_rules()
     app.state.workflow_execution_service = WorkflowExecutionService(
         workflow_repo=WorkflowRepo(session_factory=session_factory),
         workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
         template_repo=AgentTemplateRepo(session_factory=session_factory),
         llm_router=app.state.llm_router,
         checkpointer=app.state.workflow_checkpointer,
+        routing_rules=app.state.routing_rules,
     )

@@ -25,6 +25,7 @@ from uuid import UUID
 
 from agentive_backend.features.workflow_engine.domain import (
     DomainValidationError,
+    RoutingRule,
     WorkflowDag,
     WorkflowEdge,
     WorkflowNode,
@@ -35,6 +36,15 @@ from agentive_backend.features.workflow_engine.domain import (
 )
 from agentive_backend.features.workflow_engine.domain import parse as parse_condition
 from agentive_backend.features.workflow_engine.engine import build_state_graph
+from agentive_backend.features.workflow_engine.engine.agent_node import is_raw_fallback_output
+from agentive_backend.features.workflow_engine.engine.graph_builder import (
+    RoutingDecisionFailedError,
+)
+from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
+from agentive_backend.features.workflow_engine.metrics import (
+    ROUTING_DECISIONS_TOTAL,
+    ROUTING_ESCALATION_SECONDS,
+)
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowResponse,
     DiversityWarning,
@@ -42,11 +52,13 @@ from agentive_backend.features.workflow_engine.schemas import (
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
 )
+from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.diversity import LLMSelection, check_llm_diversity
 from agentive_backend.shared.contracts.events import (
     WorkflowCreatedEvent,
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
+    WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
 )
@@ -58,7 +70,7 @@ from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -471,13 +483,67 @@ def _dag_from_stored(payload: dict[str, Any]) -> WorkflowDag:
     )
 
 
+def _aggregate_routing(routing_decisions: Mapping[str, Any]) -> dict[str, Any]:
+    """``{deterministic, llm_escalated, tokens, cost_usd}`` from the run's
+    ``routing_decisions`` state channel (Story 4.3 AC3 T9.4).
+
+    A node absent from ``routing_decisions`` (every non-decision-point node,
+    AC4) simply isn't counted — the denominator is "decisions actually
+    taken", never "edges crossed" (Dev Notes § Définition du point de
+    décision de routage).
+
+    The token/cost block is the review's IG1 fix: escalation spend was
+    dropped on the floor by ``_escalate`` and therefore missing from the
+    run's ``total_cost_usd``, so a workflow whose whole selling point is
+    "route deterministically, spend less" under-reported the cost of the very
+    mechanism it was measuring. Kept as its OWN block rather than folded into
+    ``per_node`` so the claim stays falsifiable: routing spend must remain
+    separable from node spend.
+    """
+    deterministic = 0
+    llm_escalated = 0
+    input_tokens = 0
+    output_tokens = 0
+    cost = Decimal("0")
+    any_cost = False
+    for decision in routing_decisions.values():
+        if not isinstance(decision, dict):
+            continue
+        mode = decision.get("mode")
+        if mode == "deterministic":
+            deterministic += 1
+        elif mode == "llm_escalated":
+            llm_escalated += 1
+        input_tokens += int(decision.get("llm_input_tokens") or 0)
+        output_tokens += int(decision.get("llm_output_tokens") or 0)
+        cost_raw = decision.get("llm_cost_usd")
+        if cost_raw is not None:
+            any_cost = True
+            cost += Decimal(str(cost_raw))
+    return {
+        "deterministic": deterministic,
+        "llm_escalated": llm_escalated,
+        "tokens": {"input": input_tokens, "output": output_tokens},
+        "cost_usd": str(cost) if any_cost else None,
+    }
+
+
 def _aggregate_metrics(
-    node_metrics: Mapping[str, Any], *, total_duration_ms: int
+    node_metrics: Mapping[str, Any],
+    *,
+    total_duration_ms: int,
+    routing_decisions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate per-node metrics into the ``workflow_runs.metrics`` JSONB
     shape (AC4). Called on BOTH the completed path (full ``node_metrics``)
     and the failed path (only the already-executed nodes' metrics) — AC4
-    requires partial metrics to remain aggregated on failure, not dropped."""
+    requires partial metrics to remain aggregated on failure, not dropped.
+
+    ``routing_decisions`` defaults to an empty mapping (Story 4.3 AC3/AC4) —
+    explicit parameter rather than derived internally so no test call site
+    that predates this story needs to change; a workflow with no decision
+    points reports ``{"deterministic": 0, "llm_escalated": 0}``, never a
+    missing key."""
     total_input = 0
     total_output = 0
     total_cost = Decimal("0")
@@ -500,11 +566,22 @@ def _aggregate_metrics(
             "cost_usd": cost_raw,
             "model_used": metric.get("model_used"),
         }
+    # IG1 — routing escalations are LLM calls this run paid for, so they
+    # belong in the run's totals. `per_node` keeps describing NODE execution
+    # only; the `routing` block below carries the same figures separately, so
+    # the two are addable and comparable rather than conflated.
+    routing = _aggregate_routing(routing_decisions or {})
+    total_input += int(routing["tokens"]["input"])
+    total_output += int(routing["tokens"]["output"])
+    if routing["cost_usd"] is not None:
+        any_cost = True
+        total_cost += Decimal(str(routing["cost_usd"]))
     return {
         "total_duration_ms": total_duration_ms,
         "total_tokens": {"input": total_input, "output": total_output},
         "total_cost_usd": str(total_cost) if any_cost else None,
         "per_node": per_node,
+        "routing": routing,
     }
 
 
@@ -534,12 +611,27 @@ class WorkflowExecutionService:
         template_repo: AgentTemplateRepo,
         llm_router: LLMRouter,
         checkpointer: AsyncPostgresSaver,
+        routing_rules: Sequence[RoutingRule],
     ) -> None:
         self._workflow_repo = workflow_repo
         self._workflow_run_repo = workflow_run_repo
         self._template_repo = template_repo
         self._llm_router = llm_router
         self._checkpointer = checkpointer
+        # Story 4.3 T9.1/T9.3 — loaded once at boot (`app.lifespan`), never
+        # per-run. REQUIRED, not defaulted to `()`: forgetting `routing_settings`
+        # is already a hard `ValueError` in `build_state_graph`, while an empty
+        # catalog used to be accepted in silence — and the silent one is the
+        # EXPENSIVE failure, since no rule can ever match and every decision
+        # point escalates to the LLM. An empty tuple remains a legitimate
+        # explicit choice; only forgetting the argument is now impossible.
+        # `RoutingSettings` (the deployment KNOBS, as opposed to the
+        # rules themselves) is built fresh at the start of every run instead
+        # (see `_execute`) — not stashed here — because Dev Notes T5.1 is
+        # explicit that it must never be read from inside the engine, and
+        # building it once per run (not once per process) keeps a `settings`
+        # override picked up by a hot-reloading test fixture honest.
+        self._routing_rules = routing_rules
 
     async def start_run(
         self,
@@ -720,6 +812,11 @@ class WorkflowExecutionService:
         stored = run.checkpoint if isinstance(run.checkpoint, dict) else {}
         fallback_input = stored.get("task_input")
         self._report_config_drift(run_id, stored, templates)
+        # Story 4.3 T9.7 — the decisions this run already took before the
+        # crash. `_sync_checkpoint` mirrors the `routing_decisions` state
+        # channel into the applicative checkpoint on every node landing, so
+        # this is the run-scoped record the idempotence guard needs.
+        stored_decisions = stored.get("routing_decisions")
         await self._execute(
             run_id,
             workflow,
@@ -728,6 +825,9 @@ class WorkflowExecutionService:
             correlation_id=run.correlation_id,
             started_at=datetime.now(UTC),
             fallback_input=fallback_input if isinstance(fallback_input, dict) else None,
+            already_decided=(
+                tuple(stored_decisions) if isinstance(stored_decisions, dict) else None
+            ),
         )
 
     @staticmethod
@@ -776,6 +876,7 @@ class WorkflowExecutionService:
         correlation_id: UUID,
         started_at: datetime,
         fallback_input: dict[str, Any] | None = None,
+        already_decided: Collection[str] | None = None,
     ) -> None:
         """Shared driver for :meth:`_drive_run` and :meth:`_resume_run`
         (T5.5) — the only difference between a fresh run and a resumed one is
@@ -808,12 +909,35 @@ class WorkflowExecutionService:
         # Built before anything that can fail: `_mark_failed` needs it to
         # look the run's state up even when the failure IS the compilation.
         config: dict[str, Any] = {"configurable": {"thread_id": str(run_id)}}
+        # Story 4.3 T5.1/T9.3 — built once per run, from `settings`, by this
+        # assembly layer. Never read from inside the engine.
+        routing_settings = RoutingSettings(
+            threshold=settings.routing_confidence_threshold,
+            escalation_model=settings.routing_escalation_model,
+            escalation_timeout_s=settings.routing_escalation_timeout_s,
+            escalation_max_tokens=settings.routing_escalation_max_tokens,
+        )
+        # Story 4.3 T9.7 — node_ids whose routing decision has already been
+        # accounted for: counted in Prometheus AND, when escalated, published
+        # as an event. Seeded from the decisions already present in the
+        # RESTORED checkpoint (`already_decided`), not empty, because the
+        # guard has to hold "for this RUN" and not merely for this execution.
+        # Relying on "LangGraph never re-yields a committed superstep" is an
+        # argument about someone else's scheduler, not a guarantee we own —
+        # and the cost of being wrong is a permanently skewed AC3 ratio plus
+        # duplicate escalation events that over-represent resumed runs in the
+        # raw material of innovation #1.
+        accounted_decisions: set[str] = set(already_decided or ())
 
         try:
             dag = _dag_from_stored(workflow.dag)
-            graph = build_state_graph(dag, templates, self._llm_router).compile(
-                checkpointer=self._checkpointer
-            )
+            graph = build_state_graph(
+                dag,
+                templates,
+                self._llm_router,
+                rules=self._routing_rules,
+                routing_settings=routing_settings,
+            ).compile(checkpointer=self._checkpointer)
         except Exception as exc:
             # A stored DAG that no longer parses, or a `node_id` LangGraph
             # reserves (`__start__`/`__end__`, which Story 4.1 accepts at
@@ -878,6 +1002,34 @@ class WorkflowExecutionService:
                     await self._publish_step_completed_safely(
                         run_id, workflow.id, node_id, duration_ms, correlation_id=correlation_id
                     )
+
+                    # Story 4.3 T9.6 — best-effort publication, OUT of the
+                    # decision path itself: an event failure must never fail
+                    # an otherwise healthy run.
+                    #
+                    # Prometheus counting deliberately does NOT happen here
+                    # (review IG4). Counting per superstep counted only the
+                    # decisions THIS execution observed, while
+                    # `metrics["routing"]` is computed from the final state and
+                    # includes those restored from before a crash — so every
+                    # resumed run left the counters permanently below
+                    # `/routing-stats`, with nothing saying the two were not
+                    # comparable. Both now derive from the same final state,
+                    # at run end, and agree by construction.
+                    routing_update = (update[node_id] or {}).get("routing_decisions") or {}
+                    decision = routing_update.get(node_id)
+                    if isinstance(decision, dict) and node_id not in accounted_decisions:
+                        accounted_decisions.add(node_id)
+                        if decision.get("mode") == "llm_escalated":
+                            await self._publish_routing_escalated_safely(
+                                run_id,
+                                workflow.id,
+                                node_id,
+                                decision,
+                                dag=dag,
+                                node_outputs=snapshot.values.get("node_outputs") or {},
+                                correlation_id=correlation_id,
+                            )
         except Exception as exc:
             await self._mark_failed_safely(
                 run_id,
@@ -1019,6 +1171,142 @@ class WorkflowExecutionService:
                 "workflow_run_step_event_publish_failed", run_id=str(run_id), node_id=node_id
             )
 
+    @staticmethod
+    def _record_routing_metrics_safely(routing_decisions: Mapping[str, Any]) -> None:
+        """Best-effort Prometheus instrumentation (Story 4.3 T8.4), recorded
+        ONCE per run over its FINAL state.
+
+        Called from the terminal transitions — completed AND error, mirroring
+        ``_aggregate_metrics`` — and deliberately not per superstep (review
+        IG4). Per-superstep counting only ever saw the decisions of the
+        CURRENT execution, while ``metrics["routing"]`` is computed from the
+        final state and includes the decisions restored from before a crash;
+        every resumed run therefore left Prometheus permanently below
+        ``/routing-stats`` with nothing documenting the gap. Sharing one
+        source makes them agree by construction, and a run resumed three
+        times still counts its decisions once.
+
+        Trade-off accepted: counters move at run END, not live. For a ratio
+        whose authoritative reading is the SQL endpoint anyway, that is the
+        right side of the trade; a run that crashes and is never resumed
+        contributes to neither, which is consistent rather than skewed.
+
+        A metrics failure must never affect an otherwise healthy run, hence
+        the blanket guard — the only place in this path that carries one.
+        """
+        try:
+            for decision in routing_decisions.values():
+                if not isinstance(decision, dict):
+                    continue
+                mode = decision.get("mode")
+                source = decision.get("source")
+                if isinstance(mode, str) and isinstance(source, str):
+                    ROUTING_DECISIONS_TOTAL.labels(mode=mode, source=source).inc()
+                if mode == "llm_escalated":
+                    latency_ms = decision.get("llm_latency_ms")
+                    if isinstance(latency_ms, int):
+                        ROUTING_ESCALATION_SECONDS.observe(latency_ms / 1000.0)
+        except Exception:
+            # A context-free warning is unactionable: whoever reads it needs
+            # to know WHAT failed to record and WHY, not merely that
+            # something did.
+            _log.warning(
+                "workflow_engine.routing_metrics_record_failed",
+                decision_count=len(routing_decisions),
+                exc_info=True,
+            )
+
+    async def _publish_routing_escalated_safely(
+        self,
+        run_id: UUID,
+        workflow_id: UUID,
+        node_id: str,
+        decision: Mapping[str, Any],
+        *,
+        dag: WorkflowDag,
+        node_outputs: Mapping[str, Any],
+        correlation_id: UUID,
+    ) -> None:
+        """BEST-EFFORT ``routing_escalated`` — same rationale as
+        :meth:`_publish_step_completed_safely` (Story 4.3 T9.6)."""
+        try:
+            await self._publish_routing_escalated(
+                run_id,
+                workflow_id,
+                node_id,
+                decision,
+                dag=dag,
+                node_outputs=node_outputs,
+                correlation_id=correlation_id,
+            )
+        except Exception:
+            _log.warning(
+                "workflow_run_routing_escalated_publish_failed",
+                run_id=str(run_id),
+                node_id=node_id,
+            )
+
+    async def _publish_routing_escalated(
+        self,
+        run_id: UUID,
+        workflow_id: UUID,
+        node_id: str,
+        decision: Mapping[str, Any],
+        *,
+        dag: WorkflowDag,
+        node_outputs: Mapping[str, Any],
+        correlation_id: UUID,
+    ) -> None:
+        """Publish ``workflow_engine.workflow_run.routing_escalated`` (Story
+        4.3 AC2/AC3 T7, T9.6) from the SERVICE, not the engine — the engine
+        (``hybrid_router.decide_route``) runs inside a LangGraph node and
+        must not open a DB session or know about the event bus (Contract 4,
+        D91 point 7). The decision is already sitting in state; this only
+        reads it back and reconstructs the DAG-shape facts the event needs
+        (``candidates``/``context``) — deliberately WITHOUT the node's own
+        output (T7.3, payload-size discipline for the bounded SSE queue)."""
+        declared_edges = [edge for edge in dag.edges if edge.from_node_id == node_id]
+        # Deduplicated like `decide_route`'s own `declared_candidates`: two
+        # edges `a → b` under different conditions are one candidate. The
+        # event's context is the rule-learning material (AC3), so it has to
+        # describe what the decision actually saw.
+        candidates = list(dict.fromkeys(edge.to_node_id for edge in declared_edges))
+        conditional_count = sum(1 for edge in declared_edges if edge.condition is not None)
+        own_output = node_outputs.get(node_id)
+        context_payload = {
+            "candidate_count": len(candidates),
+            "conditional_count": conditional_count,
+            "unconditional_count": len(declared_edges) - conditional_count,
+            # Mirrors `hybrid_router`'s own definition, including the
+            # `{"_raw": ...}` envelope check — the event must not report
+            # "output present" for a node whose output could not be parsed
+            # (code review BS1). Reconstructed rather than read from the
+            # decision because T7.3 keeps `own_output` out of the payload.
+            "has_parsable_output": own_output is not None
+            and not is_raw_fallback_output(own_output),
+            "output_field_count": len(own_output) if isinstance(own_output, dict) else 0,
+        }
+
+        event_type = WorkflowRunRoutingEscalatedEvent.event_type
+        async with self._workflow_run_repo.with_tenant(None) as session:
+            event = WorkflowRunRoutingEscalatedEvent(
+                run_id=run_id,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                candidates=candidates,
+                decision_target=list(decision.get("targets") or []),
+                confidence_best=decision.get("confidence"),
+                rule_id_best=decision.get("rule_id"),
+                reason=str(decision.get("reason") or ""),
+                llm_model=str(decision.get("llm_model") or "unknown"),
+                llm_latency_ms=int(decision.get("llm_latency_ms") or 0),
+                context=context_payload,
+            )
+            event_id = await publish(
+                event_type, event, session=session, correlation_id=correlation_id
+            )
+        await notify_best_effort(event_id, event_type)
+
     async def _mark_failed_safely(
         self,
         run_id: UUID,
@@ -1064,6 +1352,10 @@ class WorkflowExecutionService:
             "last_node_id": last_node_id,
             "node_statuses": dict.fromkeys(node_outputs, "success"),
             "node_outputs_preview": {nid: _preview(output) for nid, output in node_outputs.items()},
+            # Story 4.3 T9.5 — per-node routing decision detail, read by the
+            # Trace Explorer (Epic 8, NFR15). Already JSON-serializable
+            # (`RoutingDecision.to_mapping()` at the point it entered state).
+            "routing_decisions": dict(state_values.get("routing_decisions") or {}),
             # Rewritten every sync rather than preserved from creation: the
             # window that matters for drift is between the LAST executed node
             # and the resume, not between creation and the resume.
@@ -1105,7 +1397,15 @@ class WorkflowExecutionService:
         ended_at = datetime.now(UTC)
         total_duration_ms = int((ended_at - started_at).total_seconds() * 1000)
         node_metrics = state_values.get("node_metrics") or {}
-        metrics = _aggregate_metrics(node_metrics, total_duration_ms=total_duration_ms)
+        routing_decisions = state_values.get("routing_decisions") or {}
+        metrics = _aggregate_metrics(
+            node_metrics,
+            total_duration_ms=total_duration_ms,
+            routing_decisions=routing_decisions,
+        )
+        # IG4 — same source as `metrics["routing"]`, so the counters and the
+        # persisted ratio cannot drift apart on a resumed run.
+        self._record_routing_metrics_safely(routing_decisions)
         total_cost_raw = metrics["total_cost_usd"]
 
         # A run that reaches `END` without executing every declared node is a
@@ -1164,6 +1464,7 @@ class WorkflowExecutionService:
                         nid: _preview(output) for nid, output in node_outputs.items()
                     },
                     "skipped_nodes": skipped,
+                    "routing_decisions": dict(state_values.get("routing_decisions") or {}),
                 },
                 last_checkpoint_at=ended_at,
             )
@@ -1217,15 +1518,39 @@ class WorkflowExecutionService:
             except Exception:
                 _log.warning("workflow_run_failed_state_lookup_failed", run_id=str(run_id))
 
-        node_outputs = state_values.get("node_outputs") or {}
-        node_metrics = state_values.get("node_metrics") or {}
+        node_outputs = dict(state_values.get("node_outputs") or {})
+        node_metrics = dict(state_values.get("node_metrics") or {})
+
+        # IG3 — a node whose ROUTING decision failed did execute: its LLM
+        # call is paid and its output exists, but LangGraph discards the
+        # update of a node that raises, so none of it is in `state_values`.
+        # `RoutingDecisionFailedError` carries that update precisely so the
+        # spend does not vanish — without this, a run ended `error` with no
+        # trace of a node that ran, and its cost missing from the totals.
+        # The run still fails: this only stops it failing *silently about
+        # what it spent*.
+        if isinstance(exc, RoutingDecisionFailedError):
+            failed_node_id = exc.node_id
+            node_outputs.update(exc.node_update.get("node_outputs") or {})
+            node_metrics.update(exc.node_update.get("node_metrics") or {})
+            # The wrapper says nothing an operator can act on; the cause does.
+            exc = exc.__cause__ if isinstance(exc.__cause__, Exception) else exc
+
         # AC4 — partial metrics from already-completed nodes stay aggregated,
         # and the run's REAL wall-clock duration is reported. The previous
         # hardcoded 0 made every failed run look instantaneous, so the AC4
         # metric could not be used to tell a fast failure from a run that
         # burned nine minutes before dying.
         total_duration_ms = int((ended_at - started_at).total_seconds() * 1000)
-        metrics = _aggregate_metrics(node_metrics, total_duration_ms=total_duration_ms)
+        routing_decisions = state_values.get("routing_decisions") or {}
+        metrics = _aggregate_metrics(
+            node_metrics,
+            total_duration_ms=total_duration_ms,
+            routing_decisions=routing_decisions,
+        )
+        # IG4 — recorded on the error path too, exactly like `_aggregate_metrics`
+        # (AC4 of Story 4.2: partial metrics are kept, never dropped).
+        self._record_routing_metrics_safely(routing_decisions)
         # NFR9 — `str(exc)` on a psycopg/httpx error routinely carries the
         # full DSN (password included) or a URL with an API key, and this
         # string is BOTH persisted in `checkpoint.last_error` and streamed

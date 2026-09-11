@@ -529,7 +529,11 @@ class _FakeCompiledGraph:
         # contains only node a" was unobservable, and the redundant per-node
         # state reads in a fan-out (review finding #21) were structurally
         # invisible to these tests.
-        self._progressive: dict[str, Any] = {"node_outputs": {}, "node_metrics": {}}
+        self._progressive: dict[str, Any] = {
+            "node_outputs": {},
+            "node_metrics": {},
+            "routing_decisions": {},
+        }
         self._stream_finished = False
 
     async def astream(
@@ -538,7 +542,7 @@ class _FakeCompiledGraph:
         assert stream_mode == "updates"
         for update in self._updates:
             for node_update in update.values():
-                for key in ("node_outputs", "node_metrics"):
+                for key in ("node_outputs", "node_metrics", "routing_decisions"):
                     self._progressive[key].update((node_update or {}).get(key) or {})
             yield update
         # Set BEFORE the raise: streaming is over either way, so the
@@ -623,6 +627,9 @@ def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, Asyn
         template_repo=template_repo,
         llm_router=AsyncMock(),
         checkpointer=AsyncMock(),
+        # Explicitly empty: these tests inject `routing_decisions` straight
+        # into the fake graph's updates, so no rule ever needs to evaluate.
+        routing_rules=(),
     )
     return service, workflow_repo, workflow_run_repo, template_repo
 
@@ -1592,3 +1599,473 @@ async def test_resume_is_silent_when_templates_are_unchanged(
 
     events = [call.args[0] for call in warn_mock.call_args_list]
     assert "workflow_run_template_config_drift" not in events
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Story 4.3 T9.4/T9.6/T9.7/T11.7 — hybrid-routing aggregation & publication
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_aggregate_metrics_includes_routing_counts_by_mode() -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    metrics = svc_module._aggregate_metrics(
+        {},
+        total_duration_ms=0,
+        routing_decisions={
+            "a": {"mode": "deterministic", "source": "dsl"},
+            "b": {"mode": "deterministic", "source": "rules"},
+            "c": {"mode": "llm_escalated", "source": "llm"},
+        },
+    )
+    assert metrics["routing"]["deterministic"] == 2
+    assert metrics["routing"]["llm_escalated"] == 1
+
+
+def test_aggregate_metrics_routing_defaults_to_zero_counts_when_absent() -> None:
+    """A workflow with no decision points reports explicit zeros, never a
+    missing key (Dev Notes § Définition du point de décision)."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    metrics = svc_module._aggregate_metrics({}, total_duration_ms=0)
+    assert metrics["routing"]["deterministic"] == 0
+    assert metrics["routing"]["llm_escalated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_run_persists_routing_counts_in_metrics(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {"status": "ok"}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {
+                        "a": {"mode": "deterministic", "source": "dsl", "targets": []}
+                    },
+                }
+            }
+        ],
+        final_state={
+            "node_outputs": {"a": {"status": "ok"}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": {"mode": "deterministic", "source": "dsl", "targets": []}},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    metrics = workflow_run_repo.update_status.await_args.kwargs["metrics"]
+    assert metrics["routing"]["deterministic"] == 1
+    assert metrics["routing"]["llm_escalated"] == 0
+    checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
+    assert checkpoint["routing_decisions"]["a"]["mode"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_still_aggregates_partial_routing_counts(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """AC4 mirrors 4.2 AC4 — partial routing counts survive a failed run,
+    exactly like partial token/cost metrics already do."""
+    workflow = _workflow(
+        dag={
+            "nodes": [
+                {"node_id": "a", "agent_template_id": str(uuid4())},
+                {"node_id": "b", "agent_template_id": str(uuid4())},
+            ],
+            "edges": [],
+        }
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {
+                        "a": {"mode": "deterministic", "source": "dsl", "targets": []}
+                    },
+                }
+            }
+        ],
+        final_state={
+            "node_outputs": {"a": {}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": {"mode": "deterministic", "source": "dsl", "targets": []}},
+        },
+        raise_after_updates=True,
+        next_nodes=("b",),
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(),
+        workflow,
+        {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})},
+        {},
+        correlation_id=uuid4(),
+    )
+
+    assert workflow_run_repo.update_status.await_args.kwargs["status"] == "error"
+    metrics = workflow_run_repo.update_status.await_args.kwargs["metrics"]
+    assert metrics["routing"]["deterministic"] == 1
+    assert metrics["routing"]["llm_escalated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_escalated_decision_publishes_routing_escalated_event(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    workflow = _workflow(
+        dag={
+            "nodes": [
+                {"node_id": "a", "agent_template_id": str(uuid4())},
+                {"node_id": "b", "agent_template_id": str(uuid4())},
+            ],
+            "edges": [{"from_node_id": "a", "to_node_id": "b", "condition": "output.x == 1"}],
+        }
+    )
+    decision = {
+        "mode": "llm_escalated",
+        "source": "llm",
+        "targets": ["b"],
+        "confidence": 0.0,
+        "rule_id": None,
+        "reason": "best guess",
+        "llm_model": "claude-haiku-4-5",
+        "llm_latency_ms": 42,
+    }
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {"x": 2}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {"a": decision},
+                }
+            },
+            {"b": {"node_outputs": {"b": {}}, "node_metrics": {"b": {}}}},
+        ],
+        final_state={
+            "node_outputs": {"a": {"x": 2}, "b": {}},
+            "node_metrics": {"a": {}, "b": {}},
+            "routing_decisions": {"a": decision},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(),
+        workflow,
+        {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})},
+        {},
+        correlation_id=uuid4(),
+    )
+
+    published_types = [call.args[0] for call in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.routing_escalated" in published_types
+    escalation_call = next(
+        call
+        for call in event_publish_mock.await_args_list
+        if call.args[0] == "workflow_engine.workflow_run.routing_escalated"
+    )
+    event_payload = escalation_call.args[1]
+    assert event_payload.node_id == "a"
+    assert event_payload.decision_target == ["b"]
+    assert event_payload.candidates == ["b"]
+    assert event_payload.llm_latency_ms == 42
+    assert "x" not in event_payload.context  # own_output never in the payload (T7.3)
+
+
+@pytest.mark.asyncio
+async def test_escalated_decision_published_only_once_per_node(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """T9.7 — defends against a node_id appearing more than once in the
+    `update` stream within a single execution (idempotence guard)."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    decision = {
+        "mode": "llm_escalated",
+        "source": "llm",
+        "targets": [],
+        "confidence": 0.0,
+        "rule_id": None,
+        "reason": "x",
+        "llm_model": "claude-haiku-4-5",
+        "llm_latency_ms": 5,
+    }
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {"a": decision},
+                }
+            },
+            {
+                "a": {
+                    "node_outputs": {"a": {}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {"a": decision},
+                }
+            },
+        ],
+        final_state={
+            "node_outputs": {"a": {}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": decision},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    published_types = [
+        call.args[0]
+        for call in event_publish_mock.await_args_list
+        if call.args[0] == "workflow_engine.workflow_run.routing_escalated"
+    ]
+    assert len(published_types) == 1
+
+
+@pytest.mark.asyncio
+async def test_routing_metrics_recorded_once_per_node_like_the_event(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """The Prometheus counter sat OUTSIDE the guard that deduplicates the
+    event, so the same decision could increment it twice while publishing
+    once — making the counters disagree with `metrics["routing"]` and
+    `/routing-stats`, both computed from the state and therefore counting
+    each decision exactly once."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    decision = {
+        "mode": "llm_escalated",
+        "source": "llm",
+        "targets": [],
+        "confidence": 0.0,
+        "rule_id": None,
+        "reason": "x",
+        "llm_model": "claude-haiku-4-5",
+        "llm_latency_ms": 5,
+    }
+    update = {
+        "a": {
+            "node_outputs": {"a": {}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": decision},
+        }
+    }
+    compiled = _FakeCompiledGraph(
+        updates=[update, update],
+        final_state={
+            "node_outputs": {"a": {}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": decision},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+    record_mock = MagicMock()
+    monkeypatch.setattr(service, "_record_routing_metrics_safely", record_mock)
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    assert record_mock.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_republish_decisions_from_the_restored_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """T9.7 literally — the guard has to hold "for this RUN", not for this
+    execution. Seeded empty on every resume, it re-published (and re-counted)
+    every escalation the run had already taken before the crash, permanently
+    over-representing resumed runs in the raw material of innovation #1.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    decision = {
+        "mode": "llm_escalated",
+        "source": "llm",
+        "targets": [],
+        "confidence": 0.0,
+        "rule_id": None,
+        "reason": "decided before the crash",
+        "llm_model": "claude-haiku-4-5",
+        "llm_latency_ms": 5,
+    }
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {}},
+                    "node_metrics": {"a": {}},
+                    "routing_decisions": {"a": decision},
+                }
+            }
+        ],
+        final_state={
+            "node_outputs": {"a": {}},
+            "node_metrics": {"a": {}},
+            "routing_decisions": {"a": decision},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    run = _workflow_run(workflow_id=workflow.id)
+    # The applicative checkpoint `_sync_checkpoint` left behind before the crash.
+    run.checkpoint = {"routing_decisions": {"a": decision}}
+    workflow_run_repo.get_by_id.return_value = run
+
+    await service._resume_run(run.id, workflow, {"a": SimpleNamespace(config={})})
+
+    republished = [
+        call.args[0]
+        for call in event_publish_mock.await_args_list
+        if call.args[0] == "workflow_engine.workflow_run.routing_escalated"
+    ]
+    assert republished == []
+
+
+@pytest.mark.asyncio
+async def test_routing_settings_and_rules_are_forwarded_to_build_state_graph(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+    from agentive_backend.features.workflow_engine.domain.routing_rules import RoutingRule
+    from agentive_backend.shared.config import settings
+
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {}}},
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_build(*args: Any, **kwargs: Any) -> _FakeGraphBuilder:
+        captured["rules"] = kwargs.get("rules")
+        captured["routing_settings"] = kwargs.get("routing_settings")
+        return _FakeGraphBuilder(compiled)
+
+    monkeypatch.setattr(svc_module, "build_state_graph", _fake_build)
+
+    rule = RoutingRule(
+        rule_id="r1",
+        description="d",
+        when=(),
+        verdict="terminate",
+        base_confidence=0.9,
+        penalties=(),
+    )
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+    service._routing_rules = (rule,)  # type: ignore[attr-defined]
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    assert captured["rules"] == (rule,)
+    assert captured["routing_settings"] is not None
+    assert captured["routing_settings"].threshold == pytest.approx(
+        settings.routing_confidence_threshold
+    )
+
+
+# ─── IG3 — the node's paid work survives a failed routing decision ────────
+
+
+@pytest.mark.asyncio
+async def test_failed_routing_decision_persists_the_node_work_it_carried(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """LangGraph discards the state update of a node that raises, so a node
+    whose ROUTING decision failed left no trace at all — the run ended
+    `error` with no record of a node that had executed, and its already-paid
+    tokens missing from the run's totals.
+
+    The run must still fail (posture unchanged) and `last_error` must still
+    describe the REAL cause, not the carrier wrapper.
+    """
+    from agentive_backend.features.workflow_engine.domain.routing_rules import (
+        RoutingEscalationError,
+    )
+    from agentive_backend.features.workflow_engine.engine.graph_builder import (
+        RoutingDecisionFailedError,
+    )
+
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    cause = RoutingEscalationError(
+        "escalation response is not valid JSON", failure_reason="unparsable"
+    )
+    carrier = RoutingDecisionFailedError(
+        node_id="a",
+        node_update={
+            "node_outputs": {"a": {"status": "unknown"}},
+            "node_metrics": {"a": {"input_tokens": 11, "output_tokens": 3, "cost_usd": "0.002"}},
+        },
+    )
+    carrier.__cause__ = cause
+
+    compiled = _FakeCompiledGraph(
+        updates=[],
+        # The node's update never reached the state — that is the whole point.
+        final_state={"node_outputs": {}, "node_metrics": {}, "routing_decisions": {}},
+        raise_after_updates=True,
+        raise_exc=carrier,
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    run_id = uuid4()
+    await service._drive_run(
+        run_id, workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    status_call = workflow_run_repo.update_status.await_args
+    assert status_call.kwargs["status"] == "error"
+
+    metrics = status_call.kwargs["metrics"]
+    # The work the run paid for is accounted, not silently dropped.
+    assert metrics["total_tokens"] == {"input": 11, "output": 3}
+    assert metrics["total_cost_usd"] == "0.002"
+    assert metrics["per_node"]["a"]["cost_usd"] == "0.002"
+
+    # The node's STEP failed, so its status is `error` — its own LLM call
+    # succeeded but the decision that completes the step did not. What IG3
+    # fixes is that its output is no longer absent from the checkpoint: an
+    # operator can now see what the node produced before the step died.
+    checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
+    assert checkpoint["node_statuses"]["a"] == "error"
+    assert checkpoint["last_node_id"] == "a"
+    assert "a" in checkpoint["node_outputs_preview"]
+    # And the recorded error is the CAUSE, not the carrier's own message.
+    assert "routing decision failed" not in checkpoint["last_error"]
+    assert "not valid JSON" in checkpoint["last_error"]

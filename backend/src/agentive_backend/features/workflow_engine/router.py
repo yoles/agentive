@@ -1,4 +1,4 @@
-"""``/api/v1/workflows`` — Workflow Engine endpoints (Story 4.1, 4.2).
+"""``/api/v1/workflows`` — Workflow Engine endpoints (Story 4.1, 4.2, 4.3).
 
 * ``POST /workflows`` — create a workflow from a client-submitted DAG
   (``{name, nodes, edges}``). Validates structural integrity, branching
@@ -8,8 +8,15 @@
 * ``POST /workflows/{workflow_id}/runs`` — start a run of an existing,
   active workflow (Story 4.2 AC1). Returns immediately — execution happens
   in a fire-and-forget background task.
+* ``GET /workflows/{workflow_id}/routing-stats`` — hybrid-routing decisions
+  aggregated in SQL over every run of the workflow (Story 4.3 AC3).
 * ``GET /workflows/runs/{run_id}/events`` — SSE stream of a run's state
   transitions (Story 4.2 AC1).
+
+Declaration order matters: ``routing-stats`` is declared BEFORE the run-events
+route under the same prefix. The two do not overlap (3 path segments vs 4),
+and ``test_router_dependencies.py`` locks that rather than leaving it to
+inspection.
 
 Sits behind ``AuthTokenMiddleware`` (Story 1.7). ``AgentiveError`` is raised
 for domain failures and converted to RFC 7807 by the global handler in
@@ -31,6 +38,7 @@ from sse_starlette.sse import EventSourceResponse
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowRequest,
     CreateWorkflowResponse,
+    RoutingStatsResponse,
     StartRunRequest,
     StartRunResponse,
 )
@@ -140,7 +148,7 @@ def _build_execution_service(request: Request) -> WorkflowExecutionService:
     # the 503 needs in order to find the failed startup step.
     missing = [
         name
-        for name in ("session_factory", "llm_router", "workflow_checkpointer")
+        for name in ("session_factory", "llm_router", "workflow_checkpointer", "routing_rules")
         if getattr(request.app.state, name, None) is None
     ] or ["workflow_execution_service"]
     raise DependencyError(
@@ -198,6 +206,46 @@ async def start_workflow_run(
         workflow_id=workflow_id,
         run_input=body.input,
         tenant_id=None,  # Story 4.2 anti-scope — single-tenant MVP.
+    )
+
+
+@router.get(
+    "/workflows/{workflow_id}/routing-stats",
+    response_model=RoutingStatsResponse,
+    summary="Aggregate hybrid-routing decisions for a workflow (Story 4.3 AC3)",
+)
+async def get_workflow_routing_stats(workflow_id: UUID, request: Request) -> RoutingStatsResponse:
+    """``% routages déterministes vs LLM``, aggregated in SQL over every run
+    of ``workflow_id`` — never a Prometheus label (unbounded cardinality,
+    Dev Notes § Divergences assumées).
+
+    Errors:
+    * 404 — ``workflow_id`` unknown (the URL's primary resource, mirror the
+      404-vs-422 decision of Story 4.2's ``POST /workflows/{workflow_id}/runs``,
+      not Story 4.1's ``POST /workflows``).
+    * 503 — lifespan state missing (session factory).
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise DependencyError(
+            detail="Workflow engine not initialised — check lifespan startup logs.",
+            context={"missing": ["session_factory"]},
+        )
+    workflow_repo = WorkflowRepo(session_factory=session_factory)
+    await workflow_repo.require_by_id(workflow_id)
+
+    workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
+    runs_counted, deterministic, llm_escalated = await workflow_run_repo.aggregate_routing_modes(
+        workflow_id
+    )
+    total = deterministic + llm_escalated
+    deterministic_pct = round(deterministic / total * 100, 1) if total > 0 else None
+    return RoutingStatsResponse(
+        workflow_id=workflow_id,
+        runs_counted=runs_counted,
+        deterministic=deterministic,
+        llm_escalated=llm_escalated,
+        deterministic_pct=deterministic_pct,
     )
 
 

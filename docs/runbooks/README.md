@@ -5,6 +5,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 ## Disponibles
 
 - [`event-bus-debug.md`](./event-bus-debug.md) — Debug du bus d'événements LISTEN/NOTIFY (Story 1.4)
+- [`hybrid-orchestration.md`](./hybrid-orchestration.md) — Orchestration hybride DSL → règles → LLM, seuil, `routing-stats` (Story 4.3)
 - [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)
 - [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
 - [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)

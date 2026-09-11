@@ -57,7 +57,25 @@ _STOP_CANCEL_TIMEOUT_S = 3.0
 # perfectly alive. The x2.5 margin below also absorbs checkpoint-write
 # latency and event-loop scheduling delay.
 _MAX_PROVIDER_CHAIN_LEN = 2
-DEFAULT_STALE_THRESHOLD_S = NODE_TIMEOUT_S * _MAX_PROVIDER_CHAIN_LEN * 2.5
+
+# Story 4.3 point 9 / T5.6 — a hybrid-routing decision point (a node with at
+# least one conditional outgoing edge) can ALSO escalate to an LLM after the
+# node's own completion, and that escalation call goes through
+# `LLMRouter.complete` too — so it pays the same per-provider timeout. A
+# decision-point node's worst case is therefore its own NODE_TIMEOUT_S PLUS
+# one escalation call, each multiplied by the provider chain length. Without
+# this term, a workflow with hybrid routing that hits one provider fallback
+# on both the node call AND the escalation call would be misclassified
+# orphaned at (60 + 15) = 75s short of what it can legitimately take.
+#
+# Mirrors the settings default (`AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`,
+# `shared/config.py`) as a plain float rather than importing `settings` —
+# this is a STATIC fallback for the constructor's own `stale_threshold_s=`
+# default, exactly like `NODE_TIMEOUT_S` above it never reads `settings`.
+_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT = 15.0
+DEFAULT_STALE_THRESHOLD_S = (
+    (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * _MAX_PROVIDER_CHAIN_LEN * 2.5
+)
 
 # A run whose resume keeps dying before completing a single node is a poison
 # run, not a transient crash. `claim_stale_running` bumps

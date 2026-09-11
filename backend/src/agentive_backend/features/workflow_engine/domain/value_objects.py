@@ -52,19 +52,28 @@ class WorkflowDag:
 class WorkflowState(TypedDict, total=False):
     """LangGraph state-channel schema for one workflow run (Story 4.2 T3.3).
 
-    ``node_outputs``/``node_metrics`` use the stdlib ``operator.or_`` reducer
-    (dict merge, Python 3.9+) — without it, a fan-out step where 2+ nodes
-    complete in the same LangGraph "superstep" would have their state
-    updates overwrite each other's key instead of merging (last-write-wins
-    is LangGraph's default with no reducer). Node ids are guaranteed unique
-    by construction (Story 4.1 AC1's duplicate-``node_id`` check), so this
-    is purely a merge concern, never a real key-collision to resolve.
+    ``node_outputs``/``node_metrics``/``routing_decisions`` all use the
+    stdlib ``operator.or_`` reducer (dict merge, Python 3.9+) — without it, a
+    fan-out step where 2+ nodes complete in the same LangGraph "superstep"
+    would have their state updates overwrite each other's key instead of
+    merging (last-write-wins is LangGraph's default with no reducer). Node
+    ids are guaranteed unique by construction (Story 4.1 AC1's duplicate-
+    ``node_id`` check), so this is purely a merge concern, never a real
+    key-collision to resolve.
     """
 
     task_input: dict[str, Any]
     correlation_id: str
     node_outputs: Annotated[dict[str, dict[str, Any] | None], operator.or_]
     node_metrics: Annotated[dict[str, dict[str, Any]], operator.or_]
+    # Story 4.3 T4.2 — one entry per routing decision POINT (a node with at
+    # least one conditional outgoing edge), keyed by that node's `node_id`.
+    # Written by the emitting node's own step (`hybrid_router.decide_route`,
+    # composed around `execute_agent_node` — T6.2), then only READ by
+    # `_make_router` (T6.3). Absent for a run checkpointed before this story;
+    # `_make_router` falls back to the pure deterministic resolution in that
+    # case (AC4 — resuming a pre-4.3 run must not raise).
+    routing_decisions: Annotated[dict[str, dict[str, Any]], operator.or_]
 
 
 __all__ = [

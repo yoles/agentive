@@ -6,6 +6,15 @@ string, a number, or ``true``/``false``. A single comparator per condition —
 no ``and``/``or``, no parentheses, no function calls (lecture littérale de
 "DSL léger" dans l'épic).
 
+Story 4.3 T2.1 extends the grammar with a second namespace, ``context.<field>``
+— used by the hybrid router's declarative rules
+(:mod:`agentive_backend.features.workflow_engine.domain.routing_rules`) to
+predicate on structural facts about the routing decision itself (candidate
+counts, whether the emitting node produced parsable output, …), not just on
+the node's own output. ``allowed_namespaces`` defaults to ``("output",)`` —
+unchanged — so every 4.1/4.2 call site keeps rejecting ``context.*`` without
+modification; only the rules loader (T3.4) opts into both.
+
 Security: the RHS literal is isolated by the regex below and parsed with
 :func:`ast.literal_eval` ONLY — never the full expression, and never
 ``eval``/``exec``. ``literal_eval`` can only produce Python literals
@@ -34,41 +43,70 @@ from agentive_backend.shared.logging import get_logger
 
 _log = get_logger(__name__)
 
+# The namespace group is DELIBERATELY generic rather than `(output|context)`.
+# Hard-coding the two known namespaces here made the regex — not the
+# `allowed_namespaces` allowlist — the thing that rejected `upstream.score > 1`,
+# so the author was told their SYNTAX was wrong, and the allowlist branch below
+# was unreachable for anything except `context` under the default. Matching the
+# SHAPE here and enforcing the VOCABULARY below keeps each check answering the
+# question it is named for.
 _CONDITION_RE = re.compile(
-    r"^output\.([a-zA-Z_][a-zA-Z0-9_]*)\s*(==|!=|<=|>=|<|>)\s*(.+)$", re.DOTALL
+    r"^([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\s*(==|!=|<=|>=|<|>)\s*(.+)$",
+    re.DOTALL,
 )
 _BOOLEAN_LITERALS: dict[str, bool] = {"true": True, "false": False}
 _ALLOWED_LITERAL_TYPES = (str, int, float, bool)
+_DEFAULT_ALLOWED_NAMESPACES: tuple[str, ...] = ("output",)
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedCondition:
-    """A successfully-parsed branching condition — ``output.<field> <op> <literal>``."""
+    """A successfully-parsed branching condition — ``<namespace>.<field> <op> <literal>``.
+
+    ``namespace`` has a default AND sits last — the dataclass is
+    ``frozen``/``slots`` and 4.1/4.2 tests already construct it with partial
+    kwargs (``ParsedCondition(field=..., operator=..., literal=...)``); a
+    field without a default would break every one of them.
+    """
 
     field: str
     operator: str
     literal: Any
+    namespace: str = "output"
 
 
-def parse(condition: str) -> ParsedCondition:
+def parse(
+    condition: str, *, allowed_namespaces: tuple[str, ...] = _DEFAULT_ALLOWED_NAMESPACES
+) -> ParsedCondition:
     """Parse ``condition`` or raise :class:`DomainValidationError`.
+
+    ``allowed_namespaces`` defaults to ``("output",)`` — unchanged from
+    Story 4.1/4.2, so every existing call site keeps rejecting
+    ``context.*``. The rules catalog loader (T3.4) is the only caller that
+    passes ``("output", "context")``.
 
     Raises:
         DomainValidationError: the condition does not match the
-            ``output.<field> <op> <literal>`` grammar, OR the RHS is not a
-            scalar literal (composite literals, names, calls, arbitrary
+            ``<namespace>.<field> <op> <literal>`` grammar, the namespace is
+            not in ``allowed_namespaces``, OR the RHS is not a scalar
+            literal (composite literals, names, calls, arbitrary
             expressions are all rejected).
     """
     match = _CONDITION_RE.match(condition.strip())
     if match is None:
         raise DomainValidationError(
             f"invalid branching condition syntax: {condition!r} "
-            "(expected 'output.<field> <op> <literal>')"
+            "(expected '<namespace>.<field> <op> <literal>')"
         )
     # NOT named `operator` — that shadowed the `operator` MODULE imported
     # above for the whole function body, so any future reference to
     # `operator.eq` inside `parse` would raise `UnboundLocalError`.
-    field, comparator, raw_literal = match.groups()
+    namespace, field, comparator, raw_literal = match.groups()
+    if namespace not in allowed_namespaces:
+        raise DomainValidationError(
+            f"namespace {namespace!r} not allowed in this context "
+            f"(expected one of {allowed_namespaces}): {condition!r}"
+        )
     raw_literal = raw_literal.strip()
 
     if raw_literal in _BOOLEAN_LITERALS:
@@ -86,7 +124,7 @@ def parse(condition: str) -> ParsedCondition:
                 f"string, a number, or true/false): {raw_literal!r}"
             )
 
-    return ParsedCondition(field=field, operator=comparator, literal=literal)
+    return ParsedCondition(field=field, operator=comparator, literal=literal, namespace=namespace)
 
 
 _COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
