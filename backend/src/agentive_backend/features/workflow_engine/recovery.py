@@ -451,6 +451,16 @@ class WorkflowRecoveryWorker:
             event = WorkflowRunFailedEvent(
                 run_id=run.id,
                 workflow_id=run.workflow_id,
+                # Story 4.6 AC3 gave this event an `error_type` so an
+                # alerting consumer can filter without parsing prose — and
+                # `_mark_failed` sets it while THIS publisher, the second of
+                # the two, left it null (review of 2026-09-12). Abandoning a
+                # poison run after `MAX_RECOVERY_ATTEMPTS` is arguably the
+                # most alert-worthy `failed` in the system, and it was the
+                # one an `error_type` filter missed. A sentinel rather than
+                # an exception class name, because there is no exception
+                # here: nothing raised, the worker gave up.
+                error_type="RecoveryAbandoned",
                 failed_node_id=_resumed_from_node_id(run.checkpoint),
                 error_summary=error_summary,
             )

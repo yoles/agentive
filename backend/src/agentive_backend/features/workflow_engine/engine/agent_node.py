@@ -340,6 +340,12 @@ def _resolve_chain(
             model=model,
             available=sorted(llm_router.providers),
             effective=list(resolution.chain) if resolution.chain else None,
+            # Carried on this branch too: the two facts are INDEPENDENT. A
+            # chain can be partially dropped AND rotated, and the `elif`
+            # below used to hide that — the warning said nothing about the
+            # reordering and the info line never fired (review of
+            # 2026-09-12).
+            reordered=resolution.reordered,
         )
     elif resolution.reordered:
         # Not a warning: the chain the author wrote is intact, only its order
