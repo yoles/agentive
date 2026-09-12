@@ -28,6 +28,8 @@ from agentive_backend.features.workflow_engine.recovery import (
     derive_stale_threshold_s,
 )
 from agentive_backend.shared.config import Settings
+from agentive_backend.shared.exceptions import NotFoundError
+from agentive_backend.shared.repositories.base import BaseRepo
 
 #: What `_WORST_CASE_BACKOFF_S` used to be: the backoff a node accumulates
 #: at the DEFAULT delay settings (1 + 2 + 4). Now computed rather than
@@ -589,3 +591,118 @@ def test_the_handoff_timeout_default_matches_the_settings_default() -> None:
     """P-16 — `.env.example` and `Settings` are the deployed truth; this
     module's static fallback must not drift from them."""
     assert Settings().workflow_handoff_summary_timeout_s == _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT
+
+
+# ─── Story 4.8 AC3, extended by code review (BS1) — batch resolution ───
+
+
+def _template_row(template_id: Any) -> SimpleNamespace:
+    return SimpleNamespace(id=template_id, archetype="producteur", config={})
+
+
+def _dag_with(*template_ids: Any) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"node_id": f"n{index}", "agent_template_id": str(tid)}
+            for index, tid in enumerate(template_ids)
+        ],
+        "edges": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_load_templates_resolves_every_node_in_one_batch_query() -> None:
+    """AC3's *When* — "les templates référencés sont résolus" — names no
+    site, and this was the third resolver. It is also the one where N+1 hurt
+    most: `run_once` sweeps runs SEQUENTIALLY, so a 100-node stale run spent
+    100 round trips blocking every other run queued behind it.
+
+    Asserted on `list_by_ids`, so a regression back to N `require_by_id`
+    calls fails here rather than passing quietly at the same speed.
+    """
+    worker, _ = _make_worker(stale_runs=[])
+    first, second = uuid4(), uuid4()
+    worker._template_repo.list_by_ids = AsyncMock(
+        return_value={first: _template_row(first), second: _template_row(second)}
+    )
+
+    templates = await worker._load_templates(_dag_with(first, second))
+
+    worker._template_repo.list_by_ids.assert_awaited_once()
+    assert list(worker._template_repo.list_by_ids.await_args.args[0]) == [first, second]
+    assert set(templates) == {"n0", "n1"}
+    worker._template_repo.require_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_load_templates_deduplicates_a_shared_template() -> None:
+    """Two nodes on the same template resolve to the same row — the map is
+    keyed by template id, not by node."""
+    worker, _ = _make_worker(stale_runs=[])
+    shared = uuid4()
+    row = _template_row(shared)
+    worker._template_repo.list_by_ids = AsyncMock(return_value={shared: row})
+
+    templates = await worker._load_templates(_dag_with(shared, shared))
+
+    assert templates["n0"] is row
+    assert templates["n1"] is row
+
+
+@pytest.mark.asyncio
+async def test_load_templates_still_raises_not_found_on_a_missing_template() -> None:
+    """The divergence this copy carries on PURPOSE is preserved.
+
+    The shared `service._load_templates` raises `InternalError` (500) for the
+    same condition; this one raises `NotFoundError`, because a recovery
+    worker has no HTTP caller to mislead — a decision Story 4.6 made and 4.8
+    deliberately did not revisit. Batching and FOLDING the three copies were
+    separable, and only the first was in AC3's scope: this test is what keeps
+    the second from happening by accident.
+    """
+    worker, _ = _make_worker(stale_runs=[])
+    missing = uuid4()
+    worker._template_repo.list_by_ids = AsyncMock(return_value={})
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await worker._load_templates(_dag_with(missing))
+
+    assert exc_info.value.context["template_id"] == str(missing)
+
+
+@pytest.mark.asyncio
+async def test_load_templates_reports_the_first_missing_in_declaration_order() -> None:
+    """Which node is reported must not depend on Postgres' return order."""
+    worker, _ = _make_worker(stale_runs=[])
+    present, first_missing, second_missing = uuid4(), uuid4(), uuid4()
+    worker._template_repo.list_by_ids = AsyncMock(return_value={present: _template_row(present)})
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await worker._load_templates(_dag_with(present, first_missing, second_missing))
+
+    assert exc_info.value.context["template_id"] == str(first_missing)
+
+
+@pytest.mark.asyncio
+async def test_load_templates_not_found_matches_the_canonical_lookup_or_404_shape() -> None:
+    """The batch rewrite re-spells, in feature code, the message
+    `require_by_id` used to produce through `BaseRepo._require_found` — audit
+    A-07's single spelling of lookup-or-404. Re-spelling beats reaching into
+    a private repo helper from a feature module, but only if the two cannot
+    drift, which is what this compares.
+    """
+    worker, _ = _make_worker(stale_runs=[])
+    missing = uuid4()
+    worker._template_repo.list_by_ids = AsyncMock(return_value={})
+
+    with pytest.raises(NotFoundError) as actual:
+        await worker._load_templates(_dag_with(missing))
+
+    with pytest.raises(NotFoundError) as canonical:
+        BaseRepo._require_found(
+            None, label="Agent template", entity_id=missing, context_key="template_id"
+        )
+
+    assert actual.value.detail == canonical.value.detail
+    assert actual.value.context == canonical.value.context
+    assert actual.value.status == canonical.value.status

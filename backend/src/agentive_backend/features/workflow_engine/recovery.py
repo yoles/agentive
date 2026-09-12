@@ -32,6 +32,7 @@ from agentive_backend.shared.contracts.events import (
     WorkflowRunResumedEvent,
 )
 from agentive_backend.shared.event_bus import notify_best_effort, publish
+from agentive_backend.shared.exceptions import NotFoundError
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
 from agentive_backend.shared.repositories.workflow_repo import RECOVERY_ATTEMPTS_KEY
@@ -581,14 +582,42 @@ class WorkflowRecoveryWorker:
         (review fix P14). Note this copy is NOT identical to that one — it
         calls ``require_by_id`` (404 on a missing template) where the shared
         function raises ``InternalError`` (500). Deliberate: a recovery
-        worker has no HTTP caller to mislead. Folding the third copy into
-        the shared function would change that behaviour, so it stays out of
-        this story's scope.
+        worker has no HTTP caller to mislead.
+
+        Story 4.8 AC3, extended in code review (BS1). The story's Dev Notes
+        called the N+1 debt "double" and closed two sites; this was the
+        third, and AC3's *When* — "les templates référencés sont résolus" —
+        names no site. It is also the one where N+1 hurts most: ``run_once``
+        sweeps runs SEQUENTIALLY, so a 100-node stale run spent 100 round
+        trips blocking every other run behind it.
+
+        What the story treated as the blocker was the ``NotFoundError`` /
+        ``InternalError`` divergence above. That blocks FOLDING the three
+        copies into one, which is still out of scope and still deliberate —
+        but it never blocked BATCHING, which is what AC3 asks for. The two
+        were separable, and only the second is done here: this copy keeps
+        raising ``NotFoundError``, on the first missing template in the
+        stored DAG's declaration order, exactly as before.
         """
+        nodes = dag_payload.get("nodes", [])
+        node_ids = [UUID(node["agent_template_id"]) for node in nodes]
+        resolved = await self._template_repo.list_by_ids(node_ids)
+        # Walk the DAG in declaration order, not the resolved map: which node
+        # is reported must not depend on Postgres' return order.
         templates: dict[str, AgentTemplate] = {}
-        for node in dag_payload.get("nodes", []):
-            template_id = UUID(node["agent_template_id"])
-            templates[node["node_id"]] = await self._template_repo.require_by_id(template_id)
+        for node, template_id in zip(nodes, node_ids, strict=True):
+            template = resolved.get(template_id)
+            if template is None:
+                # Same message and `context` shape `require_by_id` produced
+                # through `BaseRepo._require_found` (audit A-07's single
+                # spelling of lookup-or-404). Re-spelled here rather than
+                # reaching into a private repo helper from feature code; the
+                # shape is pinned by a test so the two cannot drift.
+                raise NotFoundError(
+                    detail=f"Agent template '{template_id}' not found",
+                    context={"template_id": str(template_id)},
+                )
+            templates[node["node_id"]] = template
         return templates
 
 
