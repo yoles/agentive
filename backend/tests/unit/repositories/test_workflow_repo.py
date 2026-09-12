@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -149,6 +150,82 @@ async def test_workflow_run_claim_stale_running_uses_no_tenant_scoping() -> None
     session.execute.assert_awaited_once()
 
 
+# ─── Story 4.6 T12.7 — what the claim query must and must not filter on ──
+#
+# Moved here by the review (lot 11). The two tests these replace lived in
+# `tests/unit/workflow_engine/test_recovery.py` and neither reached the
+# production query: one built its OWN `WorkflowRun.status == "running"`
+# clause in the test body and asserted SQLAlchemy renders it as `= 'running'`;
+# the other set `control_signal` on a `SimpleNamespace` while
+# `claim_stale_running` was an `AsyncMock`, and `recovery.py` never reads
+# that attribute at all. Both stayed green under the exact regressions their
+# docstrings claimed to guard. The guarantee is a property of the STATEMENT,
+# so it belongs where the statement is built.
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_claim_stale_running_filters_on_running_only() -> None:
+    """The load-bearing consequence of carrying the control request in a
+    COLUMN rather than in `status` (Story 4.6 preamble point 6).
+
+    A `paused` run is excluded for free — no extra clause, no new case to
+    remember — which is precisely why `pausing`/`cancelling` statuses were
+    rejected: each of the four places comparing against `"running"` would
+    have needed teaching about them. Widen this predicate and the sweep
+    starts re-driving paused runs in parallel on the same `thread_id`.
+    """
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalars.return_value.all.return_value = []
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.claim_stale_running(older_than=datetime.now(UTC))
+
+    rendered = str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "workflow_runs.status = 'running'" in rendered
+    assert "'paused'" not in rendered
+    assert "'cancelled'" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_claim_stale_running_ignores_a_pending_control_signal() -> None:
+    """DELIBERATE, and the opposite of what a reader expects to find.
+
+    A run whose process died after a pause was requested but before it was
+    observed stays `running` with a non-NULL `control_signal`. The sweep must
+    claim it anyway: the driver's pre-loop control check then settles the
+    signal without executing a single node. Teaching this query to skip such
+    rows — the "tidy" change — would strand them forever, because nothing
+    else ever looks at `running` rows.
+
+    Asserted as the ABSENCE of a predicate, which is the only form this
+    guarantee has: there is no line in `recovery.py` to point at.
+    """
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalars.return_value.all.return_value = []
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.claim_stale_running(older_than=datetime.now(UTC))
+
+    rendered = str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    # `control_signal` appears nowhere in the predicate — neither as a NULL
+    # check nor as a value comparison. Scoped to the WHERE clauses (the
+    # UPDATE's and the subquery's): `RETURNING` legitimately lists every
+    # column, this row's own `control_signal` included, and matching against
+    # the whole statement would have caught that instead.
+    predicate = rendered.split("RETURNING", 1)[0].split("WHERE", 1)[1]
+    assert "control_signal" not in predicate
+    # …and the scoping is honest: the clause we DO expect is in there.
+    assert "status = 'running'" in predicate
+
+
 # ─── Story 4.3 T10.1 — WorkflowRunRepo.aggregate_routing_modes ─────────
 #
 # The guard's BEHAVIOUR against legacy (no `routing` key), non-numeric and
@@ -218,3 +295,106 @@ async def test_aggregate_routing_modes_statement_carries_its_guards() -> None:
     # even though it appears in both the type guard and the cast.
     paths = [v for v in compiled.params.values() if isinstance(v, tuple)]
     assert paths == [("routing", "deterministic"), ("routing", "llm_escalated")]
+
+
+# ─── Story 4.6 review lot 12 — the control predicates, as SQL ──────────
+#
+# `request_control_in_session` and `update_status_in_session` carry the
+# entire 409 contract, and every test of them drove an `AsyncMock`: the
+# assertions pinned the ARGUMENTS (`signal="cancel"`, `overrides=("pause",)`)
+# while an `or_()` composed the wrong way, an `in_()` against a 1-tuple or a
+# dropped clause would have left all of them green. These render the
+# statement the repo actually builds.
+
+
+def _rendered(session: Any) -> str:
+    return str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_control_refuses_to_overwrite_a_pending_signal_by_default() -> None:
+    """ "Whoever asks first wins" is a SQL predicate, not a convention: a
+    second request on a run already carrying one must match no row, so the
+    service answers 409 instead of silently replacing it."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.rowcount = 0
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.request_control(uuid4(), signal="pause")
+
+    rendered = _rendered(session)
+    assert "control_signal IS NULL" in rendered
+    assert "status = 'running'" in rendered
+
+
+@pytest.mark.asyncio
+async def test_request_control_lets_cancel_replace_a_pending_pause() -> None:
+    """`BS1`'s escalation, rendered. The guard widens to
+    `control_signal IS NULL OR control_signal IN ('pause')` — and ONLY to
+    that: a `pause` may never replace a pending `cancel`, because a cancel
+    has already been confirmed to somebody."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.rowcount = 1
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.request_control(uuid4(), signal="cancel", overrides=("pause",))
+
+    rendered = _rendered(session)
+    assert "control_signal IS NULL" in rendered
+    assert "control_signal IN ('pause')" in rendered
+    assert "'cancel'" not in rendered.split("WHERE", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_update_status_can_guard_on_the_signal_it_read() -> None:
+    """Review lot 9 (F2): the driver's settle write must not land if the
+    signal changed under it — `status` stays `running` across that whole
+    window, so it cannot be the guard."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.rowcount = 1
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.update_status(
+        uuid4(), status="paused", only_if_status="running", only_if_control_signal="pause"
+    )
+
+    rendered = _rendered(session)
+    assert "control_signal = 'pause'" in rendered
+    assert "status = 'running'" in rendered
+
+
+@pytest.mark.asyncio
+async def test_update_status_clears_the_signal_in_the_same_statement() -> None:
+    """T1.6 — "the run is paused" and "the request was consumed" commit
+    together or not at all. Split in two, a crash between them leaves a
+    paused run still carrying its `pause`, which its next resume would
+    observe and act on, pausing it again before a single node ran."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.rowcount = 1
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.update_status(uuid4(), status="paused", clear_control=True)
+
+    rendered = _rendered(session)
+    set_clause = rendered.split("SET", 1)[1].split("WHERE", 1)[0]
+    assert "control_signal=NULL" in set_clause.replace(" ", "")
+    assert "control_requested_at=NULL" in set_clause.replace(" ", "")
+
+
+@pytest.mark.asyncio
+async def test_update_status_stamps_activity_when_asked_to() -> None:
+    """P4 — without this stamp on `paused -> running`, `claim_stale_running`
+    reclaims a long-paused run within one tick and drives it a SECOND time in
+    parallel on the same `thread_id`."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.rowcount = 1
+    repo = WorkflowRunRepo(session_factory=factory)
+
+    await repo.update_status(uuid4(), status="running", touch_last_checkpoint=True)
+
+    set_clause = _rendered(session).split("SET", 1)[1].split("WHERE", 1)[0]
+    assert "last_checkpoint_at=now()" in set_clause.replace(" ", "").lower()

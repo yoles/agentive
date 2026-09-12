@@ -235,6 +235,31 @@ class WorkflowRun(Base):
     # carrying the same report (review BS2). `None` only for runs predating
     # this story.
     mise_en_place: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Story 4.6 AC1/AC2 — a PENDING pause/cancel REQUEST (`"pause"`,
+    # `"cancel"`, or `NULL`), deliberately NOT a status.
+    #
+    # Interrupting a run is cooperative: the driver observes this column at
+    # the end of a superstep, the one instant where LangGraph has committed
+    # its checkpoint and stopping loses no work and cuts no already-billed
+    # LLM call. Until it does, the run is still genuinely `running` and must
+    # keep saying so — four separate pieces of code compare `status` against
+    # the literal `"running"` (`claim_stale_running`,
+    # `update_status(only_if_status=...)`, `_resume_run`'s guard,
+    # `_abandon_one`), and a `pausing`/`cancelling` status would have
+    # required teaching every one of them a new value.
+    #
+    # Two consequences fall out for free: the signal is multi-worker (it
+    # travels through the DB, not through an in-process task set), and an
+    # unobserved request self-heals — a run whose process died still reads
+    # `running`, so the recovery sweep claims it and the driver settles the
+    # signal before executing any node.
+    #
+    # `paused`/`cancelled` ARE statuses and live in `status` above, which is
+    # a free `String(50)`. Legal values and transitions: `domain/run_control.py`.
+    control_signal: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    control_requested_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
 
 
 class AgentTemplate(Base):

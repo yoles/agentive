@@ -17,11 +17,22 @@ importing ``features.playground``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
+from agentive_backend.features.workflow_engine.domain.error_policy import (
+    MAX_RUNTIME_RETRIES,
+    backoff_delay_s,
+    resolve_error_policy,
+)
+from agentive_backend.features.workflow_engine.domain.provider_chain import resolve_provider_chain
+from agentive_backend.features.workflow_engine.metrics import WORKFLOW_NODE_RETRIES_TOTAL
+from agentive_backend.infra.llm.pricing import provider_for_model
 from agentive_backend.shared.exceptions import ValidationError
+from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
 from agentive_backend.shared.llm.security import wrap_external_input
 from agentive_backend.shared.llm.types import ChatMessage
 from agentive_backend.shared.logging import get_logger
@@ -30,6 +41,7 @@ if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.domain.value_objects import WorkflowState
     from agentive_backend.infra.db.models import AgentTemplate
     from agentive_backend.shared.llm.router import LLMRouter
+    from agentive_backend.shared.llm.types import Completion
 
 _log = get_logger(__name__)
 
@@ -57,6 +69,31 @@ MIN_MAX_TOKENS: Final = 1
 # this timeout is exactly the scenario AC3's recovery worker (STALE_THRESHOLD_S)
 # is meant to catch, not a redundant safety net.
 NODE_TIMEOUT_S: Final = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class RetrySettings:
+    """Deployment knobs for the node-level retry loop (Story 4.6 T11.3).
+
+    Built ONCE from ``shared.config.settings`` by the assembly layer
+    (``app/lifespan.py``) and threaded down through ``build_state_graph``,
+    mirror :class:`~..engine.hybrid_router.RoutingSettings`. This module
+    never reads ``settings`` itself (golden rule #6, and the same testability
+    argument that produced ``RoutingSettings``/``DryRunSettings``).
+    """
+
+    base_delay_s: float
+    max_delay_s: float
+
+
+#: Static mirror of ``AGENTIVE_WORKFLOW_RETRY_{BASE,MAX}_DELAY_S``'s defaults,
+#: used when no settings were threaded down — i.e. by graph-builder callers
+#: that predate Story 4.6 and by direct ``execute_agent_node`` calls in unit
+#: tests. Deliberately a literal rather than an import of ``settings``, same
+#: posture as ``recovery._ROUTING_ESCALATION_TIMEOUT_S_DEFAULT``: a static
+#: fallback for a default value is not a configuration read. Keep in sync
+#: with ``shared/config.py`` manually.
+DEFAULT_RETRY_SETTINGS: Final = RetrySettings(base_delay_s=1.0, max_delay_s=30.0)
 
 # Cap on the serialized upstream-output payload handed to a node. See
 # `_serialize_upstream` — without it, a linear DAG's prompt grows by one full
@@ -259,12 +296,236 @@ def _build_user_message(state: WorkflowState, *, node_id: str) -> str:
     )
 
 
+def _resolve_chain(
+    config: dict[str, Any], llm_router: LLMRouter, *, node_id: str, model: str
+) -> list[str] | None:
+    """The template's ``provider_chain``, intersected with what is registered.
+
+    Closes défer **D12**: Story 2.2 persisted this chain and nothing ever
+    read it back, so every node ran on the process-wide default.
+
+    The intersection (T7.2) is what makes enabling it safe.
+    ``LLMRouter.complete()`` raises a bare ``ValueError`` for any provider
+    name absent from its registry, and ``_build_llm_router`` only registers
+    providers whose API key is configured — with no key at all, the sole
+    registered provider is ``"mock"``. A template carrying the archetypes'
+    default ``["anthropic"]`` would therefore raise INSIDE the node, be
+    caught by ``_execute``'s ``except Exception``, and end the run ``error``:
+    in dev, CI and testcontainers, that is every run of every test.
+
+    The dropped providers are logged, never swallowed: a run silently
+    executing on a chain its author did not write is exactly the kind of
+    divergence an operator needs told about.
+    """
+    resolution = resolve_provider_chain(
+        config,
+        available=llm_router.providers,
+        # The router hands index 0 the model verbatim, so the head must be the
+        # provider that serves it — see `resolve_provider_chain`.
+        model_owner=provider_for_model(model),
+    )
+    # `malformed` matters as much as `dropped` here: AC3 asks for this warning
+    # on "intersection vide, OU `provider_chain` absent / mal typé / vide".
+    # A template holding `provider_chain: "anthropic"` — a string where a list
+    # belongs — has its chain ignored in full, and without this branch that
+    # happened without a single log line.
+    if resolution.dropped or resolution.malformed or resolution.incoherent:
+        _log.warning(
+            "workflow_engine.provider_chain_unavailable",
+            node_id=node_id,
+            configured=list(resolution.configured),
+            dropped=list(resolution.dropped),
+            malformed=resolution.malformed,
+            incoherent=resolution.incoherent,
+            model=model,
+            available=sorted(llm_router.providers),
+            effective=list(resolution.chain) if resolution.chain else None,
+        )
+    elif resolution.reordered:
+        # Not a warning: the chain the author wrote is intact, only its order
+        # was made compatible with the router's index-0 contract.
+        _log.info(
+            "workflow_engine.provider_chain_reordered",
+            node_id=node_id,
+            configured=list(resolution.configured),
+            effective=list(resolution.chain or ()),
+            model=model,
+        )
+    return list(resolution.chain) if resolution.chain is not None else None
+
+
+def _chain_ended_fatally(exc: LLMAllProvidersFailedError) -> bool:
+    """True when the chain stopped on a ``fatal`` error, not on exhaustion.
+
+    The router tags every entry of ``context["attempts"]`` with an
+    ``error_class``; the LAST one is the reason the chain stopped. A ``fatal``
+    tail means a misconfiguration (no fallback model registered for a
+    ``(model, provider)`` pair), which retrying can only hide.
+
+    Defensive on the payload's shape, like every other reader of a
+    free-form mapping in this module: a malformed ``context`` degrades to
+    "not fatal" (i.e. the previous behaviour) rather than raising inside an
+    exception handler.
+    """
+    attempts = (getattr(exc, "context", None) or {}).get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return False
+    last = attempts[-1]
+    return isinstance(last, dict) and last.get("error_class") == "fatal"
+
+
+def _annotate_chain_traversals(exc: LLMAllProvidersFailedError, traversals: int) -> None:
+    """Record how many times this node walked the WHOLE provider chain.
+
+    AC3 wants an operator to see that a node cost, say, four chain
+    traversals. On the SUCCESS path that travels back as
+    ``node_metrics[node].llm_attempts``, but a node that ultimately fails
+    commits no state at all — LangGraph discards the update of a node that
+    raised — so the only carrier left is the exception itself.
+
+    ``context["attempts"]`` cannot answer this: the router builds a FRESH
+    error, with a fresh ``attempts`` list, on every call, so it only ever
+    describes the last traversal. The count is therefore added beside it,
+    never merged into it, so ``_failure_attempts``' redaction and bounding
+    keep operating on exactly the shape the router produced.
+    """
+    context = getattr(exc, "context", None)
+    if isinstance(context, dict):
+        context["chain_traversals"] = traversals
+
+
+async def _complete_with_retry(
+    llm_router: LLMRouter,
+    messages: list[ChatMessage],
+    *,
+    config: dict[str, Any],
+    node_id: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    system: str,
+    provider_chain: list[str] | None,
+    retry_settings: RetrySettings,
+) -> tuple[Completion, int]:
+    """Call the router, retrying the WHOLE chain per ``error_policy`` (D13).
+
+    Returns ``(completion, attempts)`` — the attempt count travels back so
+    the node metric can record that a node cost, say, four full chain
+    traversals rather than one.
+
+    **Retry, fallback and intra-provider retry are three different things**
+    (see ``domain/error_policy.py``'s table). This loop is the middle one: it
+    only ever fires on :class:`LLMAllProvidersFailedError`, i.e. once the
+    router has already walked the entire chain and every provider failed
+    retriably. Consequences, each deliberate:
+
+    * A ``fatal`` error (auth, bad request, no fallback model) propagates on
+      the first attempt. Two distinct paths get there, and only one is
+      obvious: the router re-raises most fatal errors as-is, but a
+      ``LLMNoFallbackModelError`` raised MID-CHAIN is wrapped into
+      ``LLMAllProvidersFailedError`` on purpose (so the caller sees the
+      retriable failure that preceded it). ``_chain_ended_fatally`` is what
+      keeps the second path from being retried.
+    * A :class:`ValidationError` from the template's own config never reaches
+      here — it is raised before the first call.
+    * The final exception is re-raised UNWRAPPED. ``_mark_failed`` and AC3
+      both read ``exc.context["attempts"]`` for the per-provider breakdown;
+      wrapping it would destroy exactly the diagnostic this story adds.
+    """
+    policy = resolve_error_policy(config)
+    # T8.5 — the runtime cap, deliberately below the schema's `le=10`. See
+    # `MAX_RUNTIME_RETRIES`: a longer worst-case node makes crash detection
+    # slower for every OTHER run in this process, because
+    # `recovery.derive_stale_threshold_s` is computed from it.
+    max_retries = min(policy.effective_retries, MAX_RUNTIME_RETRIES)
+    if policy.effective_retries > max_retries:
+        _log.warning(
+            "workflow_engine.error_policy_retries_capped",
+            node_id=node_id,
+            requested=policy.effective_retries,
+            cap=MAX_RUNTIME_RETRIES,
+        )
+
+    attempt = 0
+    while True:
+        try:
+            completion = await llm_router.complete(
+                messages,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                timeout_s=NODE_TIMEOUT_S,
+                provider_chain=provider_chain,
+            )
+        except LLMAllProvidersFailedError as exc:
+            if _chain_ended_fatally(exc):
+                # AC3 — "aucun retry, jamais, sur une erreur `fatal`". The
+                # router does NOT always re-raise a fatal error as-is: when it
+                # hits one MID-CHAIN (`LLMNoFallbackModelError` from the
+                # second `_resolve_model`, `shared/llm/router.py`), it appends
+                # it to `attempts` and surfaces the whole thing as
+                # `LLMAllProvidersFailedError` so the caller sees both the
+                # original retriable failure AND the misconfig. Filtering on
+                # the exception class alone therefore retries a
+                # misconfiguration — exactly what the AC forbids, and with
+                # backoff, so the misconfig is hidden behind ~7 s of silence.
+                _annotate_chain_traversals(exc, attempt + 1)
+                _log.error(
+                    "workflow_engine.node_chain_failed_fatally",
+                    node_id=node_id,
+                    attempts=attempt + 1,
+                )
+                raise
+            if attempt >= max_retries:
+                if max_retries > 0:
+                    # Only a node that actually RETRIED can exhaust its
+                    # retries. With `fail_fast` / `fallback_provider`,
+                    # `max_retries` is 0, so this branch was reached on the
+                    # first and only attempt and used to increment
+                    # `exhausted` anyway — a fleet configured `fail_fast` (the
+                    # recommended setting for expensive nodes) then reported
+                    # one "exhausted" per node failure with `retried` flat at
+                    # zero, which is not what the metric's own docstring says
+                    # it counts. A chain failure with retries disabled is a
+                    # node failure, not a retry event.
+                    WORKFLOW_NODE_RETRIES_TOTAL.labels(outcome="exhausted").inc()
+                _annotate_chain_traversals(exc, attempt + 1)
+                _log.error(
+                    "workflow_engine.node_retries_exhausted",
+                    node_id=node_id,
+                    attempts=attempt + 1,
+                    on_timeout=policy.on_timeout,
+                )
+                raise
+            delay = backoff_delay_s(
+                attempt,
+                policy,
+                base_s=retry_settings.base_delay_s,
+                max_s=retry_settings.max_delay_s,
+            )
+            WORKFLOW_NODE_RETRIES_TOTAL.labels(outcome="retried").inc()
+            _log.warning(
+                "workflow_engine.node_retrying",
+                node_id=node_id,
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                delay_s=delay,
+                backoff_strategy=policy.backoff_strategy,
+            )
+            await asyncio.sleep(delay)
+            attempt += 1
+        else:
+            return completion, attempt + 1
+
+
 async def execute_agent_node(
     state: WorkflowState,
     *,
     template: AgentTemplate,
     llm_router: LLMRouter,
     node_id: str,
+    retry_settings: RetrySettings | None = None,
 ) -> dict[str, Any]:
     """Execute one workflow node — a single LLM completion (AC2, AC4).
 
@@ -287,15 +548,27 @@ async def execute_agent_node(
     model, temperature, max_tokens = _resolve_llm_params(config, node_id=node_id)
     system_prompt = _guarded_system_prompt(str(config.get("system_prompt") or ""))
 
+    # Story 4.6 T7 (défer D12) — the per-agent chain, finally read back and
+    # made safe to pass. Resolved BEFORE the timer starts: it is pure
+    # dict work, and it must not be charged to the node's LLM duration.
+    provider_chain = _resolve_chain(config, llm_router, node_id=node_id, model=model)
+
     started = time.monotonic()
-    completion = await llm_router.complete(
+    completion, llm_attempts = await _complete_with_retry(
+        llm_router,
         [ChatMessage(role="user", content=user_message)],
+        config=config,
+        node_id=node_id,
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
         system=system_prompt,
-        timeout_s=NODE_TIMEOUT_S,
+        provider_chain=provider_chain,
+        retry_settings=retry_settings or DEFAULT_RETRY_SETTINGS,
     )
+    # Includes the backoff waits, deliberately: this is the wall-clock cost
+    # of the node, and the recovery worker's staleness threshold is derived
+    # against the same worst case.
     duration_ms = int((time.monotonic() - started) * 1000)
 
     parsed_output = _best_effort_json(completion.text)
@@ -315,6 +588,12 @@ async def execute_agent_node(
         ),
         "model_used": completion.model,
         "provider": completion.provider,
+        # Story 4.6 AC3 — how many times the WHOLE provider chain was walked.
+        # `1` on the nominal path; anything above it means the node paid for
+        # several full traversals, which is the only place an operator can
+        # see that cost (the router's own metrics are per-provider-attempt
+        # and carry no node identity).
+        "llm_attempts": llm_attempts,
     }
 
     return {
@@ -323,4 +602,9 @@ async def execute_agent_node(
     }
 
 
-__all__ = ["NODE_TIMEOUT_S", "execute_agent_node"]
+__all__ = [
+    "DEFAULT_RETRY_SETTINGS",
+    "NODE_TIMEOUT_S",
+    "RetrySettings",
+    "execute_agent_node",
+]

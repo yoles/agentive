@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from agentive_backend.features.workflow_engine.domain.error_policy import MAX_RUNTIME_RETRIES
 from agentive_backend.features.workflow_engine.engine.agent_node import NODE_TIMEOUT_S
 from agentive_backend.shared.contracts.events import (
     WorkflowRunFailedEvent,
@@ -73,8 +74,128 @@ _MAX_PROVIDER_CHAIN_LEN = 2
 # this is a STATIC fallback for the constructor's own `stale_threshold_s=`
 # default, exactly like `NODE_TIMEOUT_S` above it never reads `settings`.
 _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT = 15.0
-DEFAULT_STALE_THRESHOLD_S = (
-    (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * _MAX_PROVIDER_CHAIN_LEN * 2.5
+
+# Story 4.6 T8.4/T8.5 — the term this story ADDS, and the reason the whole
+# derivation had to be revisited.
+#
+# `error_policy.on_timeout = "retry_with_backoff"` makes `execute_agent_node`
+# re-run the ENTIRE provider chain up to `max_retries` times, with a backoff
+# wait in between. Every one of those seconds is wall-clock during which the
+# node writes no checkpoint — so the formula below, which assumed a node
+# traverses the chain exactly ONCE, stopped describing reality the moment the
+# dispatcher landed. Left unchanged, a perfectly healthy node on its third
+# retry would be classified orphaned, claimed by the sweep, and executed a
+# SECOND time in parallel on the same `thread_id`: duplicate billed LLM
+# calls, interleaved checkpoint writes, duplicate events.
+#
+# WHY 3 AND NOT THE SCHEMA'S 10 (T8.5, the branch taken). Story 2.2 validates
+# `max_retries` up to 10. Deriving this threshold against 10 gives
+# `((60+15) * 2 * 11 + 181) * 2.5 ≈ 4600 s` — over an hour before a genuinely
+# crashed run is even LOOKED at, which defeats the recovery worker. The two
+# numbers answer different questions: the schema validates an INTENTION a
+# template author may express, this constant guarantees a PROCESS INVARIANT.
+# So the runtime caps what it will actually execute, and the cap is the
+# number this derivation uses. An assumed divergence, not an oversight —
+# `agent_node` enforces it, and a template asking for more is honoured up to
+# here and logged. The constant lives in `domain/error_policy.py` so both
+# the enforcer and this derivation read the SAME number; a local copy here
+# is exactly how the two would silently drift apart.
+
+# Margin over the derived worst case, absorbing checkpoint-write latency and
+# event-loop scheduling delay.
+_SAFETY_MARGIN = 2.5
+
+#: The three settings defaults this module MIRRORS to size
+#: :data:`DEFAULT_STALE_THRESHOLD_S`. Mirrored rather than imported for the
+#: same reason as `NODE_TIMEOUT_S` above: this constant is the STATIC
+#: fallback used when nobody derives the threshold, and a module that reads
+#: `settings` at import time cannot be one. The mirror is not left to
+#: vigilance — `test_recovery.py` asserts each against `Settings()`.
+_DEFAULT_RETRY_BASE_DELAY_S = 1.0
+_DEFAULT_RETRY_MAX_DELAY_S = 30.0
+
+
+def _worst_case_backoff_s(*, base_delay_s: float, max_delay_s: float) -> float:
+    """Total backoff a node can accumulate across its runtime retries.
+
+    ``MAX_RUNTIME_RETRIES`` waits, each ``base * 2**attempt`` clamped to
+    ``max_delay_s`` — the ``exponential`` strategy, which is the worst case
+    of the three ``backoff_delay_s`` implements: it equals ``linear`` at
+    attempts 0 and 1 and exceeds it from attempt 2 on, and dominates
+    ``constant`` everywhere. Bounding the worst one bounds all three.
+    """
+    return float(
+        sum(min(base_delay_s * 2**attempt, max_delay_s) for attempt in range(MAX_RUNTIME_RETRIES))
+    )
+
+
+def derive_stale_threshold_s(
+    *, base_delay_s: float, max_delay_s: float, escalation_timeout_s: float
+) -> float:
+    """Worst-case wall-clock for ONE node that writes no checkpoint throughout.
+
+    ::
+
+        (node call + its routing escalation)   -> NODE_TIMEOUT_S + escalation
+        x every provider in the chain          -> _MAX_PROVIDER_CHAIN_LEN
+        x every attempt (first + retries)      -> 1 + MAX_RUNTIME_RETRIES
+        + the backoff waits between them       -> _worst_case_backoff_s(...)
+        x margin for checkpoint-write latency
+          and event-loop scheduling            -> _SAFETY_MARGIN
+
+    **A function, not a constant, because the inputs are deployment-tunable
+    and the invariant is not** (Story 4.6, review lot 7 / P-P). The three
+    arguments are `AGENTIVE_WORKFLOW_RETRY_BASE_DELAY_S`,
+    `...MAX_DELAY_S` and `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`; the
+    previous version hardcoded all three at their defaults and told the
+    operator, in a comment, that "a deployment that raises those delays must
+    raise ``stale_threshold_s=`` with them".
+
+    That instruction could not be followed: `app.lifespan` was the only
+    construction site in `src/` and passed no `stale_threshold_s=`, so the
+    parameter the comment pointed at was never plumbed from config at all.
+
+    What that cost, measured rather than asserted:
+
+    * The two RETRY DELAYS stayed covered at their ``le`` ceilings — worst
+      case 1020 s against a 1517.5 s window — but only because the x2.5
+      margin absorbed them. That margin exists for checkpoint-write latency
+      and scheduling delay, and at the ceilings it is down to x1.49. Nobody
+      chose 60.0/300.0 against this formula; the fit was luck.
+    * `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S` had NO ceiling, and it is
+      multiplied here by chain length x attempts x margin. Past ~130 s the
+      window no longer covers the node it describes; at 600 s the worst case
+      is 5287 s against the same 1517.5 s. A healthy node was then claimed by
+      the sweep and executed a SECOND time in parallel on the same
+      `thread_id` — duplicate billed LLM calls, interleaved checkpoint
+      writes, duplicate events, reachable by one env var.
+
+    Reading the numbers here makes the invariant true by construction
+    instead of by vigilance, at every legal value of all three. `settings`
+    is still not imported: the caller that already holds it passes them in,
+    the same posture `available` and `model_owner` take in
+    `domain/provider_chain.py`.
+    """
+    return (
+        (NODE_TIMEOUT_S + escalation_timeout_s)
+        * _MAX_PROVIDER_CHAIN_LEN
+        * (1 + MAX_RUNTIME_RETRIES)
+        + _worst_case_backoff_s(base_delay_s=base_delay_s, max_delay_s=max_delay_s)
+    ) * _SAFETY_MARGIN
+
+
+# ≈ 1518 s at the default settings. Detection of a genuinely crashed run is
+# therefore slower than the 375 s of Story 4.2 — that is the unavoidable
+# price of retries existing at all, and it is bounded, derived and
+# re-asserted by `test_recovery.py`'s invariants rather than guessed.
+#
+# This is the FALLBACK, for a caller that derives nothing (tests, and the
+# constructor's own default). The running process gets a threshold derived
+# from its own settings — cf `app.lifespan`.
+DEFAULT_STALE_THRESHOLD_S = derive_stale_threshold_s(
+    base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S,
+    max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
+    escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
 )
 
 # A run whose resume keeps dying before completing a single node is a poison
@@ -306,7 +427,14 @@ class WorkflowRecoveryWorker:
         ended_at = datetime.now(UTC)
 
         rowcount = await self._workflow_run_repo.update_status(
-            run.id, status="error", ended_at=ended_at, only_if_status="running"
+            run.id,
+            status="error",
+            ended_at=ended_at,
+            only_if_status="running",
+            # Terminal transition — it consumes any control request the run
+            # was still carrying, so an abandoned run does not advertise a
+            # pause that will never happen (Story 4.6 T1.4).
+            clear_control=True,
         )
         if rowcount == 0:
             # A resume spawned by an earlier sweep finished between this
@@ -407,4 +535,5 @@ __all__ = [
     "MAX_RECOVERY_ATTEMPTS",
     "RecoveryRunSummary",
     "WorkflowRecoveryWorker",
+    "derive_stale_threshold_s",
 ]

@@ -326,3 +326,91 @@ def test_mise_en_place_report_out_round_trips_full_shape() -> None:
 def test_mise_en_place_report_out_rejects_a_partial_report() -> None:
     with pytest.raises(ValidationError):
         MiseEnPlaceReportOut(checks=_four_checks()[:2], all_passed=True)
+
+
+# ─── Story 4.6 T12.8 — the two run-control schemas ─────────────────────
+#
+# T12.8 was marked `[x]` and no such test existed: neither `RunControlResponse`
+# nor `ResumeRunRequest` was named anywhere under `backend/tests/` (review lot
+# 11). Both are HTTP contract surfaces — one is what every control call
+# returns, the other is what `IG2` added to `resume`.
+
+
+def test_run_control_response_rejects_unknown_fields() -> None:
+    """`extra="forbid"` on a RESPONSE model is a typo-catcher for us, not for
+    the client: it fails the build of a body carrying a field no consumer
+    knows how to read."""
+    from agentive_backend.features.workflow_engine.schemas import RunControlResponse
+
+    with pytest.raises(ValidationError):
+        RunControlResponse(run_id=uuid4(), status="running", controle_signal="pause")  # type: ignore[call-arg]
+
+
+def test_run_control_response_status_vocabulary_matches_the_domain() -> None:
+    """The literal here is a SECOND copy of the run-status vocabulary, and
+    `domain.run_control.RUN_STATUSES` is the first. A status added to the
+    state machine but not here makes the endpoint 500 on a run that reached
+    it — the same split-brain `TERMINAL_STATUSES` produced before T5.4."""
+    from typing import get_args
+
+    from agentive_backend.features.workflow_engine.domain.run_control import RUN_STATUSES
+    from agentive_backend.features.workflow_engine.schemas import RunControlResponse
+
+    declared = get_args(RunControlResponse.model_fields["status"].annotation)
+    assert set(declared) == set(RUN_STATUSES)
+
+
+def test_run_control_response_defaults_control_signal_to_none() -> None:
+    """An IMMEDIATE transition (`resume`, `cancel` on a paused run) has no
+    pending request to report — the field is absent, not empty-stringed."""
+    from agentive_backend.features.workflow_engine.schemas import RunControlResponse
+
+    assert RunControlResponse(run_id=uuid4(), status="running").control_signal is None
+
+
+def test_resume_run_request_defaults_to_no_bypass() -> None:
+    """`POST /resume` with no body at all must be legal — the gate is the
+    normal path and the bypass is the exception."""
+    from agentive_backend.features.workflow_engine.schemas import ResumeRunRequest
+
+    body = ResumeRunRequest()
+    assert body.force is False
+    assert body.reason is None
+
+
+@pytest.mark.parametrize(
+    ("force", "reason"),
+    [
+        (True, None),  # a bypass nobody has to justify
+        (True, "   "),  # …nor one justified with whitespace
+        (False, "cle restauree"),  # a reason that would be silently dropped
+    ],
+)
+def test_resume_run_request_rejects_force_and_reason_apart(force: bool, reason: str | None) -> None:
+    """Both directions, mirroring `StartRunRequest`. A bypass with no stated
+    reason defeats the audit trail the field exists for (NFR8); a reason
+    without a bypass would be accepted and then discarded, which reads to the
+    caller exactly like it was recorded."""
+    from agentive_backend.features.workflow_engine.schemas import ResumeRunRequest
+
+    with pytest.raises(ValidationError):
+        ResumeRunRequest(force=force, reason=reason)
+
+
+def test_resume_run_request_accepts_a_justified_bypass() -> None:
+    from agentive_backend.features.workflow_engine.schemas import ResumeRunRequest
+
+    body = ResumeRunRequest(force=True, reason="MCP server retired, run must finish")
+    assert body.force is True
+    assert body.reason is not None
+
+
+def test_resume_run_request_forbids_the_start_run_fields() -> None:
+    """`ResumeRunRequest` is deliberately NOT a subclass of `StartRunRequest`
+    and shares no base with it: a resume restarts from a checkpoint, so an
+    `input` would be silently ignored. `extra="forbid"` is what turns that
+    into a 422 instead of a surprise."""
+    from agentive_backend.features.workflow_engine.schemas import ResumeRunRequest
+
+    with pytest.raises(ValidationError):
+        ResumeRunRequest(input={"task": "x"})  # type: ignore[call-arg]

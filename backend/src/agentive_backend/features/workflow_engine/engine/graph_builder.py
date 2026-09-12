@@ -33,6 +33,7 @@ from agentive_backend.shared.llm.exceptions import LLMError
 if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.domain.routing_rules import RoutingRule
     from agentive_backend.features.workflow_engine.domain.value_objects import WorkflowDag
+    from agentive_backend.features.workflow_engine.engine.agent_node import RetrySettings
     from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
     from agentive_backend.infra.db.models import AgentTemplate
     from agentive_backend.shared.llm.router import LLMRouter
@@ -158,6 +159,7 @@ def _make_node_callable(
     unconditional_targets: list[str],
     rules: Sequence[RoutingRule],
     routing_settings: RoutingSettings,
+    retry_settings: RetrySettings | None,
 ) -> Callable[[WorkflowState], Awaitable[dict[str, Any]]]:
     """Factory for a routing-DECISION-POINT node's callable (Story 4.3 T6.2).
 
@@ -182,7 +184,11 @@ def _make_node_callable(
 
     async def _call(state: WorkflowState) -> dict[str, Any]:
         node_update = await execute_agent_node(
-            state, template=template, llm_router=llm_router, node_id=node_id
+            state,
+            template=template,
+            llm_router=llm_router,
+            node_id=node_id,
+            retry_settings=retry_settings,
         )
         own_output = (node_update.get("node_outputs") or {}).get(node_id)
         try:
@@ -223,6 +229,7 @@ def build_state_graph(
     *,
     rules: Sequence[RoutingRule] = (),
     routing_settings: RoutingSettings | None = None,
+    retry_settings: RetrySettings | None = None,
 ) -> StateGraph[WorkflowState, None, WorkflowState, WorkflowState]:
     """Build (uncompiled) the ``StateGraph`` for ``dag`` — caller ``.compile()``s
     it with a checkpointer (T5.3).
@@ -254,6 +261,14 @@ def build_state_graph(
     suite predating this story) keep compiling — but any node that IS a
     decision point requires a real ``routing_settings`` (``None`` there is a
     caller bug, not a degrade-quietly case).
+
+    ``retry_settings`` (Story 4.6 T11.3) threads the node-level retry knobs
+    down from the assembly layer, mirror ``routing_settings``. ``None`` is
+    NOT a caller bug here, unlike ``routing_settings``: it falls back to
+    ``agent_node.DEFAULT_RETRY_SETTINGS``, which mirrors the same environment
+    defaults. Every node needs a value (they can all retry), so a hard
+    requirement would have broken every pre-4.6 caller for no behavioural
+    gain.
     """
     builder: StateGraph[WorkflowState, None, WorkflowState, WorkflowState] = StateGraph(
         WorkflowState
@@ -291,6 +306,7 @@ def build_state_graph(
                 unconditional_targets=unconditional_by_source.get(node.node_id, []),
                 rules=rules,
                 routing_settings=routing_settings,
+                retry_settings=retry_settings,
             )
         else:
             node_callable = functools.partial(
@@ -298,6 +314,7 @@ def build_state_graph(
                 template=templates[node.node_id],
                 llm_router=llm_router,
                 node_id=node.node_id,
+                retry_settings=retry_settings,
             )
         # LangGraph's `add_node` overloads resolve against the CONCRETE callable
         # expression at the call site (a bare `functools.partial(...)`); routed

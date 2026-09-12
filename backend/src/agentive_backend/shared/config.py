@@ -124,8 +124,20 @@ class Settings(BaseSettings):
     routing_escalation_model: str = Field(
         default="claude-haiku-4-5", min_length=1, alias="AGENTIVE_ROUTING_ESCALATION_MODEL"
     )
+    # `le=60.0` added by Story 4.6's review (lot 7, P-P). This field was the
+    # only unbounded term of `recovery.derive_stale_threshold_s`, and it is
+    # multiplied there by chain length x attempts x margin — a factor of 20,
+    # so every second granted here costs twenty before a crashed run is even
+    # looked at. 60.0 is `agent_node.NODE_TIMEOUT_S`, the budget of a node's
+    # own full LLM call: an escalation is a single classification returning
+    # at most `routing_escalation_max_tokens` (256 by default), so it has no
+    # business outlasting the node it routes.
     routing_escalation_timeout_s: float = Field(
-        default=15.0, gt=0.0, allow_inf_nan=False, alias="AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S"
+        default=15.0,
+        gt=0.0,
+        le=60.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S",
     )
     routing_escalation_max_tokens: int = Field(
         default=256, ge=1, le=4096, alias="AGENTIVE_ROUTING_ESCALATION_MAX_TOKENS"
@@ -216,6 +228,45 @@ class Settings(BaseSettings):
         le=120.0,
         allow_inf_nan=False,
         alias="AGENTIVE_MISE_EN_PLACE_CHECK_TIMEOUT_S",
+    )
+
+    # ─── Workflow Engine — node retry backoff (Story 4.6, défer D13) ───
+    # Feed `domain/error_policy.backoff_delay_s`, which spaces successive
+    # re-runs of a node's FULL provider chain (`error_policy.on_timeout =
+    # retry_with_backoff`). Not a retry policy in themselves: how MANY
+    # retries is the template's call (`error_policy.max_retries`), how long
+    # to wait between them is the deployment's.
+    #
+    # `le` on both is load-bearing, but NOT via the mechanism this comment
+    # used to name. It said "the ceiling keeps the derivation true", when
+    # the derivation read these fields' DEFAULTS and never these fields —
+    # a bound on an input a formula ignores cannot keep that formula true.
+    # What actually held was the x2.5 margin: at 60.0/300.0 the worst case
+    # is 1020s against a 1517.5s window, so it fits, with the margin down
+    # from x2.5 to x1.49. These two ceilings were never chosen against the
+    # formula; the fit was luck, and the comment described it as design.
+    #
+    # `recovery.derive_stale_threshold_s` now reads the configured values
+    # (review lot 7, P-P), so the derivation is true at every legal value
+    # and no longer leans on that coincidence. What the ceilings bound is
+    # the THRESHOLD'S OWN GROWTH: they are inputs to it, and a 3000s delay
+    # would push detection of a genuinely crashed run into the hours,
+    # defeating the recovery worker — the same argument that caps what the
+    # runtime executes at `MAX_RUNTIME_RETRIES = 3` rather than the
+    # schema's 10.
+    workflow_retry_base_delay_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=60.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_WORKFLOW_RETRY_BASE_DELAY_S",
+    )
+    workflow_retry_max_delay_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_WORKFLOW_RETRY_MAX_DELAY_S",
     )
 
     # ─── CORS ───

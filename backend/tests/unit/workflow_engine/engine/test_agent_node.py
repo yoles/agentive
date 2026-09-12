@@ -279,3 +279,503 @@ async def test_upstream_outputs_below_the_cap_are_untouched() -> None:
 
     content = router.complete.await_args.args[0][0].content
     assert '"a"' in content and '"b"' in content
+
+
+# ─── Story 4.6 T7 — provider_chain runtime (défer D12) ───────────────
+
+
+def _chain_router(
+    completion: Completion | Exception, *, providers: tuple[str, ...] = ("anthropic", "openai")
+) -> AsyncMock:
+    """`_router` with a REAL `providers` mapping.
+
+    `AsyncMock().providers` is a MagicMock whose `__contains__` silently
+    answers False — every chain would resolve to `None` and the tests would
+    pass without exercising anything.
+    """
+    router = _router(completion)
+    router.providers = dict.fromkeys(providers, object())
+    return router
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_is_available_should_pass_it_to_the_router() -> None:
+    template = SimpleNamespace(config={"provider_chain": ["anthropic", "openai"]})
+    router = _chain_router(_completion())
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] == ["anthropic", "openai"]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_is_partly_unavailable_should_filter_it() -> None:
+    """The model's own provider survives the intersection, so the chain is
+    simply narrowed to what is registered."""
+    template = SimpleNamespace(
+        config={"provider_chain": ["openai", "anthropic"], "llm_model": "gpt-5"}
+    )
+    router = _chain_router(_completion(), providers=("openai",))
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] == ["openai"]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_head_does_not_own_the_model_should_rotate() -> None:
+    """`LLMRouter._resolve_model` hands index 0 the primary model VERBATIM and
+    consults the fallback map only from index 1 on. A chain led by a provider
+    that does not serve `llm_model` therefore sends, say, `claude-sonnet-4-6`
+    to OpenAI — a 400, classified `fatal`, raised with no fallback and no
+    retry.
+
+    The author chose a SET of providers; the order that makes it work is
+    derivable, so it is derived. The fallback leg is preserved, not dropped."""
+    template = SimpleNamespace(
+        config={
+            "provider_chain": ["openai", "anthropic"],
+            "llm_model": "claude-sonnet-4-6",
+        }
+    )
+    router = _chain_router(_completion(), providers=("anthropic", "openai"))
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] == ["anthropic", "openai"]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_no_usable_provider_owns_the_model_should_drop_the_chain() -> (
+    None
+):
+    """Every declared provider is registered — but none of them serves the
+    model, so no rotation helps. The chain is dropped rather than handed over
+    with a head that would take the model it cannot serve.
+
+    Note this does NOT rescue the run on its own: the process default chain
+    has the same gap. What blocks it is the Mise en Place pre-flight, which
+    now fails on exactly this shape (`llm_providers_configured`)."""
+    template = SimpleNamespace(
+        config={"provider_chain": ["openai"], "llm_model": "claude-sonnet-4-6"}
+    )
+    router = _chain_router(_completion(), providers=("openai",))
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_is_wholly_unavailable_should_not_raise() -> None:
+    """THE trap of Story 4.6. `LLMRouter.complete()` raises a bare
+    `ValueError` on an unregistered provider name, and in dev/CI the only
+    registered provider is `mock` — so passing the declared chain straight
+    through would kill every run of every integration test."""
+    template = SimpleNamespace(config={"provider_chain": ["anthropic", "openai"]})
+    router = _chain_router(_completion(), providers=("mock",))
+
+    result = await execute_agent_node(
+        {"task_input": {}}, template=template, llm_router=router, node_id="a"
+    )
+
+    assert router.complete.await_args.kwargs["provider_chain"] is None
+    assert result["node_outputs"]["a"] == {"result": "ok"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chain", [None, [], "anthropic", {"0": "anthropic"}, [123], ["anthropic", None]]
+)
+async def test_execute_agent_node_when_chain_is_malformed_should_use_the_default(
+    chain: Any,
+) -> None:
+    template = SimpleNamespace(config={"provider_chain": chain})
+    router = _chain_router(_completion())
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_no_chain_is_declared_should_use_the_default() -> None:
+    template = SimpleNamespace(config={})
+    router = _chain_router(_completion())
+
+    await execute_agent_node({"task_input": {}}, template=template, llm_router=router, node_id="a")
+
+    assert router.complete.await_args.kwargs["provider_chain"] is None
+
+
+# ─── Story 4.6 T8 — error_policy dispatcher (défer D13) ──────────────
+
+
+@pytest.fixture
+def no_real_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record backoff delays instead of serving them — no test may dream."""
+    recorded: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        recorded.append(delay)
+
+    import agentive_backend.features.workflow_engine.engine.agent_node as node_module
+
+    monkeypatch.setattr(node_module.asyncio, "sleep", _fake_sleep)
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_whole_chain_fails_should_retry_max_retries_times(
+    no_real_sleep: list[float],
+) -> None:
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(
+        config={"error_policy": {"on_timeout": "retry_with_backoff", "max_retries": 2}}
+    )
+    router = _chain_router(LLMAllProvidersFailedError(detail="all 2 providers failed"))
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    # 1 initial attempt + 2 retries, and exactly 2 backoff waits.
+    assert router.complete.await_count == 3
+    assert len(no_real_sleep) == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_ends_on_a_fatal_error_should_not_retry(
+    no_real_sleep: list[float],
+) -> None:
+    """AC3 — "aucun retry, jamais, sur une erreur `fatal`", and
+    `LLMNoFallbackModelError` is named among them.
+
+    The subtlety this locks: the router does NOT hand that error back
+    untouched when it happens MID-CHAIN. `shared/llm/router.py` appends it to
+    `attempts` with `error_class="fatal"` and raises
+    `LLMAllProvidersFailedError` instead, so the caller can see the retriable
+    failure that came first. Dispatching on the exception CLASS alone
+    therefore retried a misconfiguration — with backoff, so a missing model
+    mapping stayed hidden behind several seconds of silence and four billed
+    chain traversals."""
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 3}})
+    router = _chain_router(
+        LLMAllProvidersFailedError(
+            detail="all 2 providers failed",
+            context={
+                "attempts": [
+                    {"provider": "anthropic", "error_class": "retriable_with_fallback"},
+                    {"provider": "openai", "error_class": "fatal"},
+                ]
+            },
+        )
+    )
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert router.complete.await_count == 1
+    assert no_real_sleep == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("on_timeout", "max_retries", "expected_exhausted"),
+    [
+        ("retry_with_backoff", 2, 1.0),
+        ("fail_fast", 5, 0.0),
+        ("fallback_provider", 5, 0.0),
+    ],
+)
+async def test_execute_agent_node_should_only_count_exhausted_when_retries_were_spent(
+    on_timeout: str,
+    max_retries: int,
+    expected_exhausted: float,
+    no_real_sleep: list[float],
+) -> None:
+    """`metrics.py` defines `exhausted` as "`max_retries` spent". With
+    `fail_fast` / `fallback_provider`, `max_retries` is 0, so the very first
+    and only attempt satisfied `attempt >= max_retries` and incremented it
+    anyway — a fleet on `fail_fast` (the recommended setting for expensive
+    nodes) reported one "exhausted" per node failure with `retried` flat at
+    zero, so the ratio between the two labels, the only useful reading of the
+    pair, measured nothing."""
+    from agentive_backend.features.workflow_engine.metrics import WORKFLOW_NODE_RETRIES_TOTAL
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    counter = WORKFLOW_NODE_RETRIES_TOTAL.labels(outcome="exhausted")
+    before = counter._value.get()
+
+    template = SimpleNamespace(
+        config={"error_policy": {"on_timeout": on_timeout, "max_retries": max_retries}}
+    )
+    router = _chain_router(LLMAllProvidersFailedError(detail="down"))
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert counter._value.get() - before == expected_exhausted
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_chain_exhausts_retriably_should_still_retry(
+    no_real_sleep: list[float],
+) -> None:
+    """The counterpart to the test above — a chain that ended on a RETRIABLE
+    error must keep retrying, or the fatal guard would have silently disabled
+    the whole dispatcher."""
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 2}})
+    router = _chain_router(
+        LLMAllProvidersFailedError(
+            detail="all 2 providers failed",
+            context={
+                "attempts": [{"provider": "openai", "error_class": "retriable_with_fallback"}]
+            },
+        )
+    )
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert router.complete.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_a_retry_succeeds_should_return_and_count_attempts(
+    no_real_sleep: list[float],
+) -> None:
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 3}})
+    router = _chain_router(_completion())
+    router.complete.side_effect = [
+        LLMAllProvidersFailedError(detail="down"),
+        _completion('{"ok": true}'),
+    ]
+
+    result = await execute_agent_node(
+        {"task_input": {}}, template=template, llm_router=router, node_id="a"
+    )
+
+    assert result["node_outputs"]["a"] == {"ok": True}
+    # The operator must be able to see a node cost two full chain traversals.
+    assert result["node_metrics"]["a"]["llm_attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_error_is_fatal_should_never_retry(
+    no_real_sleep: list[float],
+) -> None:
+    """A fatal error is a misconfiguration the router already surfaces as-is.
+    Retrying it would hide a bug instead of showing it."""
+    from agentive_backend.shared.llm.exceptions import LLMProviderAuthError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 5}})
+    router = _chain_router(LLMProviderAuthError(detail="bad key"))
+
+    with pytest.raises(LLMProviderAuthError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert router.complete.await_count == 1
+    assert no_real_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_config_is_invalid_should_never_retry(
+    no_real_sleep: list[float],
+) -> None:
+    template = SimpleNamespace(
+        config={"llm_params": {"temperature": 99}, "error_policy": {"max_retries": 5}}
+    )
+    router = _chain_router(_completion())
+
+    with pytest.raises(ValidationError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+    assert router.complete.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_timeout", ["fail_fast", "fallback_provider"])
+async def test_execute_agent_node_when_policy_disables_retry_should_still_pass_the_chain(
+    on_timeout: str, no_real_sleep: list[float]
+) -> None:
+    """`fail_fast` means ZERO NODE RETRIES, never "no fallback" — NFR12's
+    provider chain is not negotiable by template."""
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(
+        config={
+            "provider_chain": ["anthropic", "openai"],
+            "error_policy": {"on_timeout": on_timeout, "max_retries": 5},
+        }
+    )
+    router = _chain_router(LLMAllProvidersFailedError(detail="down"))
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert router.complete.await_count == 1
+    assert no_real_sleep == []
+    assert router.complete.await_args.kwargs["provider_chain"] == ["anthropic", "openai"]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_backoff_is_exponential_should_grow_and_cap(
+    no_real_sleep: list[float],
+) -> None:
+    from agentive_backend.features.workflow_engine.engine.agent_node import RetrySettings
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(
+        config={"error_policy": {"max_retries": 3, "backoff_strategy": "exponential"}}
+    )
+    router = _chain_router(LLMAllProvidersFailedError(detail="down"))
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}},
+            template=template,
+            llm_router=router,
+            node_id="a",
+            retry_settings=RetrySettings(base_delay_s=1.0, max_delay_s=3.0),
+        )
+
+    # 1 x 2^0, 1 x 2^1, then the cap bites before 1 x 2^2 = 4.
+    assert no_real_sleep == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_template_asks_for_more_retries_than_the_runtime_cap(
+    no_real_sleep: list[float],
+) -> None:
+    """T8.5 — an ASSUMED divergence with Story 2.2's `max_retries` ceiling
+    of 10.
+
+    `recovery.derive_stale_threshold_s` computes the worst-case duration of a
+    single node, retries included. Honouring 10 would push that past an hour,
+    i.e. one template's configuration would make crash detection an hour slow
+    for every OTHER run in the process. The schema validates an intention;
+    the runtime guarantees a process invariant.
+
+    Counted in LITERALS, not in `MAX_RUNTIME_RETRIES` (review lot 11). The
+    previous assertions read `1 + MAX_RUNTIME_RETRIES`, so raising the cap to
+    the schema's 10 — the one change this test exists to forbid — moved the
+    expectation with the code and left the test green. A test named for a cap
+    must not take that cap from the thing it is capping.
+    """
+    from agentive_backend.features.workflow_engine.domain.error_policy import MAX_RUNTIME_RETRIES
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 10}})
+    router = _chain_router(LLMAllProvidersFailedError(detail="down"))
+
+    with pytest.raises(LLMAllProvidersFailedError):
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    # One initial traversal + three retries. The template asked for ten.
+    assert router.complete.await_count == 4
+    assert len(no_real_sleep) == 3
+    # And the constant is what produced that count, rather than a coincidence.
+    assert MAX_RUNTIME_RETRIES == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_retries_are_exhausted_should_reraise_the_original(
+    no_real_sleep: list[float],
+) -> None:
+    """`_mark_failed` and AC3 both read `exc.context["attempts"]` — wrapping
+    the exception would destroy the per-provider breakdown."""
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    original = LLMAllProvidersFailedError(
+        detail="all 2 providers failed", context={"attempts": [{"provider": "anthropic"}]}
+    )
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 1}})
+    router = _chain_router(original)
+
+    with pytest.raises(LLMAllProvidersFailedError) as excinfo:
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert excinfo.value is original
+    assert excinfo.value.context["attempts"] == [{"provider": "anthropic"}]
+
+
+# ─── Story 4.6 AC3 / review lot 12 — the chain-traversal count ──────────
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_records_how_many_chain_traversals_it_burned(
+    no_real_sleep: list[float],
+) -> None:
+    """AC3 wants an operator to see that a node cost four chain traversals.
+
+    On the SUCCESS path that travels back as `node_metrics[node].llm_attempts`
+    — but a node that ultimately FAILS commits no state at all (LangGraph
+    discards the update of a node that raised), so the exception is the only
+    carrier left. `_annotate_chain_traversals` writes it and
+    `service._failure_chain_traversals` reads it into the checkpoint; the
+    whole three-function path had no assertion anywhere in the suite before
+    this test (review lot 12).
+    """
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 3}})
+    router = _chain_router(LLMAllProvidersFailedError(detail="down"))
+
+    with pytest.raises(LLMAllProvidersFailedError) as excinfo:
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    # One initial traversal + three retries, each walking the WHOLE chain.
+    assert excinfo.value.context["chain_traversals"] == 4
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_traversal_count_does_not_disturb_the_attempts_list() -> None:
+    """The count is added BESIDE `attempts`, never merged into it.
+
+    `attempts` describes the LAST traversal only — the router builds a fresh
+    error with a fresh list on every call — and `service._failure_attempts`
+    redacts and bounds exactly the shape the router produced. Folding the
+    count in would put a non-provider entry through that sanitiser.
+    """
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    template = SimpleNamespace(config={"error_policy": {"max_retries": 0}})
+    error = LLMAllProvidersFailedError(detail="down")
+    error.context["attempts"] = [{"provider": "anthropic", "error_class": "retriable"}]
+    router = _chain_router(error)
+
+    with pytest.raises(LLMAllProvidersFailedError) as excinfo:
+        await execute_agent_node(
+            {"task_input": {}}, template=template, llm_router=router, node_id="a"
+        )
+
+    assert excinfo.value.context["chain_traversals"] == 1
+    assert excinfo.value.context["attempts"] == [
+        {"provider": "anthropic", "error_class": "retriable"}
+    ]

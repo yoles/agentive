@@ -36,6 +36,7 @@ from agentive_backend.shared.contracts.events import WorkflowRunMiseEnPlaceRefus
 from agentive_backend.shared.correlation import set_correlation_id
 from agentive_backend.shared.exceptions import (
     BusinessRuleError,
+    ConflictError,
     DependencyError,
     InternalError,
     NotFoundError,
@@ -542,6 +543,7 @@ class _FakeCompiledGraph:
         # injects `asyncio.CancelledError` here (cf the cancellation test).
         raise_exc: BaseException | None = None,
         next_nodes: tuple[str, ...] = (),
+        restored_state: dict[str, Any] | None = None,
     ) -> None:
         self._updates = updates
         self._final_state = final_state
@@ -555,22 +557,38 @@ class _FakeCompiledGraph:
         # contains only node a" was unobservable, and the redundant per-node
         # state reads in a fan-out (review finding #21) were structurally
         # invisible to these tests.
+        # `restored_state` models a RESUMED run: LangGraph's checkpoint
+        # already holds the nodes a previous process executed, so the very
+        # first `aget_state` — before any superstep of this segment — is not
+        # empty. Without it the double could only ever describe a run
+        # starting from scratch, which is precisely the case where the
+        # pre-loop control check has nothing to account for.
+        seed = restored_state or {}
         self._progressive: dict[str, Any] = {
-            "node_outputs": {},
-            "node_metrics": {},
-            "routing_decisions": {},
+            "node_outputs": dict(seed.get("node_outputs") or {}),
+            "node_metrics": dict(seed.get("node_metrics") or {}),
+            "routing_decisions": dict(seed.get("routing_decisions") or {}),
         }
         self._stream_finished = False
+        self.stream_closed = False
 
     async def astream(
         self, _state_input: Any, _config: Any, *, stream_mode: str
     ) -> AsyncIterator[dict[str, Any]]:
         assert stream_mode == "updates"
-        for update in self._updates:
-            for node_update in update.values():
-                for key in ("node_outputs", "node_metrics", "routing_decisions"):
-                    self._progressive[key].update((node_update or {}).get(key) or {})
-            yield update
+        try:
+            for update in self._updates:
+                for node_update in update.values():
+                    for key in ("node_outputs", "node_metrics", "routing_decisions"):
+                        self._progressive[key].update((node_update or {}).get(key) or {})
+                yield update
+        except GeneratorExit:
+            # Raised at the `yield` by an explicit `aclose()` — and by
+            # nothing else, so this records a deliberate close rather than a
+            # normal exhaustion. `GeneratorExit` is a `BaseException`, hence
+            # the explicit clause.
+            self.stream_closed = True
+            raise
         # Set BEFORE the raise: streaming is over either way, so the
         # failure path's own state lookup still sees `final_state` (which is
         # what the failure tests describe). Only MID-stream reads are
@@ -615,6 +633,8 @@ def _workflow_run(
     workflow_id: UUID | None = None,
     correlation_id: UUID | None = None,
     status: str = "running",
+    metrics: dict[str, Any] | None = None,
+    control_signal: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
@@ -623,6 +643,11 @@ def _workflow_run(
         started_at=datetime.now(UTC),
         checkpoint=None,
         status=status,
+        # The column carries `server_default="{}"`, so a real row NEVER has
+        # this attribute missing — the double used to, which made it a
+        # weaker stand-in than the thing it stands in for.
+        metrics=metrics if metrics is not None else {},
+        control_signal=control_signal,
     )
 
 
@@ -808,6 +833,11 @@ def _failing_mise_en_place_report(
         for code in codes
     ]
     return build_report(checks)
+
+
+def _passing_mise_en_place_report() -> MiseEnPlaceReport:
+    """All four checks green — `failed_code` matches nothing."""
+    return _failing_mise_en_place_report(failed_code="__none__")
 
 
 @pytest.mark.asyncio
@@ -2412,3 +2442,1207 @@ async def test_failed_routing_decision_persists_the_node_work_it_carried(
     # And the recorded error is the CAUSE, not the carrier's own message.
     assert "routing decision failed" not in checkpoint["last_error"]
     assert "not valid JSON" in checkpoint["last_error"]
+
+
+# ─── Story 4.6 — request_run_control (AC1) ───────────────────────────
+
+
+def _control_service() -> tuple[WorkflowExecutionService, AsyncMock, AsyncMock]:
+    """`_make_execution_service` with the two control-path repo methods given
+    real rowcounts. Left as bare `AsyncMock`s they return `MagicMock`, which
+    compares unequal to 0 by accident — every "did the CAS land?" assertion
+    would then pass for the wrong reason."""
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+    workflow_run_repo.request_control = AsyncMock(return_value=1)
+    workflow_run_repo.get_control_signal = AsyncMock(return_value=None)
+    # AC1 requires the row write and its audit event to commit together, so
+    # `request_run_control` drives the `_in_session` variants — the
+    # self-managed wrappers above commit on their own and would leave the
+    # publish in a second transaction.
+    workflow_run_repo.request_control_in_session = AsyncMock(return_value=1)
+    workflow_run_repo.update_status_in_session = AsyncMock(return_value=1)
+    # A 409 re-reads the row to describe the conflict with the state that is
+    # true NOW, not the snapshot the caller raced against. Default the
+    # re-read to whatever `get_by_id` was given, so a test that does not care
+    # gets a coherent row instead of a `MagicMock` that compares equal to
+    # nothing.
+    workflow_run_repo.get_by_id_in_session = AsyncMock(
+        side_effect=lambda _session, _run_id: workflow_run_repo.get_by_id.return_value
+    )
+    return service, workflow_run_repo, _wrepo
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_pausing_a_running_run_should_record_a_deferred_signal(
+    event_publish_mock: AsyncMock,
+) -> None:
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="running")
+    run_repo.get_by_id.return_value = run
+
+    response = await service.request_run_control(run_id=run.id, action="pause")
+
+    # The status is UNCHANGED — interruption is cooperative, the driver
+    # settles it at the next superstep boundary.
+    assert response.status == "running"
+    assert response.control_signal == "pause"
+    run_repo.request_control_in_session.assert_awaited_once()
+    assert run_repo.request_control_in_session.await_args.kwargs["signal"] == "pause"
+    assert run_repo.request_control_in_session.await_args.kwargs["only_if_status"] == "running"
+    run_repo.update_status_in_session.assert_not_awaited()
+    assert event_publish_mock.await_count == 1
+    assert event_publish_mock.await_args.args[0] == "workflow_engine.workflow_run.pause_requested"
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_cancelling_a_running_run_should_record_a_deferred_signal(
+    event_publish_mock: AsyncMock,
+) -> None:
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="running")
+    run_repo.get_by_id.return_value = run
+
+    response = await service.request_run_control(run_id=run.id, action="cancel")
+
+    assert response.status == "running"
+    assert response.control_signal == "cancel"
+    assert run_repo.request_control_in_session.await_args.kwargs["signal"] == "cancel"
+    run_repo.update_status_in_session.assert_not_awaited()
+    assert event_publish_mock.await_args.args[0] == "workflow_engine.workflow_run.cancel_requested"
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_cancelling_a_paused_run_should_be_terminal_immediately(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """No driver is alive to observe a signal on a paused run — the caller's
+    own request has to move the row."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="paused")
+    run_repo.get_by_id.return_value = run
+
+    response = await service.request_run_control(run_id=run.id, action="cancel")
+
+    assert response.status == "cancelled"
+    assert response.control_signal is None
+    run_repo.request_control_in_session.assert_not_awaited()
+    status_call = run_repo.update_status_in_session.await_args
+    assert status_call.kwargs["status"] == "cancelled"
+    assert status_call.kwargs["only_if_status"] == "paused"
+    assert status_call.kwargs["clear_control"] is True
+    assert status_call.kwargs["ended_at"] is not None
+    assert event_publish_mock.await_args.args[0] == "workflow_engine.workflow_run.cancelled"
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resuming_a_paused_run_should_relaunch_and_clear_signal(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_correlation_id(str(uuid4()))
+    service, run_repo, workflow_repo = _control_service()
+    run = _workflow_run(status="paused")
+    run_repo.get_by_id.return_value = run
+    workflow_repo.require_by_id.return_value = _workflow()
+    resume_mock = AsyncMock()
+    monkeypatch.setattr(service, "_resume_run", resume_mock)
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    response = await service.request_run_control(run_id=run.id, action="resume")
+
+    assert response.status == "running"
+    assert response.control_signal is None
+    status_call = run_repo.update_status_in_session.await_args
+    assert status_call.kwargs["status"] == "running"
+    assert status_call.kwargs["only_if_status"] == "paused"
+    assert status_call.kwargs["clear_control"] is True
+    # `ended_at` must NOT be stamped — the run is alive again.
+    assert status_call.kwargs.get("ended_at") is None
+    # …and the resume counts as activity, or `claim_stale_running` reclaims
+    # a long-paused run within one sweep tick and drives it a second time.
+    assert status_call.kwargs["touch_last_checkpoint"] is True
+    assert event_publish_mock.await_args.args[0] == "workflow_engine.workflow_run.resumed"
+
+    # The background task must actually be scheduled, and RETAINED.
+    await asyncio.sleep(0)
+    resume_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "status"),
+    [
+        ("pause", "paused"),
+        ("pause", "completed"),
+        ("pause", "error"),
+        ("pause", "cancelled"),
+        ("resume", "running"),
+        ("resume", "completed"),
+        ("resume", "error"),
+        ("resume", "cancelled"),
+        ("cancel", "completed"),
+        ("cancel", "error"),
+        ("cancel", "cancelled"),
+    ],
+)
+async def test_request_run_control_when_transition_is_illegal_should_conflict_without_event(
+    action: str, status: str, event_publish_mock: AsyncMock
+) -> None:
+    """The negative assertion is the point: a 409 must leave NO trace in the
+    outbox. Publishing an event for a transition that did not happen is the
+    exact discipline `_mark_completed`/`_mark_failed` already enforce."""
+    from agentive_backend.shared.exceptions import ConflictError
+
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status=status)
+    run_repo.get_by_id.return_value = run
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=run.id, action=action)  # type: ignore[arg-type]
+
+    assert excinfo.value.context["run_id"] == str(run.id)
+    assert excinfo.value.context["current_status"] == status
+    event_publish_mock.assert_not_awaited()
+    run_repo.request_control_in_session.assert_not_awaited()
+    run_repo.update_status_in_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resume_hits_a_stuck_run_should_name_the_pending_signal(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Review lot 9 (F3) — the deadlock `pending_control_signal` was named for,
+    on the one path that did not carry it.
+
+    A process dying between writing a signal and observing it leaves the run
+    `running` with a pending `pause`. The operator's next move is `resume`,
+    which is illegal from `running` — so it takes the ILLEGAL-STATUS branch,
+    not the compare-and-set branch, and that branch built a 409 out of four
+    members with no way to say why the run was stuck. The field answered the
+    CAS race and missed the deadlock.
+    """
+    from agentive_backend.shared.exceptions import ConflictError
+
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="running", control_signal="pause")
+    run_repo.get_by_id.return_value = run
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=run.id, action="resume")
+
+    assert excinfo.value.context["pending_control_signal"] == "pause"
+    # The full contract AC1 states, on this branch too.
+    assert set(excinfo.value.context) == {
+        "run_id",
+        "current_status",
+        "allowed_from",
+        "action",
+        "pending_control_signal",
+    }
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_nothing_is_pending_should_say_so_explicitly(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """`None` is an answer, not an omission: it tells the operator the run is
+    refusing for its status alone, so no escalation will unblock it."""
+    from agentive_backend.shared.exceptions import ConflictError
+
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="completed")
+    run_repo.get_by_id.return_value = run
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=run.id, action="pause")
+
+    assert excinfo.value.context["pending_control_signal"] is None
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_run_is_unknown_should_raise_not_found(
+    event_publish_mock: AsyncMock,
+) -> None:
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = None
+
+    with pytest.raises(NotFoundError):
+        await service.request_run_control(run_id=uuid4(), action="pause")
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_signal_cas_loses_should_conflict_without_event(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Rowcount 0 — a concurrent caller got there first, or the run finished
+    between the read and the write. Treated exactly like an illegal status."""
+    from agentive_backend.shared.exceptions import ConflictError
+
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running")
+    run_repo.request_control_in_session.return_value = 0
+
+    with pytest.raises(ConflictError):
+        await service.request_run_control(run_id=uuid4(), action="pause")
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_status_cas_loses_should_conflict_without_event(
+    event_publish_mock: AsyncMock,
+) -> None:
+    from agentive_backend.shared.exceptions import ConflictError
+
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="paused")
+    run_repo.update_status_in_session.return_value = 0
+
+    with pytest.raises(ConflictError):
+        await service.request_run_control(run_id=uuid4(), action="cancel")
+    event_publish_mock.assert_not_awaited()
+
+
+def _resumable_service(report: MiseEnPlaceReport) -> tuple[Any, AsyncMock, AsyncMock]:
+    """`_control_service` wired for a resume: a paused run, a loadable
+    workflow, and a Mise en Place verdict the caller chooses."""
+    service, run_repo, workflow_repo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="paused")
+    workflow_repo.require_by_id.return_value = _workflow()
+    service._mise_en_place_service.run_checks = AsyncMock(return_value=report)
+    return service, run_repo, workflow_repo
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retryable", "expected"),
+    [(False, BusinessRuleError), (True, DependencyError)],
+)
+async def test_request_run_control_when_resume_fails_the_preflight_should_refuse_and_stay_paused(
+    retryable: bool,
+    expected: type[Exception],
+    event_publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 4.6 review `IG2`. An environment decays while a run sits paused —
+    a rotated API key, a decommissioned MCP server, an exhausted budget. An
+    ungated resume walked straight into it: the row moved to `running`, the
+    first node raised, `_mark_failed` closed the run `error`, and a checkpoint
+    that was still resumable a second earlier was gone for good.
+
+    Refusing leaves the row `paused`, so the run survives its environment and
+    can be resumed once a human fixes it. Same 422/503 split as `start_run`:
+    503 only when an identical retry could plausibly succeed on its own."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _resumable_service(
+        _failing_mise_en_place_report(retryable=retryable)
+    )
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(expected):
+        await service.request_run_control(run_id=uuid4(), action="resume")
+
+    # The row must NOT have moved, and no `resumed` event may exist for a
+    # resume that did not happen.
+    run_repo.update_status_in_session.assert_not_awaited()
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.resumed" not in published
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resume_is_forced_should_bypass_the_preflight(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape hatch matters as much as the gate: a check that stays red
+    for good (a decommissioned server, a spent budget) would otherwise make
+    the run permanently unresumable — `paused` with no way out."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _resumable_service(_failing_mise_en_place_report())
+    monkeypatch.setattr(service, "_resume_run", AsyncMock())
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    response = await service.request_run_control(
+        run_id=uuid4(), action="resume", force=True, reason="MCP server retired, run must finish"
+    )
+
+    assert response.status == "running"
+    run_repo.update_status_in_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resume_is_forced_should_publish_the_bypass_event(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review lot 9 (F1) — the audit trace a forced resume owes, and did not pay.
+
+    `_gate_on_mise_en_place` returns `(report, bypassed)` and the resume path
+    DISCARDED both, so overriding a red pre-flight left nothing on the bus.
+    The asymmetry is what makes it indefensible: the REFUSAL path inside the
+    same function is audited, so a refused resume was traceable and a forced
+    one was not — the wrong way round for the only one of the two a human had
+    to decide.
+
+    Asserts what the `start_run` twin asserts, field for field: an audit
+    consumer must not have to know whether the human overrode a launch or a
+    resume to find the override.
+    """
+    set_correlation_id(str(uuid4()))
+    service, _run_repo, _wrepo = _resumable_service(_failing_mise_en_place_report())
+    monkeypatch.setattr(service, "_resume_run", AsyncMock())
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    await service.request_run_control(
+        run_id=uuid4(), action="resume", force=True, reason="MCP server retired, run must finish"
+    )
+
+    published = {call.args[0]: call.args[1] for call in event_publish_mock.await_args_list}
+    assert "workflow_engine.workflow_run.mise_en_place_bypassed" in published
+    bypass = published["workflow_engine.workflow_run.mise_en_place_bypassed"]
+    assert bypass.reason == "MCP server retired, run must finish"
+    assert bypass.failed_checks == ["budget_available"]
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resume_passes_the_preflight_should_publish_no_bypass(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: an audit event that fires when nobody overrode
+    anything is worse than none at all."""
+    set_correlation_id(str(uuid4()))
+    service, _run_repo, _wrepo = _resumable_service(_passing_mise_en_place_report())
+    monkeypatch.setattr(service, "_resume_run", AsyncMock())
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    await service.request_run_control(run_id=uuid4(), action="resume")
+
+    published = [call.args[0] for call in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.mise_en_place_bypassed" not in published
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_forcing_without_a_reason_should_be_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of `start_run`: a bypass with no stated reason defeats the audit
+    trail the field exists for (NFR8)."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _resumable_service(_failing_mise_en_place_report())
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(ValidationError):
+        await service.request_run_control(run_id=uuid4(), action="resume", force=True, reason="  ")
+    run_repo.update_status_in_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+async def test_request_run_control_when_not_resuming_should_never_run_the_preflight(
+    action: str, event_publish_mock: AsyncMock
+) -> None:
+    """Neither `pause` nor `cancel` resumes execution, so neither can walk
+    into a broken environment — gating them would add latency and a failure
+    mode to the two operations an operator reaches for when things are
+    ALREADY going wrong."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running")
+    service._mise_en_place_service.run_checks = AsyncMock(
+        return_value=_failing_mise_en_place_report()
+    )
+
+    await service.request_run_control(run_id=uuid4(), action=action)  # type: ignore[arg-type]
+
+    service._mise_en_place_service.run_checks.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_cancelling_over_a_pending_pause_should_escalate(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """ "Pause… no, kill it" is the one operator sequence the strict
+    `control_signal IS NULL` guard got wrong. It is also the fix for a worse
+    case: a process dying between writing a signal and observing it left the
+    run answering 409 to `pause`, `resume` AND `cancel` until the recovery
+    sweep — ~25 minutes of a run nobody could control.
+
+    Escalation is terminal-direction only, which the companion test below
+    pins."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="running", control_signal="pause")
+    run_repo.get_by_id.return_value = run
+
+    response = await service.request_run_control(run_id=run.id, action="cancel")
+
+    assert response.control_signal == "cancel"
+    assert run_repo.request_control_in_session.await_args.kwargs["overrides"] == ("pause",)
+    assert event_publish_mock.await_args.args[0] == "workflow_engine.workflow_run.cancel_requested"
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_pausing_should_never_override_a_pending_signal(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """The reverse escalation must stay impossible: a pause revoking a
+    cancellation someone was already told they had is exactly what T1.3's
+    guard exists to prevent."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running", control_signal="cancel")
+
+    await service.request_run_control(run_id=uuid4(), action="pause")
+
+    assert run_repo.request_control_in_session.await_args.kwargs["overrides"] == ()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_a_signal_is_pending_should_name_it_in_the_conflict(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """A 409 saying only "a control request is already pending" left the
+    caller unable to tell a race from a signal nobody will ever observe, or to
+    know whether escalating would get through."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running", control_signal="cancel")
+    run_repo.request_control_in_session.return_value = 0
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=uuid4(), action="pause")
+
+    assert excinfo.value.context["pending_control_signal"] == "cancel"
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_losing_a_race_should_describe_the_state_that_is_true_now(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """The snapshot the caller raced AGAINST is the one state the 409 must not
+    report. Two concurrent `pause`s produced `pending_control_signal: null` —
+    "nothing is pending" — while a pause was, which is the single question
+    this body exists to answer."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    # Read: no signal yet. Written by a concurrent caller a moment later.
+    run_repo.get_by_id.return_value = _workflow_run(status="running", control_signal=None)
+    run_repo.get_by_id_in_session = AsyncMock(
+        return_value=_workflow_run(status="running", control_signal="pause")
+    )
+    run_repo.request_control_in_session.return_value = 0
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=uuid4(), action="pause")
+
+    assert excinfo.value.context["pending_control_signal"] == "pause"
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_the_run_finished_mid_flight_should_report_its_real_status(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Same defect on the other field: a 409 announcing `current_status:
+    "running"` for a row that reads `completed` invites the client to retry a
+    transition that can never succeed."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running")
+    run_repo.get_by_id_in_session = AsyncMock(return_value=_workflow_run(status="completed"))
+    run_repo.request_control_in_session.return_value = 0
+
+    with pytest.raises(ConflictError) as excinfo:
+        await service.request_run_control(run_id=uuid4(), action="cancel")
+
+    assert excinfo.value.context["current_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_observe_control_when_the_run_was_already_paused_should_accumulate_its_duration(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`started_at` is the start of THIS execution segment, so a run paused,
+    resumed and cancelled reported only its last few seconds. An API-driven
+    pause/resume cycle could reset the number at will — before this story it
+    took a crash to see it."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    state = {"node_outputs": {"a": {}}, "node_metrics": {}}
+    compiled = _FakeCompiledGraph(updates=[], final_state=state, restored_state=state)
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(return_value="cancel")
+    # 400 s already executed before the run was paused.
+    run_repo.get_by_id.return_value = _workflow_run(
+        status="running", metrics={"total_duration_ms": 400_000}
+    )
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    metrics = run_repo.update_status.await_args.kwargs["metrics"]
+    assert metrics["total_duration_ms"] >= 400_000
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_resume_dependencies_are_gone_should_not_move_the_row(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """The workflow can be deleted while a run sits paused. Loading it AFTER
+    the `paused → running` write left the caller a 404 on a row that was
+    already `running` with no driver behind it — unpausable (nobody observes
+    the signal), unresumable (`resume` from `running` is a 409), and stuck
+    until the recovery sweep. Nothing may move before the reload succeeds."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, workflow_repo = _control_service()
+    run = _workflow_run(status="paused")
+    run_repo.get_by_id.return_value = run
+    workflow_repo.require_by_id.side_effect = NotFoundError(detail="workflow gone")
+
+    with pytest.raises(NotFoundError):
+        await service.request_run_control(run_id=run.id, action="resume")
+
+    run_repo.update_status_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_run_control_when_cancelling_a_paused_run_should_report_executed_time_only(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """`total_duration_ms` must be the run's EXECUTED time, taken from the
+    metrics the driver aggregated when it paused — never `now() -
+    run.started_at`, which folds in the whole idle window (a run paused on
+    Monday and cancelled on Thursday reported three days) and contradicts
+    `_execute`'s own invariant that `started_at` is a segment start."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, _wrepo = _control_service()
+    run = _workflow_run(status="paused", metrics={"total_duration_ms": 4_200})
+    # Paused long ago — wall-clock would dwarf the real executed time.
+    run.started_at = datetime.now(UTC) - timedelta(days=3)
+    run_repo.get_by_id.return_value = run
+
+    await service.request_run_control(run_id=run.id, action="cancel")
+
+    event = event_publish_mock.await_args.args[1]
+    assert event.total_duration_ms == 4_200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "status", "method"),
+    [
+        ("pause", "running", "request_control_in_session"),
+        ("cancel", "running", "request_control_in_session"),
+        ("cancel", "paused", "update_status_in_session"),
+        ("resume", "paused", "update_status_in_session"),
+    ],
+)
+async def test_request_run_control_when_transition_is_legal_should_write_in_the_publish_session(
+    action: str,
+    status: str,
+    method: str,
+    event_publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1 — "un event d'audit est publié dans la même transaction que
+    l'écriture". The only way to hold that is for BOTH to run against one
+    session: the self-managed repo wrappers commit on exit, so a publish that
+    failed afterwards would leave a moved row with no event (SSE clients hung,
+    audit silent), and a resume would answer 500 on a row already `running`.
+
+    Asserting the session OBJECT is the same is what makes this a real
+    guarantee rather than a naming convention."""
+    set_correlation_id(str(uuid4()))
+    service, run_repo, workflow_repo = _control_service()
+    run = _workflow_run(status=status)
+    run_repo.get_by_id.return_value = run
+    workflow_repo.require_by_id.return_value = _workflow()
+    monkeypatch.setattr(service, "_resume_run", AsyncMock())
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.service._load_templates",
+        AsyncMock(return_value={}),
+    )
+
+    await service.request_run_control(run_id=run.id, action=action)  # type: ignore[arg-type]
+
+    write_session = getattr(run_repo, method).await_args.args[0]
+    assert event_publish_mock.await_args.kwargs["session"] is write_session
+
+
+# ─── Story 4.6 — cooperative control observation in _execute (AC2) ───
+
+
+@pytest.mark.asyncio
+async def test_execute_when_pause_signal_is_observed_should_pause_and_never_complete(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(
+        dag={
+            "nodes": [
+                {"node_id": "a", "agent_template_id": str(uuid4())},
+                {"node_id": "b", "agent_template_id": str(uuid4())},
+            ],
+            "edges": [{"from_node_id": "a", "to_node_id": "b"}],
+        }
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}},
+            {"b": {"node_outputs": {"b": {}}, "node_metrics": {"b": {"duration_ms": 1}}}},
+        ],
+        final_state={"node_outputs": {"a": {}, "b": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    # `None` before the loop, `"pause"` at the first superstep boundary.
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, "pause"])
+
+    run_id = uuid4()
+    templates = {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})}
+    await service._drive_run(run_id, workflow, templates, {}, correlation_id=uuid4())
+
+    statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
+    assert "paused" in statuses
+    assert "completed" not in statuses
+    paused_call = next(
+        c for c in run_repo.update_status.await_args_list if c.kwargs["status"] == "paused"
+    )
+    assert paused_call.kwargs["only_if_status"] == "running"
+    assert paused_call.kwargs["clear_control"] is True
+    # A paused run is NOT over — `ended_at` must stay NULL.
+    assert paused_call.kwargs.get("ended_at") is None
+
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.paused" in published
+    assert "workflow_engine.workflow_run.completed" not in published
+
+
+@pytest.mark.asyncio
+async def test_execute_when_cancel_signal_is_observed_should_mark_cancelled_with_ended_at(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {}},
+                    "node_metrics": {
+                        "a": {"duration_ms": 5, "input_tokens": 7, "output_tokens": 2}
+                    },
+                }
+            }
+        ],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, "cancel"])
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    cancelled_call = next(
+        c for c in run_repo.update_status.await_args_list if c.kwargs["status"] == "cancelled"
+    )
+    assert cancelled_call.kwargs["ended_at"] is not None
+    assert cancelled_call.kwargs["clear_control"] is True
+    # Partial spend is aggregated, never dropped (mirror `_mark_failed`).
+    assert cancelled_call.kwargs["metrics"]["total_tokens"] == {"input": 7, "output": 2}
+
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.cancelled" in published
+    assert "workflow_engine.workflow_run.completed" not in published
+
+
+@pytest.mark.asyncio
+async def test_execute_when_signal_predates_the_loop_should_execute_zero_nodes(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recovery-worker case: a run resumed while a pause request had
+    never been observed must settle without running a single node."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(return_value="pause")
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    # No superstep was ever consumed — no `step_completed`, no completion.
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.step_completed" not in published
+    assert "workflow_engine.workflow_run.paused" in published
+    assert run_repo.update_checkpoint.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_after_updates", [False, True])
+async def test_execute_when_run_reaches_a_terminal_status_should_consume_any_pending_signal(
+    raise_after_updates: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A control request written while the LAST superstep is still running is
+    never observed — the run reaches `END` (or dies) first. `request_control`
+    and `_mark_completed`/`_mark_failed` are both compare-and-set on
+    `running`, so they interleave without conflicting, and nothing else
+    cleared the column: the row settled `completed` while still advertising
+    `"pause"`, which the SSE `state` frame then reported forever."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+        raise_after_updates=raise_after_updates,
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    terminal_call = run_repo.update_status.await_args
+    assert terminal_call.kwargs["status"] == ("error" if raise_after_updates else "completed")
+    assert terminal_call.kwargs["clear_control"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_when_control_settles_should_close_the_astream_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaking out of `astream` leaves the generator suspended inside
+    LangGraph's Pregel loop, holding a checkpointer context and its own
+    background tasks. The two pre-existing exits (stream exhausted, exception)
+    finalise it themselves; the `break` this story added does not, so it must
+    close it explicitly rather than leave it to the GC."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    # Nothing pending before the loop, `pause` at the end of the first
+    # superstep — the only sequence that actually exercises the `break`. A
+    # signal present from the start returns BEFORE `astream` is ever called.
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, "pause"])
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    assert compiled.stream_closed is True
+
+
+@pytest.mark.asyncio
+async def test_execute_when_cancel_predates_the_loop_should_still_account_the_work_already_paid(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-loop branch settles runs the recovery worker picked up — runs
+    that have ALREADY executed and been billed. It used to hand
+    `_observe_control` an empty state, so the cancellation of a run that had
+    burned real money was recorded as free: `per_node` empty,
+    `total_cost_usd` null, `cancelled_at_node_id` null. The state is right
+    there in the checkpoint; not reading it was the bug."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    already_run = {
+        "node_outputs": {"a": {}},
+        "node_metrics": {"a": {"duration_ms": 5, "input_tokens": 11, "cost_usd": "0.002"}},
+    }
+    compiled = _FakeCompiledGraph(updates=[], final_state=already_run, restored_state=already_run)
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(return_value="cancel")
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    status_call = run_repo.update_status.await_args
+    assert status_call.kwargs["status"] == "cancelled"
+    metrics = status_call.kwargs["metrics"]
+    assert metrics["total_cost_usd"] == "0.002"
+    assert metrics["per_node"]["a"]["input_tokens"] == 11
+    # …and the event names where it stopped, instead of `None`.
+    event = event_publish_mock.await_args.args[1]
+    assert event.cancelled_at_node_id == "a"
+
+
+@pytest.mark.asyncio
+async def test_execute_when_cancel_metrics_are_corrupt_should_still_cancel_not_fail(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`node_metrics` is free-form graph state, and `_aggregate_metrics` does
+    `Decimal(str(cost_usd))` on it. Unguarded, one corrupt entry raised into
+    `_execute`'s handler and `_mark_failed_safely` rewrote the run as
+    `error` — a user's cancellation DESTROYING the run instead of stopping
+    it. The per-node breakdown may be lost; the cancellation may not."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    corrupt = {"node_outputs": {"a": {}}, "node_metrics": {"a": {"cost_usd": "not-a-decimal"}}}
+    compiled = _FakeCompiledGraph(updates=[], final_state=corrupt, restored_state=corrupt)
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(return_value="cancel")
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    assert run_repo.update_status.await_args.kwargs["status"] == "cancelled"
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.cancelled" in published
+    assert "workflow_engine.workflow_run.failed" not in published
+
+
+@pytest.mark.asyncio
+async def test_execute_when_control_read_fails_should_let_the_run_finish(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort on the READ: a DB hiccup on `get_control_signal` must not
+    kill an otherwise healthy run (mirror `_sync_checkpoint_safely`)."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(side_effect=RuntimeError("db down"))
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
+    assert statuses == ["completed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal", "settled_status"), [("pause", "paused"), ("cancel", "cancelled")]
+)
+async def test_execute_when_settle_cas_loses_should_keep_running_without_event(
+    signal: str,
+    settled_status: str,
+    event_publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rowcount 0 on the settle CAS means the row moved under the driver —
+    somebody else closed the run, or the signal was escalated. Either way it
+    must not publish a transition the row contradicts.
+
+    Parametrized over BOTH signals by the review (lot 12): only the `pause`
+    branch was covered, and the `cancel` one matters more — returning `None`
+    there sends `_execute` on to `_mark_completed`, so a run whose cancel CAS
+    lost then attempts a `completed` transition. That second write is itself
+    guarded on `running`, so it no-ops; nothing proved it."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, signal])
+    run_repo.update_status = AsyncMock(return_value=0)
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert f"workflow_engine.workflow_run.{settled_status}" not in published
+    # …and the run was not closed some other way either: every write lost its
+    # compare-and-set, so no terminal event may be announced at all.
+    assert "workflow_engine.workflow_run.completed" not in published
+    assert "workflow_engine.workflow_run.failed" not in published
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal", "settled_status"), [("pause", "paused"), ("cancel", "cancelled")]
+)
+async def test_execute_settle_write_is_guarded_on_the_signal_it_read(
+    signal: str,
+    settled_status: str,
+    event_publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review lot 9 (F2) — the guard that closes the escalation race.
+
+    Two DB round-trips separate the read of `control_signal` from the settle
+    write, and `status` stays `running` across both, so `only_if_status`
+    alone cannot notice the signal changing underneath. Without the second
+    predicate, a `cancel` escalating over this very `pause` is answered 202
+    and then ERASED by `clear_control=True`.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, signal])
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    settle = next(
+        call
+        for call in run_repo.update_status.await_args_list
+        if call.kwargs.get("status") == settled_status
+    )
+    assert settle.kwargs["only_if_control_signal"] == signal
+    assert settle.kwargs["only_if_status"] == "running"
+    assert settle.kwargs["clear_control"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_when_a_cancel_escalates_over_the_pause_being_settled(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What happens once the guard BITES — not the guard itself.
+
+    The sibling above pins the predicate (and fails without it). This one
+    starts from its outcome, a rowcount of 0 on the pause settle, which it
+    manufactures directly: so it would pass with or without
+    `only_if_control_signal`, and it is not a regression test for F2. What
+    it does pin is the branch the Edge Case Hunter found uncovered — the
+    driver must NOT publish a `paused` the row contradicts, and must NOT
+    treat the run as settled. Returning to the loop is what lets it observe
+    the escalated cancel at the next boundary and honour the 202 the
+    operator already holds; settling here instead would leave the run
+    `paused` with no pending signal — nothing for anyone to observe, and a
+    `cancel_requested` on the bus that no `cancelled` ever follows.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(side_effect=[None, "pause"])
+
+    # The pause settle loses (the signal is no longer `pause`); everything
+    # else still writes.
+    async def _update_status(_run_id: Any, **kwargs: Any) -> int:
+        return 0 if kwargs.get("status") == "paused" else 1
+
+    run_repo.update_status = AsyncMock(side_effect=_update_status)
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    published = [c.args[0] for c in event_publish_mock.await_args_list]
+    assert "workflow_engine.workflow_run.paused" not in published
+    # The driver went back to its loop rather than stopping: the graph ran to
+    # the end, so the completion path — not the pause path — closed the run.
+    assert "workflow_engine.workflow_run.completed" in published
+
+
+@pytest.mark.asyncio
+async def test_execute_when_control_signal_is_unrecognised_should_keep_running(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`control_signal` is a free `VARCHAR(20)`: a value from a future story
+    or a manual edit must be IGNORED, not guessed at — and must not take the
+    run down on its way past.
+
+    This also pins the logging of that value. The driver reports the
+    unexpected signal, and it must report it COERCED: handing a raw object
+    to a structured-log renderer sent it into infinite recursion (a
+    `MagicMock` grows a fresh child on every attribute access), which
+    surfaced as `RecursionError` swallowed into `checkpoint.last_error` —
+    and only once an integration test had installed the JSON renderer, so
+    the unit suite alone never saw it.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_control_signal = AsyncMock(return_value="pausing")
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
+    assert statuses == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_execute_when_control_repo_is_an_unconfigured_mock_should_still_complete(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact shape every OTHER `_drive_run` test in this module uses: a
+    bare `AsyncMock` repo whose `get_control_signal` was never configured,
+    so it answers with a `MagicMock`.
+
+    Kept as its own test rather than left implicit in the others, because
+    that implicit coverage is what failed silently: the value reached the
+    logger, the logger recursed, and eighteen unrelated tests started
+    failing with assertions that had nothing to do with the cause.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 1}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
+    assert statuses == ["completed"]
+
+
+# ─── Story 4.6 AC3 / review lot 12 — bounding and redacting the breakdown ──
+#
+# `_failure_attempts` is persisted in `workflow_runs.checkpoint` AND streamed
+# to SSE clients. Its three safety properties — redaction, at most
+# `_MAX_PERSISTED_ATTEMPTS` entries, at most `_ATTEMPT_FIELD_MAX_CHARS` per
+# field — had no assertion anywhere: the only reader in the suite checked
+# that a 2-entry list carried the right provider names (review lot 12).
+
+
+def _failed_with(attempts: Any) -> Exception:
+    from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
+
+    exc = LLMAllProvidersFailedError(detail="all providers failed")
+    exc.context["attempts"] = attempts
+    return exc
+
+
+def test_failure_attempts_redacts_secrets_a_provider_leaked_into_the_detail() -> None:
+    """NFR9. The router redacts on its way in; this re-redacts rather than
+    trusting that, because the value is about to be written to a column and
+    pushed to every SSE subscriber. The cost of re-running a regex is nothing
+    against the cost of leaking a DSN."""
+    from agentive_backend.features.workflow_engine.service import _failure_attempts
+
+    leaked = "connect failed: postgresql://agentive_app:hunter2@db:5432/agentive"
+    [entry] = _failure_attempts(_failed_with([{"provider": "openai", "error_detail": leaked}]))
+
+    assert "hunter2" not in entry["error_detail"]
+    assert entry["provider"] == "openai"
+
+
+def test_failure_attempts_caps_the_number_of_entries() -> None:
+    """A chain is at most two providers, but this reads a free JSONB context
+    off an exception — a malformed or hostile one is not bounded by that."""
+    from agentive_backend.features.workflow_engine.service import (
+        _MAX_PERSISTED_ATTEMPTS,
+        _failure_attempts,
+    )
+
+    kept = _failure_attempts(_failed_with([{"provider": f"p{i}"} for i in range(50)]))
+
+    assert len(kept) == _MAX_PERSISTED_ATTEMPTS == 5
+    # The FIRST attempts are kept — the earliest failure is the one that
+    # explains the chain, the last is just the final symptom.
+    assert kept[0]["provider"] == "p0"
+
+
+def test_failure_attempts_truncates_an_unbounded_field() -> None:
+    """`error_detail` comes from a provider's response body. Unbounded, one
+    node's failure could push a megabyte into the checkpoint column and into
+    every open SSE stream."""
+    from agentive_backend.features.workflow_engine.service import (
+        _ATTEMPT_FIELD_MAX_CHARS,
+        _failure_attempts,
+    )
+
+    [entry] = _failure_attempts(
+        _failed_with([{"provider": "openai", "error_detail": "x" * 10_000}])
+    )
+
+    assert len(entry["error_detail"]) == _ATTEMPT_FIELD_MAX_CHARS == 500
+
+
+@pytest.mark.parametrize(
+    "attempts",
+    [
+        "not-a-list",
+        None,
+        [{"provider": "openai"}, "not-a-dict", 42],
+    ],
+)
+def test_failure_attempts_survives_a_context_that_is_not_the_expected_shape(attempts: Any) -> None:
+    """`context` is a free dict on an exception that may not be the router's.
+    Raising here would replace a real failure with a confusing one, on the
+    path that is already handling a failure."""
+    from agentive_backend.features.workflow_engine.service import _failure_attempts
+
+    result = _failure_attempts(_failed_with(attempts))
+
+    assert isinstance(result, list)
+    assert all(isinstance(entry, dict) for entry in result)

@@ -20,7 +20,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
 from agentive_backend.features.workflow_engine.domain import (
@@ -36,8 +36,15 @@ from agentive_backend.features.workflow_engine.domain import (
     find_duplicate_node_ids,
 )
 from agentive_backend.features.workflow_engine.domain import parse as parse_condition
+from agentive_backend.features.workflow_engine.domain.run_control import (
+    RunAction,
+    resolve_transition,
+)
 from agentive_backend.features.workflow_engine.engine import build_state_graph
-from agentive_backend.features.workflow_engine.engine.agent_node import is_raw_fallback_output
+from agentive_backend.features.workflow_engine.engine.agent_node import (
+    RetrySettings,
+    is_raw_fallback_output,
+)
 from agentive_backend.features.workflow_engine.engine.graph_builder import (
     RoutingDecisionFailedError,
 )
@@ -51,6 +58,7 @@ from agentive_backend.features.workflow_engine.schemas import (
     DiversityWarning,
     MiseEnPlaceCheckOut,
     MiseEnPlaceReportOut,
+    RunControlResponse,
     StartRunResponse,
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
@@ -59,10 +67,15 @@ from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.diversity import LLMSelection, check_llm_diversity
 from agentive_backend.shared.contracts.events import (
     WorkflowCreatedEvent,
+    WorkflowRunCancelledEvent,
+    WorkflowRunCancelRequestedEvent,
     WorkflowRunCompletedEvent,
     WorkflowRunFailedEvent,
     WorkflowRunMiseEnPlaceBypassedEvent,
     WorkflowRunMiseEnPlaceRefusedEvent,
+    WorkflowRunPausedEvent,
+    WorkflowRunPauseRequestedEvent,
+    WorkflowRunResumedEvent,
     WorkflowRunRoutingEscalatedEvent,
     WorkflowRunStartedEvent,
     WorkflowRunStepCompletedEvent,
@@ -71,8 +84,10 @@ from agentive_backend.shared.correlation import require_correlation_id
 from agentive_backend.shared.event_bus import notify_best_effort, publish, publish_and_commit
 from agentive_backend.shared.exceptions import (
     BusinessRuleError,
+    ConflictError,
     DependencyError,
     InternalError,
+    NotFoundError,
     ValidationError,
 )
 from agentive_backend.shared.llm.redaction import redact_secrets
@@ -83,10 +98,11 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
 
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from pydantic import BaseModel
 
     from agentive_backend.features.workflow_engine.domain.mise_en_place import MiseEnPlaceReport
     from agentive_backend.features.workflow_engine.mise_en_place import MiseEnPlaceService
-    from agentive_backend.infra.db.models import AgentTemplate, Workflow
+    from agentive_backend.infra.db.models import AgentTemplate, Workflow, WorkflowRun
     from agentive_backend.shared.llm.router import LLMRouter
 
 _log = get_logger(__name__)
@@ -481,6 +497,103 @@ def _preview(value: Any) -> str:
     return text[:_CHECKPOINT_PREVIEW_MAX_CHARS] + "…"
 
 
+# Story 4.6 T10.2 — how much of a failed chain's per-attempt breakdown is
+# persisted. Bounded on BOTH axes: a chain is at most 4 providers today
+# (Story 2.2's `max_length=4`), and each field is truncated to the same 500
+# chars the router already applies to `error_detail`. The `checkpoint` JSONB
+# is read by the SSE `state` frame and the Trace Explorer — it must not grow
+# without limit, and NFR9 forbids letting a provider's echoed prompt through
+# unredacted.
+_MAX_PERSISTED_ATTEMPTS: Final = 5
+_ATTEMPT_FIELD_MAX_CHARS: Final = 500
+_ATTEMPT_FIELDS: Final = (
+    "provider",
+    "model_attempted",
+    "error_type",
+    "error_detail",
+    "error_class",
+)
+
+
+def _failure_attempts(exc: Exception) -> list[dict[str, str]]:
+    """Extract and sanitise ``exc.context["attempts"]`` (Story 4.6 AC3).
+
+    ``LLMAllProvidersFailedError`` carries one entry per provider the router
+    tried. The router already redacts ``error_detail`` on its way in, but
+    redaction is re-applied here rather than trusted: this value is about to
+    be persisted AND streamed to SSE clients, and the cost of re-running a
+    regex is nothing against the cost of leaking a DSN or an API key (NFR9).
+
+    Returns ``[]`` for any exception that carries no such breakdown — which
+    is most of them.
+    """
+    context = getattr(exc, "context", None)
+    if not isinstance(context, dict):
+        return []
+    raw = context.get("attempts")
+    if not isinstance(raw, list):
+        return []
+    sanitised: list[dict[str, str]] = []
+    for entry in raw[:_MAX_PERSISTED_ATTEMPTS]:
+        if not isinstance(entry, dict):
+            continue
+        sanitised.append(
+            {
+                field: redact_secrets(str(entry[field]))[:_ATTEMPT_FIELD_MAX_CHARS]
+                for field in _ATTEMPT_FIELDS
+                if field in entry
+            }
+        )
+    return sanitised
+
+
+def _failure_chain_traversals(exc: Exception) -> int | None:
+    """``exc.context["chain_traversals"]`` when the node's retry loop set it.
+
+    ``None`` for every exception that carries no such count — most of them,
+    including any failure that never reached the LLM.
+    """
+    context = getattr(exc, "context", None)
+    if not isinstance(context, dict):
+        return None
+    raw = context.get("chain_traversals")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else None
+
+
+def _latest_node_id(state_values: Mapping[str, Any]) -> str | None:
+    """The most recently completed node, read off ``node_outputs``.
+
+    Relies on the same insertion-order invariant ``_serialize_upstream``
+    already documents ("`node_outputs` preserves completion order"), so the
+    LAST key is the newest. Used where the applicative checkpoint's
+    ``last_node_id`` is not in hand but the graph state is.
+    """
+    node_outputs = state_values.get("node_outputs")
+    if not isinstance(node_outputs, dict) or not node_outputs:
+        return None
+    latest = next(reversed(node_outputs))
+    return latest if isinstance(latest, str) else None
+
+
+def _last_node_id(checkpoint: dict[str, Any] | None) -> str | None:
+    """Best-effort ``checkpoint["last_node_id"]`` — the last node that
+    COMPLETED, as stamped by :meth:`WorkflowExecutionService._sync_checkpoint`.
+
+    ``None`` for a run whose first checkpoint sync never landed, or whose
+    ``checkpoint`` JSONB is malformed. Never raises: every caller (Story 4.6's
+    ``paused``/``cancelled`` events) treats this as a trace field, not as a
+    resume cursor — resuming is LangGraph's own committed checkpoint's job.
+
+    Mirror of ``recovery._resumed_from_node_id``; duplicated rather than
+    imported, because ``recovery`` imports THIS module and the reverse
+    direction would close a cycle.
+    """
+    if not isinstance(checkpoint, dict):
+        return None
+    value = checkpoint.get("last_node_id")
+    return value if isinstance(value, str) else None
+
+
 def _dag_from_stored(payload: dict[str, Any]) -> WorkflowDag:
     """Reconstruct the domain :class:`WorkflowDag` from ``workflows.dag``
     JSONB — the exact inverse of ``WorkflowService.create_workflow``'s
@@ -645,6 +758,14 @@ def _aggregate_metrics(
             "output_tokens": output_tokens,
             "cost_usd": cost_raw,
             "model_used": metric.get("model_used"),
+            # Story 4.6 AC3 — how many times this node walked the FULL
+            # provider chain. Projected here, not merely left in LangGraph
+            # state, because `workflow_runs.metrics` is the only surface an
+            # operator can actually query: a node that cost four chain
+            # traversals otherwise looked identical to one that cost one,
+            # with only its `duration_ms` hinting at the difference.
+            # Defaults to 1 for rows written before this story.
+            "llm_attempts": metric.get("llm_attempts", 1),
         }
     # IG1 — routing escalations are LLM calls this run paid for, so they
     # belong in the run's totals. `per_node` keeps describing NODE execution
@@ -780,6 +901,434 @@ class WorkflowExecutionService:
         # workflow does not start" to hold structurally rather than by
         # convention (a row created first would already be `running` by the
         # time a check failed).
+        report, bypassed = await self._gate_on_mise_en_place(
+            workflow_id=workflow_id,
+            templates=templates,
+            task_input=run_input,
+            tenant_id=tenant_id,
+            correlation_id=correlation_id,
+            force=force,
+            reason=reason,
+        )
+
+        event_type = WorkflowRunStartedEvent.event_type
+        async with self._workflow_run_repo.with_tenant(tenant_id) as session:
+            run = await self._workflow_run_repo.create_in_session(
+                session,
+                workflow_id=workflow_id,
+                correlation_id=correlation_id,
+                tenant_id=tenant_id,
+                # Preserve the caller's input so a run that crashes BEFORE
+                # LangGraph writes its first checkpoint can still be restarted
+                # from START (AC3's "crashé avant tout checkpoint"). Overwritten
+                # by `_sync_checkpoint` as soon as the first node lands, at
+                # which point LangGraph owns the state and this is dead weight.
+                checkpoint={
+                    "task_input": run_input,
+                    TEMPLATE_FINGERPRINTS_KEY: _template_fingerprints(templates),
+                },
+                # The SAME shape the API returns, not `asdict(report)`
+                # (review P13). `all_passed` is a computed `@property`, so
+                # `asdict` dropped it — leaving the JSONB unvalidatable by
+                # `MiseEnPlaceReportOut`, the model that documents itself as
+                # the persisted shape, and un-queryable via
+                # `mise_en_place->>'all_passed'`. One shape, both surfaces.
+                mise_en_place=_mise_en_place_out(report).model_dump(mode="json"),
+            )
+            event = WorkflowRunStartedEvent(
+                run_id=run.id, workflow_id=workflow_id, tenant_id=tenant_id
+            )
+            event_id = await publish(
+                event_type, event, session=session, correlation_id=correlation_id
+            )
+            bypass_event_id: UUID | None = None
+            # The reason travels on the report itself — `_gate_on_mise_en_place`
+            # owns the validated, redacted value and returns it there.
+            if bypassed and report.bypass_reason is not None:
+                bypass_event = WorkflowRunMiseEnPlaceBypassedEvent(
+                    run_id=run.id,
+                    workflow_id=workflow_id,
+                    reason=report.bypass_reason,
+                    failed_checks=[check.code for check in report.checks if not check.passed],
+                    tenant_id=tenant_id,
+                )
+                bypass_event_id = await publish(
+                    WorkflowRunMiseEnPlaceBypassedEvent.event_type,
+                    bypass_event,
+                    session=session,
+                    correlation_id=correlation_id,
+                )
+            # commit happens at __aexit__ if no exception is raised.
+
+        await notify_best_effort(event_id, event_type)
+        if bypass_event_id is not None:
+            # Notified like `started`, instead of waiting for the outbox
+            # poll (review P11). An explicit human bypass is the event an
+            # audit consumer most needs promptly — it had the longest
+            # latency of the two published here.
+            await notify_best_effort(
+                bypass_event_id, WorkflowRunMiseEnPlaceBypassedEvent.event_type
+            )
+
+        task = asyncio.create_task(
+            self._drive_run(run.id, workflow, templates, run_input, correlation_id=correlation_id),
+            name=f"workflow-run-{run.id}",
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+        _log.info(
+            "workflow_run_started",
+            run_id=str(run.id),
+            workflow_id=str(workflow_id),
+            node_count=len(templates),
+        )
+        return StartRunResponse(
+            run_id=run.id,
+            status="running",
+            warnings=warnings,
+            mise_en_place=_mise_en_place_out(report),
+        )
+
+    async def request_run_control(
+        self,
+        *,
+        run_id: UUID,
+        action: RunAction,
+        tenant_id: UUID | None = None,
+        force: bool = False,
+        reason: str | None = None,
+    ) -> RunControlResponse:
+        """Apply a ``pause``/``resume``/``cancel`` request to a run (AC1).
+
+        Two shapes of outcome, decided entirely by
+        :func:`~..domain.run_control.resolve_transition`:
+
+        * DEFERRED (``pause``/``cancel`` on a live run) — writes
+          ``control_signal`` and leaves ``status`` alone. The driver settles
+          it at its next superstep boundary, which is bounded by a node's
+          duration, never instantaneous. HTTP ``202``.
+        * IMMEDIATE (``resume``, and ``cancel`` on an already-``paused``
+          run) — moves the row here and now, because no driver is alive to
+          observe anything.
+
+        Every write is a compare-and-set and a 0 rowcount is treated exactly
+        like an illegal starting status: ``ConflictError`` (409) and **no
+        event published**. That is the discipline ``_mark_completed``/
+        ``_mark_failed`` already enforce — an event announcing a transition
+        that did not happen tells every SSE client and every downstream
+        consumer the opposite of what the row says.
+        """
+        run = await self._workflow_run_repo.get_by_id(run_id, tenant_id=tenant_id)
+        if run is None:
+            # 404, symmetric with `POST /workflows/{workflow_id}/runs`
+            # (decision 4.2): the id is the URL's primary resource.
+            raise NotFoundError(
+                detail=f"Workflow run '{run_id}' not found", context={"run_id": str(run_id)}
+            )
+
+        try:
+            transition = resolve_transition(action, run.status)
+        except ConflictError as exc:
+            # The pure function cannot know the run id nor the pending
+            # signal; the 409 body must carry both (AC1's `context`
+            # contract, as revised by `BS1`).
+            exc.context["run_id"] = str(run_id)
+            # Review lot 9 (F3). `pending_control_signal` used to exist ONLY
+            # on the rowcount-0 branch below — and the scenario `BS1` added
+            # it for lands HERE instead. A process dying between writing a
+            # signal and observing it leaves the run `running` with a
+            # pending `pause`; the operator's next move is `resume`, which
+            # is illegal from `running`, so it took this path and got a 409
+            # that could not say why the run was stuck. The field answered
+            # the CAS race and missed the deadlock it was named for.
+            exc.context["pending_control_signal"] = run.control_signal
+            raise
+
+        ended_at = datetime.now(UTC) if transition.immediate_status == "cancelled" else None
+        event_type, event = self._control_event(
+            action, run=run, transition_status=transition.immediate_status, tenant_id=tenant_id
+        )
+
+        # A resume's dependencies are loaded BEFORE anything is written. Both
+        # calls can raise — the workflow may have been deleted, or a template
+        # the DAG references removed, while the run sat paused — and they used
+        # to run AFTER the row had moved to `running` and the `resumed` event
+        # had been published and notified. The caller then got a 404 on a run
+        # that was already `running` with no driver behind it: unpausable
+        # (nobody observes the signal), unresumable (`resume` from `running`
+        # is a 409), and left to the recovery sweep. Failing here costs
+        # nothing — the row has not moved.
+        resume_context = (
+            await self._load_resume_context(run, tenant_id=tenant_id)
+            if action == "resume"
+            else None
+        )
+        # Review lot 9 (F1). `_gate_on_mise_en_place`'s return value was
+        # DISCARDED here, so a resume that overrode a red pre-flight left no
+        # trace at all — while the REFUSAL path inside the same function is
+        # audited (`_audit_mise_en_place_refusal`). A refused resume reached
+        # the bus and a forced one did not, which is the wrong way round for
+        # the only one of the two a human had to decide.
+        resume_report: MiseEnPlaceReport | None = None
+        resume_bypassed = False
+        if resume_context is not None:
+            # Story 4.6 review, `IG2` — a resume re-runs the pre-flight, with
+            # the same bypass vector as a launch. An environment decays while
+            # a run sits paused (a rotated key, a decommissioned MCP server,
+            # an exhausted budget), and an ungated resume walked straight
+            # into it: the row moved to `running`, the first node raised, and
+            # `_mark_failed` closed the run `error` — destroying a checkpoint
+            # that was still resumable a second earlier. Refusing here leaves
+            # the row `paused`, so the run survives its environment.
+            #
+            # Deliberately AFTER `_load_resume_context` (which supplies the
+            # templates the checks run against) and BEFORE any write, so a
+            # refusal costs nothing. The recovery worker stays UNGATED: a
+            # sweep that refuses to resume would leave orphans stranded,
+            # which is the opposite of what it exists for.
+            workflow_for_resume, templates_for_resume = resume_context
+            resume_report, resume_bypassed = await self._gate_on_mise_en_place(
+                workflow_id=workflow_for_resume.id,
+                templates=templates_for_resume,
+                task_input={},
+                tenant_id=tenant_id,
+                correlation_id=run.correlation_id,
+                force=force,
+                reason=reason,
+            )
+
+        async with self._workflow_run_repo.with_tenant(tenant_id) as session:
+            if transition.immediate_status is None:
+                if transition.signal is None:  # pragma: no cover — table invariant
+                    raise InternalError(detail="control transition has neither signal nor status")
+                rowcount = await self._workflow_run_repo.request_control_in_session(
+                    session,
+                    run_id,
+                    signal=transition.signal,
+                    only_if_status=run.status,
+                    # `cancel` may replace a pending `pause` (and only that).
+                    # Without it, "pause… no, kill it" answered 409 for as
+                    # long as the node took, and a signal left behind by a
+                    # dead process locked every control action on the run
+                    # until the recovery sweep.
+                    overrides=transition.overrides,
+                )
+            else:
+                rowcount = await self._workflow_run_repo.update_status_in_session(
+                    session,
+                    run_id,
+                    status=transition.immediate_status,
+                    ended_at=ended_at,
+                    only_if_status=run.status,
+                    clear_control=True,
+                    # A resume goes back to `running`, so the sweep must see
+                    # it as live activity — without this stamp,
+                    # `claim_stale_running` reclaims a long-paused run within
+                    # one tick and drives it a second time in parallel.
+                    touch_last_checkpoint=transition.immediate_status == "running",
+                )
+            if rowcount == 0:
+                # Lost a race: a concurrent control call got there first, the
+                # run reached a terminal status between the read and the
+                # write, or a signal was already pending (`request_control`
+                # refuses to overwrite one). Same answer as an illegal
+                # status — and nothing published, since the transaction the
+                # `publish` below would have joined is about to be rolled
+                # back by this raise anyway.
+                #
+                # Re-read before describing the conflict. The snapshot above
+                # is what the caller raced AGAINST, so reporting it here
+                # answered with the very state that is no longer true: two
+                # concurrent `pause`s produced a 409 saying
+                # `pending_control_signal: null` — "nothing is pending" —
+                # while a pause was, which is the one question this body
+                # exists to answer. A run that finished mid-flight likewise
+                # reported `current_status: "running"`.
+                current = await self._workflow_run_repo.get_by_id_in_session(session, run_id)
+                observed_status = current.status if current is not None else run.status
+                observed_signal = current.control_signal if current is not None else None
+                raise ConflictError(
+                    detail=(
+                        f"cannot {action} run '{run_id}': its state changed concurrently "
+                        "or a control request is already pending"
+                    ),
+                    context={
+                        "run_id": str(run_id),
+                        "current_status": observed_status,
+                        "allowed_from": list(transition.allowed_from),
+                        "action": action,
+                        # WHICH request is pending. Without it the caller was
+                        # told only that "a control request is already
+                        # pending", with no way to tell a race from a signal
+                        # nobody will ever observe — and no way to know
+                        # whether escalating to `cancel` would get through.
+                        "pending_control_signal": observed_signal,
+                    },
+                )
+            # Same transaction as the write (mirror `start_run`) — the event
+            # and the row commit together or not at all.
+            event_id = await publish(
+                event_type, event, session=session, correlation_id=run.correlation_id
+            )
+            bypass_event_id: UUID | None = None
+            if resume_bypassed and resume_report is not None and resume_report.bypass_reason:
+                # Byte-for-byte the event `start_run` publishes for the same
+                # decision — same type, same fields, same transaction. An
+                # audit consumer must not have to know whether the human
+                # overrode a launch or a resume to find the override.
+                bypass_event_id = await publish(
+                    WorkflowRunMiseEnPlaceBypassedEvent.event_type,
+                    WorkflowRunMiseEnPlaceBypassedEvent(
+                        run_id=run_id,
+                        workflow_id=run.workflow_id,
+                        reason=resume_report.bypass_reason,
+                        failed_checks=[
+                            check.code for check in resume_report.checks if not check.passed
+                        ],
+                        tenant_id=tenant_id,
+                    ),
+                    session=session,
+                    correlation_id=run.correlation_id,
+                )
+
+        await notify_best_effort(event_id, event_type)
+        if bypass_event_id is not None:
+            await notify_best_effort(
+                bypass_event_id, WorkflowRunMiseEnPlaceBypassedEvent.event_type
+            )
+
+        if resume_context is not None:
+            self._launch_resume(run, *resume_context)
+
+        _log.info(
+            "workflow_run_control_requested",
+            run_id=str(run_id),
+            action=action,
+            from_status=run.status,
+            deferred=transition.immediate_status is None,
+        )
+        return RunControlResponse(
+            run_id=run_id,
+            status=transition.immediate_status or run.status,
+            control_signal=transition.signal,
+        )
+
+    @staticmethod
+    def _control_event(
+        action: RunAction,
+        *,
+        run: WorkflowRun,
+        transition_status: str | None,
+        tenant_id: UUID | None,
+    ) -> tuple[str, BaseModel]:
+        """The event for one control transition — built BEFORE the write so
+        the transactional block stays a write + a publish and nothing else."""
+        if action == "resume":
+            # Reuses Story 4.2's existing event rather than inventing a
+            # `user_resumed` twin: what happened is identical (the run
+            # restarts from its last checkpoint), only the trigger differs,
+            # and `correlation_id` already distinguishes the two.
+            return WorkflowRunResumedEvent.event_type, WorkflowRunResumedEvent(
+                run_id=run.id,
+                workflow_id=run.workflow_id,
+                resumed_from_node_id=_last_node_id(run.checkpoint),
+                tenant_id=tenant_id,
+            )
+        if action == "pause":
+            return WorkflowRunPauseRequestedEvent.event_type, WorkflowRunPauseRequestedEvent(
+                run_id=run.id, workflow_id=run.workflow_id, tenant_id=tenant_id
+            )
+        if transition_status == "cancelled":
+            # Terminal on the spot — no gap between request and effect to
+            # record, so this publishes the EFFECT, not a request.
+            #
+            # The duration comes from the metrics the DRIVER aggregated when
+            # it paused, never from `now() - run.started_at`. That subtraction
+            # folds the idle window into the run's execution time — a run
+            # paused on Monday and cancelled on Thursday reported three days
+            # — and `_execute` documents the invariant it breaks: `started_at`
+            # is the start of an execution SEGMENT, never
+            # `workflow_runs.started_at`. Falls back to 0 rather than to a
+            # wall-clock number that is knowably wrong.
+            metrics = run.metrics if isinstance(run.metrics, dict) else {}
+            raw_duration = metrics.get("total_duration_ms")
+            duration_ms = raw_duration if isinstance(raw_duration, int) else 0
+            return WorkflowRunCancelledEvent.event_type, WorkflowRunCancelledEvent(
+                run_id=run.id,
+                workflow_id=run.workflow_id,
+                cancelled_at_node_id=_last_node_id(run.checkpoint),
+                total_duration_ms=max(duration_ms, 0),
+                tenant_id=tenant_id,
+            )
+        return WorkflowRunCancelRequestedEvent.event_type, WorkflowRunCancelRequestedEvent(
+            run_id=run.id, workflow_id=run.workflow_id, tenant_id=tenant_id
+        )
+
+    async def _load_resume_context(
+        self, run: WorkflowRun, *, tenant_id: UUID | None
+    ) -> tuple[Workflow, dict[str, AgentTemplate]]:
+        """Load what re-driving a resumed run needs — BEFORE any write.
+
+        Same calls as ``WorkflowRecoveryWorker._resume_one``, but the worker
+        is deliberately NOT imported: sweeping for orphans and serving a
+        user's resume are distinct responsibilities that merely share a
+        destination.
+
+        Split out from :meth:`_launch_resume` so it can fail while the row is
+        still ``paused``. Both calls raise on a workflow deleted or a
+        template removed during the pause, and running them after the status
+        write left a `running` row that no task was driving.
+        """
+        workflow = await self._workflow_repo.require_by_id(run.workflow_id, tenant_id=tenant_id)
+        templates = await _load_templates(self._template_repo, workflow.dag, tenant_id=tenant_id)
+        return workflow, templates
+
+    def _launch_resume(
+        self, run: WorkflowRun, workflow: Workflow, templates: dict[str, AgentTemplate]
+    ) -> None:
+        """Schedule the background task that re-drives a resumed run (T3.1 §6).
+
+        Synchronous on purpose: everything that can fail was already done by
+        :meth:`_load_resume_context`, so nothing between the commit and the
+        task creation can raise and strand the run.
+
+        ``_resume_run``'s own ``status != "running"`` guard stays correct and
+        untouched, because the caller above has ALREADY moved the row to
+        ``running`` before this runs. That ordering is load-bearing — flip it
+        and the resume silently no-ops.
+        """
+        task = asyncio.create_task(
+            self._resume_run(run.id, workflow, templates),
+            name=f"workflow-run-resume-{run.id}",
+        )
+        # Retained until completion — a task with no external reference can
+        # be garbage-collected mid-`await` (mirror `start_run`).
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _gate_on_mise_en_place(
+        self,
+        *,
+        workflow_id: UUID,
+        templates: dict[str, AgentTemplate],
+        task_input: dict[str, Any],
+        tenant_id: UUID | None,
+        correlation_id: UUID,
+        force: bool,
+        reason: str | None,
+    ) -> tuple[MiseEnPlaceReport, bool]:
+        """Run the pre-flight and refuse the caller unless it passes (AC2/AC3).
+
+        Returns ``(report, bypassed)``. Raises before ANYTHING is persisted —
+        the necessary condition for "the workflow does not start" to hold
+        structurally rather than by convention.
+
+        Shared by ``start_run`` and by ``resume`` (Story 4.6 review, `IG2`).
+        Extracted rather than copied: the 422-vs-503 rule, the RFC 7807
+        context shape and the audit-on-refusal discipline are subtle enough
+        that two copies would answer differently within a release.
+        """
         bypass_reason: str | None = None
         if force:
             candidate = (reason or "").strip()
@@ -808,7 +1357,7 @@ class WorkflowExecutionService:
         report = await self._mise_en_place_service.run_checks(
             workflow_id=workflow_id,
             templates=templates,
-            task_input=run_input,
+            task_input=task_input,
             tenant_id=tenant_id,
         )
 
@@ -880,82 +1429,7 @@ class WorkflowExecutionService:
         # "no-op silencieux") — `report` stays unbypassed and no audit event
         # is published, since nothing was actually bypassed.
 
-        event_type = WorkflowRunStartedEvent.event_type
-        async with self._workflow_run_repo.with_tenant(tenant_id) as session:
-            run = await self._workflow_run_repo.create_in_session(
-                session,
-                workflow_id=workflow_id,
-                correlation_id=correlation_id,
-                tenant_id=tenant_id,
-                # Preserve the caller's input so a run that crashes BEFORE
-                # LangGraph writes its first checkpoint can still be restarted
-                # from START (AC3's "crashé avant tout checkpoint"). Overwritten
-                # by `_sync_checkpoint` as soon as the first node lands, at
-                # which point LangGraph owns the state and this is dead weight.
-                checkpoint={
-                    "task_input": run_input,
-                    TEMPLATE_FINGERPRINTS_KEY: _template_fingerprints(templates),
-                },
-                # The SAME shape the API returns, not `asdict(report)`
-                # (review P13). `all_passed` is a computed `@property`, so
-                # `asdict` dropped it — leaving the JSONB unvalidatable by
-                # `MiseEnPlaceReportOut`, the model that documents itself as
-                # the persisted shape, and un-queryable via
-                # `mise_en_place->>'all_passed'`. One shape, both surfaces.
-                mise_en_place=_mise_en_place_out(report).model_dump(mode="json"),
-            )
-            event = WorkflowRunStartedEvent(
-                run_id=run.id, workflow_id=workflow_id, tenant_id=tenant_id
-            )
-            event_id = await publish(
-                event_type, event, session=session, correlation_id=correlation_id
-            )
-            bypass_event_id: UUID | None = None
-            if bypassed and bypass_reason is not None:
-                bypass_event = WorkflowRunMiseEnPlaceBypassedEvent(
-                    run_id=run.id,
-                    workflow_id=workflow_id,
-                    reason=bypass_reason,
-                    failed_checks=[check.code for check in report.checks if not check.passed],
-                    tenant_id=tenant_id,
-                )
-                bypass_event_id = await publish(
-                    WorkflowRunMiseEnPlaceBypassedEvent.event_type,
-                    bypass_event,
-                    session=session,
-                    correlation_id=correlation_id,
-                )
-            # commit happens at __aexit__ if no exception is raised.
-
-        await notify_best_effort(event_id, event_type)
-        if bypass_event_id is not None:
-            # Notified like `started`, instead of waiting for the outbox
-            # poll (review P11). An explicit human bypass is the event an
-            # audit consumer most needs promptly — it had the longest
-            # latency of the two published here.
-            await notify_best_effort(
-                bypass_event_id, WorkflowRunMiseEnPlaceBypassedEvent.event_type
-            )
-
-        task = asyncio.create_task(
-            self._drive_run(run.id, workflow, templates, run_input, correlation_id=correlation_id),
-            name=f"workflow-run-{run.id}",
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-
-        _log.info(
-            "workflow_run_started",
-            run_id=str(run.id),
-            workflow_id=str(workflow_id),
-            node_count=len(templates),
-        )
-        return StartRunResponse(
-            run_id=run.id,
-            status="running",
-            warnings=warnings,
-            mise_en_place=_mise_en_place_out(report),
-        )
+        return report, bypassed
 
     async def _audit_mise_en_place_refusal(
         self,
@@ -1172,6 +1646,13 @@ class WorkflowExecutionService:
             escalation_timeout_s=settings.routing_escalation_timeout_s,
             escalation_max_tokens=settings.routing_escalation_max_tokens,
         )
+        # Story 4.6 T11.3 — same posture as `routing_settings` above: built
+        # here, in the assembly layer, from `settings`; `engine/` and
+        # `domain/` never read configuration themselves (golden rule #6).
+        retry_settings = RetrySettings(
+            base_delay_s=settings.workflow_retry_base_delay_s,
+            max_delay_s=settings.workflow_retry_max_delay_s,
+        )
         # Story 4.3 T9.7 — node_ids whose routing decision has already been
         # accounted for: counted in Prometheus AND, when escalated, published
         # as an event. Seeded from the decisions already present in the
@@ -1192,6 +1673,7 @@ class WorkflowExecutionService:
                 self._llm_router,
                 rules=self._routing_rules,
                 routing_settings=routing_settings,
+                retry_settings=retry_settings,
             ).compile(checkpointer=self._checkpointer)
         except Exception as exc:
             # A stored DAG that no longer parses, or a `node_id` LangGraph
@@ -1220,17 +1702,51 @@ class WorkflowExecutionService:
             else None
         )
 
+        # Story 4.6 AC2 — set once the driver has settled a pause/cancel
+        # request, so the completion block below is skipped. A local flag,
+        # not an exception: stopping on request is a normal outcome, and
+        # raising would route it through `_mark_failed`.
+        settled: str | None = None
+
         try:
             if state_input is None:
                 state_input = await self._restart_input_if_never_checkpointed(
                     graph, config, fallback_input, run_id=run_id, correlation_id=correlation_id
                 )
 
-            async for update in graph.astream(  # type: ignore[call-overload]
+            # Evaluated BEFORE the first superstep (T6.2): a run the recovery
+            # worker picked up while a pause/cancel request had never been
+            # observed (its previous process died in between) must settle
+            # without executing a single node — otherwise the request costs
+            # one more billed LLM call every time the sweep resumes it.
+            # Read the state BEFORE settling. This path exists for runs the
+            # recovery worker picked up — runs that have already executed and
+            # BILLED nodes — so passing an empty mapping recorded the
+            # cancellation of a run that cost real money as free: `per_node`
+            # empty, `total_cost_usd` null, `cancelled_at_node_id` null. That
+            # is exactly what the cancel branch aggregates metrics to avoid.
+            pre_state = await self._state_values_safely(graph, config, run_id=run_id)
+            settled = await self._observe_control(
+                run_id,
+                workflow.id,
+                correlation_id=correlation_id,
+                started_at=started_at,
+                state_values=pre_state,
+                last_node_id=_latest_node_id(pre_state),
+            )
+            if settled is not None:
+                return
+
+            # Held in a name so the `break` below can close it. Story 4.6
+            # added the only exit that leaves this generator suspended
+            # mid-`await`: the two pre-existing ones (the stream running out,
+            # an exception) finalise it themselves.
+            stream = graph.astream(  # type: ignore[call-overload]
                 state_input,
                 config,
                 stream_mode="updates",
-            ):
+            )
+            async for update in stream:
                 # `stream_mode="updates"` also surfaces LangGraph's own
                 # bookkeeping keys (`__interrupt__`, …). Filtering on
                 # `templates` keeps a phantom `step_completed` event for a
@@ -1285,6 +1801,36 @@ class WorkflowExecutionService:
                                 node_outputs=snapshot.values.get("node_outputs") or {},
                                 correlation_id=correlation_id,
                             )
+
+                # END OF SUPERSTEP — the one instant in a run where stopping
+                # costs nothing (Story 4.6 AC2). LangGraph has committed its
+                # own checkpoint for the superstep that just finished, and
+                # `_sync_checkpoint_safely` above has written the applicative
+                # summary; a `break` here leaves a run that resumes from
+                # exactly this point without re-executing a single node.
+                #
+                # Deliberately AFTER the `step_completed` publications: the
+                # work of this superstep happened and must be reported, even
+                # though the run stops right after it.
+                settled = await self._observe_control(
+                    run_id,
+                    workflow.id,
+                    correlation_id=correlation_id,
+                    started_at=started_at,
+                    state_values=snapshot.values,
+                    last_node_id=max(node_ids),
+                )
+                if settled is not None:
+                    # Finalise the generator HERE rather than leaving it to
+                    # the GC: it is suspended inside LangGraph's Pregel loop,
+                    # holding a checkpointer context and its own background
+                    # tasks. Deferred cleanup surfaces as a late checkpoint
+                    # write against an already-terminal run, and as "Task was
+                    # destroyed but it is pending" at shutdown. Best-effort —
+                    # a failure to close must not undo a pause that the row
+                    # has already recorded.
+                    await self._aclose_stream_safely(stream, run_id=run_id)
+                    break
         except Exception as exc:
             await self._mark_failed_safely(
                 run_id,
@@ -1295,6 +1841,14 @@ class WorkflowExecutionService:
                 correlation_id=correlation_id,
                 started_at=started_at,
             )
+            return
+
+        if settled is not None:
+            # The run stopped ON REQUEST, at a superstep boundary — it did
+            # not reach `END`. `_observe_control` already wrote the terminal
+            # (or suspended) status and published its event; marking it
+            # `completed` on top would overwrite a legitimate `paused`/
+            # `cancelled` with a lie about a run that never finished.
             return
 
         try:
@@ -1324,6 +1878,243 @@ class WorkflowExecutionService:
                 correlation_id=correlation_id,
                 started_at=started_at,
             )
+
+    async def _prior_duration_ms(self, run_id: UUID) -> int:
+        """Executed time already persisted for this run, or ``0``.
+
+        Best-effort, like every other read on the settle path: losing the
+        earlier total costs accuracy on one metric, raising would cost the
+        interruption the operator asked for.
+        """
+        try:
+            run = await self._workflow_run_repo.get_by_id(run_id)
+        except Exception:
+            _log.warning("workflow_engine.prior_duration_read_failed", run_id=str(run_id))
+            return 0
+        metrics = getattr(run, "metrics", None)
+        if not isinstance(metrics, dict):
+            return 0
+        prior = metrics.get("total_duration_ms")
+        return prior if isinstance(prior, int) and not isinstance(prior, bool) and prior > 0 else 0
+
+    @staticmethod
+    async def _aclose_stream_safely(stream: Any, *, run_id: UUID) -> None:
+        """``stream.aclose()``, swallowing everything — never raises.
+
+        A test double or a future LangGraph version may not expose
+        ``aclose``; and a generator that refuses to unwind must not convert a
+        recorded pause into an ``error`` through ``_execute``'s handler.
+        """
+        aclose = getattr(stream, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except Exception:
+            _log.warning("workflow_engine.stream_close_failed", run_id=str(run_id))
+
+    @staticmethod
+    def _partial_metrics(
+        state_values: Mapping[str, Any], *, total_duration_ms: int, run_id: UUID
+    ) -> dict[str, Any]:
+        """``_aggregate_metrics`` over a partially-executed run — never raises.
+
+        Mirrors `_mark_failed`, not `_mark_completed`: a run stopped on
+        request has real partial spend, and every node that finished before
+        the stop was billed. Dropping it would make an interruption look free.
+
+        The guard matters because ``node_metrics`` is free-form graph state:
+        ``Decimal(str(cost_usd))`` and ``int(input_tokens)`` both raise on a
+        corrupt entry. Unguarded, that exception escaped into `_execute`'s
+        handler and `_mark_failed_safely` rewrote the run as ``error`` — so a
+        user's cancellation destroyed the run instead of stopping it. The
+        duration is preserved even when the per-node breakdown cannot be.
+        """
+        try:
+            return _aggregate_metrics(
+                state_values.get("node_metrics") or {},
+                total_duration_ms=total_duration_ms,
+                routing_decisions=state_values.get("routing_decisions") or {},
+            )
+        except Exception:
+            _log.warning("workflow_engine.partial_metrics_aggregation_failed", run_id=str(run_id))
+            return _aggregate_metrics({}, total_duration_ms=total_duration_ms)
+
+    async def _state_values_safely(
+        self, graph: Any, config: dict[str, Any], *, run_id: UUID
+    ) -> dict[str, Any]:
+        """``graph.aget_state(config).values``, or ``{}`` — never raises.
+
+        Best-effort for the same reason ``_sync_checkpoint_safely`` is: this
+        read feeds observability (which nodes ran, what they cost), and a
+        transient failure must not turn an otherwise healthy run into an
+        ``error``. Degrading to ``{}`` costs the accounting of one
+        cancellation; raising would cost the run.
+        """
+        try:
+            snapshot = await graph.aget_state(config)
+            values = snapshot.values
+        except Exception:
+            _log.warning("workflow_engine.state_read_failed", run_id=str(run_id))
+            return {}
+        # `dict`, not `Mapping`: this module imports `Mapping` under
+        # `TYPE_CHECKING` only, so an isinstance against it passes mypy and
+        # raises `NameError` at runtime — inside `_execute`'s handler, which
+        # would rewrite a healthy run as `error`.
+        return dict(values) if isinstance(values, dict) else {}
+
+    async def _observe_control(
+        self,
+        run_id: UUID,
+        workflow_id: UUID,
+        *,
+        correlation_id: UUID,
+        started_at: datetime,
+        state_values: Mapping[str, Any],
+        last_node_id: str | None,
+    ) -> str | None:
+        """Settle a pending pause/cancel request, or return ``None`` (AC2).
+
+        Returns the status the run was moved to (``"paused"`` /
+        ``"cancelled"``), which the caller uses both to leave the ``astream``
+        loop and to skip the completion block. ``None`` means "nothing to do,
+        keep running".
+
+        **Best-effort on the READ, strict on the WRITE.** A DB failure while
+        reading ``control_signal`` must not kill an otherwise healthy run —
+        the request will simply be observed at the next superstep, or by the
+        recovery sweep (mirror ``_sync_checkpoint_safely``, correctif lot 1 of
+        the 4.2 review). The compare-and-set, by contrast, is not softened: a
+        0 rowcount means the transition did NOT happen — someone else already
+        closed this run — so nothing is published and the run continues,
+        rather than announcing a state the row contradicts.
+
+        One ``SELECT control_signal`` per superstep, against one LLM call per
+        superstep: the cost is noise. It must NOT be cached in-process —
+        that cache is precisely what would break the multi-worker property
+        the DB-borne signal buys for free.
+        """
+        try:
+            signal = await self._workflow_run_repo.get_control_signal(run_id)
+        except Exception:
+            _log.warning("workflow_engine.control_signal_read_failed", run_id=str(run_id))
+            return None
+        if signal not in ("pause", "cancel"):
+            # Includes `None` (the overwhelmingly common case) and any value
+            # a future story or a manual edit may have put there: an
+            # unrecognised signal is ignored rather than guessed at.
+            if signal is not None:
+                _log.warning(
+                    "workflow_engine.control_signal_unknown",
+                    run_id=str(run_id),
+                    # Coerced and bounded, never the raw value: this comes
+                    # from a free `VARCHAR(20)` column, and a structured-log
+                    # renderer is not the place to discover what an
+                    # unexpected object serializes to.
+                    signal=str(signal)[:20],
+                )
+            return None
+
+        # Both branches aggregate. The pause branch used to skip it, on the
+        # reasoning that `_mark_completed` would do it when the run finished
+        # — but a paused run may never finish: `cancel` on a `paused` run is
+        # terminal on the spot, and it is served by `request_run_control`,
+        # which has no graph and therefore no access to `node_metrics` at
+        # all. The party holding the state is this one, so it is the one that
+        # must write it; otherwise a run paused after eight billed nodes and
+        # then cancelled reports `metrics = {}`.
+        # `max(..., 0)` because the contract is `Field(ge=0)` and this value
+        # is a wall-clock subtraction: an NTP step backwards makes it
+        # negative, and the resulting `ValidationError` would be raised AFTER
+        # the `cancelled` write had already committed — leaving a terminal row
+        # with no event at all. `_control_event` already clamps; this path
+        # did not, and the asymmetry was the tell.
+        elapsed_ms = max(int((datetime.now(UTC) - started_at).total_seconds() * 1000), 0)
+        # `started_at` is the start of THIS execution segment, so a run that
+        # has already been paused once would report only its latest segment.
+        # Carrying the previously persisted total forward is what makes the
+        # number mean "time this run spent executing" rather than "time since
+        # it was last resumed" — an API-driven pause/resume cycle otherwise
+        # resets it at will (before this story it took a crash to see it).
+        elapsed_ms += await self._prior_duration_ms(run_id)
+        metrics = self._partial_metrics(state_values, total_duration_ms=elapsed_ms, run_id=run_id)
+
+        # Review lot 9 (F2) — the settle write is guarded on the SIGNAL as
+        # well as the status, on both branches. Two DB round-trips separate
+        # the read of `signal` above from the write below, and `status` does
+        # not move during that window, so `only_if_status` alone cannot see
+        # a signal that changed underneath. A `cancel` escalating over this
+        # very `pause` would be answered 202 and then erased by
+        # `clear_control=True` here.
+        if signal == "pause":
+            # `ended_at` stays NULL: a paused run is suspended, not finished.
+            rowcount = await self._workflow_run_repo.update_status(
+                run_id,
+                status="paused",
+                metrics=metrics,
+                only_if_status="running",
+                only_if_control_signal="pause",
+                clear_control=True,
+            )
+            if rowcount == 0:
+                # NOT an error: losing here means the signal changed, and the
+                # only legal change is an escalation to `cancel`. Returning
+                # `None` sends the driver back into its loop, which observes
+                # the cancel at the next boundary and settles it — one extra
+                # superstep, and the operator gets the cancellation they were
+                # promised.
+                _log.warning("workflow_run_pause_transition_skipped", run_id=str(run_id))
+                return None
+            event_type: str = WorkflowRunPausedEvent.event_type
+            event: BaseModel = WorkflowRunPausedEvent(
+                run_id=run_id, workflow_id=workflow_id, paused_at_node_id=last_node_id
+            )
+            _log.info("workflow_run_paused", run_id=str(run_id), paused_at_node_id=last_node_id)
+        else:
+            ended_at = datetime.now(UTC)
+            total_duration_ms = elapsed_ms
+            rowcount = await self._workflow_run_repo.update_status(
+                run_id,
+                status="cancelled",
+                ended_at=ended_at,
+                metrics=metrics,
+                only_if_status="running",
+                only_if_control_signal="cancel",
+                clear_control=True,
+            )
+            if rowcount == 0:
+                _log.warning("workflow_run_cancel_transition_skipped", run_id=str(run_id))
+                return None
+            # `cancelled` is a TERMINAL transition, so it owes the same
+            # Prometheus write as `completed` and `error`. Omitting it
+            # reopened the drift the IG4 fix closed: `aggregate_routing_modes`
+            # counts every run regardless of status, so `/routing-stats`
+            # included cancelled runs while the counter did not, and the two
+            # "agree by construction" only as long as every terminal path
+            # records. Deliberately NOT done on the pause branch — a paused
+            # run can still resume and reach `_mark_completed`, which would
+            # then count its decisions twice.
+            self._record_routing_metrics_safely(state_values.get("routing_decisions") or {})
+            event_type = WorkflowRunCancelledEvent.event_type
+            event = WorkflowRunCancelledEvent(
+                run_id=run_id,
+                workflow_id=workflow_id,
+                cancelled_at_node_id=last_node_id,
+                total_duration_ms=total_duration_ms,
+            )
+            _log.info(
+                "workflow_run_cancelled",
+                run_id=str(run_id),
+                cancelled_at_node_id=last_node_id,
+                total_duration_ms=total_duration_ms,
+            )
+
+        async with self._workflow_run_repo.with_tenant(None) as session:
+            event_id = await publish(
+                event_type, event, session=session, correlation_id=correlation_id
+            )
+        await notify_best_effort(event_id, event_type)
+        return "paused" if signal == "pause" else "cancelled"
 
     async def _restart_input_if_never_checkpointed(
         self,
@@ -1697,6 +2488,13 @@ class WorkflowExecutionService:
             ended_at=ended_at,
             metrics=metrics,
             only_if_status="running",
+            # A control request written while the last superstep was still
+            # running is never observed — the run reaches `END` first. Both
+            # writes are compare-and-set on `running`, so they interleave
+            # without conflicting, and nothing else clears the column: the
+            # row ended up `completed` while still carrying `"pause"`, which
+            # the SSE `state` frame then reported forever.
+            clear_control=True,
         )
         if rowcount == 0:
             _log.warning("workflow_run_completed_transition_skipped", run_id=str(run_id))
@@ -1821,12 +2619,30 @@ class WorkflowExecutionService:
         if failed_node_id is not None:
             node_statuses[failed_node_id] = "error"
 
-        checkpoint = {
+        checkpoint: dict[str, Any] = {
             "last_node_id": failed_node_id,
             "node_statuses": node_statuses,
             "node_outputs_preview": {nid: _preview(output) for nid, output in node_outputs.items()},
             "last_error": error_summary,
         }
+        # Story 4.6 AC3 — when the whole provider chain failed, the router
+        # packs a per-attempt breakdown into `exc.context["attempts"]`
+        # (provider, model attempted, error type, redacted detail). It was
+        # ENTIRELY lost: `error_summary` is a single line reading "all N
+        # providers failed", which tells an operator nothing about WHICH
+        # provider failed HOW. Persisted here, bounded and re-redacted.
+        attempts = _failure_attempts(exc)
+        if attempts:
+            checkpoint["last_error_attempts"] = attempts
+
+        # How many times the node re-walked the whole chain before giving up
+        # (Story 4.6 AC3). `attempts` above describes ONE traversal — the
+        # router builds a fresh error each call — so without this a node that
+        # burned 8 billed provider calls is indistinguishable from one that
+        # burned 2, and the failing node commits no `node_metrics` to say so.
+        traversals = _failure_chain_traversals(exc)
+        if traversals is not None:
+            checkpoint["last_error_chain_traversals"] = traversals
 
         # Compare-and-set — see `_mark_completed`. A run another writer has
         # already finished must not be rewritten as failed, and must not
@@ -1837,6 +2653,10 @@ class WorkflowExecutionService:
             ended_at=ended_at,
             metrics=metrics,
             only_if_status="running",
+            # Same race as `_mark_completed`: a node can raise while a
+            # control request sits unobserved, leaving an `error` row that
+            # advertises a pending cancellation for good.
+            clear_control=True,
         )
         if rowcount == 0:
             _log.warning(
@@ -1856,6 +2676,10 @@ class WorkflowExecutionService:
                 workflow_id=workflow_id,
                 failed_node_id=failed_node_id,
                 error_summary=error_summary,
+                # Story 4.6 AC3 — the failure's CLASS, so an alerting
+                # consumer can filter on `LLMAllProvidersFailedError`
+                # without parsing `error_summary`'s redacted prose.
+                error_type=type(exc).__name__[:200],
             )
             event_id = await publish(
                 event_type, event, session=session, correlation_id=correlation_id

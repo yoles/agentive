@@ -28,7 +28,8 @@ from agentive_backend.features.workflow_engine.domain.mise_en_place import (
     MiseEnPlaceReport,
     build_report,
 )
-from agentive_backend.infra.llm.pricing import ANTHROPIC_MODEL_PRICING, OPENAI_MODEL_PRICING
+from agentive_backend.features.workflow_engine.domain.provider_chain import resolve_provider_chain
+from agentive_backend.infra.llm.pricing import KNOWN_PROVIDERS, provider_for_model
 from agentive_backend.infra.mcp.client import discover_tools
 from agentive_backend.shared.exceptions import NotFoundError
 from agentive_backend.shared.logging import get_logger
@@ -44,20 +45,24 @@ if TYPE_CHECKING:
 
 _log = get_logger(__name__)
 
-#: `(provider_name, pricing_table)` — mirror `dry_run._provider_pricing`,
-#: reduced to a membership test (this check needs a provider NAME, never a
-#: cost — no token counts exist at this point in the flow).
-_PROVIDER_PRICING: tuple[tuple[str, Mapping[str, Any]], ...] = (
-    ("anthropic", ANTHROPIC_MODEL_PRICING),
-    ("openai", OPENAI_MODEL_PRICING),
-)
-
 #: The model a template without an explicit `llm_model` actually runs on —
 #: mirror `engine.agent_node.DEFAULT_LLM_MODEL` and `dry_run._DEFAULT_LLM_MODEL`
 #: (both `config.get("llm_model") or DEFAULT`). Duplicated rather than
 #: imported: `engine/__init__` pulls LangGraph in transitively, and this
 #: module sits on the launch path of every run. Keep in sync with those two.
 _DEFAULT_LLM_MODEL: Final = "claude-sonnet-4-6"
+
+#: Every provider name this process can possibly register, i.e. the keys
+#: `_provider_key_present` knows how to answer for. Needed by Story 4.6's
+#: `provider_chain` resolution (T9.1), which must be given the set of
+#: AVAILABLE providers — the same intersection `agent_node` performs at
+#: runtime, so the check predicts what the run will actually do.
+#:
+#: Imported, not rebuilt locally: T9.1's whole point is that the pre-flight
+#: and the runtime share ONE rule. A private copy here was identical to
+#: `pricing`'s by luck, and `provider_for_model`'s own docstring already
+#: claimed the two were shared "by construction" while they were not.
+_KNOWN_PROVIDERS: Final[tuple[str, ...]] = KNOWN_PROVIDERS
 
 #: Ceiling on MCP probes running at once. `discover_tools` on a `stdio`
 #: server SPAWNS A SUBPROCESS, so an unbounded `gather` turned a 20-server
@@ -98,15 +103,35 @@ def _label_servers(servers: Sequence[ToolServer]) -> list[str]:
     )
 
 
-def _resolve_provider(model: str) -> str | None:
-    """Resolve ``model`` to its provider name, or ``None`` if it is absent
-    from every known pricing table (T3.6) — the model has no key to check,
-    same posture as Dry Run's ``model_price_unresolved`` (never a reason to
-    fail this check on its own)."""
-    for provider, pricing in _PROVIDER_PRICING:
-        if model in pricing:
-            return provider
-    return None
+#: Resolve a model to the provider that owns it. Aliased, not reimplemented:
+#: `engine/agent_node` calls the same function, which is what makes "the
+#: pre-flight predicts what the runtime does" true by construction (T9.1)
+#: instead of true by coincidence.
+_resolve_provider = provider_for_model
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderScan:
+    """What one pass over the templates found, before it is phrased.
+
+    Six buckets rather than a verdict, because they are not
+    interchangeable: a missing key is fixed in the environment, an
+    incoherent, unreadable or misspelt chain is fixed in the template, and a
+    degraded chain is fixed by nobody — it runs, just without its fallback
+    leg. Collapsing any two of them is how the check came to tell an
+    operator to edit a template whose only problem was an absent API key,
+    and — the other direction — to go configure a key for a provider that
+    does not exist.
+    """
+
+    resolved: dict[str, None]
+    missing: dict[str, None]
+    incoherent: dict[str, None]
+    malformed: dict[str, None]
+    #: Declared provider names outside :data:`_KNOWN_PROVIDERS`. Kept apart
+    #: from :attr:`missing` because no environment can ever satisfy them.
+    unknown: dict[str, None]
+    degraded: set[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +542,152 @@ class MiseEnPlaceService:
             ),
         )
 
+    def _scan_templates(
+        self, templates: Mapping[str, AgentTemplate], *, available: tuple[str, ...]
+    ) -> _ProviderScan:
+        """Classify every template into the buckets the verdict is built from.
+
+        Split out of :meth:`_check_llm_providers` to keep both under the
+        repo's cyclomatic gate (``pyproject.toml`` is explicit that the
+        ceiling is a ratchet: split the function, never raise the number).
+        The separation is also the honest one — this decides WHAT is wrong,
+        the caller decides how to SAY it.
+        """
+        resolved_providers: dict[str, None] = {}
+        missing_providers: dict[str, None] = {}
+        incoherent_models: dict[str, None] = {}
+        malformed_templates: dict[str, None] = {}
+        unknown_providers: dict[str, None] = {}
+        degraded_providers: set[str] = set()
+        for node_id, template in templates.items():
+            config = _config_of(template)
+            # Resolved BEFORE the chain branch because the chain resolution
+            # now depends on it: the router hands index 0 the model verbatim,
+            # so which provider owns the model decides whether a declared
+            # chain is usable at all. Hoisting it is what keeps this check
+            # calling `resolve_provider_chain` with the SAME arguments the
+            # node passes.
+            raw_model = config.get("llm_model")
+            # A template WITHOUT an explicit `llm_model` is not "nothing to
+            # check": `agent_node.execute_agent_node` and `dry_run` both run
+            # it on `_DEFAULT_LLM_MODEL` (`config.get("llm_model") or
+            # DEFAULT`). Skipping it here cleared the gate for the single
+            # most common template shape — a run on Anthropic reported as
+            # "every provider configured" with no Anthropic key at all
+            # (review P2).
+            model = raw_model if isinstance(raw_model, str) and raw_model else _DEFAULT_LLM_MODEL
+            model_provider = _resolve_provider(model)
+            # Story 4.6 T9.1 — a template declaring a `provider_chain` will
+            # run on THAT chain, not on the provider its `llm_model` implies.
+            # Before this story the runtime ignored the chain entirely, so
+            # checking `llm_model` alone was accurate; now it is not. A
+            # template with `provider_chain: ["openai"]` and
+            # `llm_model: "claude-sonnet-4-6"` used to be reported as fine
+            # with only an Anthropic key configured — and then failed at the
+            # first node. A pre-flight check must predict what the runtime
+            # DOES, never what the config LOOKS like (fil rouge of the 4.5
+            # review), which is why this calls the very function the node
+            # calls (`resolve_provider_chain`) rather than re-deriving it.
+            resolution = resolve_provider_chain(
+                config, available=available, model_owner=model_provider
+            )
+            if resolution.malformed:
+                # The column held something this code cannot read (a bare
+                # string, an empty list, a non-string element), so the whole
+                # chain is ignored and the node runs on the process default —
+                # against providers the author did not choose. Same class of
+                # problem as `incoherent`, and reported separately from a
+                # missing key because the remediation is different: fix the
+                # template, not the environment. `resolution.malformed` was
+                # computed and then dropped on the floor here, so a template
+                # carrying `provider_chain: "anthropic"` passed this gate
+                # without a word.
+                malformed_templates.setdefault(node_id, None)
+                continue
+
+            if resolution.configured:
+                # Only the providers the run will ACTUALLY use. Feeding this
+                # from `configured` listed the dropped ones too, so the
+                # success message ("Every resolved LLM provider has a
+                # configured API key: anthropic, openai") named a provider
+                # with no key at all — the check stated the opposite of what
+                # it had just measured.
+                for provider in resolution.chain or ():
+                    resolved_providers.setdefault(provider, None)
+                # `dropped` means "declared but not usable", which lumps two
+                # faults with OPPOSITE remediations into one tuple:
+                # `resolve_provider_chain` cannot tell them apart because it
+                # is given only the AVAILABLE set, and a provider absent from
+                # it is either real-but-keyless or not a provider at all.
+                # Here we do know: everything outside `_KNOWN_PROVIDERS` is a
+                # name this process can never register, whatever the
+                # environment. Reported as a missing key, it produced the one
+                # verdict an operator cannot act on — "Configurer la clé API
+                # mistral manquante", for a setting that does not exist.
+                keyless = tuple(name for name in resolution.dropped if name in _KNOWN_PROVIDERS)
+                for name in resolution.dropped:
+                    if name not in _KNOWN_PROVIDERS:
+                        unknown_providers.setdefault(f"{node_id} ({name})", None)
+                if keyless:
+                    degraded_providers.update(keyless)
+                # FAIL only when NOTHING in the declared chain is usable.
+                #
+                # A partially-available chain is a degradation, not a
+                # failure: the runtime intersects and runs on the providers
+                # that ARE configured, logging the ones it dropped. Failing
+                # there would block a launch that works perfectly well
+                # without its fallback leg — the opposite of NFR12's intent.
+                #
+                # An EMPTY intersection is different in kind: the node falls
+                # back to the process default chain, so the run executes
+                # against a provider the template's author did not choose.
+                # That is the case T9.3 names, and the one this check
+                # previously waved through by only ever looking at
+                # `llm_model`.
+                # `keyless`, not `dropped`: `_resolve_provider` only ever
+                # returns a `_KNOWN_PROVIDERS` name, so the two are the same
+                # test here — the narrower one just says so out loud.
+                if resolution.incoherent and model_provider in keyless:
+                    # The model's own provider IS in the chain — it was just
+                    # dropped for want of a key. Reporting this as "your
+                    # template is incoherent" sent the operator to edit a
+                    # template that is perfectly correct, while the real fix
+                    # (set the API key) went unmentioned. `dropped` held the
+                    # answer and was discarded on this branch.
+                    missing_providers.setdefault(model_provider, None)
+                elif resolution.incoherent:
+                    # Every declared provider is registered, yet NONE of them
+                    # serves `llm_model`. No ordering saves this chain, so the
+                    # node drops it and runs on the process default — against
+                    # a provider the author did not choose. Distinct from a
+                    # missing key, and reported as such.
+                    incoherent_models.setdefault(f"{node_id} ({model})", None)
+                elif resolution.chain is None:
+                    # Only the real ones. A chain emptied purely by misspelt
+                    # names leaves this empty and is carried by
+                    # `unknown_providers` instead.
+                    for provider in keyless:
+                        missing_providers.setdefault(provider, None)
+                continue
+
+            if model_provider is None:
+                # Unresolved model — no pricing-table entry, hence no known
+                # provider to check a key for (mirror Dry Run's
+                # `model_price_unresolved`, never a reason to fail here).
+                continue
+            resolved_providers.setdefault(model_provider, None)
+            if not self._provider_key_present(model_provider):
+                missing_providers.setdefault(model_provider, None)
+
+        return _ProviderScan(
+            resolved=resolved_providers,
+            missing=missing_providers,
+            incoherent=incoherent_models,
+            malformed=malformed_templates,
+            unknown=unknown_providers,
+            degraded=degraded_providers,
+        )
+
     async def _check_llm_providers(self, templates: Mapping[str, AgentTemplate]) -> CheckResult:
         """``llm_providers_configured`` (AC1) — every LLM provider resolved
         from the templates' ``llm_model`` must have an API key configured.
@@ -545,44 +716,78 @@ class MiseEnPlaceService:
                 ),
             )
 
-        models: dict[str, None] = {}
-        for template in templates.values():
-            raw_model = _config_of(template).get("llm_model")
-            # A template WITHOUT an explicit `llm_model` is not "nothing to
-            # check": `agent_node.execute_agent_node` and `dry_run` both run
-            # it on `_DEFAULT_LLM_MODEL` (`config.get("llm_model") or
-            # DEFAULT`). Skipping it here cleared the gate for the single
-            # most common template shape — a run on Anthropic reported as
-            # "every provider configured" with no Anthropic key at all
-            # (review P2).
-            model = raw_model if isinstance(raw_model, str) and raw_model else _DEFAULT_LLM_MODEL
-            models.setdefault(model, None)
+        # Which providers are configured AT ALL in this process — the same
+        # set `app.lifespan._build_llm_router` registers, and therefore the
+        # same set `agent_node._resolve_chain` will intersect a template's
+        # declared chain against at runtime (Story 4.6 T9.1). Computed here
+        # so the check and the runtime answer "which providers can this run
+        # actually use?" with ONE rule instead of two that drift.
+        available = tuple(
+            provider for provider in _KNOWN_PROVIDERS if self._provider_key_present(provider)
+        )
 
-        resolved_providers: dict[str, None] = {}
-        missing_providers: dict[str, None] = {}
-        for model in models:
-            provider = _resolve_provider(model)
-            if provider is None:
-                # Unresolved model — no pricing-table entry, hence no known
-                # provider to check a key for (mirror Dry Run's
-                # `model_price_unresolved`, never a reason to fail here).
-                continue
-            resolved_providers.setdefault(provider, None)
-            if not self._provider_key_present(provider):
-                missing_providers.setdefault(provider, None)
+        scan = self._scan_templates(templates, available=available)
+        resolved_providers = scan.resolved
+        missing_providers = scan.missing
+        incoherent_models = scan.incoherent
+        malformed_templates = scan.malformed
+        unknown_providers = scan.unknown
+        degraded_providers = scan.degraded
 
+        # One verdict carrying EVERY problem found, not the first one. Three
+        # separate `return`s meant an instance with both a missing key and a
+        # broken template showed only one: the operator fixed it, relaunched,
+        # and discovered the next — two round trips for information the check
+        # held all along.
+        problems: list[str] = []
+        actions: list[str] = []
         if missing_providers:
             joined = ", ".join(sorted(missing_providers))
+            problems.append(f"Missing API key for provider(s): {joined}")
+            # Singular is AC2's exact wording (review P15).
+            actions.append(
+                f"Configurer les clés API manquantes : {joined}"
+                if len(missing_providers) > 1
+                else f"Configurer la clé API {joined} manquante"
+            )
+        if incoherent_models:
+            joined = ", ".join(sorted(incoherent_models))
+            # Named by NODE, with the model in parentheses. Listing models
+            # alone was unactionable the moment two templates shared one:
+            # the sentence said "template(s)" and the list held model names.
+            problems.append(
+                f"Node(s) whose provider_chain serves none of their llm_model: {joined}"
+            )
+            actions.append(
+                "Ajouter le provider du modèle à provider_chain, ou choisir un "
+                "llm_model servi par la chaîne déclarée"
+            )
+        if malformed_templates:
+            joined = ", ".join(sorted(malformed_templates))
+            problems.append(f"Node(s) with an unreadable provider_chain: {joined}")
+            actions.append("Corriger provider_chain (liste de chaînes non vide) ou la retirer")
+        if unknown_providers:
+            # FAILS even when the rest of the chain is usable, unlike a
+            # missing key — and the asymmetry is deliberate. An absent key is
+            # a legitimate per-environment state (staging runs without an
+            # OpenAI key on purpose); blocking on it would make staging
+            # unlaunchable, which is why a partially-available chain passes
+            # as `degraded`. A name outside `_KNOWN_PROVIDERS` is a typo in
+            # no environment's interest: the template claims a fallback leg
+            # that has never existed and never will, and the operator
+            # believes they are covered. `force` remains the escape hatch.
+            joined = ", ".join(sorted(unknown_providers))
+            problems.append(f"Node(s) declaring an unknown provider name: {joined}")
+            actions.append(
+                "Corriger provider_chain — providers supportés : "
+                f"{', '.join(sorted(_KNOWN_PROVIDERS))}"
+            )
+        if problems:
             return CheckResult(
                 code="llm_providers_configured",
                 passed=False,
-                detail=f"Missing API key for provider(s): {joined}",
-                # Singular is AC2's exact wording (review P15).
-                suggested_action=(
-                    f"Configurer les clés API manquantes : {joined}"
-                    if len(missing_providers) > 1
-                    else f"Configurer la clé API {joined} manquante"
-                ),
+                detail="; ".join(problems),
+                suggested_action=" / ".join(actions),
             )
         if not resolved_providers:
             # Passing, but say WHY: "every resolved provider has a key" read
@@ -596,14 +801,22 @@ class MiseEnPlaceService:
                     "(no model matched a known pricing table) — nothing to verify."
                 ),
             )
-        return CheckResult(
-            code="llm_providers_configured",
-            passed=True,
-            detail=(
-                f"Every resolved LLM provider has a configured API key: "
-                f"{', '.join(sorted(resolved_providers))}."
-            ),
+        detail = (
+            f"Every resolved LLM provider has a configured API key: "
+            f"{', '.join(sorted(resolved_providers))}."
         )
+        if degraded_providers:
+            # Passing, but not silently: a partially-available chain runs
+            # WITHOUT its fallback leg. That is a degradation the launch
+            # survives (hence `passed=True`, decision T9) — the operator
+            # still deserves to know the run has no second provider to fall
+            # back on, which the previous message actively concealed by
+            # listing the dropped providers as if they were configured.
+            detail += (
+                " Degraded: no API key for "
+                f"{', '.join(sorted(degraded_providers))}, dropped from the declared chain(s)."
+            )
+        return CheckResult(code="llm_providers_configured", passed=True, detail=detail)
 
     def _provider_key_present(self, provider: str) -> bool:
         if provider == "anthropic":

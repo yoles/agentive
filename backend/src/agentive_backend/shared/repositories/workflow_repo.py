@@ -6,13 +6,15 @@ ALL DB access must go through these classes — features must never import
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, Numeric, case, cast, func, literal, select, update
+from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from agentive_backend.infra.db.models import Workflow, WorkflowRun
 from agentive_backend.shared.repositories.base import BaseRepo
@@ -248,6 +250,9 @@ class WorkflowRunRepo(BaseRepo):
         ended_at: datetime | None = None,
         metrics: dict[str, Any] | None = None,
         only_if_status: str | None = None,
+        only_if_control_signal: str | None = None,
+        clear_control: bool = False,
+        touch_last_checkpoint: bool = False,
         tenant_id: UUID | None = None,
     ) -> int:
         """Update an existing run. Returns the number of rows updated.
@@ -265,21 +270,226 @@ class WorkflowRunRepo(BaseRepo):
         rowcount as "someone else already finished this run" — and in
         particular do NOT publish a lifecycle event for a transition that
         never happened.
+
+        ``clear_control`` (Story 4.6 T1.6) nulls ``control_signal`` and
+        ``control_requested_at`` in the SAME statement as the transition, so
+        "the run is now paused" and "the pause request has been consumed"
+        commit together or not at all. Split across two statements, a crash
+        in between would leave a ``paused`` run still carrying a ``"pause"``
+        signal — which its next resume would observe and act on, pausing it
+        again before a single node ran.
+
+        ``only_if_status`` deliberately stays a single value rather than a
+        tuple: every caller in Story 4.6 transitions from exactly one known
+        status, and widening the guard would weaken the compare-and-set for
+        the callers that do not need it.
+
+        ``only_if_control_signal`` extends the compare-and-set to the SIGNAL
+        (review lot 9, F2). ``only_if_status`` alone is not enough for the
+        driver's settle write, because the status it guards on does not
+        change during the window it needs to protect: see
+        :meth:`update_status_in_session`.
+
+        ``touch_last_checkpoint`` stamps ``last_checkpoint_at = now()`` in the
+        same statement. Required on any transition BACK to ``running``: see
+        :meth:`update_status_in_session`.
+
+        Convenience wrapper — self-managed transaction. Use
+        :meth:`update_status_in_session` from inside an existing transaction
+        when the write must commit with something else (an outbox event).
         """
         async with self.with_tenant(tenant_id) as session:
-            values: dict[str, Any] = {"status": status}
-            if ended_at is not None:
-                values["ended_at"] = ended_at
-            if metrics is not None:
-                values["metrics"] = metrics
-            stmt = update(WorkflowRun).where(WorkflowRun.id == run_id).values(**values)
-            if only_if_status is not None:
-                stmt = stmt.where(WorkflowRun.status == only_if_status)
+            return await self.update_status_in_session(
+                session,
+                run_id,
+                status=status,
+                ended_at=ended_at,
+                metrics=metrics,
+                only_if_status=only_if_status,
+                only_if_control_signal=only_if_control_signal,
+                clear_control=clear_control,
+                touch_last_checkpoint=touch_last_checkpoint,
+            )
+
+    async def update_status_in_session(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        *,
+        status: str,
+        ended_at: datetime | None = None,
+        metrics: dict[str, Any] | None = None,
+        only_if_status: str | None = None,
+        only_if_control_signal: str | None = None,
+        clear_control: bool = False,
+        touch_last_checkpoint: bool = False,
+    ) -> int:
+        """UPDATE inside the caller's transaction — caller owns commit.
+
+        Mirror of :meth:`WorkflowRepo.create_in_session`. Story 4.6 AC1
+        requires the control event and the status write to "commit together
+        or not at all"; that is only true if the publish joins THIS session,
+        which the self-managed wrapper above cannot offer (it commits on
+        exit, before the caller's publish has even run).
+
+        ``touch_last_checkpoint`` exists for the ``paused → running``
+        transition. ``claim_stale_running`` decides staleness from
+        ``COALESCE(last_checkpoint_at, started_at)``, so a run resumed after
+        sitting paused longer than the recovery worker's stale threshold
+        (``recovery.derive_stale_threshold_s``) would be
+        claimed by the recovery sweep within one tick and driven a SECOND
+        time, concurrently, on the same ``thread_id`` — duplicate billed LLM
+        calls and interleaved checkpoint writes. Stamping the resume as
+        activity is what keeps the sweep off a run that just came back.
+
+        ``only_if_control_signal`` makes the write conditional on the signal
+        still being the one the caller READ. It exists for exactly one
+        caller, ``WorkflowExecutionService._observe_control``, and for
+        exactly one race (review lot 9, F2):
+
+        1. the driver reads ``control_signal = "pause"``;
+        2. an operator escalates — ``POST /cancel`` passes
+           :meth:`request_control_in_session`'s guard, because the status is
+           still ``running`` and ``cancel`` is allowed to override a pending
+           ``pause`` — and is answered **202**;
+        3. the driver's settle write lands: ``status = 'paused'`` with
+           ``clear_control=True``, which ERASES that cancel.
+
+        The run then sits ``paused`` with no pending signal, so there is
+        nothing left for anyone to observe: the caller was promised a
+        cancellation that will never happen and no ``cancelled`` event will
+        ever follow the ``cancel_requested`` already on the bus. Guarding on
+        ``status`` cannot catch it — the status is ``running`` throughout the
+        window and only the SIGNAL changed. Note that this race did not
+        exist before ``Transition.overrides`` (review `BS1`) allowed a
+        ``cancel`` to replace a pending ``pause``; letting the escalation
+        through without the symmetric guard on the settle side is what
+        opened it.
+        """
+        values: dict[str, Any] = {"status": status}
+        if ended_at is not None:
+            values["ended_at"] = ended_at
+        if metrics is not None:
+            values["metrics"] = metrics
+        if clear_control:
+            values["control_signal"] = None
+            values["control_requested_at"] = None
+        if touch_last_checkpoint:
+            values["last_checkpoint_at"] = func.now()
+        stmt = update(WorkflowRun).where(WorkflowRun.id == run_id).values(**values)
+        if only_if_status is not None:
+            stmt = stmt.where(WorkflowRun.status == only_if_status)
+        if only_if_control_signal is not None:
+            stmt = stmt.where(WorkflowRun.control_signal == only_if_control_signal)
+        result = await session.execute(stmt)
+        # ``rowcount`` is exposed by SQLAlchemy CursorResult (DML executions)
+        # but the static type is Result[Any]; getattr keeps mypy strict happy.
+        rowcount = getattr(result, "rowcount", None)
+        return int(rowcount or 0)
+
+    async def request_control(
+        self,
+        run_id: UUID,
+        *,
+        signal: str,
+        only_if_status: str = "running",
+        overrides: Sequence[str] = (),
+        tenant_id: UUID | None = None,
+    ) -> int:
+        """Record a PENDING pause/cancel request (Story 4.6 T1.3, AC1).
+
+        Compare-and-set on two conditions, and the second one is the
+        interesting one:
+
+        * ``status = only_if_status`` — the usual guard; a run that finished
+          between the caller's read and this write must not gain a signal
+          nobody will ever observe.
+        * ``control_signal IS NULL`` — a run that ALREADY carries a pending
+          request refuses a second one (rowcount 0, which the service turns
+          into a 409). Without it, a ``cancel`` would silently overwrite a
+          ``pause`` that the driver had not yet reached: the caller who asked
+          to pause would get a cancelled run and no indication that their
+          request had been dropped. Whoever asks first wins, and the loser is
+          told.
+
+        Returns the rowcount — 0 means "not applied", for any of those
+        reasons or RLS, exactly like :meth:`update_status`.
+
+        Convenience wrapper — self-managed transaction. Use
+        :meth:`request_control_in_session` when the write must commit with
+        its audit event (Story 4.6 AC1).
+        """
+        async with self.with_tenant(tenant_id) as session:
+            return await self.request_control_in_session(
+                session,
+                run_id,
+                signal=signal,
+                only_if_status=only_if_status,
+                overrides=overrides,
+            )
+
+    async def request_control_in_session(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        *,
+        signal: str,
+        only_if_status: str = "running",
+        overrides: Sequence[str] = (),
+    ) -> int:
+        """Record a pending request inside the caller's transaction.
+
+        See :meth:`update_status_in_session` for why Story 4.6 AC1 needs
+        this shape rather than the self-managed wrapper.
+
+        ``overrides`` lists the pending signals this write may REPLACE, on top
+        of the default "no signal pending". The domain owns which ones (see
+        ``domain.run_control.Transition.overrides``); the repo only applies
+        them. Empty keeps the strict first-writer-wins guard.
+        """
+        pending_ok: ColumnElement[bool] = WorkflowRun.control_signal.is_(None)
+        if overrides:
+            pending_ok = or_(pending_ok, WorkflowRun.control_signal.in_(tuple(overrides)))
+        stmt = (
+            update(WorkflowRun)
+            .where(
+                WorkflowRun.id == run_id,
+                WorkflowRun.status == only_if_status,
+                pending_ok,
+            )
+            .values(control_signal=signal, control_requested_at=func.now())
+        )
+        result = await session.execute(stmt)
+        rowcount = getattr(result, "rowcount", None)
+        return int(rowcount or 0)
+
+    # There is deliberately NO standalone `clear_control()`. Every path that
+    # consumes or invalidates a signal also changes the status, so each one
+    # uses `update_status(..., clear_control=True)` and gets the two writes in
+    # ONE statement. A separate unconditional `UPDATE ... WHERE id = :id`
+    # would have no status guard and no signal guard, so a caller "cleaning
+    # up" a signal it had just consumed would also erase one written
+    # microseconds earlier by a concurrent request — answering that caller
+    # 202 for a cancellation that then never happens.
+
+    async def get_control_signal(
+        self, run_id: UUID, *, tenant_id: UUID | None = None
+    ) -> str | None:
+        """Read just ``control_signal`` (Story 4.6 T1.5).
+
+        A targeted ``SELECT`` of one column, NOT ``get_by_id``: the driver
+        calls this once per superstep, and the rest of the row — including
+        the ``checkpoint`` JSONB, which holds every node's output preview —
+        is not needed to answer "should I stop?".
+
+        ``None`` covers both "no request pending" and "no such run"; the
+        driver treats them identically (keep running), so distinguishing them
+        would buy nothing.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = select(WorkflowRun.control_signal).where(WorkflowRun.id == run_id)
             result = await session.execute(stmt)
-            # ``rowcount`` is exposed by SQLAlchemy CursorResult (DML executions)
-            # but the static type is Result[Any]; getattr keeps mypy strict happy.
-            rowcount = getattr(result, "rowcount", None)
-            return int(rowcount or 0)
+            return result.scalar_one_or_none()
 
     async def update_checkpoint(
         self,

@@ -53,6 +53,7 @@ def _template(
     namespace: str | None = None,
     archetype: str = "producteur",
     optin: bool | None = None,
+    provider_chain: list[str] | None = None,
 ) -> SimpleNamespace:
     """`archetype`/`optin` mirror the runtime Push Memory gate: only a
     Contrôleur needs `optin=True` for its namespace to be live (Story 3.5
@@ -61,6 +62,8 @@ def _template(
     config: dict[str, Any] = {}
     if llm_model is not None:
         config["llm_model"] = llm_model
+    if provider_chain is not None:
+        config["provider_chain"] = provider_chain
     if namespace is not None:
         push_memory: dict[str, Any] = {"namespace": namespace}
         if optin is not None:
@@ -602,6 +605,266 @@ async def test_check_llm_providers_ignores_model_absent_from_every_pricing_table
     )
     check = next(c for c in report.checks if c.code == "llm_providers_configured")
     assert check.passed is True
+
+
+# ─── Story 4.6 T9.3 — the check must predict the CHAIN, not just the model ───
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_is_wholly_unavailable_should_fail() -> None:
+    """The non-regression this story owes 4.5's fil rouge.
+
+    Before Story 4.6 the runtime ignored `provider_chain` entirely, so
+    checking `llm_model` alone was accurate. Now a template declaring
+    `provider_chain: ["openai"]` runs on OpenAI whatever its `llm_model`
+    says — and this exact shape used to PASS with only an Anthropic key,
+    because the check looked at `claude-sonnet-4-6` and saw Anthropic.
+    """
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=False)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["openai"]),
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "openai" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_is_partly_available_should_pass() -> None:
+    """A partially available chain is a DEGRADATION, not a failure: the
+    runtime intersects and runs on the providers that are configured. Failing
+    here would block a launch that works fine without its fallback leg —
+    the opposite of what NFR12's chain is for."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=False)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["anthropic", "openai"]),
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is True
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_is_malformed_should_name_the_node() -> None:
+    """A `provider_chain` the resolver cannot read (a bare string, an empty
+    list, a non-string element) is ignored WHOLE, so the node runs on the
+    process default chain — against providers its author never chose. That is
+    the same class of problem as an incoherent chain, and it used to pass this
+    gate without a word: `resolution.malformed` was computed and discarded.
+
+    Reported by NODE id, because that is what the operator has to go and
+    edit."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={"a": _template(llm_model="claude-sonnet-4-6", provider_chain=[])},
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "unreadable provider_chain: a" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_serves_no_model_should_fail() -> None:
+    """Both keys present, every declared provider registered — and the launch
+    is still refused, because none of them serves the template's `llm_model`.
+
+    The router hands index 0 the model verbatim, so this run would send
+    `claude-sonnet-4-6` to OpenAI: a fatal 400 at the first node, with no
+    fallback and no retry. The runtime drops the chain, but that does not
+    rescue it (the process default has the same gap) — this check is what
+    stops the launch."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={"a": _template(llm_model="claude-sonnet-4-6", provider_chain=["openai"])},
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "claude-sonnet-4-6" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_only_needs_reordering_should_pass() -> None:
+    """The same shape, but with the model's own provider present in the
+    chain: the runtime rotates it to the head and runs normally, so the
+    pre-flight must NOT refuse it. A check that predicts what the runtime
+    does has to predict the rotation too."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["openai", "anthropic"])
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is True
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_chain_is_partly_available_should_not_claim_a_missing_key() -> (
+    None
+):
+    """The check passes — a degraded chain still runs (decision T9) — but the
+    message must not name a provider that has no key.
+
+    It did: `resolved_providers` was fed from `resolution.configured` (every
+    DECLARED provider) instead of `resolution.chain` (the ones the run will
+    actually use), so the success line read "Every resolved LLM provider has
+    a configured API key: anthropic, openai" with no OpenAI key anywhere. The
+    check stated the opposite of what it had just measured."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=False)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["anthropic", "openai"])
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is True
+    configured_part, _, degraded_part = check.detail.partition("Degraded:")
+    assert "openai" not in configured_part
+    # …and the degradation is stated rather than concealed.
+    assert "openai" in degraded_part
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_the_models_provider_lacks_a_key_should_say_so() -> None:
+    """`anthropic` IS in the declared chain — it was dropped for want of a
+    key. Reporting that as "your provider_chain serves none of your llm_model"
+    sent the operator to edit a template that is perfectly correct, while the
+    real fix (set ANTHROPIC_API_KEY) went unmentioned. `resolution.dropped`
+    held the answer and this branch discarded it."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=False, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["anthropic", "openai"])
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "Missing API key" in check.detail
+    assert "anthropic" in check.detail
+    assert "serves none" not in check.detail
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_several_things_are_wrong_should_report_them_all() -> None:
+    """Three separate `return`s meant the first problem hid the rest: the
+    operator fixed it, relaunched, and discovered the next — two round trips
+    for information the check held all along."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=False)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "broken": _template(llm_model="claude-sonnet-4-6", provider_chain=[]),
+            "nokey": _template(llm_model="gpt-5"),
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "Missing API key" in check.detail and "openai" in check.detail
+    assert "unreadable provider_chain: broken" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_a_declared_provider_does_not_exist_should_say_so() -> None:
+    """Story 4.6, review lot 6 (P-O) — the one verdict an operator cannot
+    act on.
+
+    `resolve_provider_chain` is handed only the AVAILABLE set, so a name
+    absent from it is indistinguishable, THERE, between "real provider, no
+    key" and "not a provider at all". Both landed in `dropped`, and this
+    check turned the whole tuple into "Missing API key for provider(s):
+    mistral" — sending the operator to configure `MISTRAL_API_KEY`, a
+    setting that does not exist and never will."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={"a": _template(llm_model="claude-sonnet-4-6", provider_chain=["mistral"])},
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "unknown provider name: a (mistral)" in check.detail
+    # The remediation the operator must NOT be given.
+    assert "Missing API key" not in check.detail
+    assert check.suggested_action is not None
+    assert "anthropic, openai" in check.suggested_action
+
+
+@pytest.mark.asyncio
+async def test_check_llm_providers_when_an_unknown_name_sits_beside_a_usable_one() -> None:
+    """Deliberately blocking, unlike the missing-key case beside it.
+
+    An absent key is a legitimate per-environment state — staging runs
+    without an OpenAI key on purpose — so a partially-available chain passes
+    as `degraded`. A name outside `KNOWN_PROVIDERS` is in no environment's
+    interest: the template claims a fallback leg that has never existed, and
+    the operator believes they are covered."""
+    service, *_ = _make_service(
+        settings=_settings(anthropic_api_key_present=True, openai_api_key_present=True)
+    )
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={
+            "a": _template(llm_model="claude-sonnet-4-6", provider_chain=["anthropic", "mistrl"])
+        },
+        task_input={},
+        tenant_id=None,
+    )
+    check = next(c for c in report.checks if c.code == "llm_providers_configured")
+    assert check.passed is False
+    assert "unknown provider name: a (mistrl)" in check.detail
+    # And it is never described as a missing key, in either verdict half.
+    # Matched against the message the code ACTUALLY builds — "Missing API key
+    # for provider(s): …" — not against a paraphrase. The first version of
+    # this line looked for "API key for mistrl", a substring that string can
+    # never contain whatever the code does, so it held before the fix as
+    # readily as after (review lot 10, T2).
+    assert "mistrl" not in check.detail.split("unknown provider name")[0]
+    assert "Missing API key" not in check.detail
 
 
 # ─── mock-provider mode (review IG1) ─────────────────────────────────────

@@ -13,6 +13,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 - [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) — Hook pré-workflow (4 checks, blocage/bypass `force`) (Story 4.5)
 - [`observability.md`](./observability.md) — Guide pratique observabilité : logs JSON, RFC 7807, correlation_id, redaction (Story 1.9)
 - [`repositories-usage.md`](./repositories-usage.md) — Utilisation Repository Pattern + RLS (Story 1.5)
+- [`run-control-et-fallback.md`](./run-control-et-fallback.md) — Pause/resume/cancel d'un run, `provider_chain` per-agent, retry `error_policy` (Story 4.6)
 
 ## À implémenter (progressivement)
 

@@ -150,6 +150,43 @@ class StartRunRequest(BaseModel):
         return self
 
 
+class ResumeRunRequest(BaseModel):
+    """Optional body of ``POST /api/v1/workflows/runs/{run_id}/resume``.
+
+    Story 4.6 review, `IG2` — a resume re-runs the Mise en Place pre-flight,
+    so it needs the same bypass vector as a launch. An environment can decay
+    while a run sits paused (a rotated API key, a decommissioned MCP server,
+    an exhausted budget), and an ungated resume walked straight into it: the
+    row moved to ``running``, the first node raised, and the run ended
+    ``error`` with its checkpoint gone — a run that was still recoverable a
+    second earlier. Refusing keeps it ``paused``, hence resumable once the
+    environment is fixed.
+
+    ``pause`` and ``cancel`` deliberately take NO body: neither resumes
+    execution, so neither can walk into a broken environment.
+
+    Same coupling as :class:`StartRunRequest`, deliberately duplicated rather
+    than shared by inheritance — the two bodies have nothing else in common,
+    and a common base would invite ``input`` onto this route.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    force: bool = False
+    reason: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _reason_requires_force(self) -> ResumeRunRequest:
+        """Mirror of :meth:`StartRunRequest._reason_requires_force`, both
+        directions: a bypass with no stated reason defeats the audit trail
+        (NFR8), and a reason without a bypass would be silently discarded."""
+        if self.force and not (self.reason or "").strip():
+            raise ValueError("reason is required when force=true")
+        if not self.force and (self.reason or "").strip():
+            raise ValueError("reason is only meaningful with force=true")
+        return self
+
+
 class MiseEnPlaceCheckOut(BaseModel):
     """One of the four pre-workflow checks (Story 4.5 AC1), as returned/persisted.
 
@@ -245,6 +282,35 @@ class RoutingStatsResponse(BaseModel):
     deterministic: int = Field(ge=0)
     llm_escalated: int = Field(ge=0)
     deterministic_pct: float | None = None
+
+
+class RunControlResponse(BaseModel):
+    """Response of ``POST /workflows/runs/{run_id}/{pause,resume,cancel}``
+    (Story 4.6 AC1).
+
+    Both fields are needed because a ``202`` says the request was RECORDED,
+    not applied: after a ``pause`` the run still reads ``status="running"``
+    with ``control_signal="pause"``, and only reaches ``paused`` once the
+    driver hits its next superstep boundary. Returning the status alone would
+    look, to a client, exactly like the call having done nothing.
+
+    ``pause`` and ``cancel`` take no request body: a ``reason``/``actor``
+    audit field would be a natural extension but no AC asks for one (unlike
+    Story 4.5's ``force``+``reason``, which the epic demanded explicitly), so
+    adding it there would be scope creep. ``resume`` is the exception — it
+    accepts :class:`ResumeRunRequest`, because the review (``IG2``) made it
+    re-run the Mise en Place pre-flight and a gate needs its bypass. This
+    docstring claimed all three were bodiless until review lot 11.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    status: Literal["running", "paused", "completed", "error", "cancelled"]
+    #: The PENDING request, if the effect is deferred. ``None`` once the
+    #: transition has actually been applied (``resume``, and ``cancel`` on an
+    #: already-paused run).
+    control_signal: Literal["pause", "cancel"] | None = None
 
 
 class DryRunRequest(BaseModel):
@@ -390,7 +456,9 @@ __all__ = [
     "MiseEnPlaceCheckOut",
     "MiseEnPlaceReportOut",
     "ProviderTokenEstimate",
+    "ResumeRunRequest",
     "RoutingStatsResponse",
+    "RunControlResponse",
     "StartRunRequest",
     "StartRunResponse",
     "WorkflowEdgeRequest",

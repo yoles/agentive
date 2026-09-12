@@ -29,7 +29,10 @@ from agentive_backend.features.workflow_engine.mise_en_place import (
     MiseEnPlaceService,
     MiseEnPlaceSettings,
 )
-from agentive_backend.features.workflow_engine.recovery import WorkflowRecoveryWorker
+from agentive_backend.features.workflow_engine.recovery import (
+    WorkflowRecoveryWorker,
+    derive_stale_threshold_s,
+)
 from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
@@ -62,6 +65,7 @@ from agentive_backend.infra.llm.voyage_adapter import (
 )
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.events import (
+    LLMFallbackTriggeredEvent,
     SystemShutdownEvent,
     SystemStartedEvent,
 )
@@ -517,18 +521,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             token = _correlation_id_var.set(str(cid))
             try:
                 async with session_factory() as session:
+                    # Story 4.6 T4.3 — the SAME event name and the SAME
+                    # payload shape Story 1.6 has published since day one,
+                    # now carried by a Pydantic contract instead of an
+                    # anonymous dict. Consumers (the `llm-usage` runbook, the
+                    # 1.6 test suite) know this event by that exact shape;
+                    # the typing validates it at the publish site, it does
+                    # not redefine it.
                     await publish_and_commit(
                         session,
-                        "workflow_engine.llm.fallback_triggered",
-                        {
-                            "failed_provider": ctx.failed_provider,
-                            "next_provider": ctx.next_provider,
-                            "error_class": ctx.error_class,
-                            "error_type": ctx.error_type,
-                            "model_attempted": ctx.model_attempted,
-                            "model_fallback": ctx.model_fallback,
-                            "correlation_id": str(cid),
-                        },
+                        LLMFallbackTriggeredEvent.event_type,
+                        LLMFallbackTriggeredEvent(
+                            failed_provider=ctx.failed_provider,
+                            next_provider=ctx.next_provider,
+                            error_class=ctx.error_class,
+                            error_type=ctx.error_type,
+                            model_attempted=ctx.model_attempted,
+                            model_fallback=ctx.model_fallback,
+                            correlation_id=str(cid),
+                        ).model_dump(mode="json"),
                     )
             finally:
                 _correlation_id_var.reset(token)
@@ -708,6 +719,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     workflow_recovery_worker = WorkflowRecoveryWorker(
         workflow_execution_service=workflow_execution_service,
         session_factory=session_factory,
+        # Story 4.6, review lot 7 (P-P) — derived from THIS deployment's
+        # retry and escalation settings, not from the module default.
+        #
+        # `recovery.py` used to instruct, in a comment, that "a deployment
+        # that raises those delays must raise `stale_threshold_s=` with
+        # them". This was the only construction site in `src/` and it passed
+        # no such argument, so the instruction was unfollowable — and
+        # `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`, which had no ceiling at
+        # all, made it consequential: past ~130s the sweep's window no
+        # longer covered the node it described, so healthy nodes were
+        # claimed and re-executed in parallel on the same `thread_id`.
+        # Deriving here is what makes the invariant true by construction —
+        # `settings` lives in this layer, so the numbers reach the formula
+        # without `recovery` importing config.
+        stale_threshold_s=derive_stale_threshold_s(
+            base_delay_s=settings.workflow_retry_base_delay_s,
+            max_delay_s=settings.workflow_retry_max_delay_s,
+            escalation_timeout_s=settings.routing_escalation_timeout_s,
+        ),
     )
     try:
         await workflow_recovery_worker.start()

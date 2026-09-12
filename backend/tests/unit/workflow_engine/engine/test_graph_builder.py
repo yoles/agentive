@@ -434,6 +434,11 @@ async def test_failed_escalation_preserves_the_node_update_on_the_exception() ->
                 escalation_timeout_s=15.0,
                 escalation_max_tokens=256,
             ),
+            # Story 4.6 T11.3 — threaded down like `routing_settings`.
+            # `None` means "use `agent_node.DEFAULT_RETRY_SETTINGS`", which
+            # is what this test wants: it patches `execute_agent_node` away
+            # entirely, so no retry loop ever runs.
+            retry_settings=None,
         )
 
         with pytest.raises(RoutingDecisionFailedError) as exc_info:

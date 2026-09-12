@@ -86,4 +86,41 @@ OPENAI_MODEL_PRICING: Final[ModelPricing] = MappingProxyType(
     }
 )
 
-__all__ = ["ANTHROPIC_MODEL_PRICING", "OPENAI_MODEL_PRICING", "ModelPricing"]
+_PROVIDER_PRICING: Final[tuple[tuple[str, ModelPricing], ...]] = (
+    ("anthropic", ANTHROPIC_MODEL_PRICING),
+    ("openai", OPENAI_MODEL_PRICING),
+)
+
+
+#: Every provider name these tables describe. The Mise en Place pre-flight
+#: uses it as the universe of providers it can answer "is a key configured?"
+#: for; exposed here so that set and :func:`provider_for_model` can never
+#: disagree about which providers exist.
+KNOWN_PROVIDERS: Final[tuple[str, ...]] = tuple(name for name, _pricing in _PROVIDER_PRICING)
+
+
+def provider_for_model(model: str) -> str | None:
+    """The provider that OWNS ``model``, or ``None`` if no table knows it.
+
+    Lives here because this is the layer that holds the tables, and because
+    two features need the exact same answer: the Mise en Place pre-flight
+    check and ``engine/agent_node``'s chain resolution. A pre-flight check
+    must predict what the runtime DOES, and that is only true by construction
+    when both read the same function.
+
+    ``None`` is not a failure — an unknown model simply cannot be reasoned
+    about, and no caller may fail a run on that alone.
+    """
+    for provider, pricing in _PROVIDER_PRICING:
+        if model in pricing:
+            return provider
+    return None
+
+
+__all__ = [
+    "ANTHROPIC_MODEL_PRICING",
+    "KNOWN_PROVIDERS",
+    "OPENAI_MODEL_PRICING",
+    "ModelPricing",
+    "provider_for_model",
+]

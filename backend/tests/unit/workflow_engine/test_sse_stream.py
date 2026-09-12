@@ -38,8 +38,14 @@ def _run(
     status: str = "running",
     checkpoint: dict[str, Any] | None = None,
     run_id: UUID | None = None,
+    control_signal: str | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(id=run_id or uuid4(), status=status, checkpoint=checkpoint)
+    return SimpleNamespace(
+        id=run_id or uuid4(),
+        status=status,
+        checkpoint=checkpoint,
+        control_signal=control_signal,
+    )
 
 
 def _event(run_id: UUID, action: str, **payload: Any) -> Event:
@@ -200,6 +206,75 @@ async def test_stream_closes_on_repoll_when_the_terminal_event_never_arrives(
     assert [f["event"] for f in frames] == ["state", "state"]
     assert '"status": "completed"' in frames[-1]["data"]
     assert '"reason": "status_repoll"' in frames[-1]["data"]
+
+
+@pytest.mark.asyncio
+async def test_stream_reports_a_pause_whose_event_was_dropped(
+    monkeypatch: pytest.MonkeyPatch, captured_handler: dict[str, Any]
+) -> None:
+    """Story 4.6, review lot 6 (P-K) — the worst case the terminal-only
+    re-poll left open.
+
+    `paused` is deliberately NOT terminal (the stream must survive a
+    resume), and a paused run emits nothing further, so the queue never
+    wakes the loop again. With the re-poll looking only for terminality, a
+    dropped `paused` event — `put_nowait` drops by design under a slow
+    consumer — left the client staring at "running" on a silent stream for
+    the full hour."""
+    monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
+    # Bounded deadline, and it is not decoration (review lot 10, T1). Without
+    # it a regression yields NO second frame, so `_drain(limit=2)` never
+    # reaches its limit and the generator loops until `_MAX_STREAM_DURATION_S`
+    # — 3600 s. There is no `pytest-timeout` in `addopts`, so the result is a
+    # one-hour CI stall with no diagnostic, not a failure. With it, the
+    # regression closes on a `stream_timeout` frame and the assertion below
+    # fails in under a second, saying exactly what went wrong.
+    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.5)
+    running = _run()
+    paused = _run(status="paused", run_id=running.id, checkpoint={"last_node_id": "b"})
+
+    frames = await _drain(_stream_run_events(running, _repo(running, paused)), limit=2)
+
+    assert '"status": "paused"' in frames[-1]["data"]
+    assert '"reason": "status_repoll"' in frames[-1]["data"]
+
+
+@pytest.mark.asyncio
+async def test_stream_reports_a_pending_control_signal_whose_event_was_dropped(
+    monkeypatch: pytest.MonkeyPatch, captured_handler: dict[str, Any]
+) -> None:
+    """A pause REQUEST changes `control_signal` and nothing else — the row
+    still says `running`. Reconciling on `status` alone would have missed
+    it, which is precisely the window T5.5 exists to make visible."""
+    monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.5)  # cf T1 above
+    running = _run()
+    requested = _run(run_id=running.id, control_signal="pause")
+
+    frames = await _drain(_stream_run_events(running, _repo(running, requested)), limit=2)
+
+    assert '"control_signal": "pause"' in frames[-1]["data"]
+    assert '"reason": "status_repoll"' in frames[-1]["data"]
+
+
+@pytest.mark.asyncio
+async def test_repoll_does_not_repeat_a_state_frame_that_has_not_changed(
+    monkeypatch: pytest.MonkeyPatch, captured_handler: dict[str, Any]
+) -> None:
+    """Reconciling on CHANGE, not on every tick: an idle run polled twice a
+    second must not turn the stream into a state-frame firehose."""
+    monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.08)
+    run = _run()
+
+    frames = await _drain(_stream_run_events(run, _repo(run)))
+
+    # The opening frame and the deadline's closing frame — nothing in between.
+    assert [f["event"] for f in frames] == ["state", "state"]
+    assert '"reason": "stream_timeout"' in frames[-1]["data"]
 
 
 # ─── #16 — wall-clock deadline, and a definitive last frame ────────────

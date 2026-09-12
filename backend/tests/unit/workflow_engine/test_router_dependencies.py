@@ -160,6 +160,70 @@ def test_dry_run_route_does_not_collide_with_run_events_route() -> None:
     assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") is None
 
 
+# ─── Story 4.6 T5.6 — run-control route-collision lock ───────────────────
+
+
+def test_run_control_routes_resolve_to_their_own_endpoints() -> None:
+    """The three control routes share the 4-segment
+    `/workflows/runs/{run_id}/...` space with the SSE `events` route, each
+    behind its own distinct literal last segment. They must never capture
+    one another, nor the stream."""
+    run_id = "0199d0a1-5555-7000-8000-000000000000"
+
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/pause") == (
+        "pause_workflow_run"
+    )
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/resume") == (
+        "resume_workflow_run"
+    )
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/cancel") == (
+        "cancel_workflow_run"
+    )
+    # The stream is GET-only and sits at the same depth — it must not answer
+    # a POST, and none of the control routes may answer a GET.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") is None
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/pause") is None
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/cancel") is None
+
+
+def test_run_control_routes_do_not_collide_with_the_three_segment_routes() -> None:
+    """`dry-run` and `runs` live one segment shallower under
+    `{workflow_id}`. A workflow literally named `runs` must not let them
+    swallow a control route."""
+    workflow_id = "0199d0a1-6666-7000-8000-000000000000"
+
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/runs") == (
+        "start_workflow_run"
+    )
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/dry-run") == (
+        "dry_run_workflow"
+    )
+    # A workflow literally named `pause` still reaches its own `runs` route:
+    # the control routes are one segment deeper, so they cannot capture it.
+    assert _resolve_post_endpoint_name("/api/v1/workflows/pause/runs") == "start_workflow_run"
+    # And the mirror direction: nothing answers a 3-segment path ending in a
+    # control verb, so `POST /workflows/{workflow_id}/pause` is NOT a route
+    # this feature accidentally exposes.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/pause") is None
+
+
+def test_sse_terminal_statuses_when_read_should_come_from_the_domain() -> None:
+    """T5.4 — one definition, not two. A cancelled run must close its SSE
+    stream instead of leaving clients hanging for an hour; a paused one must
+    NOT, since it can still resume."""
+    from agentive_backend.features.workflow_engine.domain.run_control import TERMINAL_STATUSES
+    from agentive_backend.features.workflow_engine.router import (
+        _TERMINAL_EVENT_SUFFIXES,
+        _TERMINAL_STATUSES,
+    )
+
+    assert _TERMINAL_STATUSES is TERMINAL_STATUSES
+    assert "cancelled" in _TERMINAL_STATUSES
+    assert "paused" not in _TERMINAL_STATUSES
+    assert "cancelled" in _TERMINAL_EVENT_SUFFIXES
+    assert "paused" not in _TERMINAL_EVENT_SUFFIXES
+
+
 def test_missing_session_factory_raises_503() -> None:
     with pytest.raises(DependencyError) as exc:
         _build_workflow_service(_request())

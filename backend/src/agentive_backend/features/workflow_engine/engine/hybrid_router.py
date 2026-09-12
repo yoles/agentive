@@ -321,6 +321,18 @@ async def _escalate(
     # cases invisible to monitoring (review IG2). Instrumentation lives here
     # rather than in the service (T8.4's usual placement) for the one reason
     # that matters: this is the only scope that knows WHY it failed.
+    # NO `provider_chain=` here, and that is deliberate (Story 4.6 T7.4 —
+    # not an oversight to "complete"). Story 4.6 gave `execute_agent_node`
+    # the per-agent chain from `agent_templates.config["provider_chain"]`,
+    # which is right: that call runs the AGENT's work under the agent
+    # author's contract. This call does not — it runs the ROUTER's own
+    # escalation on `routing_settings.escalation_model`, a process-wide knob
+    # (`AGENTIVE_ROUTING_ESCALATION_MODEL`) with no agent behind it. Handing
+    # it some node's chain would route a shared infrastructure call through
+    # one template's provider preference. The process default chain is the
+    # correct scope. Same reasoning for `error_policy`: escalation failure
+    # already degrades deterministically (`RoutingEscalationError`), and a
+    # per-agent retry budget has no meaning for a shared call.
     try:
         completion = await llm_router.complete(
             [ChatMessage(role="user", content=user)],

@@ -14,12 +14,29 @@
   aggregated in SQL over every run of the workflow (Story 4.3 AC3).
 * ``GET /workflows/runs/{run_id}/events`` — SSE stream of a run's state
   transitions (Story 4.2 AC1).
+* ``POST /workflows/runs/{run_id}/pause`` — ask a live run to suspend at its
+  next superstep boundary (Story 4.6 AC1).
+* ``POST /workflows/runs/{run_id}/resume`` — restart a paused run from its
+  last checkpoint (Story 4.6 AC1).
+* ``POST /workflows/runs/{run_id}/cancel`` — stop a run for good (Story 4.6
+  AC1).
 
 Declaration order matters: ``routing-stats``/``dry-run`` are declared BEFORE
 the run-events route under the same prefix. None of the three overlap (3
 path segments vs 4, and ``dry-run``/``routing-stats`` are distinct literal
 segments), and ``test_router_dependencies.py`` locks that rather than
-leaving it to inspection.
+leaving it to inspection. The three Story 4.6 control routes join the same
+4-segment ``/workflows/runs/{run_id}/...`` space as ``events``, each behind
+its own distinct literal last segment — so they are unambiguous wherever
+they are declared, and the test locks that too.
+
+**202 vs 200 on the control routes.** ``pause`` and ``cancel`` on a LIVE run
+return ``202``: the request is RECORDED, and the driver applies it at its
+next superstep boundary — bounded by a node's duration, never instant. The
+one path that IS immediate — ``cancel`` on an already-``paused`` run, which
+has no driver alive to observe anything — returns ``200``. The status code
+is the message about whether the effect has already happened, so the routes
+declare ``202`` and that single path overrides it on the ``Response``.
 
 Sits behind ``AuthTokenMiddleware`` (Story 1.7). ``AgentiveError`` is raised
 for domain failures and converted to RFC 7807 by the global handler in
@@ -35,16 +52,22 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Request, Response, status
 from sse_starlette.sse import EventSourceResponse
 
+from agentive_backend.features.workflow_engine.domain.run_control import (
+    TERMINAL_EVENT_SUFFIXES,
+    TERMINAL_STATUSES,
+)
 from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowRequest,
     CreateWorkflowResponse,
     DryRunRequest,
     DryRunResponse,
+    ResumeRunRequest,
     RoutingStatsResponse,
+    RunControlResponse,
     StartRunRequest,
     StartRunResponse,
 )
@@ -82,8 +105,26 @@ _RUN_EVENT_PATTERN = re.compile(r"workflow_engine\.workflow_run\.\w+")
 # so a server-sent event of the same name would be indistinguishable from a
 # dropped connection in `es.addEventListener("error", ...)`. Divergence from
 # the AC letter, deliberate — cf Dev Notes.
-_TERMINAL_STATUSES = frozenset({"completed", "error"})
-_TERMINAL_EVENT_SUFFIXES = frozenset({"completed", "failed"})
+#
+# Story 4.6 T5.4 — BOTH sets are now IMPORTED from `domain.run_control`
+# rather than redefined here, because a second definition is how `cancelled`
+# came to be missing from one of them: a cancelled run stayed `running` as
+# far as this loop was concerned, so every SSE client hung until the
+# one-hour `_MAX_STREAM_DURATION_S` ceiling.
+#
+# T5.4 moved only the STATUS set and declared the duplication closed. The
+# event set stayed a literal right underneath the import (review lot 8,
+# P-E) — so a fourth terminal status still had to be remembered in two
+# places, which is exactly the failure the move was meant to end. It is
+# derived from a table there rather than aliased, because the mapping is
+# not the identity: status `error` publishes event `failed`.
+#
+# `paused` is in NEITHER set, and that is deliberate: a paused run can
+# resume, so its stream must stay open to carry the rest of the run.
+# `_MAX_STREAM_DURATION_S` bounds the case where it never does. This is the
+# kind of asymmetry a hurried reader "fixes" in the wrong direction.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
+_TERMINAL_EVENT_SUFFIXES = TERMINAL_EVENT_SUFFIXES
 
 # How long one queue-poll blocks before the loop re-checks its exit
 # conditions (deadline, DB status re-poll).
@@ -359,6 +400,116 @@ async def stream_workflow_run_events(run_id: UUID, request: Request) -> EventSou
     return EventSourceResponse(_stream_run_events(run, workflow_run_repo))
 
 
+@router.post(
+    "/workflows/runs/{run_id}/pause",
+    response_model=RunControlResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ask a running workflow run to pause (Story 4.6 AC1)",
+)
+async def pause_workflow_run(run_id: UUID, request: Request) -> RunControlResponse:
+    """``202`` — ACCEPTED, not applied.
+
+    The response still reads ``status="running"``, with
+    ``control_signal="pause"``: interruption is cooperative, so the run stops
+    at its driver's next superstep boundary. That delay is bounded by a
+    node's duration (``NODE_TIMEOUT_S``, plus any ``error_policy`` retries)
+    and is the price of an interruption that loses no work and cuts no
+    already-billed LLM call.
+
+    Legal only from ``running``.
+
+    Errors, shared by all three control routes — ``resume`` adds ``422``
+    on top, because it alone re-runs the Mise en Place pre-flight (review
+    IG2); ``pause`` and ``cancel`` stop a run and can never be blocked by
+    the state of the environment it would have run in.
+
+    * 404 — ``run_id`` unknown (the URL's primary resource, mirror
+      ``POST /workflows/{workflow_id}/runs``).
+    * 409 — the run is not in a status this action accepts, or a concurrent
+      caller won the compare-and-set (a control request was already pending,
+      or the run reached a terminal status between the read and the write).
+      The RFC 7807 ``context`` names ``run_id``, ``current_status``,
+      ``allowed_from``, ``action`` and ``pending_control_signal`` on BOTH
+      paths — the last of these added by the review (BS1), so a caller told
+      "a request is already pending" can see WHICH, and therefore whether
+      escalating to ``cancel`` would get through; ``null`` means the refusal
+      is about the status alone and no escalation will help. Nothing is
+      published on this path.
+    * 503 — lifespan state missing.
+    """
+    service = _build_execution_service(request)
+    return await service.request_run_control(
+        run_id=run_id,
+        action="pause",
+        tenant_id=None,  # Story 4.6 anti-scope — single-tenant MVP (Story 4.9).
+    )
+
+
+@router.post(
+    "/workflows/runs/{run_id}/resume",
+    response_model=RunControlResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Resume a paused workflow run (Story 4.6 AC1)",
+)
+async def resume_workflow_run(
+    run_id: UUID, request: Request, body: ResumeRunRequest | None = None
+) -> RunControlResponse:
+    """``202`` — the row moves to ``running`` synchronously, but execution
+    itself restarts in a background task, exactly like ``start_run``.
+
+    Resumption goes through the path Story 4.2 already delivered
+    (``astream(None, config)``), so LangGraph picks up from its own last
+    committed checkpoint and **no node that already completed is
+    re-executed**.
+
+    Legal only from ``paused``.
+
+    Re-runs the Mise en Place pre-flight (Story 4.6 review, `IG2`), so this
+    route answers ``422``/``503`` on a failing check exactly like
+    ``POST /workflows/{id}/runs`` — and, critically, leaves the run
+    ``paused`` rather than letting it die ``error`` on its first node in an
+    environment that decayed while it waited. The optional body carries the
+    same ``force``/``reason`` bypass; ``pause`` and ``cancel`` take no body
+    because neither resumes execution.
+    """
+    service = _build_execution_service(request)
+    control = body or ResumeRunRequest()
+    return await service.request_run_control(
+        run_id=run_id,
+        action="resume",
+        tenant_id=None,
+        force=control.force,
+        reason=control.reason,
+    )
+
+
+@router.post(
+    "/workflows/runs/{run_id}/cancel",
+    response_model=RunControlResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={status.HTTP_200_OK: {"model": RunControlResponse}},
+    summary="Cancel a workflow run (Story 4.6 AC1)",
+)
+async def cancel_workflow_run(
+    run_id: UUID, request: Request, response: Response
+) -> RunControlResponse:
+    """``202`` from ``running`` (deferred to the next superstep boundary),
+    ``200`` from ``paused`` (terminal immediately).
+
+    The difference is not cosmetic: a paused run has no driver alive to
+    observe a signal, so the request applies on the spot and the response
+    already reads ``status="cancelled"``. The status code is what tells a
+    client which of the two happened without inspecting the body.
+
+    Legal from ``running`` or ``paused``.
+    """
+    service = _build_execution_service(request)
+    result = await service.request_run_control(run_id=run_id, action="cancel", tenant_id=None)
+    if result.status == "cancelled":
+        response.status_code = status.HTTP_200_OK
+    return result
+
+
 def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, str]:
     """Build the ``state`` frame — AC1's catch-up payload.
 
@@ -386,9 +537,29 @@ def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, st
     if isinstance(last_error, str):
         # Already redacted at the source (`_mark_failed`), never re-derived here.
         payload["last_error"] = last_error
+    # Story 4.6 T5.5 — a run that has been ASKED to pause still reads
+    # `status="running"` (interruption is cooperative), so without this a
+    # client watching the stream sees nothing at all between the request and
+    # the effect. Read straight off the row, no hardcoded enumeration.
+    control_signal = getattr(run, "control_signal", None)
+    if isinstance(control_signal, str):
+        payload["control_signal"] = control_signal
     if reason is not None:
         payload["reason"] = reason
     return {"event": "state", "data": json.dumps(payload, default=str)}
+
+
+def _state_signature(run: WorkflowRun) -> tuple[str, str | None]:
+    """The part of a row a `state` frame actually carries, for comparison.
+
+    `status` alone is not enough: a pause REQUEST changes nothing but
+    `control_signal`, and that is exactly what the client is waiting to see
+    between asking for a pause and getting one. Reads the row the same
+    defensive way :func:`_state_event` does, so the two can never disagree
+    about what "changed" means.
+    """
+    control_signal = getattr(run, "control_signal", None)
+    return run.status, control_signal if isinstance(control_signal, str) else None
 
 
 async def _stream_run_events(
@@ -428,6 +599,15 @@ async def _stream_run_events(
         yield _state_event(latest)
         if latest.status in _TERMINAL_STATUSES:
             return
+        # What the client has been told VIA A `state` FRAME. Lifecycle
+        # events deliberately do NOT update it: deducing a status from an
+        # event name is the mapping that is not 1:1 (status `error` is event
+        # `failed`), and getting it wrong here would suppress the very frame
+        # this exists to send. The cost of not deducing is one redundant —
+        # and idempotent — `state` frame after a change that WAS delivered
+        # normally, and only once the run has gone quiet. That is the right
+        # side to err on.
+        last_state = _state_signature(latest)
 
         # NOT `request.is_disconnected()` here. That call re-issues a
         # `receive()` on the ASGI channel, which conflicts with
@@ -452,12 +632,25 @@ async def _stream_run_events(
                 # row, which is the authoritative status. Without this, a
                 # single dropped terminal event left the client hanging
                 # until the deadline.
+                #
+                # Reconciles ANY divergence, not just a terminal one. The
+                # terminal-only version fixed the case it was written for and
+                # left the worse one open: `paused` is deliberately NOT
+                # terminal (the stream must survive a resume), so a dropped
+                # `paused` event — and `put_nowait` above drops by design
+                # under a slow consumer — left the client watching a silent
+                # stream, showing "running", for up to the full hour. Nothing
+                # else would ever arrive: a paused run emits no events, so the
+                # queue never wakes up. The one mechanism that could tell it
+                # was this poll, and it was looking only for the end.
                 if loop.time() >= next_repoll:
                     next_repoll = loop.time() + _STATUS_REPOLL_INTERVAL_S
                     current = await workflow_run_repo.get_by_id(run_id)
-                    if current is not None and current.status in _TERMINAL_STATUSES:
+                    if current is not None and _state_signature(current) != last_state:
+                        last_state = _state_signature(current)
                         yield _state_event(current, reason="status_repoll")
-                        return
+                        if current.status in _TERMINAL_STATUSES:
+                            return
                 continue
             action = event.event_type.rsplit(".", 1)[-1]
             yield {"event": action, "data": json.dumps(event.payload, default=str)}

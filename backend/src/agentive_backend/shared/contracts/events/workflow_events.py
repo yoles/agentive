@@ -24,6 +24,22 @@ Events shipped to date:
   checks were failing. The first event in this repo representing an explicit
   user bypass with a stated reason (grep-confirmed at story time — no prior
   ``_bypassed``/``_forced`` event existed).
+* ``workflow_engine.workflow_run.pause_requested`` / ``.cancel_requested``
+  (Story 4.6 AC1) — a caller ASKED for a live run to pause or stop. The run
+  is still ``running`` at this point: interruption is cooperative, so the
+  driver settles the request at its next superstep boundary. These two exist
+  separately from ``paused``/``cancelled`` precisely because the gap between
+  request and effect is real and bounded by a node's duration — an audit
+  trail that collapsed them would hide it.
+* ``workflow_engine.workflow_run.paused`` (Story 4.6 AC2) — the driver
+  observed a pause request and suspended the run at a committed checkpoint.
+  NOT terminal: a ``resume`` restarts it from exactly there.
+* ``workflow_engine.workflow_run.cancelled`` (Story 4.6 AC2) — terminal,
+  either observed by the driver or applied directly to an already-``paused``
+  run (which has no driver alive to observe anything).
+* ``workflow_engine.llm.fallback_triggered`` (Story 1.6, typed in Story 4.6
+  T4.3) — the LLM router moved to the next provider in the chain. The only
+  event of this module NOT under the ``workflow_run`` entity.
 * ``workflow_engine.workflow_run.mise_en_place_refused`` (Story 4.5 AC2,
   review BS2) — the symmetric case: a launch REFUSED because a check failed
   and no ``force`` was given. It exists because AC2 forbids creating a
@@ -131,6 +147,14 @@ class WorkflowRunFailedEvent(BaseModel):
     workflow_id: UUID
     failed_node_id: str | None = None
     error_summary: str = Field(max_length=500)
+    #: Story 4.6 AC3 — the exception's class name (e.g.
+    #: ``"LLMAllProvidersFailedError"``). Added so an alerting consumer can
+    #: filter on the KIND of failure without parsing ``error_summary``'s
+    #: prose, which is a redacted human string with no stable shape. This is
+    #: what carries the epic's "alerte Dashboard" (Epic 7 owns the UI).
+    #: Defaults to ``None`` — backward-compatible with every event already
+    #: sitting in ``outbox_events``.
+    error_type: str | None = Field(default=None, max_length=200)
     tenant_id: UUID | None = None
 
 
@@ -223,12 +247,139 @@ class WorkflowRunMiseEnPlaceRefusedEvent(BaseModel):
     tenant_id: UUID | None = None
 
 
+class WorkflowRunPauseRequestedEvent(BaseModel):
+    """Published when a caller asks a LIVE run to pause (Story 4.6 AC1).
+
+    The run is STILL ``running`` when this lands, and stays so until the
+    driver reaches its next superstep boundary — bounded by a node's
+    duration, never instantaneous. That gap is the whole reason this event is
+    distinct from :class:`WorkflowRunPausedEvent`: an audit trail that only
+    recorded the effect could not show that someone asked at ``t0`` and the
+    run stopped at ``t0 + 40s``, nor that a request was never honoured
+    because the run finished first.
+
+    ``actor`` mirrors :class:`WorkflowRunMiseEnPlaceBypassedEvent` — ``"system"``
+    under the Sprint-1 convention (no authenticated-actor propagation exists
+    yet), and like there, this is an event where a real actor will matter.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.pause_requested"
+
+    run_id: UUID
+    workflow_id: UUID
+    actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
+class WorkflowRunCancelRequestedEvent(BaseModel):
+    """Published when a caller asks a LIVE run to stop (Story 4.6 AC1).
+
+    Symmetric to :class:`WorkflowRunPauseRequestedEvent` — see there for why
+    the request and the effect are two events.
+
+    A ``cancel`` on an ALREADY-``paused`` run publishes
+    :class:`WorkflowRunCancelledEvent` directly instead: no driver is alive
+    to observe a signal, so there is no gap to record.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.cancel_requested"
+
+    run_id: UUID
+    workflow_id: UUID
+    actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
+class WorkflowRunPausedEvent(BaseModel):
+    """Published when the driver suspends a run at a superstep boundary
+    (Story 4.6 AC2).
+
+    NOT terminal, and deliberately absent from
+    ``router.py``'s ``_TERMINAL_EVENT_SUFFIXES``: a paused run can resume, so
+    its SSE clients must stay connected. (``cancelled`` IS in that set —
+    without it a cancelled run left every client hanging for an hour.)
+
+    ``paused_at_node_id`` is the last node that COMPLETED, read from the
+    applicative checkpoint — not the node that would have run next. The run
+    resumes from LangGraph's own committed checkpoint, so no node is ever
+    re-executed and this field is a trace, not a resume cursor.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.paused"
+
+    run_id: UUID
+    workflow_id: UUID
+    paused_at_node_id: str | None = Field(
+        default=None, description="last COMPLETED node — best-effort, None if not determinable"
+    )
+    tenant_id: UUID | None = None
+
+
+class WorkflowRunCancelledEvent(BaseModel):
+    """Published when a run stops for good at the caller's request
+    (Story 4.6 AC2) — a terminal status, like ``completed`` and ``error``.
+
+    Carries ``total_duration_ms`` because a cancelled run has REAL partial
+    spend: every node that completed before the cancellation was billed.
+    Mirror :meth:`_mark_failed`'s posture, not :meth:`_mark_completed`'s —
+    partial metrics are aggregated and kept, never dropped.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.cancelled"
+
+    run_id: UUID
+    workflow_id: UUID
+    cancelled_at_node_id: str | None = Field(
+        default=None, description="last COMPLETED node — best-effort, None if not determinable"
+    )
+    total_duration_ms: int = Field(ge=0)
+    tenant_id: UUID | None = None
+
+
+class LLMFallbackTriggeredEvent(BaseModel):
+    """The LLM router moved to the next provider in the chain (Story 1.6).
+
+    **A typisation, not a new event.** ``app.lifespan._publish_fallback`` has
+    published this payload as an anonymous ``dict`` since Story 1.6, and
+    consumers (the ``llm-usage`` runbook, the Story 1.6 test suite) know it
+    by that exact name and shape. Neither may change here — Story 4.6 T4.3
+    only gives it a contract so the payload is validated at the publish site
+    instead of being trusted.
+
+    Lives in this module despite being an ``llm.*`` event because its module
+    prefix is ``workflow_engine.`` — the router publishes through the
+    workflow engine's bus namespace.
+
+    Deliberately carries NO ``run_id``/``node_id``: joining a fallback to a
+    run is done on ``correlation_id`` (NFR15). Adding ``run_id`` would force
+    ``shared/llm`` — a kernel package — to know what a workflow run is, an
+    inverted dependency. If Epic 8's Trace Explorer proves correlation alone
+    is not enough, the clean fix is a neutral ``ContextVar`` in
+    ``shared/llm``, not a business field here.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.llm.fallback_triggered"
+
+    failed_provider: str
+    next_provider: str
+    error_class: str
+    error_type: str
+    model_attempted: str
+    model_fallback: str
+    correlation_id: str
+
+
 __all__ = [
+    "LLMFallbackTriggeredEvent",
     "WorkflowCreatedEvent",
+    "WorkflowRunCancelRequestedEvent",
+    "WorkflowRunCancelledEvent",
     "WorkflowRunCompletedEvent",
     "WorkflowRunFailedEvent",
     "WorkflowRunMiseEnPlaceBypassedEvent",
     "WorkflowRunMiseEnPlaceRefusedEvent",
+    "WorkflowRunPauseRequestedEvent",
+    "WorkflowRunPausedEvent",
     "WorkflowRunResumedEvent",
     "WorkflowRunRoutingEscalatedEvent",
     "WorkflowRunStartedEvent",

@@ -38,6 +38,23 @@ ROUTING_ESCALATION_SECONDS: Histogram = Histogram(
     buckets=[0.1, 0.25, 0.5, 1, 2, 5, 10, 15],
 )
 
+# Story 4.6 T8.3 (défer D13) — node-level retries, i.e. re-runs of the WHOLE
+# provider chain after `LLMAllProvidersFailedError`. Distinct from
+# `LLM_FALLBACK_TRIGGERED_TOTAL` (`shared/llm/metrics.py`), which counts
+# moves BETWEEN providers inside one chain traversal: a node that retries
+# twice over a 2-provider chain increments this twice and that one four
+# times, and the pair is what tells an operator whether a provider is flaky
+# or the whole chain is down.
+#
+# `outcome` is a closed two-value set, per the cardinality rule above:
+# `retried` (another attempt follows) and `exhausted` (`max_retries` spent,
+# the run is about to fail).
+WORKFLOW_NODE_RETRIES_TOTAL: Counter = Counter(
+    "agentive_workflow_engine_node_retries",
+    "Node-level retries of a full LLM provider chain, by outcome.",
+    labelnames=["outcome"],
+)
+
 #: Escalations that never produced a decision (review IG2).
 #:
 #: A SEPARATE metric rather than a fourth ``source`` value on
@@ -63,4 +80,5 @@ __all__ = [
     "ROUTING_DECISIONS_TOTAL",
     "ROUTING_ESCALATION_FAILURES_TOTAL",
     "ROUTING_ESCALATION_SECONDS",
+    "WORKFLOW_NODE_RETRIES_TOTAL",
 ]

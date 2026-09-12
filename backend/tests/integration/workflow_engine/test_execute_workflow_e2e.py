@@ -48,9 +48,13 @@ def _completion(text_: str) -> Completion:
     )
 
 
-async def _create_template(session_factory: async_sessionmaker[AsyncSession]) -> Any:
+async def _create_template(
+    session_factory: async_sessionmaker[AsyncSession], *, config: dict[str, Any] | None = None
+) -> Any:
     repo = AgentTemplateRepo(session_factory=session_factory)
-    return await repo.create(name=f"tpl-{uuid4()}", archetype="producteur", config={})
+    return await repo.create(
+        name=f"tpl-{uuid4()}", archetype="producteur", config=config if config is not None else {}
+    )
 
 
 async def _poll_run_status(
@@ -176,7 +180,18 @@ async def test_execute_workflow_e2e_llm_failure_marks_run_error(
     workflow_checkpointer: Any,
 ) -> None:
     """AC4 — a node LLM failure terminates the run as `error`, not silently."""
-    tpl_a = await _create_template(app_session_factory)
+    # `error_policy.on_timeout = "fail_fast"` pins ONE attempt (Story 4.6,
+    # défer D13). Since that story a template declaring no `error_policy`
+    # inherits Story 2.2's defaults — `retry_with_backoff`, `max_retries=3` —
+    # so this node would re-run the whole chain four times, exhaust the
+    # single queued exception, and fail on `MockProvider`'s own
+    # "exhausted" `ValueError` instead of the provider error under test
+    # (and pay ~7 s of real backoff on the way). The retry behaviour itself
+    # is covered by `test_agent_node.py` and `test_llm_fallback_e2e.py`;
+    # this test is about what a node FAILURE does to a run.
+    tpl_a = await _create_template(
+        app_session_factory, config={"error_policy": {"on_timeout": "fail_fast"}}
+    )
     app = _make_app(session_factory=app_session_factory)
     app.state.workflow_checkpointer = workflow_checkpointer
     app.state.llm_router = LLMRouter(
