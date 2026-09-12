@@ -145,6 +145,35 @@ def test_dry_run_route_does_not_collide_with_routing_stats_route() -> None:
     assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/dry-run") is None
 
 
+# ─── Story 4.7 T6.5 — handoff-stats route-collision lock ─────────────────
+
+
+def test_handoff_stats_route_does_not_collide_with_its_neighbours() -> None:
+    """`handoff-stats` (Story 4.7 AC3) sits at the same 3-segment depth as
+    `routing-stats`/`dry-run`, under the same `{workflow_id}` prefix — the
+    same collision surface T5.3/T10.4 already lock for its siblings."""
+    run_id = "0199d0a1-4444-7000-8000-000000000000"
+    workflow_id = "0199d0a1-5555-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/handoff-stats") == (
+        "get_workflow_handoff_stats"
+    )
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") == (
+        "stream_workflow_run_events"
+    )
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+    # Same path, different verb: GET-only, must not answer POST.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/{workflow_id}/handoff-stats") is None
+
+
+def test_a_workflow_literally_named_runs_does_not_steal_the_handoff_stats_route() -> None:
+    assert _resolve_endpoint_name("/api/v1/workflows/runs/handoff-stats") == (
+        "get_workflow_handoff_stats"
+    )
+
+
 def test_dry_run_route_does_not_collide_with_run_events_route() -> None:
     """Review fix P12 — the third pair T5.3 names. `runs/{run_id}/events` is
     4 segments deep against `dry-run`'s 3, so they cannot overlap; this

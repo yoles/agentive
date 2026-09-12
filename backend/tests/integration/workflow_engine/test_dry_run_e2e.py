@@ -201,7 +201,26 @@ async def test_dry_run_reflects_real_routing_decisions_from_history(
     tpl_b = await _create_template(app_session_factory, config={"llm_model": "claude-haiku-4-5"})
     app = _make_app(session_factory=app_session_factory)
     app.state.workflow_checkpointer = workflow_checkpointer
-    provider = MockProvider("mock", [_completion(json.dumps({"status": "done"}))])
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(json.dumps({"status": "done"})),
+            # Story 4.7 — `a` has a successor (`b`), so it triggers a
+            # handoff-summary call after its own completion. The routing
+            # decision terminates at `a` (rule resolves to END), so `b`
+            # never executes and needs no queued response of its own.
+            _completion(
+                json.dumps(
+                    {
+                        "decisions": [],
+                        "artifacts_refs": [],
+                        "blockers": [],
+                        "next_questions": [],
+                    }
+                )
+            ),
+        ],
+    )
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     wire_execution_service(app)
 
@@ -265,8 +284,9 @@ async def test_dry_run_reflects_real_routing_decisions_from_history(
     involvement = {a["node_id"]: a["on_probable_path"] for a in body["agents_involved"]}
     assert involvement == {"a": True, "b": False}
 
-    # Only the node's own completion — the Dry Run itself called nothing.
-    assert len(provider.calls) == 1
+    # `a`'s own completion + its handoff summary (Story 4.7 — `a` has a
+    # successor) — the Dry Run itself called nothing.
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio

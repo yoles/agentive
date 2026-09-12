@@ -52,8 +52,8 @@ class WorkflowDag:
 class WorkflowState(TypedDict, total=False):
     """LangGraph state-channel schema for one workflow run (Story 4.2 T3.3).
 
-    ``node_outputs``/``node_metrics``/``routing_decisions`` all use the
-    stdlib ``operator.or_`` reducer (dict merge, Python 3.9+) — without it, a
+    ``node_outputs``/``node_metrics``/``routing_decisions``/``handoffs``/
+    ``handoff_substitutions`` all use the stdlib ``operator.or_`` reducer (dict merge, Python 3.9+) — without it, a
     fan-out step where 2+ nodes complete in the same LangGraph "superstep"
     would have their state updates overwrite each other's key instead of
     merging (last-write-wins is LangGraph's default with no reducer). Node
@@ -74,6 +74,44 @@ class WorkflowState(TypedDict, total=False):
     # `_make_router` falls back to the pure deterministic resolution in that
     # case (AC4 — resuming a pre-4.3 run must not raise).
     routing_decisions: Annotated[dict[str, dict[str, Any]], operator.or_]
+    # Story 4.7 T1.2 — one entry per node that (a) produced an output AND
+    # (b) has at least one successor in the DAG, keyed by that node's
+    # `node_id` (mirror `routing_decisions` exactly: same reducer, same
+    # keying, same "one entry per relevant node" shape — a `dict`, not the
+    # `handoffs[]` the epic's own prose uses, for reducer consistency with
+    # the other three channels here). Written by `execute_agent_node` via
+    # `summarize_handoff` (`engine/handoff.py`), then READ by
+    # `_serialize_upstream`/`_build_user_message` (`engine/agent_node.py`)
+    # instead of `node_outputs`, UNLESS a consuming template opts out via
+    # `config["include_raw_previous_output"] = True` (AC2). `node_outputs`
+    # itself is never touched by this channel — `condition_dsl`/`_make_router`
+    # (Story 4.3) keep routing on the raw output, never on a summary.
+    # Absent for a run checkpointed before this story, AND absent for any
+    # node whose summarization failed (AC1) — both cases degrade the same
+    # way: a per-key fallback onto that node's own `node_outputs` entry,
+    # never a hard failure (AC2).
+    handoffs: Annotated[dict[str, dict[str, Any]], operator.or_]
+
+    # What each CONSUMING node's prompt actually substituted, keyed by that
+    # consumer's `node_id` (review of 2026-09-12, B-01). Same reducer, same
+    # shape; keyed by consumer where `handoffs` is keyed by producer, so the
+    # two never collide on merge.
+    #
+    # `handoffs` answers "what did producing summaries cost"; this answers
+    # "what did substituting them actually save", and only the second one can
+    # honestly feed FR53's reduction ratio. Counting on the producer side
+    # credited a saving three ways it never made: to a consumer that opted
+    # out and read the raw output anyway; to an entry the
+    # `MAX_UPSTREAM_OUTPUT_CHARS` cap dropped before it reached any prompt;
+    # and, on a chain, ONCE for an output that `_serialize_upstream`'s
+    # cumulative upstream view forwards to every downstream node in turn.
+    # Written by `execute_agent_node` from what `_serialize_upstream` really
+    # emitted, after truncation — never from what was produced.
+    #
+    # Absent for a run checkpointed before that review; the ratio then reads
+    # `None`, the same honest "nothing measured" the zero-denominator case
+    # already returns, never a fabricated figure.
+    handoff_substitutions: Annotated[dict[str, dict[str, Any]], operator.or_]
 
 
 __all__ = [

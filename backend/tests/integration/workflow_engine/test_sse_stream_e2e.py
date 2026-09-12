@@ -96,7 +96,17 @@ async def test_sse_stream_receives_state_then_live_step_and_completed_events(
             "mock": _SlowProvider(
                 MockProvider(
                     "mock",
-                    [_completion('{"step": "a"}'), _completion('{"step": "b"}')],
+                    [
+                        _completion('{"step": "a"}'),
+                        # Story 4.7 — `a` has a successor (`b`), so it
+                        # triggers a handoff-summary call after its own
+                        # completion.
+                        _completion(
+                            '{"decisions": [], "artifacts_refs": [], '
+                            '"blockers": [], "next_questions": []}'
+                        ),
+                        _completion('{"step": "b"}'),
+                    ],
                 ),
                 _NODE_DELAY_S,
             )

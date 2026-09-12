@@ -76,7 +76,31 @@ ROUTING_ESCALATION_FAILURES_TOTAL: Counter = Counter(
     labelnames=["reason"],
 )
 
+#: Handoff summaries (Story 4.7) that produced no usable summary, by reason.
+#:
+#: Review of 2026-09-12 (P-8). Without this, a misconfigured summary model
+#: disabled FR53 across the whole fleet SILENTLY: every non-terminal node
+#: paid a full LLM round-trip that failed, `handoffs` stayed empty, and
+#: `GET /workflows/{id}/handoff-stats` returned `reduction_ratio_pct: null`
+#: — byte-identical to the legitimate "no node in this workflow has a
+#: downstream successor" case. One `_log.warning` per node was the only
+#: trace, and nothing could be alerted on.
+#:
+#: A failure counter rather than an extra `metrics["handoffs"]` key: the
+#: run-level JSONB records what a run DID, and a summary that never
+#: materialised leaves nothing to record there — same reasoning as
+#: ROUTING_ESCALATION_FAILURES_TOTAL above, for the same class of hole.
+#:
+#: `reason` is a closed set of six literals — bounded, like every label in
+#: this module. Never add `node_id`/`workflow_id` here.
+HANDOFF_SUMMARY_FAILURES_TOTAL: Counter = Counter(
+    "agentive_workflow_engine_handoff_summary_failures",
+    "Handoff summaries that produced no usable result, by reason.",
+    labelnames=["reason"],
+)
+
 __all__ = [
+    "HANDOFF_SUMMARY_FAILURES_TOTAL",
     "ROUTING_DECISIONS_TOTAL",
     "ROUTING_ESCALATION_FAILURES_TOTAL",
     "ROUTING_ESCALATION_SECONDS",

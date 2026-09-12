@@ -15,6 +15,7 @@ from agentive_backend.features.workflow_engine.engine.agent_node import (
     _resolve_llm_params,
     execute_agent_node,
 )
+from agentive_backend.features.workflow_engine.engine.handoff import HandoffSettings
 from agentive_backend.shared.exceptions import ValidationError
 from agentive_backend.shared.llm.types import Completion
 
@@ -779,3 +780,482 @@ async def test_execute_agent_node_traversal_count_does_not_disturb_the_attempts_
     assert excinfo.value.context["attempts"] == [
         {"provider": "anthropic", "error_class": "retriable"}
     ]
+
+
+# ─── Story 4.7 AC1/AC2 — handoff summaries ───────────────────────────────
+
+
+def _handoff_settings() -> HandoffSettings:
+    return HandoffSettings(model="claude-haiku-4-5", max_tokens=512, timeout_s=20.0)
+
+
+_VALID_HANDOFF_JSON = (
+    '{"decisions": ["chose plan A"], "artifacts_refs": [], "blockers": [], "next_questions": []}'
+)
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_has_downstream_false_should_never_call_router_twice() -> (
+    None
+):
+    """T3.1 default — a direct caller that omits the new params gets the
+    pre-4.7 behaviour exactly: one LLM call, no `handoffs` key at all."""
+    template = SimpleNamespace(config={})
+    router = _router(_completion('{"result": "ok"}'))
+    state = {"task_input": {}, "node_outputs": {}, "node_metrics": {}}
+
+    result = await execute_agent_node(state, template=template, llm_router=router, node_id="a")
+
+    assert "handoffs" not in result
+    router.complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_has_downstream_true_but_no_settings_should_not_summarize() -> (
+    None
+):
+    """`handoff_settings=None` (no assembly layer wired it) skips
+    summarization even when `has_downstream=True` — the settings gate, not
+    just the DAG-shape gate, must hold."""
+    template = SimpleNamespace(config={})
+    router = _router(_completion('{"result": "ok"}'))
+    state = {"task_input": {}, "node_outputs": {}, "node_metrics": {}}
+
+    result = await execute_agent_node(
+        state, template=template, llm_router=router, node_id="a", has_downstream=True
+    )
+
+    assert "handoffs" not in result
+    router.complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_has_downstream_and_settings_should_write_handoff_entry() -> (
+    None
+):
+    template = SimpleNamespace(config={})
+    router = _router(_completion('{"result": "ok"}'))
+    router.complete.side_effect = [
+        _completion('{"result": "ok"}', input_tokens=42, output_tokens=7),
+        _completion(_VALID_HANDOFF_JSON, input_tokens=30, output_tokens=9),
+    ]
+    state = {"task_input": {}, "node_outputs": {}, "node_metrics": {}}
+
+    result = await execute_agent_node(
+        state,
+        template=template,
+        llm_router=router,
+        node_id="a",
+        has_downstream=True,
+        handoff_settings=_handoff_settings(),
+    )
+
+    assert router.complete.await_count == 2
+    entry = result["handoffs"]["a"]
+    assert entry["decisions"] == ["chose plan A"]
+    assert entry["artifacts_refs"] == []
+    assert entry["summary_input_tokens"] == 30
+    assert entry["summary_output_tokens"] == 9
+    # The node's OWN output_tokens (7, not its 42 INPUT tokens) is what would
+    # have been forwarded raw — the baseline the reduction ratio compares
+    # against (AC3). The comment here used to name 42, which is the wrong
+    # side of the call entirely (review of 2026-09-12, P-14): the assertion
+    # was right, its explanation was not, and this is the exact value a
+    # future change to `raw_output_tokens_replaced` would reason from.
+    assert entry["raw_output_tokens_replaced"] == 7
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_when_summarization_fails_should_not_write_handoffs_or_disturb_output() -> (
+    None
+):
+    template = SimpleNamespace(config={})
+    router = _router(_completion('{"result": "ok"}'))
+    router.complete.side_effect = [
+        _completion('{"result": "ok"}'),
+        _completion("not json at all"),
+    ]
+    state = {"task_input": {}, "node_outputs": {}, "node_metrics": {}}
+
+    result = await execute_agent_node(
+        state,
+        template=template,
+        llm_router=router,
+        node_id="a",
+        has_downstream=True,
+        handoff_settings=_handoff_settings(),
+    )
+
+    assert "handoffs" not in result
+    assert result["node_outputs"] == {"a": {"result": "ok"}}
+    assert result["node_metrics"]["a"]["output_tokens"] == 7
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_terminal_node_never_calls_router_for_summary() -> None:
+    """A caller that never sets `has_downstream=True` (a terminal node, per
+    `build_state_graph`'s computation, T4.1) never pays for a summary."""
+    template = SimpleNamespace(config={})
+    router = _router(_completion('{"result": "ok"}'))
+    state = {"task_input": {}, "node_outputs": {}, "node_metrics": {}}
+
+    await execute_agent_node(
+        state,
+        template=template,
+        llm_router=router,
+        node_id="a",
+        has_downstream=False,
+        handoff_settings=_handoff_settings(),
+    )
+
+    router.complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_default_reads_handoffs_not_node_outputs_for_upstream() -> None:
+    """AC2 default: the prompt carries the upstream HANDOFF, not its raw
+    output, when both exist for the same upstream node."""
+    template = SimpleNamespace(config={})
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"upstream": {"huge": "raw payload, verbose"}},
+        "node_metrics": {},
+        "handoffs": {
+            "upstream": {
+                "decisions": ["condensed"],
+                "artifacts_refs": [],
+                "blockers": [],
+                "next_questions": [],
+            }
+        },
+    }
+
+    await execute_agent_node(state, template=template, llm_router=router, node_id="b")
+
+    content = router.complete.await_args.args[0][0].content
+    assert "condensed" in content
+    assert "huge" not in content
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_falls_back_to_raw_output_when_handoff_entry_missing() -> None:
+    """AC2 per-key fallback: an upstream node with NO entry in `handoffs`
+    (never attempted, or failed) still reaches the prompt via its raw
+    `node_outputs` entry — never dropped."""
+    template = SimpleNamespace(config={})
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"upstream": {"answer": 42}},
+        "node_metrics": {},
+        "handoffs": {},
+    }
+
+    await execute_agent_node(state, template=template, llm_router=router, node_id="b")
+
+    content = router.complete.await_args.args[0][0].content
+    assert '"answer": 42' in content
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_include_raw_previous_output_true_bypasses_handoffs_entirely() -> (
+    None
+):
+    """AC2 opt-out: `include_raw_previous_output=True` on the CONSUMING
+    template reads `node_outputs` in full, byte-identical to pre-4.7 —
+    regardless of what `handoffs` holds for the same upstream node."""
+    template = SimpleNamespace(config={"include_raw_previous_output": True})
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"upstream": {"answer": 42}},
+        "node_metrics": {},
+        "handoffs": {
+            "upstream": {
+                "decisions": ["condensed"],
+                "artifacts_refs": [],
+                "blockers": [],
+                "next_questions": [],
+            }
+        },
+    }
+
+    await execute_agent_node(state, template=template, llm_router=router, node_id="b")
+    opted_out = router.complete.await_args.args[0][0].content
+
+    # T8.3 asks for a STRICT non-regression assertion on this branch, not a
+    # substring probe (review of 2026-09-12, P-16): this is the one path where
+    # a bug in Story 4.7 would break a prompt existing templates may already
+    # depend on, byte for byte. Build the same prompt on a state with NO
+    # `handoffs` channel at all — the literal pre-4.7 shape — and require the
+    # two to be identical.
+    pre_4_7_state = {k: v for k, v in state.items() if k != "handoffs"}
+    router_baseline = _router(_completion())
+    await execute_agent_node(
+        pre_4_7_state,
+        template=SimpleNamespace(config={"include_raw_previous_output": True}),
+        llm_router=router_baseline,
+        node_id="b",
+    )
+    assert opted_out == router_baseline.complete.await_args.args[0][0].content
+    assert '"answer": 42' in opted_out
+    assert "condensed" not in opted_out
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_node_include_raw_previous_output_mistyped_string_does_not_opt_out() -> (
+    None
+):
+    """AC2 — only the literal boolean `True` opts out; a mistyped value
+    (e.g. the string `"true"`) must NOT silently disable summaries."""
+    template = SimpleNamespace(config={"include_raw_previous_output": "true"})
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"upstream": {"answer": 42}},
+        "node_metrics": {},
+        "handoffs": {
+            "upstream": {
+                "decisions": ["condensed"],
+                "artifacts_refs": [],
+                "blockers": [],
+                "next_questions": [],
+            }
+        },
+    }
+
+    await execute_agent_node(state, template=template, llm_router=router, node_id="b")
+
+    content = router.complete.await_args.args[0][0].content
+    assert "condensed" in content
+    assert '"answer": 42' not in content
+
+
+# ─── Revue du 2026-09-12 — ce que le consommateur voit, et ne doit pas voir ───
+
+
+def _handoff_state() -> dict[str, Any]:
+    return {
+        "task_input": {},
+        "node_outputs": {"upstream": {"answer": 42}},
+        "node_metrics": {},
+        "handoffs": {
+            "upstream": {
+                "decisions": ["condensed"],
+                "artifacts_refs": [],
+                "blockers": [],
+                "next_questions": [],
+                "summary_input_tokens": 30,
+                "summary_output_tokens": 9,
+                "summary_cost_usd": "0.00042",
+                "raw_output_tokens_replaced": 1000,
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_consumer_prompt_carries_the_summary_but_never_the_engines_bookkeeping() -> None:
+    """P-4 — `_serialize_upstream` used to substitute the WHOLE `handoffs`
+    entry, so the next agent's prompt carried `"raw_output_tokens_replaced":
+    1000, "summary_input_tokens": 30, …` inside `<tool_output>`: the engine's
+    billing bookkeeping handed to an agent as business content. Noise paid for
+    at every hop, working against the very token reduction this story exists
+    for, and recitable by the agent into its own output."""
+    router = _router(_completion())
+
+    await execute_agent_node(
+        _handoff_state(),
+        template=SimpleNamespace(config={}),
+        llm_router=router,
+        node_id="b",
+    )
+
+    content = router.complete.await_args.args[0][0].content
+    assert "condensed" in content
+    assert "answer" not in content
+    for leaked in (
+        "raw_output_tokens_replaced",
+        "summary_input_tokens",
+        "summary_output_tokens",
+        "summary_cost_usd",
+    ):
+        assert leaked not in content
+
+
+@pytest.mark.parametrize("corrupt", ["not a dict", 42, [], None])
+@pytest.mark.asyncio
+async def test_a_corrupt_handoff_entry_falls_back_to_that_nodes_raw_output(
+    corrupt: Any,
+) -> None:
+    """P-5 — T3.3's literal `… or raw`. The shipped `handoffs.get(nid, raw)`
+    substituted whatever was stored, so a corrupt entry reached the prompt as
+    itself instead of degrading to the raw output AC2 promises."""
+    state = _handoff_state()
+    state["handoffs"]["upstream"] = corrupt
+    router = _router(_completion())
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="b"
+    )
+
+    assert '"answer": 42' in router.complete.await_args.args[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_a_handoffs_channel_of_the_wrong_type_does_not_fail_every_node() -> None:
+    """P-5 — `state.get("handoffs") or {}` only guards `None`. A checkpoint
+    holding a LIST here (corruption, or a future migration following the
+    epic's literal `handoffs[]` prose) raised `AttributeError` on the hot
+    path, failing EVERY node of the run rather than degrading one entry."""
+    state = _handoff_state()
+    state["handoffs"] = [{"upstream": {"decisions": ["condensed"]}}]
+    router = _router(_completion())
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="b"
+    )
+
+    assert '"answer": 42' in router.complete.await_args.args[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_a_mistyped_opt_out_value_is_logged_not_just_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-11 — strict is right, SILENT is not. `config` is a free JSONB blob:
+    no schema declares this key, so a UI serializing booleans as strings wrote
+    `"true"`, kept getting summaries, and nothing anywhere related cause to
+    effect. `_resolve_llm_params`, cited as the model for this posture, logs
+    or raises on a bad value."""
+    import agentive_backend.features.workflow_engine.engine.agent_node as node_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(node_module._log, "warning", lambda event, **kw: warnings.append(event))
+
+    await execute_agent_node(
+        _handoff_state(),
+        template=SimpleNamespace(config={"include_raw_previous_output": "true"}),
+        llm_router=_router(_completion()),
+        node_id="b",
+    )
+
+    assert "workflow_engine.include_raw_previous_output_ignored" in warnings
+
+
+# ─── B-01 — ce qui est VRAIMENT substitué, et non ce qui a été produit ──────
+
+
+@pytest.mark.asyncio
+async def test_a_consumer_records_what_its_prompt_actually_substituted() -> None:
+    """The nominal case: `b` substitutes `a`'s summary, so `b` — the
+    CONSUMER — records the pair, keyed by itself. `handoffs` stays keyed by
+    producer; the two channels never collide on merge."""
+    router = _router(_completion())
+
+    result = await execute_agent_node(
+        _handoff_state(),
+        template=SimpleNamespace(config={}),
+        llm_router=router,
+        node_id="b",
+    )
+
+    assert result["handoff_substitutions"] == {
+        "b": {"raw_tokens_replaced": 1000, "summary_tokens": 9, "sources": ["upstream"]}
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_opted_out_consumer_records_no_substitution() -> None:
+    """Divergence (a). The producer's summary exists and was paid for, but
+    THIS consumer read the raw output — nothing was replaced in this prompt,
+    so nothing is credited. Counting on the producer side credited it
+    anyway, which is how a workflow whose consumers all read raw could still
+    report a healthy reduction ratio."""
+    router = _router(_completion())
+
+    result = await execute_agent_node(
+        _handoff_state(),
+        template=SimpleNamespace(config={"include_raw_previous_output": True}),
+        llm_router=router,
+        node_id="b",
+    )
+
+    assert "handoff_substitutions" not in result
+
+
+@pytest.mark.asyncio
+async def test_an_entry_dropped_by_the_size_cap_is_not_counted_as_replaced() -> None:
+    """Divergence (b). An upstream entry the `MAX_UPSTREAM_OUTPUT_CHARS` cap
+    evicts never reached the model, so it replaced nothing. The accounting
+    runs AFTER the truncation loop for exactly this reason."""
+    state = _handoff_state()
+    # `dropped` is the OLDEST key (evicted first), and its own SUMMARY — the
+    # value actually serialized once substitution happened — is what blows
+    # the cap. A merely huge raw output would not: substituting shrinks it.
+    state["node_outputs"] = {
+        "dropped": {"step": "dropped"},
+        "upstream": {"answer": 42},
+    }
+    state["handoffs"]["dropped"] = {
+        "decisions": ["x" * (MAX_UPSTREAM_OUTPUT_CHARS * 2)],
+        "artifacts_refs": [],
+        "blockers": [],
+        "next_questions": [],
+        "summary_output_tokens": 500,
+        "raw_output_tokens_replaced": 99_999,
+    }
+    router = _router(_completion())
+
+    result = await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="b"
+    )
+
+    entry = result["handoff_substitutions"]["b"]
+    assert entry["sources"] == ["upstream"]
+    assert entry["raw_tokens_replaced"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_each_downstream_consumer_counts_the_same_upstream_again() -> None:
+    """Divergence (c). `_serialize_upstream` forwards a CUMULATIVE upstream
+    view, so on `a -> b -> c` the output of `a` is replaced in `b`'s prompt
+    AND again in `c`'s. Counting once at production understated the saving
+    by exactly that multiplicity — and made two workflows of the same size
+    report incomparable ratios."""
+    state = _handoff_state()
+    router_b = _router(_completion())
+    first = await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router_b, node_id="b"
+    )
+
+    # `c` now sees both `upstream` and `b`; only `upstream` has a summary.
+    state["node_outputs"]["b"] = {"step": "b"}
+    router_c = _router(_completion())
+    second = await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router_c, node_id="c"
+    )
+
+    assert first["handoff_substitutions"]["b"]["raw_tokens_replaced"] == 1000
+    assert second["handoff_substitutions"]["c"]["raw_tokens_replaced"] == 1000
+    assert second["handoff_substitutions"]["c"]["sources"] == ["upstream"]
+
+
+@pytest.mark.asyncio
+async def test_substitution_accounting_never_introduces_a_tokenizer() -> None:
+    """Both sides stay router-measured, read back from the producer's own
+    `handoffs` entry (the story forbids heuristic tokenisation, and nothing
+    in this repo provides it). A producer entry with no recorded counts
+    therefore contributes zero rather than an estimate."""
+    state = _handoff_state()
+    del state["handoffs"]["upstream"]["summary_output_tokens"]
+    del state["handoffs"]["upstream"]["raw_output_tokens_replaced"]
+    router = _router(_completion())
+
+    result = await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="b"
+    )
+
+    entry = result["handoff_substitutions"]["b"]
+    assert entry == {"raw_tokens_replaced": 0, "summary_tokens": 0, "sources": ["upstream"]}

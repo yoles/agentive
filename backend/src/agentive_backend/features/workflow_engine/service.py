@@ -18,7 +18,7 @@ import contextlib
 import hashlib
 import json
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
@@ -48,6 +48,7 @@ from agentive_backend.features.workflow_engine.engine.agent_node import (
 from agentive_backend.features.workflow_engine.engine.graph_builder import (
     RoutingDecisionFailedError,
 )
+from agentive_backend.features.workflow_engine.engine.handoff import HandoffSettings
 from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
 from agentive_backend.features.workflow_engine.metrics import (
     ROUTING_DECISIONS_TOTAL,
@@ -721,26 +722,146 @@ def _aggregate_routing(routing_decisions: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _coerce_token_count(value: Any) -> int:
+    """One JSONB number as a non-negative int, or ``0`` for anything else.
+
+    Review of 2026-09-12 (P-5). ``_aggregate_handoffs`` promised in its own
+    docstring to be "defensive per-entry (a corrupt entry is skipped, never
+    poisons the whole aggregate)" but only checked ``isinstance(entry, dict)``:
+    ``int("n/a")`` raises ``ValueError`` and ``int({...})`` raises
+    ``TypeError``. That mattered because ``_mark_completed`` calls
+    ``_aggregate_metrics`` with NO ``try``/``except`` (unlike the partial path,
+    which has one), so one corrupt value meant ``update_status("completed")``
+    was never reached: the run stayed ``running``, got claimed by the recovery
+    sweep, was RE-EXECUTED up to ``MAX_RECOVERY_ATTEMPTS`` and finally marked
+    ``error`` — a run that had in fact succeeded.
+
+    Negative values are floored at 0 for the same reason the SQL aggregate
+    casts defensively: a token count below zero is corruption, and letting it
+    through only moves the failure to the response schema's ``ge=0``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(int(value), 0)
+
+
+def _aggregate_handoffs(
+    handoffs: Mapping[str, Any], substitutions: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """``{raw_tokens_replaced, summary_tokens, reduction_ratio, tokens,
+    cost_usd}`` from the run's ``handoffs`` state channel (Story 4.7 AC3).
+
+    Mirror ``_aggregate_routing`` exactly: defensive per-entry (a corrupt
+    entry is skipped, never poisons the whole aggregate), a SEPARATE block
+    rather than folded into ``per_node`` totals — see below for why.
+
+    The ratio compares OUTPUT sizes on both sides of the substitution: what
+    the producing node ITSELF output (``raw_output_tokens_replaced`` — the
+    volume that would have been forwarded raw to the next agent before this
+    story) against what its summary output instead (``summary_output_tokens``
+    — the volume actually forwarded). This is what FR53 means by "reduces
+    the next agent's token consumption": the OUTPUT of one hop becomes the
+    INPUT of the next, so shrinking that output is exactly what shrinks the
+    next agent's bill. The summary call's OWN input cost
+    (``summary_input_tokens`` — reading the raw output it condenses) is a
+    real cost too, but it is the price of running the optimization, not the
+    saving it produces — kept visible separately per-node (``_aggregate_metrics``)
+    rather than netted into this ratio, which would make the ≥30% target
+    unfalsifiable (a expensive-to-run summary could still report a "good"
+    ratio if its own cost were absorbed into the same fraction).
+
+    ``tokens``/``cost_usd`` (review of 2026-09-12, P-2) are what this block
+    owes the run's TOTALS, and they are the summary call's FULL spend — input
+    included. The ratio above and these totals answer two different questions:
+    "did substituting shrink the payload?" and "what did this run actually
+    cost?". Conflating them is exactly what left the second unanswerable.
+
+    **The two sides come from two different channels** (review of 2026-09-12,
+    B-01). ``handoffs`` is keyed by PRODUCER and says what summarizing cost:
+    that is where ``tokens``/``cost_usd`` belong. ``handoff_substitutions`` is
+    keyed by CONSUMER and says what substituting actually replaced, in a real
+    prompt, after truncation: that is where the RATIO belongs. Reading the
+    ratio off the producer side credited a saving three ways it never made —
+    to a consumer that opted out and read the raw output anyway, to an entry
+    the size cap dropped before any prompt saw it, and once for an output a
+    chain forwards to every downstream node in turn. It was also, precisely,
+    the number the story offered as proof of its ">= 30%" target.
+    """
+    substitutions = substitutions if isinstance(substitutions, dict) else {}
+    raw_tokens_replaced = 0
+    summary_tokens = 0
+    for entry in substitutions.values():
+        if not isinstance(entry, dict):
+            continue
+        raw_tokens_replaced += _coerce_token_count(entry.get("raw_tokens_replaced"))
+        summary_tokens += _coerce_token_count(entry.get("summary_tokens"))
+
+    input_tokens = 0
+    output_tokens = 0
+    cost = Decimal("0")
+    any_cost = False
+    for entry in handoffs.values():
+        if not isinstance(entry, dict):
+            continue
+        input_tokens += _coerce_token_count(entry.get("summary_input_tokens"))
+        output_tokens += _coerce_token_count(entry.get("summary_output_tokens"))
+        cost_raw = entry.get("summary_cost_usd")
+        if cost_raw is not None:
+            try:
+                cost += Decimal(str(cost_raw))
+            except InvalidOperation:
+                continue
+            any_cost = True
+    reduction_ratio = (
+        round(1 - summary_tokens / raw_tokens_replaced, 4) if raw_tokens_replaced > 0 else None
+    )
+    # P-10 — a ratio below zero means the summaries came out BIGGER than the
+    # outputs they replaced: the optimization is costing more than it saves.
+    # The value is reported as measured (clamping would hide the only signal
+    # that says so), but it is no longer reported in silence.
+    if reduction_ratio is not None and reduction_ratio < 0:
+        _log.warning(
+            "workflow_engine.handoff_summary_inflated",
+            raw_tokens_replaced=raw_tokens_replaced,
+            summary_tokens=summary_tokens,
+            reduction_ratio=reduction_ratio,
+        )
+    return {
+        "raw_tokens_replaced": raw_tokens_replaced,
+        "summary_tokens": summary_tokens,
+        "reduction_ratio": reduction_ratio,
+        "tokens": {"input": input_tokens, "output": output_tokens},
+        "cost_usd": str(cost) if any_cost else None,
+    }
+
+
 def _aggregate_metrics(
     node_metrics: Mapping[str, Any],
     *,
     total_duration_ms: int,
     routing_decisions: Mapping[str, Any] | None = None,
+    handoffs: Mapping[str, Any] | None = None,
+    handoff_substitutions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate per-node metrics into the ``workflow_runs.metrics`` JSONB
     shape (AC4). Called on BOTH the completed path (full ``node_metrics``)
     and the failed path (only the already-executed nodes' metrics) — AC4
     requires partial metrics to remain aggregated on failure, not dropped.
 
-    ``routing_decisions`` defaults to an empty mapping (Story 4.3 AC3/AC4) —
-    explicit parameter rather than derived internally so no test call site
-    that predates this story needs to change; a workflow with no decision
-    points reports ``{"deterministic": 0, "llm_escalated": 0}``, never a
-    missing key."""
+    ``routing_decisions``/``handoffs`` default to an empty mapping (Story 4.3
+    AC3/AC4, Story 4.7 AC3) — explicit parameters rather than derived
+    internally so no test call site that predates either story needs to
+    change; a workflow with no decision points / no handoffs reports the
+    zeroed shape, never a missing key."""
     total_input = 0
     total_output = 0
     total_cost = Decimal("0")
     any_cost = False
+    # P-5 — `… or {}` only guards `None`; a checkpoint holding a list here
+    # used to raise on `.values()`/`.get()` inside an unprotected
+    # `_mark_completed`. Same discipline `recovery.py` already applies to
+    # every value it reads back out of a checkpoint.
+    handoffs = handoffs if isinstance(handoffs, dict) else {}
     per_node: dict[str, Any] = {}
     for node_id, metric in node_metrics.items():
         metric = metric if isinstance(metric, dict) else {}
@@ -752,7 +873,7 @@ def _aggregate_metrics(
         if cost_raw is not None:
             any_cost = True
             total_cost += Decimal(str(cost_raw))
-        per_node[node_id] = {
+        node_per_node: dict[str, Any] = {
             "duration_ms": metric.get("duration_ms"),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -767,6 +888,27 @@ def _aggregate_metrics(
             # Defaults to 1 for rows written before this story.
             "llm_attempts": metric.get("llm_attempts", 1),
         }
+        # Story 4.7 — the cost of producing THIS node's own handoff summary
+        # (a separate LLM call, T3.2), same rationale as `llm_attempts`: the
+        # only surface an operator can query. Absent (not `0`) for a node
+        # that was never summarized (terminal node, or summarization failed)
+        # — mirror `llm_attempts`' "defaults to 1 for rows written before
+        # this story" posture, but as an absent key rather than a fabricated
+        # default, since "never attempted" and "attempted for free" are
+        # different facts.
+        handoff_entry = handoffs.get(node_id)
+        if isinstance(handoff_entry, dict):
+            node_per_node["handoff_summary_tokens"] = {
+                "input": _coerce_token_count(handoff_entry.get("summary_input_tokens")),
+                "output": _coerce_token_count(handoff_entry.get("summary_output_tokens")),
+            }
+            # P-2 — the per-node surface an operator queries owes the cost as
+            # well as the tokens, exactly like `cost_usd` beside it.
+            node_per_node["handoff_summary_cost_usd"] = handoff_entry.get("summary_cost_usd")
+            # I-03 — the Dry Run prices historical spend against the model it
+            # was actually spent on, mirror `routing_decisions.llm_model`.
+            node_per_node["handoff_summary_model"] = handoff_entry.get("summary_model")
+        per_node[node_id] = node_per_node
     # IG1 — routing escalations are LLM calls this run paid for, so they
     # belong in the run's totals. `per_node` keeps describing NODE execution
     # only; the `routing` block below carries the same figures separately, so
@@ -777,12 +919,28 @@ def _aggregate_metrics(
     if routing["cost_usd"] is not None:
         any_cost = True
         total_cost += Decimal(str(routing["cost_usd"]))
+    # Review of 2026-09-12 (P-2) — IG1 above, applied to Story 4.7's own extra
+    # call. A handoff summary is an LLM call this run paid for, on every
+    # non-terminal node, so on a 10-node linear DAG the run billed 19 calls and
+    # reported 10: `total_cost_usd` stayed byte-identical to a pre-4.7 run while
+    # the provider invoice did not. Any budget, overrun alert or per-run
+    # rebilling built on this field was wrong by roughly half the call count.
+    # The `handoffs` block below still carries the same figures separately, so
+    # node spend, routing spend and summary spend stay addable and comparable
+    # rather than conflated — the same shape IG1 settled on for routing.
+    handoff_block = _aggregate_handoffs(handoffs, handoff_substitutions)
+    total_input += int(handoff_block["tokens"]["input"])
+    total_output += int(handoff_block["tokens"]["output"])
+    if handoff_block["cost_usd"] is not None:
+        any_cost = True
+        total_cost += Decimal(str(handoff_block["cost_usd"]))
     return {
         "total_duration_ms": total_duration_ms,
         "total_tokens": {"input": total_input, "output": total_output},
         "total_cost_usd": str(total_cost) if any_cost else None,
         "per_node": per_node,
         "routing": routing,
+        "handoffs": handoff_block,
     }
 
 
@@ -1664,6 +1822,21 @@ class WorkflowExecutionService:
             base_delay_s=settings.workflow_retry_base_delay_s,
             max_delay_s=settings.workflow_retry_max_delay_s,
         )
+        # Story 4.7 T5.1 — same posture as `routing_settings`/`retry_settings`
+        # above: built here, in the assembly layer, from `settings`; `engine/`
+        # never reads configuration itself (golden rule #6).
+        # Review of 2026-09-12 (I-04) — `None` is the deployment kill switch,
+        # and it is the path `build_state_graph`/`execute_agent_node` already
+        # default to: no new branch, the pre-4.7 behaviour byte for byte.
+        handoff_settings = (
+            HandoffSettings(
+                model=settings.workflow_handoff_summary_model,
+                max_tokens=settings.workflow_handoff_summary_max_tokens,
+                timeout_s=settings.workflow_handoff_summary_timeout_s,
+            )
+            if settings.workflow_handoff_summary_enabled
+            else None
+        )
         # Story 4.3 T9.7 — node_ids whose routing decision has already been
         # accounted for: counted in Prometheus AND, when escalated, published
         # as an event. Seeded from the decisions already present in the
@@ -1685,6 +1858,7 @@ class WorkflowExecutionService:
                 rules=self._routing_rules,
                 routing_settings=routing_settings,
                 retry_settings=retry_settings,
+                handoff_settings=handoff_settings,
             ).compile(checkpointer=self._checkpointer)
         except Exception as exc:
             # A stored DAG that no longer parses, or a `node_id` LangGraph
@@ -1957,6 +2131,8 @@ class WorkflowExecutionService:
                 state_values.get("node_metrics") or {},
                 total_duration_ms=total_duration_ms,
                 routing_decisions=state_values.get("routing_decisions") or {},
+                handoffs=state_values.get("handoffs") or {},
+                handoff_substitutions=state_values.get("handoff_substitutions") or {},
             )
         except Exception:
             _log.warning("workflow_engine.partial_metrics_aggregation_failed", run_id=str(run_id))
@@ -2424,6 +2600,16 @@ class WorkflowExecutionService:
             # Trace Explorer (Epic 8, NFR15). Already JSON-serializable
             # (`RoutingDecision.to_mapping()` at the point it entered state).
             "routing_decisions": dict(state_values.get("routing_decisions") or {}),
+            # Story 4.7 T5.2 — mirror `routing_decisions` exactly: the
+            # applicative reflection of the `handoffs` state channel, read by
+            # an operator inspecting `workflow_runs.checkpoint` directly (and
+            # a future Trace Explorer, Epic 8) without needing to reconstruct
+            # LangGraph's own checkpoint.
+            "handoffs": dict(state_values.get("handoffs") or {}),
+            # B-01 — mirrored beside `handoffs` for the same reason: an
+            # operator reading this JSONB must be able to tell what a summary
+            # COST from what substituting it actually SAVED.
+            "handoff_substitutions": dict(state_values.get("handoff_substitutions") or {}),
             # Rewritten every sync rather than preserved from creation: the
             # window that matters for drift is between the LAST executed node
             # and the resume, not between creation and the resume.
@@ -2475,10 +2661,14 @@ class WorkflowExecutionService:
         total_duration_ms += await self._prior_duration_ms(run_id)
         node_metrics = state_values.get("node_metrics") or {}
         routing_decisions = state_values.get("routing_decisions") or {}
+        handoffs = state_values.get("handoffs") or {}
+        handoff_substitutions = state_values.get("handoff_substitutions") or {}
         metrics = _aggregate_metrics(
             node_metrics,
             total_duration_ms=total_duration_ms,
             routing_decisions=routing_decisions,
+            handoffs=handoffs,
+            handoff_substitutions=handoff_substitutions,
         )
         # IG4 — same source as `metrics["routing"]`, so the counters and the
         # persisted ratio cannot drift apart on a resumed run.
@@ -2549,6 +2739,8 @@ class WorkflowExecutionService:
                     },
                     "skipped_nodes": skipped,
                     "routing_decisions": dict(state_values.get("routing_decisions") or {}),
+                    "handoffs": dict(handoffs),
+                    "handoff_substitutions": dict(handoff_substitutions),
                 },
                 last_checkpoint_at=ended_at,
             )
@@ -2630,10 +2822,13 @@ class WorkflowExecutionService:
         # pause owes the same honest total as one that succeeded.
         total_duration_ms += await self._prior_duration_ms(run_id)
         routing_decisions = state_values.get("routing_decisions") or {}
+        handoffs = state_values.get("handoffs") or {}
         metrics = _aggregate_metrics(
             node_metrics,
             total_duration_ms=total_duration_ms,
             routing_decisions=routing_decisions,
+            handoffs=handoffs,
+            handoff_substitutions=state_values.get("handoff_substitutions") or {},
         )
         # IG4 — recorded on the error path too, exactly like `_aggregate_metrics`
         # (AC4 of Story 4.2: partial metrics are kept, never dropped).

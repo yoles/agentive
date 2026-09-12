@@ -297,6 +297,55 @@ async def test_aggregate_routing_modes_statement_carries_its_guards() -> None:
     assert paths == [("routing", "deterministic"), ("routing", "llm_escalated")]
 
 
+# ─── Story 4.7 AC3 — WorkflowRunRepo.aggregate_token_reduction ─────────
+# Mirror the `aggregate_routing_modes` suite above exactly — same guards,
+# same risk of a future simplification quietly dropping them.
+
+
+@pytest.mark.asyncio
+async def test_aggregate_token_reduction_returns_counts_from_row() -> None:
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.one.return_value = (5, 300, 60)
+    repo = WorkflowRunRepo(session_factory=factory)
+    result = await repo.aggregate_token_reduction(uuid4())
+    assert result == (5, 300, 60)
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_token_reduction_zero_when_no_runs() -> None:
+    """No run at all for this workflow — the COALESCE floor, not a crash."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.one.return_value = (0, 0, 0)
+    repo = WorkflowRunRepo(session_factory=factory)
+    result = await repo.aggregate_token_reduction(uuid4())
+    assert result == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_token_reduction_statement_carries_its_guards() -> None:
+    """Same guard as `aggregate_routing_modes`: floor through `numeric`
+    (never a bare `::int`, which raises on a fractional value), gated on
+    `jsonb_typeof`, scoped to the workflow."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.one.return_value = (0, 0, 0)
+    repo = WorkflowRunRepo(session_factory=factory)
+    workflow_id = uuid4()
+    await repo.aggregate_token_reduction(workflow_id)
+
+    compiled = session.execute.await_args.args[0].compile(dialect=postgresql.dialect())
+    sql = str(compiled).lower()
+
+    assert "workflow_runs.workflow_id" in sql
+    assert workflow_id in compiled.params.values()
+    assert sql.count("jsonb_typeof(") == 2
+    assert sql.count("floor(") == 2
+    assert "numeric" in sql
+    assert "coalesce" in sql
+    paths = [v for v in compiled.params.values() if isinstance(v, tuple)]
+    assert paths == [("handoffs", "raw_tokens_replaced"), ("handoffs", "summary_tokens")]
+
+
 # ─── Story 4.6 review lot 12 — the control predicates, as SQL ──────────
 #
 # `request_control_in_session` and `update_status_in_session` carry the

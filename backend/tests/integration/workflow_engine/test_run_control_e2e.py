@@ -33,6 +33,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agentive_backend.features.workflow_engine.engine.handoff import (
+    DEFAULT_HANDOFF_SUMMARY_SYSTEM_PROMPT,
+)
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.types import Completion
 from agentive_backend.shared.repositories import AgentTemplateRepo
@@ -81,6 +84,11 @@ def _completion(text_: str) -> Completion:
 # déroutant. Du bruit dans un test déjà rouge, pas une contamination.
 
 
+#: A slice of the summarizer's system prompt, long enough to be unambiguous
+#: and short enough to survive a reword of the rest of it.
+_HANDOFF_SYSTEM_MARKER = DEFAULT_HANDOFF_SUMMARY_SYSTEM_PROMPT[:60]
+
+
 class _GatedProvider:
     """Blocks each completion until the test opens the gate, counting calls.
 
@@ -97,10 +105,32 @@ class _GatedProvider:
         #: be genuinely inside a node instead of sleeping and hoping.
         self.entered = asyncio.Event()
 
-    async def complete(self, messages: Any, **_kwargs: Any) -> Completion:
+    async def complete(self, messages: Any, **kwargs: Any) -> Completion:
         self.call_count += 1
         self.entered.set()
         await self.gate.wait()
+        # Review of 2026-09-12 (P-6) — answer a handoff-summary call with a
+        # VALID summary. This provider is generative, not a FIFO queue, so it
+        # was returning `{"call": N}` to EVERY call including the summary
+        # ones; `HandoffSummary`'s `extra="forbid"` rejected that, and these
+        # three tests silently exercised Story 4.7's FAILURE path on every
+        # run. `pause`, `resume` and `cancel` were therefore never tested
+        # against the nominal summarization path at all — the one that costs
+        # an extra call inside the superstep, which is precisely what these
+        # tests measure. Discriminating on the system prompt keeps each
+        # node's own output shape (`{"call": N}`) untouched, so every
+        # pre-existing assertion still means what it meant.
+        if _HANDOFF_SYSTEM_MARKER in str(kwargs.get("system") or ""):
+            return _completion(
+                json.dumps(
+                    {
+                        "decisions": [f"call {self.call_count}"],
+                        "artifacts_refs": [],
+                        "blockers": [],
+                        "next_questions": [],
+                    }
+                )
+            )
         return _completion(json.dumps({"call": self.call_count}))
 
 
@@ -241,7 +271,10 @@ async def test_pause_when_run_is_mid_node_should_suspend_at_the_superstep_bounda
     assert row["ended_at"] is None
     # Node `a` landed; node `b` never started.
     assert row["checkpoint"]["last_node_id"] == "a"
-    assert calls_at_pause == 1
+    # Story 4.7 — node `a` has a successor, so its ONE superstep costs TWO
+    # provider calls (its own completion, then its handoff summary) before
+    # the pause is observed at the boundary — never a THIRD (node `b`).
+    assert calls_at_pause == 2
 
     assert (
         await _count_outbox(
@@ -285,7 +318,9 @@ async def test_resume_when_run_was_paused_should_complete_without_replaying_a_no
         await client.post(f"/api/v1/workflows/runs/{run_id}/pause", headers=_auth_headers())
         provider.gate.set()
         await _poll_run(seed_session_factory, run_id, until={"paused"})
-        assert provider.call_count == 1
+        # Story 4.7 — `a`'s own completion + its handoff summary (it has a
+        # successor), both consumed before the pause settles.
+        assert provider.call_count == 2
 
         resume_resp = await client.post(
             f"/api/v1/workflows/runs/{run_id}/resume", headers=_auth_headers()
@@ -297,9 +332,11 @@ async def test_resume_when_run_was_paused_should_complete_without_replaying_a_no
         row = await _poll_run(seed_session_factory, run_id, until={"completed", "error"})
 
     assert row["status"] == "completed", row
-    # THE assertion. Two nodes, two LLM calls total — node `a` was restored
-    # from LangGraph's committed checkpoint, never re-run.
-    assert provider.call_count == 2
+    # THE assertion. Node `a` was restored from LangGraph's committed
+    # checkpoint, never re-run: only ONE more call (node `b`'s own
+    # completion — `b` is terminal, no summary of its own) on top of the 2
+    # `a` already spent.
+    assert provider.call_count == 3
     assert row["checkpoint"]["node_statuses"] == {"a": "success", "b": "success"}
     assert (
         await _count_outbox(
@@ -338,10 +375,22 @@ async def test_cancel_when_run_is_live_should_stop_it_and_keep_partial_metrics(
     assert row["status"] == "cancelled"
     assert row["ended_at"] is not None
     assert row["control_signal"] is None
-    assert calls == 1
+    # Story 4.7 — `a`'s own completion + its handoff summary, both consumed
+    # before the cancel settles at the boundary.
+    assert calls == 2
     # Node `a` was billed — its spend must survive the cancellation (mirror
     # `_mark_failed`, never `_mark_completed`).
-    assert row["metrics"]["total_tokens"] == {"input": 10, "output": 5}
+    #
+    # Review of 2026-09-12 (P-7) — the comment that used to sit here claimed
+    # the summary's own spend was "tracked separately in `metrics['handoffs']`,
+    # never folded into this total". Both halves were wrong at once: the
+    # summary call FAILED in this fixture (P-6), so `metrics["handoffs"]` was
+    # zeroed and the 10/5 it had actually billed appeared NOWHERE — a hole
+    # described as a design choice. Both calls are billed and both are now
+    # counted (P-2): 10/5 for `a` itself, 10/5 for its summary.
+    assert row["metrics"]["total_tokens"] == {"input": 20, "output": 10}
+    assert row["metrics"]["handoffs"]["tokens"] == {"input": 10, "output": 5}
+    assert row["metrics"]["handoffs"]["cost_usd"] == "0.0001"
     assert (
         await _count_outbox(
             seed_session_factory, "workflow_engine.workflow_run.cancelled", run_id=run_id

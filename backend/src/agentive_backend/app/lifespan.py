@@ -737,6 +737,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_delay_s=settings.workflow_retry_base_delay_s,
             max_delay_s=settings.workflow_retry_max_delay_s,
             escalation_timeout_s=settings.routing_escalation_timeout_s,
+            # Story 4.7 T5.6 — `execute_agent_node` now pays a second,
+            # process-wide LLM call (`summarize_handoff`) on top of its own
+            # completion; the sweep's window must grow with it or a node
+            # legitimately still summarizing gets reclaimed and re-executed.
+            handoff_summary_timeout_s=settings.workflow_handoff_summary_timeout_s,
         ),
     )
     try:

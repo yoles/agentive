@@ -15,7 +15,7 @@ whose outgoing edges are all unconditional (AC4 — those keep the exact
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from langgraph.graph import END, START, StateGraph
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.domain.routing_rules import RoutingRule
     from agentive_backend.features.workflow_engine.domain.value_objects import WorkflowDag
     from agentive_backend.features.workflow_engine.engine.agent_node import RetrySettings
+    from agentive_backend.features.workflow_engine.engine.handoff import HandoffSettings
     from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
     from agentive_backend.infra.db.models import AgentTemplate
     from agentive_backend.shared.llm.router import LLMRouter
@@ -160,6 +161,8 @@ def _make_node_callable(
     rules: Sequence[RoutingRule],
     routing_settings: RoutingSettings,
     retry_settings: RetrySettings | None,
+    has_downstream: bool = False,
+    handoff_settings: HandoffSettings | None = None,
 ) -> Callable[[WorkflowState], Awaitable[dict[str, Any]]]:
     """Factory for a routing-DECISION-POINT node's callable (Story 4.3 T6.2).
 
@@ -189,6 +192,8 @@ def _make_node_callable(
             llm_router=llm_router,
             node_id=node_id,
             retry_settings=retry_settings,
+            has_downstream=has_downstream,
+            handoff_settings=handoff_settings,
         )
         own_output = (node_update.get("node_outputs") or {}).get(node_id)
         try:
@@ -222,6 +227,36 @@ def _make_node_callable(
     return _call
 
 
+def _any_successor_reads_summaries(
+    successor_ids: Sequence[str], templates: Mapping[str, AgentTemplate]
+) -> bool:
+    """Whether summarizing for ``successor_ids`` can ever be read (I-01).
+
+    ``False`` only when there IS no successor, or when EVERY successor has
+    opted out of handoff summaries — both cases where the summary is pure
+    cost. Conservative by construction: an unknown ``node_id`` (absent from
+    ``templates``) counts as a reader, because a missing template is a
+    reason to know less, never a licence to skip work.
+
+    What this deliberately does NOT cover, because it is not statically
+    decidable: a decision point whose routing resolves to ``END`` at
+    runtime, and successors skipped by ``condition_dsl`` degradation. Both
+    still pay a summary nobody reads; both depend on the state of the run,
+    which this function — a pure build-time shape analysis — cannot see.
+    """
+    for successor_id in successor_ids:
+        template = templates.get(successor_id)
+        if template is None:
+            return True
+        config = template.config if isinstance(template.config, dict) else {}
+        # Mirror `agent_node._build_user_message` EXACTLY, including its
+        # strictness: only the literal `True` opts out, so a mistyped value
+        # keeps summaries here for the same reason it keeps them there.
+        if config.get("include_raw_previous_output") is not True:
+            return True
+    return False
+
+
 def build_state_graph(
     dag: WorkflowDag,
     templates: dict[str, AgentTemplate],
@@ -230,6 +265,7 @@ def build_state_graph(
     rules: Sequence[RoutingRule] = (),
     routing_settings: RoutingSettings | None = None,
     retry_settings: RetrySettings | None = None,
+    handoff_settings: HandoffSettings | None = None,
 ) -> StateGraph[WorkflowState, None, WorkflowState, WorkflowState]:
     """Build (uncompiled) the ``StateGraph`` for ``dag`` — caller ``.compile()``s
     it with a checkpointer (T5.3).
@@ -269,6 +305,15 @@ def build_state_graph(
     defaults. Every node needs a value (they can all retry), so a hard
     requirement would have broken every pre-4.6 caller for no behavioural
     gain.
+
+    ``handoff_settings`` (Story 4.7 T4.1) mirrors ``retry_settings``'s own
+    posture, not ``routing_settings``'s: ``None`` is not a caller bug, it
+    simply means no node in this graph will ever summarize its output
+    (``execute_agent_node``'s own default, T3.1). This function computes
+    ``has_downstream`` per node from the edge maps already built above —
+    a node with at least one outgoing edge (conditional or not) has
+    ``has_downstream=True``; a sink has ``False`` and is never summarized
+    (AC1 — nobody would ever read it).
     """
     builder: StateGraph[WorkflowState, None, WorkflowState, WorkflowState] = StateGraph(
         WorkflowState
@@ -292,6 +337,22 @@ def build_state_graph(
 
     for node in dag.nodes:
         conditional_edges = conditional_by_source.get(node.node_id, [])
+        # Story 4.7 T4.1 — pure lookup against the edge maps already built
+        # above, no new DAG traversal. A node absent from BOTH maps has no
+        # outgoing edge at all (a sink).
+        #
+        # Review of 2026-09-12 (I-01) — "has a successor" is not the same
+        # question as "anyone will read it", and AC1 asks the second one
+        # ("a node with no successor is never summarized: nobody would ever
+        # read it"). A node ALL of whose successors opt out via
+        # `include_raw_previous_output=True` paid a summary call every run
+        # for a summary nothing would ever open — so the opt-out INCREASED
+        # the bill instead of reducing it: the run paid for the summary AND
+        # forwarded the raw output. That case is decidable right here, from
+        # data this function already holds.
+        successor_ids = [target for target, _ in conditional_edges]
+        successor_ids += unconditional_by_source.get(node.node_id, [])
+        has_downstream = _any_successor_reads_summaries(successor_ids, templates)
         if conditional_edges:
             if routing_settings is None:
                 raise ValueError(
@@ -307,6 +368,8 @@ def build_state_graph(
                 rules=rules,
                 routing_settings=routing_settings,
                 retry_settings=retry_settings,
+                has_downstream=has_downstream,
+                handoff_settings=handoff_settings,
             )
         else:
             node_callable = functools.partial(
@@ -315,6 +378,8 @@ def build_state_graph(
                 llm_router=llm_router,
                 node_id=node.node_id,
                 retry_settings=retry_settings,
+                has_downstream=has_downstream,
+                handoff_settings=handoff_settings,
             )
         # LangGraph's `add_node` overloads resolve against the CONCRETE callable
         # expression at the call site (a bare `functools.partial(...)`); routed

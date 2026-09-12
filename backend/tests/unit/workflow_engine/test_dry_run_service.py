@@ -644,3 +644,112 @@ async def test_dry_run_should_report_probable_path_cost_beside_the_upper_bound()
     # 3 identical nodes billed vs the 2 on the path.
     assert expected < upper
     assert expected * 3 == upper * 2
+
+
+@pytest.mark.asyncio
+async def test_dry_run_should_include_historical_handoff_summary_cost() -> None:
+    """Review of 2026-09-12 (I-03) — **IG6 reopened, one story later.**
+
+    Story 4.7 added a second auxiliary LLM call, on every non-terminal node,
+    and recorded its spend in `metrics.per_node[node_id].handoff_summary_tokens`.
+    `NodeMetricSample` consumes only `input_tokens`/`output_tokens` from the
+    same mapping, so the Dry Run threw the summary away exactly as it once
+    threw escalations away — and the endpoint whose entire purpose is to
+    PREDICT a cost predicted, again and systematically, below the real one.
+    """
+    a, b, c = uuid4(), uuid4(), uuid4()
+    service, workflow_repo, workflow_run_repo, template_repo = _make_service()
+    workflow_repo.require_by_id.return_value = _workflow(dag=_branching_dag(a, b, c))
+    workflow_run_repo.list_by_workflow.return_value = [
+        _run(
+            metrics={
+                "per_node": {
+                    "a": {
+                        "input_tokens": 10,
+                        "output_tokens": 10,
+                        "handoff_summary_tokens": {"input": 1_000_000, "output": 1_000_000},
+                        "handoff_summary_model": "claude-haiku-4-5",
+                    }
+                }
+            }
+        )
+    ]
+    template_repo.get_by_id = _every_template()
+
+    response = await service.dry_run(workflow_id=uuid4(), task_input={})
+
+    # Same arithmetic as the escalation test above: Haiku at 1M in + 1M out
+    # = 0.80 + 4.00 = 4.80 USD, which used to be invisible.
+    assert response.cost_estimate_usd is not None
+    assert Decimal(response.cost_estimate_usd) > Decimal("4.80")
+
+
+@pytest.mark.asyncio
+async def test_dry_run_averages_the_summary_over_every_run_not_only_summarized_ones() -> None:
+    """A node that summarizes in half its runs costs half a summary per run.
+    Same denominator choice, and same reasoning, as the escalation average:
+    the expectation is the useful number, not the conditional cost."""
+    from agentive_backend.features.workflow_engine.dry_run import _handoff_averages_from_runs
+
+    averages = _handoff_averages_from_runs(
+        [
+            _run(
+                metrics={
+                    "per_node": {
+                        "a": {
+                            "handoff_summary_tokens": {"input": 100, "output": 40},
+                            "handoff_summary_model": "claude-haiku-4-5",
+                        }
+                    }
+                }
+            ),
+            # Ran, was not summarized (terminal, opted-out consumers, or the
+            # summary failed): really cost nothing, still counts below.
+            _run(metrics={"per_node": {"a": {"input_tokens": 5, "output_tokens": 5}}}),
+        ]
+    )
+
+    assert averages["a"].input_tokens == 50
+    assert averages["a"].output_tokens == 20
+    assert averages["a"].model == "claude-haiku-4-5"
+
+
+def test_handoff_averages_skip_nodes_that_never_summarized() -> None:
+    """Only nodes with at least one priced summary appear — mirror the
+    escalation average, so a node that never summarized adds no phantom
+    zero-token entry for the accounting loop to price."""
+    from agentive_backend.features.workflow_engine.dry_run import _handoff_averages_from_runs
+
+    assert (
+        _handoff_averages_from_runs(
+            [_run(metrics={"per_node": {"a": {"input_tokens": 5, "output_tokens": 5}}})]
+        )
+        == {}
+    )
+
+
+def test_handoff_averages_tolerate_corrupt_shapes() -> None:
+    """Same defensive posture the whole module states: an unexpected shape
+    counts for nothing, never raises."""
+    from agentive_backend.features.workflow_engine.dry_run import _handoff_averages_from_runs
+
+    assert (
+        _handoff_averages_from_runs(
+            [
+                _run(metrics={"per_node": "not a dict"}),
+                _run(metrics={"per_node": {"a": "not a dict"}}),
+                _run(metrics={"per_node": {"a": {"handoff_summary_tokens": "not a dict"}}}),
+                _run(
+                    metrics={
+                        "per_node": {
+                            "a": {
+                                "handoff_summary_tokens": {"input": True, "output": -5},
+                                "handoff_summary_model": "claude-haiku-4-5",
+                            }
+                        }
+                    }
+                ),
+            ]
+        )["a"].input_tokens
+        == 0
+    )

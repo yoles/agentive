@@ -179,3 +179,134 @@ PY
 ```
 
 Output should contain `[REDACTED]` rather than the fake key.
+
+## Résumés de passage (Story 4.7, FR53)
+
+`features.workflow_engine.engine.handoff.summarize_handoff` condenses a
+node's output into a `HandoffSummary` (`decisions`/`artifacts_refs`/
+`blockers`/`next_questions`) for the next agent in the chain, so the next
+node's prompt carries the condensed summary instead of the raw output —
+default behaviour.
+
+**What this does and does not fix.** It shrinks the CONSTANT, not the order
+of growth. `_serialize_upstream` still hands a node every upstream output
+committed before it, one entry per upstream node, so prompt size across a
+long linear DAG still grows quadratically with node count — replacing each
+term with a smaller term does not change that. `MAX_UPSTREAM_OUTPUT_CHARS`
+(50 000 chars, oldest entries evicted first, drop logged as
+`workflow_engine.upstream_outputs_truncated`) remains the actual bound, and
+on a wide enough DAG it will still fire. Do not read this feature as a
+reason to stop watching that log line.
+
+### The model has no `provider_chain`, on purpose
+
+`summarize_handoff` is called with the engine's own model
+(`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MODEL`, default `claude-haiku-4-5`) and
+no `provider_chain=` — mirror the hybrid-routing escalation call
+(`engine/hybrid_router.py`). Both are PROCESS-WIDE auxiliary calls, not a
+behaviour of the agent template's author: a per-agent `provider_chain`
+governs the agent's own completion, never the engine's internal
+optimizations. This also means summarization is NOT retried and NOT
+fallback-chained the way a node's own completion is (Story 4.6's
+`error_policy` dispatcher) — a failed summary degrades to the raw output for
+that one hop (see below), so retrying it would only add latency to a
+best-effort call.
+
+### What the ratio actually measures
+
+`reduction_ratio` compares, **per substitution actually performed**, the
+producer's own output tokens against the tokens of the summary that replaced
+them in a consumer's prompt. Both figures are router-measured; no tokenizer
+is involved anywhere.
+
+Two channels, two questions, and they are deliberately not the same number:
+
+| Channel | Keyed by | Answers |
+|---|---|---|
+| `handoffs` | producer | what producing the summaries **cost** (`metrics.handoffs.tokens`, `.cost_usd`, folded into the run totals) |
+| `handoff_substitutions` | consumer | what substituting them actually **saved** (`raw_tokens_replaced`, `summary_tokens`, `reduction_ratio`) |
+
+The consumer side is what feeds FR53's ratio, because a summary only saves
+anything at the moment a prompt uses it instead of the raw output. Three
+cases make the two sides genuinely differ, and all three used to be credited
+as savings that never happened: a consumer that opted out and read the raw
+output anyway; an entry the `MAX_UPSTREAM_OUTPUT_CHARS` cap dropped before
+any prompt saw it; and, on a chain, an output that `_serialize_upstream`'s
+cumulative upstream view forwards to *every* downstream node in turn —
+replaced as many times as it is forwarded, not once.
+
+`handoff_substitutions[consumer]["sources"]` lists which producers that
+prompt condensed, so a run's checkpoint says where a reported saving came
+from rather than asking you to trust the arithmetic.
+
+A run resumed from a checkpoint written before this change has no
+`handoff_substitutions` channel: the ratio then reads `null`, the same
+honest "nothing measured" as a workflow that never substituted — never a
+back-filled figure.
+
+### Reading the metric
+
+Per-run: `workflow_runs.metrics.handoffs` = `{raw_tokens_replaced,
+summary_tokens, reduction_ratio}` — `reduction_ratio` compares the producing
+node's own `output_tokens` (what would have been forwarded raw) against the
+summary's `output_tokens` (what was forwarded instead). `None` when no
+handoff exists in the run (e.g. every node was terminal).
+
+Per-workflow (aggregated across every run): `GET
+/api/v1/workflows/{workflow_id}/handoff-stats`, mirror
+`/routing-stats` — never a Prometheus label (unbounded cardinality by
+`workflow_id`, same rule as the hybrid-routing ratio, see
+`features/workflow_engine/metrics.py`'s own module docstring).
+
+### Disabling it for one agent
+
+Set `config["include_raw_previous_output"] = true` on the CONSUMING
+template — it reads `node_outputs` (the raw upstream output) in full instead
+of `handoffs`, exactly the pre-4.7 behaviour. Only the literal boolean
+`True` opts out; a mistyped value (e.g. the string `"true"`) does not — and
+since the review of 2026-09-12 a mistyped value is logged
+(`workflow_engine.include_raw_previous_output_ignored`) rather than ignored
+in silence, because `config` is a free JSONB blob that no schema validates.
+
+Opting a consumer out also stops its PRODUCERS paying for summaries nobody
+would read: a node whose successors have ALL opted out is not summarized at
+all. Before that fix the opt-out increased the bill — the run paid for the
+summary *and* forwarded the raw output.
+
+### Disabling it fleet-wide (rollout / rollback)
+
+`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_ENABLED=false` turns off every handoff
+summary without touching a single template: the engine falls back to the
+pre-4.7 path byte for byte. Use it to stage a rollout, or to roll one back
+without editing every consuming template under incident.
+
+This matters because summarization is **on by default**, which changes the
+prompt of templates already in production. A template written against an
+upstream node's raw output (reading, say, `upstream_outputs["a"]["invoice_id"]`)
+stops finding that field, with no change to its own config. If you are
+enabling this on an existing fleet, turn it on deliberately and watch the
+consuming agents' outputs — the per-template opt-out is the permanent fix,
+this switch is the emergency brake.
+
+### Failure mode
+
+A failed summarization (LLM error, unparsable response, a response that
+does not validate against `HandoffSummary`, an empty summary, or a reply cut
+off at `max_tokens`) is logged (`workflow_engine.handoff_summary_failed`),
+counted (`agentive_workflow_engine_handoff_summary_failures_total{reason}`)
+and simply omits that node from `handoffs` for the run — the next node then
+falls back to that ONE node's raw output (never the whole prompt).
+`node_outputs` and the run's own correctness are never affected either way.
+
+**Alert on the counter, not on the ratio.** `GET /workflows/{id}/handoff-stats`
+returns `reduction_ratio_pct: null` both when no node in the workflow has a
+downstream successor and when every summary failed — a misconfigured
+`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MODEL` looks exactly like a workflow that
+never summarizes, while billing one wasted LLM round-trip per node.
+`reason="LLMNoFallbackModelError"` climbing is that case.
+
+A `reduction_ratio` below zero means the summaries came out BIGGER than the
+outputs they replaced (common on nodes with very short, structured outputs).
+The value is reported as measured rather than clamped — clamping would erase
+the only signal saying the optimization costs more than it saves — and
+`workflow_engine.handoff_summary_inflated` is logged when it happens.

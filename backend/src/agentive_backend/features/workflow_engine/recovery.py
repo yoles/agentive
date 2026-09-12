@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -75,6 +76,23 @@ _MAX_PROVIDER_CHAIN_LEN = 2
 # default, exactly like `NODE_TIMEOUT_S` above it never reads `settings`.
 _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT = 15.0
 
+# Story 4.7 T5.6 — `execute_agent_node` now makes a SECOND LLM call after its
+# own completion, on every node with a downstream successor: `summarize_handoff`
+# (T3.2). It carries no `provider_chain=` (a process-wide call, like the
+# escalation above), so it pays the SAME per-provider-in-the-chain timeout,
+# once, on top of the node's own worst case. Without this term, a node whose
+# handoff summary is legitimately still running — e.g. its first provider in
+# the default chain timed out and the router fell back to the second — would
+# be classified orphaned and claimed by the sweep while alive: the exact
+# double-execution bug T8.4 (Story 4.6) already fixed for retries, reopened
+# by a different addition.
+#
+# Mirrors the settings default (`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_TIMEOUT_S`,
+# `shared/config.py`) as a plain float, same posture as
+# `_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT` above — a static fallback for the
+# constructor's own default, never a `settings` read from this module.
+_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT = 20.0
+
 # Story 4.6 T8.4/T8.5 — the term this story ADDS, and the reason the whole
 # derivation had to be revisited.
 #
@@ -130,7 +148,11 @@ def _worst_case_backoff_s(*, base_delay_s: float, max_delay_s: float) -> float:
 
 
 def derive_stale_threshold_s(
-    *, base_delay_s: float, max_delay_s: float, escalation_timeout_s: float
+    *,
+    base_delay_s: float,
+    max_delay_s: float,
+    escalation_timeout_s: float,
+    handoff_summary_timeout_s: float,
 ) -> float:
     """Worst-case wall-clock for ONE node that writes no checkpoint throughout.
 
@@ -140,8 +162,21 @@ def derive_stale_threshold_s(
         x every provider in the chain          -> _MAX_PROVIDER_CHAIN_LEN
         x every attempt (first + retries)      -> 1 + MAX_RUNTIME_RETRIES
         + the backoff waits between them       -> _worst_case_backoff_s(...)
+        + its handoff summary, once, across
+          every provider in the chain          -> handoff_summary_timeout_s
+                                                   x _MAX_PROVIDER_CHAIN_LEN
         x margin for checkpoint-write latency
           and event-loop scheduling            -> _SAFETY_MARGIN
+
+    ``handoff_summary_timeout_s`` is REQUIRED, like its three siblings.
+    Review of 2026-09-12 (P-15): it shipped with a default, and a default on
+    an argument of this function is precisely the failure it exists to
+    prevent — a future caller who forgets to wire it silently derives a
+    window from 20.0 s instead of the deployed value, and a window that is
+    too short is the double-execution bug this whole derivation was written
+    for (Story 4.6 T8.4). The compatibility argument does not hold either:
+    the only production caller (``app/lifespan.py``) was edited in the same
+    change that introduced the default.
 
     **A function, not a constant, because the inputs are deployment-tunable
     and the invariant is not** (Story 4.6, review lot 7 / P-P). The three
@@ -176,11 +211,27 @@ def derive_stale_threshold_s(
     the same posture `available` and `model_owner` take in
     `domain/provider_chain.py`.
     """
+    # P-15 — the invariant this function exists to make true by construction
+    # is only true over a sane domain. `Settings` carries `gt=0`/
+    # `allow_inf_nan=False` on all four inputs, but this is a PUBLIC function
+    # called directly (including from tests), and a negative value here yields
+    # a NEGATIVE threshold: every `running` run is instantly classified
+    # orphaned and re-claimed, i.e. generalised double execution — silently.
+    for name, value in (
+        ("base_delay_s", base_delay_s),
+        ("max_delay_s", max_delay_s),
+        ("escalation_timeout_s", escalation_timeout_s),
+        ("handoff_summary_timeout_s", handoff_summary_timeout_s),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
+
     return (
         (NODE_TIMEOUT_S + escalation_timeout_s)
         * _MAX_PROVIDER_CHAIN_LEN
         * (1 + MAX_RUNTIME_RETRIES)
         + _worst_case_backoff_s(base_delay_s=base_delay_s, max_delay_s=max_delay_s)
+        + handoff_summary_timeout_s * _MAX_PROVIDER_CHAIN_LEN
     ) * _SAFETY_MARGIN
 
 
@@ -196,6 +247,7 @@ DEFAULT_STALE_THRESHOLD_S = derive_stale_threshold_s(
     base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S,
     max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
     escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
+    handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
 )
 
 # A run whose resume keeps dying before completing a single node is a poison

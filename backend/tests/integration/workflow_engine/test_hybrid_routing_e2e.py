@@ -122,7 +122,20 @@ async def test_declarative_rule_resolves_without_escalation(
     tpl_b = await _create_template(app_session_factory)
     app = _make_app(session_factory=app_session_factory)
     app.state.workflow_checkpointer = workflow_checkpointer
-    provider = MockProvider("mock", [_completion(json.dumps({"status": "done"}))])
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(json.dumps({"status": "done"})),
+            # Story 4.7 — `a` has a successor (`b`) in the DAG's SHAPE, so
+            # it triggers a handoff-summary call regardless of whether the
+            # actual routing decision reaches `b` (it doesn't, here).
+            _completion(
+                json.dumps(
+                    {"decisions": [], "artifacts_refs": [], "blockers": [], "next_questions": []}
+                )
+            ),
+        ],
+    )
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     wire_execution_service(app)
 
@@ -175,9 +188,10 @@ async def test_declarative_rule_resolves_without_escalation(
     assert decision["source"] == "rules"
     assert decision["rule_id"] == "terminal-output-status"
 
-    # Exactly ONE provider call total — the node's own completion. A second
-    # call would mean an (unwanted) escalation happened.
-    assert len(provider.calls) == 1
+    # Exactly TWO provider calls total — the node's own completion plus its
+    # handoff summary (Story 4.7). A THIRD call would mean an (unwanted)
+    # escalation happened.
+    assert len(provider.calls) == 2
 
     escalated_count = await _count_outbox(
         seed_session_factory, "workflow_engine.workflow_run.routing_escalated", run_id=run_id
@@ -201,6 +215,13 @@ async def test_no_matching_rule_escalates_and_continues_down_chosen_branch(
         "mock",
         [
             _completion(json.dumps({"status": "in_progress"})),  # node a's own output
+            # Story 4.7 — `a` has a successor, so it summarizes before the
+            # decision escalation call below.
+            _completion(
+                json.dumps(
+                    {"decisions": [], "artifacts_refs": [], "blockers": [], "next_questions": []}
+                )
+            ),
             _completion(json.dumps({"target": "b", "reason": "keep going"})),  # escalation
             _completion(json.dumps({"status": "final"})),  # node b's own output
         ],
@@ -299,6 +320,13 @@ async def test_routing_stats_endpoint_reports_ratio_and_null_for_empty_workflow(
         "mock",
         [
             _completion(json.dumps({"status": "in_progress"})),
+            # Story 4.7 — `a` has a successor, so it summarizes before the
+            # decision escalation call below.
+            _completion(
+                json.dumps(
+                    {"decisions": [], "artifacts_refs": [], "blockers": [], "next_questions": []}
+                )
+            ),
             _completion(json.dumps({"target": "b", "reason": "keep going"})),
             _completion(json.dumps({"status": "final"})),
         ],

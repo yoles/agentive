@@ -12,6 +12,8 @@
   for a workflow, WITHOUT executing it or calling any LLM (Story 4.4 AC1).
 * ``GET /workflows/{workflow_id}/routing-stats`` — hybrid-routing decisions
   aggregated in SQL over every run of the workflow (Story 4.3 AC3).
+* ``GET /workflows/{workflow_id}/handoff-stats`` — handoff-summary token
+  reduction aggregated in SQL over every run of the workflow (Story 4.7 AC3).
 * ``GET /workflows/runs/{run_id}/events`` — SSE stream of a run's state
   transitions (Story 4.2 AC1).
 * ``POST /workflows/runs/{run_id}/pause`` — ask a live run to suspend at its
@@ -21,14 +23,15 @@
 * ``POST /workflows/runs/{run_id}/cancel`` — stop a run for good (Story 4.6
   AC1).
 
-Declaration order matters: ``routing-stats``/``dry-run`` are declared BEFORE
-the run-events route under the same prefix. None of the three overlap (3
-path segments vs 4, and ``dry-run``/``routing-stats`` are distinct literal
-segments), and ``test_router_dependencies.py`` locks that rather than
-leaving it to inspection. The three Story 4.6 control routes join the same
-4-segment ``/workflows/runs/{run_id}/...`` space as ``events``, each behind
-its own distinct literal last segment — so they are unambiguous wherever
-they are declared, and the test locks that too.
+Declaration order matters: ``routing-stats``/``dry-run``/``handoff-stats``
+are declared BEFORE the run-events route under the same prefix. None of the
+four overlap (3 path segments vs 4, and ``dry-run``/``routing-stats``/
+``handoff-stats`` are distinct literal segments), and
+``test_router_dependencies.py`` locks that rather than leaving it to
+inspection. The three Story 4.6 control routes join the same 4-segment
+``/workflows/runs/{run_id}/...`` space as ``events``, each behind its own
+distinct literal last segment — so they are unambiguous wherever they are
+declared, and the test locks that too.
 
 **202 vs 200 on the control routes.** ``pause`` and ``cancel`` on a LIVE run
 return ``202``: the request is RECORDED, and the driver applies it at its
@@ -65,6 +68,7 @@ from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowResponse,
     DryRunRequest,
     DryRunResponse,
+    HandoffStatsResponse,
     ResumeRunRequest,
     RoutingStatsResponse,
     RunControlResponse,
@@ -368,6 +372,49 @@ async def get_workflow_routing_stats(workflow_id: UUID, request: Request) -> Rou
         deterministic=deterministic,
         llm_escalated=llm_escalated,
         deterministic_pct=deterministic_pct,
+    )
+
+
+@router.get(
+    "/workflows/{workflow_id}/handoff-stats",
+    response_model=HandoffStatsResponse,
+    summary="Aggregate handoff-summary token reduction for a workflow (Story 4.7 AC3)",
+)
+async def get_workflow_handoff_stats(workflow_id: UUID, request: Request) -> HandoffStatsResponse:
+    """Token-reduction from handoff summaries, aggregated in SQL over every
+    run of ``workflow_id`` — mirror ``get_workflow_routing_stats`` exactly,
+    never a Prometheus label (unbounded cardinality, same rule as above).
+
+    Errors:
+    * 404 — ``workflow_id`` unknown.
+    * 503 — lifespan state missing (session factory).
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise DependencyError(
+            detail="Workflow engine not initialised — check lifespan startup logs.",
+            context={"missing": ["session_factory"]},
+        )
+    workflow_repo = WorkflowRepo(session_factory=session_factory)
+    await workflow_repo.require_by_id(workflow_id)
+
+    workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
+    (
+        runs_counted,
+        raw_tokens_replaced,
+        summary_tokens,
+    ) = await workflow_run_repo.aggregate_token_reduction(workflow_id)
+    reduction_ratio_pct = (
+        round((1 - summary_tokens / raw_tokens_replaced) * 100, 1)
+        if raw_tokens_replaced > 0
+        else None
+    )
+    return HandoffStatsResponse(
+        workflow_id=workflow_id,
+        runs_counted=runs_counted,
+        raw_tokens_replaced=raw_tokens_replaced,
+        summary_tokens=summary_tokens,
+        reduction_ratio_pct=reduction_ratio_pct,
     )
 
 

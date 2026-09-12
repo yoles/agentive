@@ -105,7 +105,16 @@ async def test_execute_workflow_e2e_completes_with_checkpoint_and_metrics(
         providers={
             "mock": MockProvider(
                 "mock",
-                [_completion('{"step": "a"}'), _completion('{"step": "b"}')],
+                [
+                    _completion('{"step": "a"}'),
+                    # Story 4.7 — `a` has a successor (`b`), so it triggers a
+                    # handoff-summary call after its own completion.
+                    _completion(
+                        '{"decisions": [], "artifacts_refs": [], '
+                        '"blockers": [], "next_questions": []}'
+                    ),
+                    _completion('{"step": "b"}'),
+                ],
             )
         },
         default_chain=["mock"],

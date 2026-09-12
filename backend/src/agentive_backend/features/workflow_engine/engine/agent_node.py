@@ -29,8 +29,13 @@ from agentive_backend.features.workflow_engine.domain.error_policy import (
     resolve_error_policy,
 )
 from agentive_backend.features.workflow_engine.domain.provider_chain import resolve_provider_chain
+from agentive_backend.features.workflow_engine.engine.handoff import (
+    HandoffSettings,
+    summarize_handoff,
+)
 from agentive_backend.features.workflow_engine.metrics import WORKFLOW_NODE_RETRIES_TOTAL
 from agentive_backend.infra.llm.pricing import provider_for_model
+from agentive_backend.shared.contracts.handoff import HandoffSummary
 from agentive_backend.shared.exceptions import ValidationError
 from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
 from agentive_backend.shared.llm.security import wrap_external_input
@@ -229,8 +234,54 @@ def _guarded_system_prompt(system_prompt: str) -> str:
     return f"{system_prompt}\n\n{_INJECTION_GUARD}".strip()
 
 
-def _serialize_upstream(state: WorkflowState, *, node_id: str) -> str:
-    """Serialize the upstream node outputs this node can see, under a size cap.
+#: The ONLY keys of a `handoffs` entry a consuming agent may see. The entry
+#: also carries per-node accounting (`summary_input_tokens`,
+#: `summary_output_tokens`, `summary_cost_usd`, `raw_output_tokens_replaced`)
+#: read by `service._aggregate_metrics` — engine telemetry, not content.
+_HANDOFF_CONTRACT_KEYS: Final = frozenset(HandoffSummary.model_fields)
+
+
+def _positive_int(value: Any) -> int:
+    """A JSONB number as a non-negative int, ``0`` for anything else — the
+    same posture `service._coerce_token_count` applies on the way out."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(int(value), 0)
+
+
+def _handoff_view(entry: Any) -> dict[str, Any] | None:
+    """One ``handoffs`` entry as the consuming agent should see it, or ``None``
+    when there is nothing usable to show (AC2 per-key fallback).
+
+    Review of 2026-09-12, two holes closed at once:
+
+    * **P-4** — ``_serialize_upstream`` used to substitute the WHOLE entry, so
+      the next agent's prompt carried ``"raw_output_tokens_replaced": 1000,
+      "summary_input_tokens": 30, …`` inside ``<tool_output>``. That is the
+      engine's billing bookkeeping presented to an agent as business content:
+      noise paid for at every hop, working against the very token reduction
+      this story exists for, and recitable by an agent into its own output.
+      Project onto the contract's four fields instead.
+    * **P-5** — ``state["handoffs"]`` and its entries were trusted to be
+      ``dict``s because ``… or {}`` "already handled it". It only handles
+      ``None``: a checkpoint holding a list (corruption, or a future migration
+      following the epic's literal ``handoffs[]`` prose) raised
+      ``AttributeError`` on the hot path and failed EVERY node of the run.
+      Anything that is not a usable mapping now degrades to the raw output,
+      which is what AC2 promises for a missing entry.
+    """
+    if not isinstance(entry, dict):
+        return None
+    view = {key: entry[key] for key in _HANDOFF_CONTRACT_KEYS if key in entry}
+    # T3.3's literal `… or raw`: an entry with no contract key left is not a
+    # summary, it is an empty object — route the consumer to the raw output.
+    return view or None
+
+
+def _serialize_upstream(
+    state: WorkflowState, *, node_id: str, prefer_handoffs: bool
+) -> tuple[str, dict[str, Any] | None]:
+    """Serialize the upstream context this node can see, under a size cap.
 
     What LangGraph hands a node is every output committed in a STRICTLY
     EARLIER superstep — so on ``a → {b, c} → d``, ``b`` and ``c`` each see
@@ -242,6 +293,16 @@ def _serialize_upstream(state: WorkflowState, *, node_id: str) -> str:
     sees ``a``, which is no direct predecessor of it. Hence
     ``upstream_outputs``.
 
+    Story 4.7 AC2 — ``prefer_handoffs=True`` (the default, driven by the
+    consuming template's ``include_raw_previous_output`` config, T3.4) reads
+    the condensed :class:`~..engine.handoff.HandoffSummary` produced for each
+    upstream node instead of its raw ``node_outputs`` entry, WHEN one exists.
+    An upstream node absent from ``handoffs`` (summarization never attempted
+    — a pre-4.7 checkpoint — or it failed, AC1) falls back to ITS OWN raw
+    output only: a per-key fallback, never an all-or-nothing switch.
+    ``node_outputs`` itself is never mutated by this — routing (Story 4.3)
+    keeps reading it directly, unaffected by this function entirely.
+
     The cap is the real fix. On a linear DAG this payload grows by one full
     node output per step, so total prompt tokens across a run grow
     QUADRATICALLY with node count — unbounded cost and, eventually, a
@@ -249,7 +310,22 @@ def _serialize_upstream(state: WorkflowState, *, node_id: str) -> str:
     OLDEST outputs are dropped first (the nearest upstream ones are the most
     likely to matter) and the drop is logged, never silent.
     """
-    outputs = dict(state.get("node_outputs") or {})
+    raw_outputs = state.get("node_outputs") or {}
+    handoffs: dict[str, Any] = {}
+    substituted: set[str] = set()
+    if prefer_handoffs:
+        raw_handoffs = state.get("handoffs")
+        handoffs = raw_handoffs if isinstance(raw_handoffs, dict) else {}
+        outputs = {}
+        for nid, raw in raw_outputs.items():
+            view = _handoff_view(handoffs.get(nid))
+            if view is None:
+                outputs[nid] = raw
+            else:
+                outputs[nid] = view
+                substituted.add(nid)
+    else:
+        outputs = dict(raw_outputs)
     dropped: list[str] = []
     while outputs:
         serialized = json.dumps(outputs, ensure_ascii=False, sort_keys=True)
@@ -269,10 +345,42 @@ def _serialize_upstream(state: WorkflowState, *, node_id: str) -> str:
             dropped_nodes=dropped,
             cap_chars=MAX_UPSTREAM_OUTPUT_CHARS,
         )
-    return serialized
+
+    # B-01 — account the substitutions that SURVIVED, in this prompt. After
+    # the truncation loop, because an entry the cap dropped never reached the
+    # model and replaced nothing; and per consuming node, because the
+    # cumulative upstream view forwards one producer's output to every
+    # downstream node in turn — a saving made as many times as it is made,
+    # not once at production.
+    #
+    # Both figures stay ROUTER-MEASURED, read back from the producer's own
+    # `handoffs` entry: no tokenizer is introduced here, which the story
+    # forbids and which nothing in this repo provides.
+    surviving = substituted & outputs.keys()
+    if not surviving:
+        return serialized, None
+    raw_tokens = 0
+    summary_tokens = 0
+    for nid in surviving:
+        entry = handoffs.get(nid)
+        if not isinstance(entry, dict):
+            continue
+        raw_tokens += _positive_int(entry.get("raw_output_tokens_replaced"))
+        summary_tokens += _positive_int(entry.get("summary_output_tokens"))
+    substitution = {
+        "raw_tokens_replaced": raw_tokens,
+        "summary_tokens": summary_tokens,
+        # Which producers this prompt actually condensed — the fact an
+        # operator reading `workflow_runs.checkpoint` needs to tell a real
+        # saving from an arithmetic one.
+        "sources": sorted(surviving),
+    }
+    return serialized, substitution
 
 
-def _build_user_message(state: WorkflowState, *, node_id: str) -> str:
+def _build_user_message(
+    state: WorkflowState, *, node_id: str, config: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None]:
     """Compose the node's user message with both untrusted parts wrapped.
 
     CONVENTIONS.md règle d'or #9 (AR44) requires every external input to be
@@ -285,15 +393,39 @@ def _build_user_message(state: WorkflowState, *, node_id: str) -> str:
     Two envelopes, two kinds: the caller's payload is ``user_input``; another
     agent's output is ``tool_output``. ``wrap_external_input`` escapes ``<``
     so neither can forge a closing tag and break out.
+
+    Story 4.7 AC2 — ``config["include_raw_previous_output"]`` opts this node
+    OUT of handoff summaries. Only the literal ``True`` counts (a mistyped
+    value, e.g. the string ``"true"``, does NOT opt out) — mirror the
+    defensive-but-strict posture of ``_resolve_llm_params`` elsewhere in this
+    module.
+
+    Review of 2026-09-12 (P-11) — strict, but no longer SILENT. ``config`` is
+    a free JSONB blob on ``AgentTemplate``: no schema declares this key, so a
+    UI that serializes booleans as strings, or a hand-edited template, wrote
+    ``"true"`` and kept getting summaries with nothing anywhere relating cause
+    to effect. ``_resolve_llm_params``, cited as the model for this posture,
+    logs or raises on a bad value; this did neither.
     """
     task_input = json.dumps(state.get("task_input"), ensure_ascii=False)
-    upstream = _serialize_upstream(state, node_id=node_id)
-    return (
+    opt_out = config.get("include_raw_previous_output")
+    if opt_out is not None and not isinstance(opt_out, bool):
+        _log.warning(
+            "workflow_engine.include_raw_previous_output_ignored",
+            node_id=node_id,
+            value_type=type(opt_out).__name__,
+        )
+    prefer_handoffs = opt_out is not True
+    upstream, substitution = _serialize_upstream(
+        state, node_id=node_id, prefer_handoffs=prefer_handoffs
+    )
+    message = (
         "task_input:\n"
         f"{wrap_external_input(task_input, 'user_input')}\n\n"
         "upstream_outputs:\n"
         f"{wrap_external_input(upstream, 'tool_output')}"
     )
+    return message, substitution
 
 
 def _resolve_chain(
@@ -532,6 +664,8 @@ async def execute_agent_node(
     llm_router: LLMRouter,
     node_id: str,
     retry_settings: RetrySettings | None = None,
+    has_downstream: bool = False,
+    handoff_settings: HandoffSettings | None = None,
 ) -> dict[str, Any]:
     """Execute one workflow node — a single LLM completion (AC2, AC4).
 
@@ -542,14 +676,22 @@ async def execute_agent_node(
     degradation on a missing routing variable (a data-shape mismatch, not an
     infrastructure failure).
 
-    Returns a partial state update — ``node_outputs``/``node_metrics``
-    single-key dicts merged into the accumulated state by the
+    Returns a partial state update — ``node_outputs``/``node_metrics``/
+    ``handoffs`` single-key dicts merged into the accumulated state by the
     ``operator.or_`` reducer (``WorkflowState``, T3.3), never the full
     accumulated dicts themselves.
+
+    Story 4.7 T3.1 — ``has_downstream``/``handoff_settings`` default to
+    "summarization off": a direct test caller of this function that does not
+    pass them must never trigger an extra LLM call behind its back. Only
+    :func:`~.graph_builder.build_state_graph`, which knows the DAG's shape,
+    computes and passes ``has_downstream=True`` where it is legitimate
+    (T4.1) — a node with no successor is never summarized (AC1): nobody
+    would ever read it.
     """
     config = template.config if isinstance(template.config, dict) else {}
 
-    user_message = _build_user_message(state, node_id=node_id)
+    user_message, handoff_substitution = _build_user_message(state, node_id=node_id, config=config)
 
     model, temperature, max_tokens = _resolve_llm_params(config, node_id=node_id)
     system_prompt = _guarded_system_prompt(str(config.get("system_prompt") or ""))
@@ -602,10 +744,50 @@ async def execute_agent_node(
         "llm_attempts": llm_attempts,
     }
 
-    return {
+    node_update: dict[str, Any] = {
         "node_outputs": {node_id: node_output},
         "node_metrics": {node_id: node_metric},
     }
+
+    # B-01 — what THIS node's prompt really substituted, keyed by this node
+    # (the consumer), never by the producers it condensed: `handoffs` owns
+    # that key, and the two channels must not collide on merge.
+    if handoff_substitution is not None:
+        node_update["handoff_substitutions"] = {node_id: handoff_substitution}
+
+    # Story 4.7 T3.2 (AC1) — summarize ONLY when someone downstream could
+    # ever read it, and only when the assembly layer actually wired a model
+    # for it (`handoff_settings is None` covers every direct test caller of
+    # this function that predates this story). A failed summarization
+    # (`summarize_handoff` returns `None`) writes NOTHING to `handoffs` —
+    # the absence IS the signal the AC2 per-key fallback reacts to, never a
+    # placeholder.
+    if has_downstream and handoff_settings is not None:
+        outcome = await summarize_handoff(
+            node_output, llm_router=llm_router, node_id=node_id, settings=handoff_settings
+        )
+        if outcome is not None:
+            node_update["handoffs"] = {
+                node_id: {
+                    **outcome.summary.model_dump(),
+                    "summary_input_tokens": outcome.input_tokens,
+                    "summary_output_tokens": outcome.output_tokens,
+                    # Review of 2026-09-12 (P-2) — carried so the run's
+                    # `total_cost_usd` can include what this call actually
+                    # cost. `summarize_handoff` used to drop
+                    # `completion.cost_estimate_usd` on the floor, leaving the
+                    # spend unreconstructible from any surface. `str(...)` for
+                    # the same reason `_aggregate_routing` stringifies its
+                    # own: a `Decimal` is not JSONB-serializable.
+                    "summary_cost_usd": (
+                        str(outcome.cost_usd) if outcome.cost_usd is not None else None
+                    ),
+                    "summary_model": outcome.model,
+                    "raw_output_tokens_replaced": completion.output_tokens,
+                }
+            }
+
+    return node_update
 
 
 __all__ = [

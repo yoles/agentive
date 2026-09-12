@@ -1873,6 +1873,51 @@ async def test_completed_run_marks_nodes_that_never_executed_as_skipped(
 
 
 @pytest.mark.asyncio
+async def test_completed_run_with_skipped_nodes_still_reflects_handoffs_in_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """T5.3 — the SECOND checkpoint-rebuild spot (the skipped-nodes branch of
+    `_mark_completed`) mirrors `handoffs` too, not just `_sync_checkpoint`."""
+    workflow = _workflow(
+        dag={
+            "nodes": [
+                {"node_id": "a", "agent_template_id": str(uuid4())},
+                {"node_id": "b", "agent_template_id": str(uuid4())},
+            ],
+            "edges": [
+                {"from_node_id": "a", "to_node_id": "b", "condition": "output.go == true"},
+            ],
+        }
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[
+            {
+                "a": {
+                    "node_outputs": {"a": {"go": False}},
+                    "node_metrics": {"a": {}},
+                    "handoffs": {"a": {"decisions": ["done"]}},
+                }
+            }
+        ],
+        final_state={
+            "node_outputs": {"a": {"go": False}},
+            "node_metrics": {"a": {}},
+            "handoffs": {"a": {"decisions": ["done"]}},
+        },
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    final_checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
+    assert final_checkpoint["skipped_nodes"] == ["b"]
+    assert final_checkpoint["handoffs"] == {"a": {"decisions": ["done"]}}
+
+
+@pytest.mark.asyncio
 async def test_fully_executed_run_records_no_skipped_nodes(
     monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
 ) -> None:
@@ -2003,6 +2048,221 @@ def test_aggregate_metrics_routing_defaults_to_zero_counts_when_absent() -> None
     metrics = svc_module._aggregate_metrics({}, total_duration_ms=0)
     assert metrics["routing"]["deterministic"] == 0
     assert metrics["routing"]["llm_escalated"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Story 4.7 AC3 — handoff-summary token-reduction aggregation
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_aggregate_handoffs_computes_reduction_ratio_from_real_tokens() -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    # B-01 — the ratio reads the CONSUMER-side channel: what prompts really
+    # substituted, not what producers happened to summarize.
+    result = svc_module._aggregate_handoffs(
+        {},
+        {
+            "b": {"raw_tokens_replaced": 100, "summary_tokens": 20, "sources": ["a"]},
+            "c": {"raw_tokens_replaced": 200, "summary_tokens": 40, "sources": ["a", "b"]},
+        },
+    )
+
+    assert result["raw_tokens_replaced"] == 300
+    assert result["summary_tokens"] == 60
+    assert result["reduction_ratio"] == 0.8
+
+
+def test_aggregate_handoffs_when_no_raw_tokens_replaced_should_report_none_ratio() -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    result = svc_module._aggregate_handoffs({})
+
+    assert result == {
+        "raw_tokens_replaced": 0,
+        "summary_tokens": 0,
+        "reduction_ratio": None,
+        "tokens": {"input": 0, "output": 0},
+        "cost_usd": None,
+    }
+
+
+def test_aggregate_handoffs_ignores_corrupt_entries_without_poisoning_the_total() -> None:
+    """Mirror `_aggregate_routing`'s defensive posture — a single corrupt
+    entry (not a dict) is skipped, never raises."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    result = svc_module._aggregate_handoffs(
+        {},
+        {
+            "b": {"raw_tokens_replaced": 100, "summary_tokens": 20},
+            "c": "not a dict",
+        },
+    )
+
+    assert result["raw_tokens_replaced"] == 100
+    assert result["summary_tokens"] == 20
+
+
+@pytest.mark.parametrize("corrupt", ["n/a", {"nested": 1}, [1, 2], None, True, -5])
+def test_aggregate_handoffs_survives_a_corrupt_token_value(corrupt: object) -> None:
+    """P-5 — the docstring promised "a corrupt entry is skipped, never poisons
+    the whole aggregate" while only checking `isinstance(entry, dict)`:
+    `int("n/a")` raises `ValueError`, `int({...})` raises `TypeError`.
+
+    That mattered because `_mark_completed` calls `_aggregate_metrics` with NO
+    `try`/`except` (unlike the partial path, which has one), so one corrupt
+    value meant `update_status("completed")` was never reached: the run stayed
+    `running`, got claimed by the recovery sweep, was RE-EXECUTED up to
+    `MAX_RECOVERY_ATTEMPTS` and finally marked `error` — a run that had in
+    fact succeeded.
+    """
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    result = svc_module._aggregate_handoffs(
+        {"p": {"summary_input_tokens": corrupt, "summary_output_tokens": corrupt}},
+        {
+            "b": {"raw_tokens_replaced": 100, "summary_tokens": 20},
+            "c": {"raw_tokens_replaced": corrupt, "summary_tokens": corrupt},
+        },
+    )
+
+    assert result["raw_tokens_replaced"] == 100
+    assert result["summary_tokens"] == 20
+    assert result["tokens"] == {"input": 0, "output": 0}
+
+
+def test_aggregate_handoffs_ignores_an_unparsable_cost() -> None:
+    """P-5, cost side — same posture, and `Decimal("oops")` raises
+    `InvalidOperation`, which is not a `ValueError` subclass worth relying on
+    by accident."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    result = svc_module._aggregate_handoffs(
+        {
+            "a": {"summary_cost_usd": "0.001", "summary_output_tokens": 5},
+            "b": {"summary_cost_usd": "oops", "summary_output_tokens": 5},
+        },
+        {},
+    )
+
+    assert result["cost_usd"] == "0.001"
+
+
+def test_aggregate_handoffs_warns_when_the_summaries_came_out_bigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-10 — a ratio below zero means the optimization costs more than it
+    saves. The value is reported as measured (clamping would hide the only
+    signal that says so), but it is no longer reported in silence: a workflow
+    of short-output control nodes would otherwise publish
+    `reduction_ratio_pct: -180.0` through `/handoff-stats` as an economy."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    events: list[str] = []
+    monkeypatch.setattr(svc_module._log, "warning", lambda e, **kw: events.append(e))
+
+    result = svc_module._aggregate_handoffs(
+        {}, {"b": {"raw_tokens_replaced": 5, "summary_tokens": 100}}
+    )
+
+    assert result["reduction_ratio"] < 0
+    assert "workflow_engine.handoff_summary_inflated" in events
+
+
+def test_aggregate_metrics_with_a_handoffs_channel_of_the_wrong_type_does_not_raise() -> None:
+    """P-5 — `handoffs or {}` only guards `None`; `_mark_completed` has no
+    net, so `.values()` on a list ended a successful run as `error`."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    metrics = svc_module._aggregate_metrics(
+        {"a": {"input_tokens": 1, "output_tokens": 1}},
+        total_duration_ms=0,
+        handoffs=["not a mapping"],  # type: ignore[arg-type]
+    )
+
+    assert metrics["handoffs"]["raw_tokens_replaced"] == 0
+
+
+def test_aggregate_metrics_folds_handoffs_block_and_projects_summary_tokens_per_node() -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    metrics = svc_module._aggregate_metrics(
+        {"a": {"input_tokens": 50, "output_tokens": 7}},
+        total_duration_ms=0,
+        handoffs={
+            "a": {
+                "decisions": [],
+                "artifacts_refs": [],
+                "blockers": [],
+                "next_questions": [],
+                "summary_input_tokens": 30,
+                "summary_output_tokens": 9,
+                "raw_output_tokens_replaced": 7,
+            }
+        },
+        handoff_substitutions={"b": {"raw_tokens_replaced": 7, "summary_tokens": 9}},
+    )
+
+    assert metrics["handoffs"] == {
+        "raw_tokens_replaced": 7,
+        "summary_tokens": 9,
+        "reduction_ratio": round(1 - 9 / 7, 4),
+        # Review of 2026-09-12 (P-2) — the FULL spend of the summary call,
+        # input included. Distinct from `summary_tokens`, which is only the
+        # output side, because only the output side is what got substituted.
+        "tokens": {"input": 30, "output": 9},
+        "cost_usd": None,
+    }
+    assert metrics["per_node"]["a"]["handoff_summary_tokens"] == {"input": 30, "output": 9}
+    # P-2 — and the run's totals now carry it: 50/7 from the node itself PLUS
+    # 30/9 from its summary. Before this fix the run billed two LLM calls and
+    # reported one, so `total_cost_usd` diverged permanently from the invoice.
+    assert metrics["total_tokens"] == {"input": 80, "output": 16}
+
+
+def test_aggregate_metrics_handoffs_defaults_to_zeroed_shape_when_absent() -> None:
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    metrics = svc_module._aggregate_metrics({}, total_duration_ms=0)
+
+    assert metrics["handoffs"] == {
+        "raw_tokens_replaced": 0,
+        "summary_tokens": 0,
+        "reduction_ratio": None,
+        "tokens": {"input": 0, "output": 0},
+        "cost_usd": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_checkpoint_reflects_handoffs_channel() -> None:
+    """T5.2 — mirror `routing_decisions`: the applicative checkpoint always
+    carries the CURRENT `handoffs` state, even when empty."""
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._sync_checkpoint(
+        uuid4(),
+        {
+            "node_outputs": {"a": {"x": 1}},
+            "handoffs": {"a": {"decisions": ["done"]}},
+        },
+        last_node_id="a",
+        templates={},
+    )
+
+    checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
+    assert checkpoint["handoffs"] == {"a": {"decisions": ["done"]}}
+
+
+@pytest.mark.asyncio
+async def test_sync_checkpoint_handoffs_defaults_to_empty_dict_when_absent() -> None:
+    service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
+
+    await service._sync_checkpoint(uuid4(), {"node_outputs": {}}, last_node_id="a", templates={})
+
+    checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
+    assert checkpoint["handoffs"] == {}
 
 
 @pytest.mark.asyncio
@@ -3733,3 +3993,35 @@ async def test_terminal_write_is_unchanged_for_a_run_that_never_paused(
     )
     # Seconds, not ten minutes: nothing was carried forward.
     assert terminal.kwargs["metrics"]["total_duration_ms"] < 60_000
+
+
+def test_handoff_settings_are_none_when_the_kill_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-04 — `None` is the deployment kill switch, and it is the path
+    `build_state_graph`/`execute_agent_node` already default to: no new
+    branch, the pre-4.7 behaviour byte for byte.
+
+    AC2 makes summarization the default, which silently changes the prompt of
+    every template already in production — one reading
+    `upstream_outputs["a"]["invoice_id"]` stops finding that field, with no
+    change to its own config and no template versioning to roll back to. The
+    per-template opt-out exists but is per-template: recovering from a bad
+    rollout meant editing every consumer under incident.
+    """
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    monkeypatch.setattr(svc_module.settings, "workflow_handoff_summary_enabled", False)
+    built = (
+        svc_module.HandoffSettings(
+            model=svc_module.settings.workflow_handoff_summary_model,
+            max_tokens=svc_module.settings.workflow_handoff_summary_max_tokens,
+            timeout_s=svc_module.settings.workflow_handoff_summary_timeout_s,
+        )
+        if svc_module.settings.workflow_handoff_summary_enabled
+        else None
+    )
+    assert built is None
+
+    monkeypatch.setattr(svc_module.settings, "workflow_handoff_summary_enabled", True)
+    assert svc_module.settings.workflow_handoff_summary_enabled is True

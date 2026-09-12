@@ -18,6 +18,8 @@ from agentive_backend.features.workflow_engine.engine.agent_node import NODE_TIM
 from agentive_backend.features.workflow_engine.recovery import (
     _DEFAULT_RETRY_BASE_DELAY_S,
     _DEFAULT_RETRY_MAX_DELAY_S,
+    _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+    _MAX_PROVIDER_CHAIN_LEN,
     _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
     DEFAULT_STALE_THRESHOLD_S,
     MAX_RECOVERY_ATTEMPTS,
@@ -33,6 +35,11 @@ from agentive_backend.shared.config import Settings
 _DEFAULT_BACKOFF_S = _worst_case_backoff_s(
     base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S, max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S
 )
+
+#: Story 4.7 T5.6 — the handoff-summary term at its default, added once
+#: (never multiplied by `1 + MAX_RUNTIME_RETRIES`: a node summarizes ONCE
+#: regardless of how many times its own completion retried).
+_DEFAULT_HANDOFF_S = _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT * _MAX_PROVIDER_CHAIN_LEN
 
 
 @pytest.fixture
@@ -236,6 +243,7 @@ def test_stale_threshold_covers_a_decision_point_node_with_its_escalation() -> N
                 * 2
                 * (1 + MAX_RUNTIME_RETRIES)
                 + _DEFAULT_BACKOFF_S
+                + _DEFAULT_HANDOFF_S
             )
             * 2.5
         )
@@ -295,6 +303,12 @@ def test_recovery_escalation_default_matches_the_settings_default() -> None:
     assert Settings().routing_escalation_timeout_s == _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT
 
 
+def test_recovery_handoff_summary_timeout_default_matches_the_settings_default() -> None:
+    """Story 4.7 T5.6 — same parity requirement as the escalation timeout
+    above, for the mirror this story adds."""
+    assert Settings().workflow_handoff_summary_timeout_s == _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT
+
+
 def test_recovery_retry_delay_defaults_match_the_settings_defaults() -> None:
     """Same parity requirement as the escalation timeout above, extended to
     the two delays the derivation now reads (review lot 7, P-P). These sit
@@ -316,12 +330,13 @@ def test_the_module_default_is_the_derivation_at_the_default_settings() -> None:
     the same formula, so a change inside `_worst_case_backoff_s` or to the
     margin moved both sides together and nothing in the suite moved.
 
-    A literal breaks that symmetry: ((60 + 15) x 2 x 4 + (1 + 2 + 4)) x 2,5.
-    Touch the formula, the margin, the chain length or the retry cap, and a
-    human has to come here and re-justify the number — which is the point,
-    because this number is how long a genuinely crashed run stays unexamined.
+    A literal breaks that symmetry: ((60 + 15) x 2 x 4 + (1 + 2 + 4) + 20 x 2) x 2,5.
+    Touch the formula, the margin, the chain length, the retry cap or the
+    handoff-summary timeout (Story 4.7 T5.6), and a human has to come here
+    and re-justify the number — which is the point, because this number is
+    how long a genuinely crashed run stays unexamined.
     """
-    assert DEFAULT_STALE_THRESHOLD_S == 1517.5
+    assert DEFAULT_STALE_THRESHOLD_S == 1617.5
 
 
 def test_the_threshold_grows_with_the_configured_retry_delay() -> None:
@@ -332,19 +347,38 @@ def test_the_threshold_grows_with_the_configured_retry_delay() -> None:
     So the delays never produced the double execution, and the claim that
     "the ceiling keeps the derivation true" was wrong about the mechanism
     rather than about the outcome — what held was the margin, eroded to
-    x1,49 in the process. Asserting the margin, not just the ordering, is
-    what would catch a future ceiling raised past what it can absorb.
+    x1,49 in the process.
+
+    Story 4.7 T5.6 adds a FIXED term (the handoff-summary timeout, not scaled
+    by `1 + MAX_RUNTIME_RETRIES`) to both sides of this comparison. Because
+    the numerator's own x2,5 margin amplifies that fixed addition while the
+    raw `worst_case_node_s` denominator does not, the erosion is now x1,53 —
+    still comfortably below the x2,5 the formula nominally grants, but no
+    longer x1,49. Asserting the margin, not just the ordering, is what would
+    catch a future ceiling (or handoff timeout) raised past what it can absorb.
     """
     raised = derive_stale_threshold_s(
-        base_delay_s=60.0, max_delay_s=300.0, escalation_timeout_s=15.0
+        base_delay_s=60.0,
+        max_delay_s=300.0,
+        escalation_timeout_s=15.0,
+        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
     )
-    worst_case_node_s = (NODE_TIMEOUT_S + 15.0) * 2 * (1 + MAX_RUNTIME_RETRIES) + (
-        60.0 + 120.0 + 240.0
+    worst_case_node_s = (
+        (NODE_TIMEOUT_S + 15.0) * 2 * (1 + MAX_RUNTIME_RETRIES)
+        + (60.0 + 120.0 + 240.0)
+        + _DEFAULT_HANDOFF_S
+    )
+    default_worst_case_node_s = (
+        (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * 2 * (1 + MAX_RUNTIME_RETRIES)
+        + _DEFAULT_BACKOFF_S
+        + _DEFAULT_HANDOFF_S
     )
     assert raised > DEFAULT_STALE_THRESHOLD_S
     # The derived window restores the full margin the fixed one had spent.
-    assert raised / worst_case_node_s == pytest.approx(DEFAULT_STALE_THRESHOLD_S / 607.0)
-    assert DEFAULT_STALE_THRESHOLD_S / worst_case_node_s < 1.5
+    assert raised / worst_case_node_s == pytest.approx(
+        DEFAULT_STALE_THRESHOLD_S / default_worst_case_node_s
+    )
+    assert DEFAULT_STALE_THRESHOLD_S / worst_case_node_s < 1.6
 
 
 def test_the_threshold_grows_with_the_configured_escalation_timeout() -> None:
@@ -363,7 +397,10 @@ def test_the_threshold_grows_with_the_configured_escalation_timeout() -> None:
     ) + _DEFAULT_BACKOFF_S
     assert worst_case_at_150 > DEFAULT_STALE_THRESHOLD_S  # the old, fixed window: not covering
     derived = derive_stale_threshold_s(
-        base_delay_s=1.0, max_delay_s=30.0, escalation_timeout_s=150.0
+        base_delay_s=1.0,
+        max_delay_s=30.0,
+        escalation_timeout_s=150.0,
+        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
     )
     assert derived > worst_case_at_150  # the derived one: covering
 
@@ -384,7 +421,10 @@ def test_the_escalation_timeout_is_bounded_by_config() -> None:
     # the DEFAULTS (asserted above on `DEFAULT_STALE_THRESHOLD_S`); what the
     # ceilings owe is that the worst case stays bounded and knowable.
     at_ceilings = derive_stale_threshold_s(
-        base_delay_s=60.0, max_delay_s=300.0, escalation_timeout_s=60.0
+        base_delay_s=60.0,
+        max_delay_s=300.0,
+        escalation_timeout_s=60.0,
+        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
     )
     assert at_ceilings < 60 * 60
 
@@ -497,3 +537,55 @@ async def test_stop_cancels_inflight_resume_tasks() -> None:
 #
 # Both verified against those two regressions before this note was written
 # (review lot 11).
+
+
+# ─── Revue du 2026-09-12 — P-15 : le paramètre handoff n'a plus de défaut ───
+
+
+def test_the_handoff_timeout_is_a_required_argument_like_its_three_siblings() -> None:
+    """It shipped with a default, and a default on an argument of THIS
+    function is precisely the failure it exists to prevent: a future caller
+    who forgets to wire it silently derives a window from 20.0 s instead of
+    the deployed value, and a window that is too short is the double-execution
+    bug this whole derivation was written for (Story 4.6 T8.4). The
+    compatibility argument did not hold either — the only production caller
+    (`app/lifespan.py`) was edited in the same change that introduced it."""
+    with pytest.raises(TypeError, match="handoff_summary_timeout_s"):
+        derive_stale_threshold_s(  # type: ignore[call-arg]
+            base_delay_s=1.0, max_delay_s=30.0, escalation_timeout_s=15.0
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"base_delay_s": -1.0},
+        {"max_delay_s": -1.0},
+        {"escalation_timeout_s": -1.0},
+        {"handoff_summary_timeout_s": -1000.0},
+        {"handoff_summary_timeout_s": float("inf")},
+        {"escalation_timeout_s": float("nan")},
+    ],
+)
+def test_a_value_outside_the_sane_domain_is_refused(kwargs: dict[str, float]) -> None:
+    """The invariant this function makes true by construction is only true
+    over a sane domain. `Settings` carries `gt=0`/`allow_inf_nan=False` on all
+    four inputs, but this is a PUBLIC function called directly (tests
+    included), and a negative value yields a NEGATIVE threshold: every
+    `running` run is instantly classified orphaned and re-claimed, i.e.
+    generalised double execution — silently."""
+    base: dict[str, float] = {
+        "base_delay_s": 1.0,
+        "max_delay_s": 30.0,
+        "escalation_timeout_s": 15.0,
+        "handoff_summary_timeout_s": _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+    }
+    base.update(kwargs)
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        derive_stale_threshold_s(**base)  # type: ignore[arg-type]
+
+
+def test_the_handoff_timeout_default_matches_the_settings_default() -> None:
+    """P-16 — `.env.example` and `Settings` are the deployed truth; this
+    module's static fallback must not drift from them."""
+    assert Settings().workflow_handoff_summary_timeout_s == _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT

@@ -284,6 +284,29 @@ class RoutingStatsResponse(BaseModel):
     deterministic_pct: float | None = None
 
 
+class HandoffStatsResponse(BaseModel):
+    """Response of ``GET /api/v1/workflows/{workflow_id}/handoff-stats``
+    (Story 4.7 AC3) — token-reduction from handoff summaries, aggregated
+    across every run of the workflow. Mirror ``RoutingStatsResponse``.
+
+    ``reduction_ratio_pct`` is ``None`` when ``raw_tokens_replaced == 0`` — a
+    legitimate state (no node in this workflow ever had a downstream
+    successor to summarize for, or the workflow has zero runs), never a
+    division-by-zero to paper over.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: UUID
+    #: EVERY run of this workflow, whatever its status. NOT the denominator
+    #: of `reduction_ratio_pct` — a workflow can report many runs counted and
+    #: zero handoffs (e.g. every workflow here is a single terminal node).
+    runs_counted: int = Field(ge=0)
+    raw_tokens_replaced: int = Field(ge=0)
+    summary_tokens: int = Field(ge=0)
+    reduction_ratio_pct: float | None = None
+
+
 class RunControlResponse(BaseModel):
     """Response of ``POST /workflows/runs/{run_id}/{pause,resume,cancel}``
     (Story 4.6 AC1).
@@ -453,6 +476,7 @@ __all__ = [
     "DryRunRequest",
     "DryRunResponse",
     "DryRunRisk",
+    "HandoffStatsResponse",
     "MiseEnPlaceCheckOut",
     "MiseEnPlaceReportOut",
     "ProviderTokenEstimate",

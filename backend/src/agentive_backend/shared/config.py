@@ -269,6 +269,77 @@ class Settings(BaseSettings):
         alias="AGENTIVE_WORKFLOW_RETRY_MAX_DELAY_S",
     )
 
+    # ─── Story 4.7 — handoff summaries (FR53) ───
+    # Same posture as `routing_escalation_model`: a fixed, lightweight,
+    # PROCESS-WIDE model for an auxiliary engine call, never a per-agent
+    # `provider_chain`/`error_policy` (Dev Notes § comment already written in
+    # `hybrid_router.py` for the routing escalation call — a summary is a
+    # function of the engine, not the agent template author's behaviour).
+    workflow_handoff_summary_model: str = Field(
+        default="claude-haiku-4-5",
+        min_length=1,
+        alias="AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MODEL",
+    )
+    # A résumé is 4 short lists of strings — far below a content node's
+    # `DEFAULT_MAX_TOKENS = 4096` (`agent_node.py`). `le` mirrors
+    # `routing_escalation_max_tokens`: an auxiliary engine call has no
+    # business outgrowing the node it serves.
+    workflow_handoff_summary_max_tokens: int = Field(
+        default=512,
+        ge=1,
+        le=4096,
+        alias="AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MAX_TOKENS",
+    )
+    # More generous than `routing_escalation_timeout_s` (15s): the input
+    # being condensed here is a full content node's output, potentially much
+    # larger than a routing classification's input.
+    #
+    # Review of 2026-09-12 (I-02) — `le=60.0` was MISSING, and this knob is
+    # the twin of `routing_escalation_timeout_s` above, whose own ceiling
+    # exists because `recovery.derive_stale_threshold_s` multiplies it (here,
+    # by `_MAX_PROVIDER_CHAIN_LEN`). Unbounded, it moved two things at once,
+    # both by one env var: the staleness window (past which a crashed run
+    # sits unexamined — at 600 s the window passes three hours), and the
+    # worst-case latency of a `pause`/`cancel`, which is observed only at the
+    # superstep boundary and now waits for this call before reaching it.
+    #
+    # 45.0 rather than `routing_escalation_timeout_s`'s 60.0, and the number
+    # is DERIVED, not picked: `derive_stale_threshold_s` adds this term as
+    # `h * _MAX_PROVIDER_CHAIN_LEN * _SAFETY_MARGIN` = `5h` on top of
+    # 1517.5 s at otherwise-default settings, and `DEFAULT_STALE_THRESHOLD_S`
+    # commits in writing to staying under 30 min. `1517.5 + 5h < 1800` gives
+    # `h < 56.5`; 45.0 lands at 1742.5 s (29.0 min) with margin to spare,
+    # while still granting more than twice the 20.0 default. At 60.0 the
+    # window would be 1817.5 s — 30.3 min — quietly breaking that promise
+    # through a knob nobody would think to check.
+    workflow_handoff_summary_timeout_s: float = Field(
+        default=20.0,
+        gt=0.0,
+        le=45.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_TIMEOUT_S",
+    )
+    # Review of 2026-09-12 (I-04) — the deployment-level kill switch Story
+    # 4.7 shipped without.
+    #
+    # AC2 makes summarization the DEFAULT, which silently changes the prompt
+    # of every template already in production: one written and validated
+    # against an upstream node's raw output (reading, say,
+    # `upstream_outputs["a"]["invoice_id"]`) stops finding that field, with
+    # no change to its own config and no template versioning to roll back to.
+    # The per-template opt-out exists, but it is per-template: recovering
+    # from a bad rollout meant editing every consumer under incident.
+    #
+    # `False` makes `_execute` pass `handoff_settings=None`, which is the
+    # path `execute_agent_node`/`build_state_graph` already default to and
+    # already test — not a new branch, the pre-4.7 behaviour byte for byte.
+    # Default `True`: the AC's default stands, and this only makes it
+    # reversible without a deploy of template edits.
+    workflow_handoff_summary_enabled: bool = Field(
+        default=True,
+        alias="AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_ENABLED",
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

@@ -639,3 +639,37 @@ class WorkflowRunRepo(BaseRepo):
             result = await session.execute(stmt)
             row = result.one()
             return int(row[0]), int(row[1]), int(row[2])
+
+    async def aggregate_token_reduction(
+        self, workflow_id: UUID, *, tenant_id: UUID | None = None
+    ) -> tuple[int, int, int]:
+        """``(runs_counted, raw_tokens_replaced, summary_tokens)`` across
+        every run of ``workflow_id`` (Story 4.7 AC3).
+
+        Mirror ``aggregate_routing_modes`` EXACTLY — same defensive
+        ``jsonb_typeof``/``numeric``/``floor`` cast per row (a single
+        corrupted or fractional value must not poison the whole workflow's
+        aggregate), reading ``metrics["handoffs"]`` instead of
+        ``metrics["routing"]``. Tolerant of rows that predate this story
+        (no ``handoffs`` key at all) the same way.
+        """
+
+        def _handoff_count(key: str) -> Any:
+            path = WorkflowRun.metrics[("handoffs", key)]
+            return case(
+                (
+                    func.jsonb_typeof(path) == "number",
+                    cast(func.floor(cast(path.astext, Numeric)), Integer),
+                ),
+                else_=literal(0),
+            )
+
+        async with self.with_tenant(tenant_id) as session:
+            stmt = select(
+                func.count(),
+                func.coalesce(func.sum(_handoff_count("raw_tokens_replaced")), literal(0)),
+                func.coalesce(func.sum(_handoff_count("summary_tokens")), literal(0)),
+            ).where(WorkflowRun.workflow_id == workflow_id)
+            result = await session.execute(stmt)
+            row = result.one()
+            return int(row[0]), int(row[1]), int(row[2])

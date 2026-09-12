@@ -414,3 +414,89 @@ def test_resume_run_request_forbids_the_start_run_fields() -> None:
 
     with pytest.raises(ValidationError):
         ResumeRunRequest(input={"task": "x"})  # type: ignore[call-arg]
+
+
+# ─── Story 4.7 T6.2/T8.7 — HandoffStatsResponse ──────────────────────────
+
+
+def test_handoff_stats_response_rejects_unknown_fields() -> None:
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    with pytest.raises(ValidationError):
+        HandoffStatsResponse(
+            workflow_id=uuid4(),
+            runs_counted=1,
+            raw_tokens_replaced=0,
+            summary_tokens=0,
+            extra_field="nope",  # type: ignore[call-arg]
+        )
+
+
+def test_handoff_stats_response_reduction_ratio_defaults_to_none() -> None:
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    response = HandoffStatsResponse(
+        workflow_id=uuid4(), runs_counted=5, raw_tokens_replaced=0, summary_tokens=0
+    )
+    assert response.reduction_ratio_pct is None
+
+
+def test_handoff_stats_response_accepts_a_computed_ratio() -> None:
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    response = HandoffStatsResponse(
+        workflow_id=uuid4(),
+        runs_counted=5,
+        raw_tokens_replaced=300,
+        summary_tokens=60,
+        reduction_ratio_pct=80.0,
+    )
+    assert response.reduction_ratio_pct == 80.0
+
+
+# ─── Revue du 2026-09-12 (P-16) — le domaine réel de la réponse ────────────
+
+
+def test_handoff_stats_response_refuses_negative_token_counts() -> None:
+    """`Field(ge=0)` is the last line of defence, and it is a LOUD one: the
+    SQL aggregate accepts any `jsonb_typeof = number`, negatives included, so
+    a single corrupt row used to reach here and 500 the endpoint for every
+    other run of the workflow. `_coerce_token_count` now floors at 0 upstream;
+    this locks the contract that made the failure loud enough to find."""
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    with pytest.raises(ValidationError):
+        HandoffStatsResponse(
+            workflow_id=uuid4(),
+            runs_counted=1,
+            raw_tokens_replaced=-5,
+            summary_tokens=0,
+        )
+
+
+def test_handoff_stats_response_allows_a_negative_ratio() -> None:
+    """P-10 — a negative ratio is not corruption, it is a real and reportable
+    outcome: the summaries came out BIGGER than the outputs they replaced.
+    Clamping it would erase the only signal saying the optimization costs more
+    than it saves, so the schema accepts it and `_aggregate_handoffs` warns."""
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    response = HandoffStatsResponse(
+        workflow_id=uuid4(),
+        runs_counted=1,
+        raw_tokens_replaced=5,
+        summary_tokens=100,
+        reduction_ratio_pct=-1900.0,
+    )
+    assert response.reduction_ratio_pct == -1900.0
+
+
+def test_handoff_stats_response_ratio_is_none_when_nothing_was_replaced() -> None:
+    """The legitimate "no node in this workflow ever had a successor" state —
+    never a division by zero papered over, and never confused with 0%."""
+    from agentive_backend.features.workflow_engine.schemas import HandoffStatsResponse
+
+    response = HandoffStatsResponse(
+        workflow_id=uuid4(), runs_counted=3, raw_tokens_replaced=0, summary_tokens=0
+    )
+    assert response.reduction_ratio_pct is None

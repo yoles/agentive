@@ -271,6 +271,80 @@ def _escalation_averages_from_runs(
     return averages
 
 
+@dataclass(slots=True)
+class _HandoffAverage:
+    """Expected handoff-summary cost of ONE node, per run."""
+
+    input_tokens: int
+    output_tokens: int
+    model: str
+
+
+def _handoff_averages_from_runs(
+    runs: Sequence[WorkflowRun],
+) -> dict[str, _HandoffAverage]:
+    """Average handoff-summary usage per node (review of 2026-09-12, I-03).
+
+    **This is IG6 reopened.** Story 4.4's review already fixed exactly this
+    bug for routing escalations — see :func:`_escalation_averages_from_runs`:
+    "The Dry Run loaded the same rows and threw the fields away, so it
+    compared a 'nodes only' estimate against a 'nodes + escalations' reality
+    and understated every workflow that escalates." Story 4.7 then added a
+    SECOND auxiliary LLM call, on every non-terminal node, and
+    ``NodeMetricSample`` consumes only ``input_tokens``/``output_tokens``
+    from ``metrics.per_node[node_id]`` — while the summary's spend lives in
+    the sibling key ``handoff_summary_tokens``. The endpoint whose entire
+    purpose is to PREDICT a cost was therefore predicting, again and
+    systematically, below the real one.
+
+    Averaged over every run in which the node appears, not only the runs
+    where it summarized: a node that summarizes in half its runs costs half
+    a summary per run, and that expectation is the useful number — same
+    denominator choice, and same reasoning, as the escalation average above.
+    Only nodes with at least one priced summary appear in the result.
+    """
+    totals: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        metrics = run.metrics if isinstance(run.metrics, dict) else {}
+        per_node = metrics.get("per_node")
+        if not isinstance(per_node, dict):
+            continue
+        for node_id, metric in per_node.items():
+            if not isinstance(node_id, str) or not isinstance(metric, dict):
+                continue
+            entry = totals.setdefault(
+                node_id, {"runs": 0, "input": 0, "output": 0, "models": Counter[str]()}
+            )
+            entry["runs"] += 1
+            tokens = metric.get("handoff_summary_tokens")
+            if not isinstance(tokens, dict):
+                # The node ran and was NOT summarized (terminal, opted-out
+                # consumers, or the summary failed). It really did cost
+                # nothing, and it still counts in the denominator.
+                continue
+            entry["input"] += _usable_token_count(tokens.get("input")) or 0
+            entry["output"] += _usable_token_count(tokens.get("output")) or 0
+            model = metric.get("handoff_summary_model")
+            if isinstance(model, str) and model:
+                entry["models"][model] += 1
+
+    averages: dict[str, _HandoffAverage] = {}
+    for node_id, entry in totals.items():
+        models: Counter[str] = entry["models"]
+        if not models or not entry["runs"]:
+            continue
+        averages[node_id] = _HandoffAverage(
+            input_tokens=round(entry["input"] / entry["runs"]),
+            output_tokens=round(entry["output"] / entry["runs"]),
+            # The model this node actually summarized with most often — NOT
+            # `settings.workflow_handoff_summary_model`, for the same reason
+            # spelled out on the escalation average: that is today's config,
+            # while these tokens were spent under whatever was set then.
+            model=models.most_common(1)[0][0],
+        )
+    return averages
+
+
 def _usable_token_count(value: object) -> int | None:
     """``value`` as a token count, or ``None`` if it is not plausibly one.
 
@@ -397,6 +471,7 @@ class DryRunService:
         completed_runs = [run for run in history_runs if run.status == "completed"]
         routing_history = _routing_history_from_runs(completed_runs)
         escalation_averages = _escalation_averages_from_runs(completed_runs)
+        handoff_averages = _handoff_averages_from_runs(history_runs)
         node_cost_samples = _node_metric_samples_from_runs(history_runs)
 
         result = compute_probable_path(dag, routing_history)
@@ -473,6 +548,12 @@ class DryRunService:
                     escalation.input_tokens,
                     escalation.output_tokens,
                 )
+
+            # Handoff summaries this node paid for historically (I-03) —
+            # the same omission as IG6, one story later.
+            handoff = handoff_averages.get(node_id)
+            if handoff is not None and (handoff.input_tokens or handoff.output_tokens):
+                _account(node_id, handoff.model, handoff.input_tokens, handoff.output_tokens)
 
         token_estimate_per_provider = {
             provider: ProviderTokenEstimate(

@@ -24,6 +24,7 @@ from agentive_backend.features.workflow_engine.domain.value_objects import (
     WorkflowNode,
 )
 from agentive_backend.features.workflow_engine.engine.graph_builder import build_state_graph
+from agentive_backend.features.workflow_engine.engine.handoff import HandoffSettings
 from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.testing import MockProvider
@@ -453,3 +454,191 @@ async def test_failed_escalation_preserves_the_node_update_on_the_exception() ->
     # And the work the run already paid for came along.
     assert exc_info.value.node_update["node_outputs"] == {"a": {"status": "unknown"}}
     assert exc_info.value.node_update["node_metrics"]["a"]["cost_usd"] == "0.002"
+
+
+# ─── Story 4.7 T4 — `has_downstream` computed per node, threaded to both wiring branches ───
+
+
+def _handoff_settings() -> HandoffSettings:
+    return HandoffSettings(model="mock-model", max_tokens=256, timeout_s=20.0)
+
+
+_VALID_HANDOFF_JSON = (
+    '{"decisions": ["done"], "artifacts_refs": [], "blockers": [], "next_questions": []}'
+)
+
+
+@pytest.mark.asyncio
+async def test_sink_node_is_never_summarized_even_with_handoff_settings_provided() -> None:
+    """A mono-node DAG's only node has no successor: `has_downstream=False`,
+    so only ONE completion is consumed — never a second one for a summary
+    nobody would ever read (AC1)."""
+    dag = _dag(["a"], [])
+    templates = {"a": _template()}
+    provider = MockProvider("mock", [_completion('{"x": 1}')])
+    router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    graph = build_state_graph(
+        dag, templates, router, handoff_settings=_handoff_settings()
+    ).compile()
+
+    result = await graph.ainvoke(_initial_state())
+
+    assert result["node_outputs"] == {"a": {"x": 1}}
+    assert "handoffs" not in result or result["handoffs"] == {}
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_unconditional_node_is_summarized_when_settings_provided() -> None:
+    """`a -> b`: `a` has a successor, so `has_downstream=True` for `a` and it
+    is summarized (a 2nd completion consumed); `b` is terminal, no summary."""
+    dag = _dag(["a", "b"], [("a", "b", None)])
+    templates = {n: _template() for n in ("a", "b")}
+    provider = MockProvider(
+        "mock",
+        [
+            _completion('{"step": "a"}'),
+            _completion(_VALID_HANDOFF_JSON),
+            _completion('{"step": "b"}'),
+        ],
+    )
+    router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    graph = build_state_graph(
+        dag, templates, router, handoff_settings=_handoff_settings()
+    ).compile()
+
+    result = await graph.ainvoke(_initial_state())
+
+    assert result["node_outputs"] == {"a": {"step": "a"}, "b": {"step": "b"}}
+    assert result["handoffs"] == {
+        "a": {
+            "decisions": ["done"],
+            "artifacts_refs": [],
+            "blockers": [],
+            "next_questions": [],
+            "summary_input_tokens": 10,
+            "summary_output_tokens": 5,
+            # Review of 2026-09-12 (P-2) — the summary call's own cost travels
+            # with it now, so the run's `total_cost_usd` can include it.
+            "summary_cost_usd": None,
+            # I-03 — the model that actually answered, so the Dry Run prices
+            # past spend against it rather than today's config.
+            "summary_model": "mock-model",
+            "raw_output_tokens_replaced": 5,
+        }
+    }
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_decision_point_node_is_also_summarized_via_make_node_callable_branch() -> None:
+    """A node with conditional outgoing edges goes through `_make_node_callable`
+    (T4.2), not the plain `functools.partial` branch — `has_downstream` must
+    reach it there too."""
+    dag = _dag(
+        ["a", "b"],
+        [("a", "b", "output.status == 'ok'")],
+    )
+    templates = {n: _template() for n in ("a", "b")}
+    provider = MockProvider(
+        "mock",
+        [
+            _completion('{"status": "ok"}'),
+            _completion(_VALID_HANDOFF_JSON),
+            _completion('{"reached": true}'),
+        ],
+    )
+    router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    graph = build_state_graph(
+        dag,
+        templates,
+        router,
+        routing_settings=_routing_settings(),
+        handoff_settings=_handoff_settings(),
+    ).compile()
+
+    result = await graph.ainvoke(_initial_state())
+
+    assert "a" in result["handoffs"]
+    assert len(provider.calls) == 3
+
+
+# ─── Revue du 2026-09-12 (I-01) — « a-t-il un successeur » ≠ « sera-t-il lu » ──
+
+
+@pytest.mark.asyncio
+async def test_node_is_not_summarized_when_every_successor_opted_out() -> None:
+    """`a -> b` with `b` opting out: a summary of `a` is something nobody in
+    this DAG could ever read, so `a` must not pay for one.
+
+    `has_downstream` used to answer the STRUCTURAL question, so this graph
+    burned one LLM call per run forever — and the opt-out, whose entire
+    purpose is to reduce what a consumer receives, INCREASED the bill: the
+    run paid for the summary AND forwarded the raw output.
+    """
+    dag = _dag(["a", "b"], [("a", "b", None)])
+    templates = {
+        "a": _template(),
+        "b": _template_with({"include_raw_previous_output": True}),
+    }
+    provider = MockProvider("mock", [_completion('{"step": "a"}'), _completion('{"step": "b"}')])
+    router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    graph = build_state_graph(
+        dag, templates, router, handoff_settings=_handoff_settings()
+    ).compile()
+
+    result = await graph.ainvoke(_initial_state())
+
+    assert "handoffs" not in result or result["handoffs"] == {}
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_node_is_still_summarized_when_only_some_successors_opted_out() -> None:
+    """One reader is enough. The rule is "nobody will read it", not "someone
+    opted out" — a summary serving a single consumer is still earning its
+    cost."""
+    dag = _dag(["a", "b", "c"], [("a", "b", None), ("a", "c", None)])
+    templates = {
+        "a": _template(),
+        "b": _template_with({"include_raw_previous_output": True}),
+        "c": _template(),
+    }
+    provider = MockProvider(
+        "mock",
+        [
+            _completion('{"step": "a"}'),
+            _completion(_VALID_HANDOFF_JSON),
+            _completion('{"step": "b"}'),
+            _completion('{"step": "c"}'),
+        ],
+    )
+    router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    graph = build_state_graph(
+        dag, templates, router, handoff_settings=_handoff_settings()
+    ).compile()
+
+    result = await graph.ainvoke(_initial_state())
+
+    assert set(result["handoffs"]) == {"a"}
+
+
+def test_an_unknown_successor_template_counts_as_a_reader() -> None:
+    """Conservative by construction: a missing template is a reason to know
+    less, never a licence to skip work a consumer might need."""
+    from agentive_backend.features.workflow_engine.engine.graph_builder import (
+        _any_successor_reads_summaries,
+    )
+
+    templates = {"b": _template()}
+    assert _any_successor_reads_summaries(["absent"], templates) is True
+    # No successor at all — a sink. The AC1 rule this all serves.
+    assert _any_successor_reads_summaries([], templates) is False
+    # Strictness mirrors `_build_user_message`: a mistyped opt-out does not
+    # opt out THERE, so it must not skip the summary HERE either.
+    assert (
+        _any_successor_reads_summaries(
+            ["b"], {"b": _template_with({"include_raw_previous_output": "true"})}
+        )
+        is True
+    )
