@@ -115,8 +115,19 @@ NODE_TIMEOUT_S (60 s) × longueur de la chaîne de providers
   + les retries éventuels de error_policy
 ```
 
-soit **~2 minutes** dans le pire cas nominal (chaîne à 2 providers, aucun
-retry), et davantage si le template déclare `retry_with_backoff`.
+soit **~2 minutes** pour un template qui déclare `on_timeout: fail_fast`.
+
+> ⚠️ **Ce n'est PAS le cas nominal, et cette ligne disait le contraire
+> jusqu'au 2026-09-12.** `retry_with_backoff` est le **défaut** : un template
+> sans `error_policy` hérite de `retry_with_backoff` / `max_retries: 3` /
+> `exponential` (`domain/error_policy.py`), ce que l'AC3 de la 4.6 énonce
+> explicitement. Pour la forme de template la plus répandue — aucune
+> `error_policy` déclarée — le pire cas nominal est donc
+> `(60 + 15) × 2 × 4 + 7 ≈ **607 s**, soit ~10 minutes`, pas deux.
+>
+> Et si le process pilote est **mort**, aucune de ces bornes ne s'applique :
+> la demande attend le balayage de recovery, soit ~25 minutes aux réglages
+> par défaut (cf § 5).
 
 **Pourquoi c'est voulu.** L'interruption est *coopérative* : le driver
 observe le signal à la frontière d'un superstep, le seul instant où

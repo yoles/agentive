@@ -15,8 +15,31 @@ Anthropic comes first because:
   workflows we benchmark against (qualitative — to be revisited Sprint 2+).
 
 Per-agent override is supported: an agent template can declare
-`provider_chain = ["anthropic"]` (no fallback) or
-`provider_chain = ["openai", "anthropic"]` (OpenAI primary).
+`provider_chain = ["anthropic"]` or `provider_chain = ["openai", "anthropic"]`.
+
+**What those declarations actually do changed in Story 4.6, and this
+paragraph said otherwise until 2026-09-12.**
+
+* **The order you write is not necessarily the order that runs.**
+  `LLMRouter._resolve_model` hands index 0 the primary model VERBATIM and
+  consults the fallback map only from index 1 on, so a chain whose head does
+  not own `llm_model` would send that model to the wrong provider — a 400,
+  classified `fatal`, with no fallback and no retry.
+  `domain/provider_chain.resolve_provider_chain` therefore **rotates the
+  model's owning provider to the head**. `["openai", "anthropic"]` is
+  *not* "OpenAI primary" whenever `llm_model` is Anthropic-owned — which
+  includes the very common case of `llm_model` being **unset**, since both
+  `agent_node` and `dry_run` default it to `claude-sonnet-4-6`. It is
+  "OpenAI as the fallback leg". A rotation is logged
+  (`provider_chain_reordered`).
+* **A single-provider chain is not a guarantee of "no fallback."** When the
+  declared chain has no usable provider left after intersection with what the
+  process registered, it is dropped and the node runs on the process default
+  chain — which does fall back. That gap is recorded as defer **D96**;
+  a template that needs a provider CONSTRAINT (data residency, say) does not
+  have one today.
+
+See `docs/runbooks/run-control-et-fallback.md` § 7 for the resolution table.
 
 ## Error classification table
 

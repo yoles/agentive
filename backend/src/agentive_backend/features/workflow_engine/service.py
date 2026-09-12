@@ -1226,9 +1226,20 @@ class WorkflowExecutionService:
         the transactional block stays a write + a publish and nothing else."""
         if action == "resume":
             # Reuses Story 4.2's existing event rather than inventing a
-            # `user_resumed` twin: what happened is identical (the run
-            # restarts from its last checkpoint), only the trigger differs,
-            # and `correlation_id` already distinguishes the two.
+            # `user_resumed` twin: what happened is identical — the run
+            # restarts from its last checkpoint, only the trigger differs.
+            #
+            # An earlier version of this comment added "and `correlation_id`
+            # already distinguishes the two". It does NOT (review of
+            # 2026-09-12): this publishes with `run.correlation_id`, and so
+            # does `recovery._resume_one`, both being the run's original
+            # LAUNCH id. The two events are byte-identical on the bus, so an
+            # operator cannot tell a human resume from a sweep reclaim —
+            # the first question asked when a run's cost doubles overnight.
+            # Left as-is deliberately; closing it means a new event or field,
+            # or using the HTTP request's id, which would break the "every
+            # event of a run carries the run's correlation id" trace model
+            # relied on since 4.2. Recorded as a `defer`.
             return WorkflowRunResumedEvent.event_type, WorkflowRunResumedEvent(
                 run_id=run.id,
                 workflow_id=run.workflow_id,
