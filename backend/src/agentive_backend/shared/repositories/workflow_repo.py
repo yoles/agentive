@@ -13,12 +13,12 @@ from uuid import UUID
 
 from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from agentive_backend.infra.db.models import Workflow, WorkflowRun
-from agentive_backend.shared.exceptions import ConflictError
+from agentive_backend.shared.exceptions import ConflictError, DependencyError
 from agentive_backend.shared.repositories.base import BaseRepo
 
 # Key inside the applicative ``checkpoint`` JSONB counting how many times the
@@ -59,6 +59,28 @@ def _is_request_fingerprint_violation(exc: IntegrityError) -> bool:
         return False
     diag = getattr(orig, "diag", None)
     return getattr(diag, "constraint_name", None) == REQUEST_FINGERPRINT_INDEX
+
+
+# Postgres ``lock_not_available`` — raised when a statement's wait for a row
+# lock exceeds ``lock_timeout`` (Story 4.14 AC2). Distinct from
+# ``57014 query_canceled`` (``statement_timeout``, not set here) and from
+# ``40001 serialization_failure`` (not applicable — this repo never uses
+# ``SERIALIZABLE``): only the exact GUC ``create_workflow`` sets is
+# translated, so a different Postgres timeout elsewhere is never mistaken
+# for this one.
+_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+
+def _is_lock_timeout(exc: OperationalError) -> bool:
+    """True only for a ``lock_timeout`` expiry, never any other
+    ``OperationalError`` (connection loss, admin shutdown, ...).
+
+    Mirrors :func:`_is_request_fingerprint_violation`'s discipline for the
+    same reason: the caller turns this into a specific, typed 503, so a
+    blanket ``except OperationalError`` would misreport a connection drop
+    as "the lock timed out, retry me" instead of surfacing the real fault.
+    """
+    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
 
 
 class WorkflowRepo(BaseRepo):
@@ -207,11 +229,28 @@ class WorkflowRepo(BaseRepo):
         the same transaction, so a collision guarantees no second event was
         written without needing a guard to say so.
 
+        Story 4.14 AC2 — when the caller opened this transaction with
+        ``with_tenant(..., lock_timeout_ms=...)`` (``create_workflow`` does),
+        a LOSING concurrent replay can wait on
+        ``uq_workflow_request_fingerprint`` for longer than that bound. The
+        resulting ``OperationalError`` (SQLSTATE ``55P03``,
+        ``lock_not_available``) is translated to a domain
+        :class:`DependencyError` for the same reason the unique violation
+        above is: feature code must stay free of ``sqlalchemy`` imports, and
+        the caller needs a typed, retriable signal — not a raw driver
+        exception — for "the wait was bounded and it expired," which is a
+        different fact from either "you already created this" (409) or
+        "your input is invalid" (422).
+
         Raises:
             ConflictError: If ``(request_fingerprint, tenant_id)`` already
                 exists, i.e. this exact creation request already produced a
                 workflow. The caller turns that into an idempotent replay.
+            DependencyError: The transaction's ``lock_timeout`` expired
+                waiting for a conflicting writer to finish (503, retriable).
             IntegrityError: Any OTHER constraint violation, re-raised as-is.
+            OperationalError: Any OTHER database-level failure, re-raised
+                as-is.
         """
         workflow = Workflow(
             name=name,
@@ -230,6 +269,13 @@ class WorkflowRepo(BaseRepo):
             raise ConflictError(
                 detail=f"Workflow '{name}' was already created by an identical request",
                 context={"name": name, "request_fingerprint": request_fingerprint},
+            ) from exc
+        except OperationalError as exc:
+            if not _is_lock_timeout(exc):
+                raise
+            raise DependencyError(
+                detail=f"Timed out waiting for a lock while creating workflow '{name}'",
+                context={"name": name},
             ) from exc
         await session.refresh(workflow)
         return workflow
@@ -654,6 +700,49 @@ class WorkflowRunRepo(BaseRepo):
             else_=literal(0),
         )
 
+    @staticmethod
+    def _checkpoint_object_expr() -> Any:
+        """``checkpoint`` coerced to a JSON OBJECT — the only shape
+        ``jsonb_set`` can target (Story 4.14 AC1/T1, review-confirmed root
+        cause of the intermittent ``cannot set path in scalar`` failure of
+        :meth:`claim_stale_running`).
+
+        A plain ``coalesce(checkpoint, '{}'::jsonb)`` — the previous
+        guard — only substitutes on SQL ``NULL``. It does NOT cover a
+        ``checkpoint`` holding the JSON literal ``null`` (nor any other
+        scalar), which is non-NULL at the SQL level and makes
+        ``jsonb_set``'s first argument a scalar — an error, for the WHOLE
+        UPDATE, not just this row.
+
+        That shape is not exotic: every :class:`WorkflowRun` is created
+        with ``checkpoint=None`` before its first superstep
+        (``create_in_session``'s default, used by every real
+        ``start_run``). ``WorkflowRun.checkpoint`` is
+        ``postgresql.JSONB`` with the SQLAlchemy default
+        ``none_as_null=False``, so binding that Python ``None`` serializes
+        to ``'null'::jsonb`` — NOT SQL ``NULL`` — the moment the ORM
+        attribute is explicitly set (verified against a live Postgres: for
+        such a row, ``checkpoint IS NULL`` is false and
+        ``jsonb_typeof(checkpoint)`` is ``'null'``). A run that crashes
+        before its first ``_sync_checkpoint_safely`` call — the exact
+        scenario the recovery sweep exists to catch — keeps that shape
+        forever, and the next sweep that reaches it fails to claim ANY of
+        up to 50 batched orphans, not just the poisoned one.
+
+        ``jsonb_typeof(...) = 'object'`` is the same defense
+        :meth:`_recovery_attempts_expr` already applies one level down
+        (there, on the VALUE stored at a key; here, on the checkpoint
+        itself) — mirrored rather than special-cased, and it covers a
+        missing column (SQL ``NULL``), a JSON ``null``, and any other
+        scalar (number/string/bool) uniformly, falling back to an empty
+        object in every case.
+        """
+        stored = WorkflowRun.checkpoint
+        return case(
+            (func.jsonb_typeof(stored) == "object", stored),
+            else_=cast(literal("{}"), JSONB),
+        )
+
     async def claim_stale_running(
         self, *, older_than: datetime, limit: int = 50
     ) -> list[WorkflowRun]:
@@ -703,7 +792,7 @@ class WorkflowRunRepo(BaseRepo):
                 .values(
                     last_checkpoint_at=func.now(),
                     checkpoint=func.jsonb_set(
-                        func.coalesce(WorkflowRun.checkpoint, cast(literal("{}"), JSONB)),
+                        self._checkpoint_object_expr(),
                         array([RECOVERY_ATTEMPTS_KEY]),
                         func.to_jsonb(self._recovery_attempts_expr() + literal(1)),
                         True,

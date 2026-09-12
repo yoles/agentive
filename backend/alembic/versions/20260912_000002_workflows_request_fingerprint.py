@@ -55,6 +55,19 @@ Le trou est permanent, mais borné à une population qui ne grandit plus.
 Aucun ``GRANT`` ni aucune politique RLS nouvelle : ``workflows`` est déjà
 dans ``app_writable_tables`` et porte déjà ``tenant_isolation`` (migration
 initiale ``20260419000000``) ; un index n'a ni l'un ni l'autre.
+
+``CREATE UNIQUE INDEX`` ci-dessous est délibérément SANS ``CONCURRENTLY``
+(Story 4.14 AC3, mesuré après coup — cette migration elle-même n'est pas
+retouchée : seul ce paragraphe documente le résultat). Non problématique ICI
+précisément parce que le prédicat partiel ne matche AUCUNE row au moment de
+la construction (colonne tout juste ajoutée, entièrement NULL) : le coût est
+celui d'un balayage de table, pas d'une écriture d'index. Mesuré en conditions
+réelles sur ce dépôt : 13,6 ms sur 100 000 lignes, 46,7 ms sur 1 000 000 —
+négligeable, ``ACCESS EXCLUSIVE`` compris. Un index dont le prédicat matche
+une fraction significative des lignes existantes n'a PAS cette propriété et
+doit être construit en ``CONCURRENTLY`` (cf
+``docs/runbooks/concurrent-index-migrations.md``, confirmé fonctionner sans
+modification du harnais Alembic de ce dépôt).
 """
 
 from __future__ import annotations

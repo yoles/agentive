@@ -169,21 +169,86 @@ Three rules when you reach for it:
    including any time that transaction itself spends blocked. Two concurrent
    replays of the same body make the loser block on
    `uq_workflow_request_fingerprint` **while still holding its template
-   locks**, so a `PUT /agents/templates/{id}` queues behind that wait too.
+   locks**, so a `PUT /agents/templates/{id}` queues behind that wait too —
+   **bounded** since Story 4.14 (rule 1a below), where it used to be open-ended.
+   1a. **The wait is capped by `lock_timeout`, scoped to the transaction that
+       needs it — never repo-wide.** `create_workflow` opens its transaction
+       via `self._workflow_repo.with_tenant(tenant_id, lock_timeout_ms=...)`
+       (`settings.workflow_create_lock_timeout_s`, default 5.0s,
+       `AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S`). `WorkflowRepo.create_in_session`
+       translates the resulting `OperationalError` (SQLSTATE `55P03`,
+       `lock_not_available`) into a domain `DependencyError` (503,
+       retriable) — never let a raw driver exception reach feature code, the
+       same discipline `_is_request_fingerprint_violation` already applies
+       to the unique-violation path next to it. Pass `lock_timeout_ms` only
+       from the call site that needs the bound: it is opt-in on
+       `with_tenant`, not a default on the method, because a role-wide or
+       method-wide timeout would change every query's behaviour and is not
+       a decision one caller gets to make for everyone.
 2. **No call to an external service runs under the lock.** The window must
    stay a batch SELECT, pure-CPU validation, and the write. An LLM or MCP
    call inside it would make template writers wait on a provider. This is
-   not the same as "nothing here blocks" — see rule 1 — and nothing in the
-   codebase sets a `lock_timeout` or `statement_timeout` to cap the wait.
+   not the same as "nothing here blocks" — see rule 1 — but the wait itself
+   is now capped by `lock_timeout` (rule 1a) wherever the caller opts in.
 3. **It guarantees coherence up to the commit, and not one moment further.**
    A template rewritten a second later leaves the stored DAG stale, and no
    lock prevents that; that horizon belongs to the run-time checks
    (`start_run`'s diversity re-evaluation, `_template_fingerprints` drift
-   detection, `_load_templates`' `InternalError`).
+   detection, `_load_templates`' `InternalError`) — but see the honest
+   accounting below (Story 4.14 AC4) of what those three actually cover.
 
 Background: the P-02 note on `WorkflowRunRepo.get_by_id_in_session` (defer
 **D42**) named `with_for_update(read=True)` as the remedy for this exact
 class of race and deferred it "to Story 4.x". This is that application.
+
+**`_load_templates` (the run/dry-run path) deliberately does NOT lock —
+verified, not assumed (Story 4.14 AC4).** Two independent reasons, not one:
+
+- **Locking it would protect nothing on `start_run`'s own path.** The read
+  (`_load_templates`) sits in its own auto-committing transaction that
+  closes immediately — any `FOR SHARE` taken there would already be
+  released before `_gate_on_mise_en_place` runs (MCP pings, a full Dry Run:
+  real external I/O) and long before the eventual `workflow_runs` INSERT, a
+  THIRD, separate transaction. To make the lock cover the actual write it
+  would have to span the Mise en Place gate too — which is precisely the
+  external-I/O-under-a-lock rule 2 above forbids. Query cost was measured
+  and is NOT the blocker (`SELECT ... FOR SHARE` on 100 rows: ~1.2ms vs
+  ~0.9ms plain — negligible); the transaction shape is.
+- **On the dry-run path it would protect literally nothing.** `DryRunService.dry_run`
+  never writes a `workflow_runs` row at all — there is no downstream write
+  for a lock to guard.
+
+**What the three catch-up mechanisms actually cover, checked line by
+line — weaker than the shorthand above suggests:**
+
+- `start_run`'s diversity re-evaluation runs on the SAME in-memory
+  `templates` dict `_load_templates` already returned — it re-evaluates,
+  it does not re-READ. It cannot see an edit that lands after that dict
+  was built.
+- `_template_fingerprints` drift detection (`_resume_run`'s
+  `_warn_on_template_drift`) compares the fingerprint STAMPED into the
+  checkpoint at creation time — itself computed from that same
+  already-read `templates` dict — against a fresh read taken at RESUME
+  time. It only ever runs on a crash-and-resume. A run that starts, races
+  a concurrent `PUT /agents/templates/{id}` in the window between
+  `_load_templates` and the `workflow_runs` INSERT, and then completes
+  normally WITHOUT ever crashing, has that edit surfaced NOWHERE — not
+  logged, not in the trace, not anywhere. Verified by reading both call
+  sites (`service.py`, the `TEMPLATE_FINGERPRINTS_KEY` stamp at run
+  creation and the drift comparison in the resume path); this is not
+  hypothetical, it is what the code does today.
+- `_load_templates`' `InternalError` only fires on a MISSING template
+  (deleted or never existed) — a *modified* one still resolves and is
+  silently used.
+
+**Net:** the residual gap for a same-call, no-crash template edit racing
+`start_run` is real and currently open. Closing it would mean moving the
+template read into the SAME transaction as the `workflow_runs` INSERT and
+re-verifying there — after `_gate_on_mise_en_place` (Story 4.8's own rule
+against I/O under a lock, applied here too), not before — a materially
+different, larger change than adding `lock=True` to the existing call.
+Out of Story 4.14's scope (bounding timeouts, not redesigning `start_run`'s
+transaction shape); not yet filed as its own story.
 
 ## When to deviate from the pattern
 

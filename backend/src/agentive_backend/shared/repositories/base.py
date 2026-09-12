@@ -72,13 +72,29 @@ class BaseRepo:
         return entity
 
     @asynccontextmanager
-    async def with_tenant(self, tenant_id: UUID | None) -> AsyncIterator[AsyncSession]:
+    async def with_tenant(
+        self, tenant_id: UUID | None, *, lock_timeout_ms: int | None = None
+    ) -> AsyncIterator[AsyncSession]:
         """Open a transaction-scoped session bound to ``tenant_id``.
 
         Args:
             tenant_id: UUID of the tenant to bind, or ``None`` for the
                 single-tenant MVP path (the RLS policy matches global rows
                 with ``tenant_id IS NULL``).
+            lock_timeout_ms: Story 4.14 AC2 — when given, bounds how long
+                THIS transaction alone will wait on a row lock (``SET LOCAL
+                lock_timeout``) before Postgres raises
+                ``LockNotAvailable``/``QueryCanceled``. ``None`` (the
+                default) leaves the session-wide/role-wide setting
+                untouched — deliberately opt-in per call site rather than a
+                blanket change here, since a repository-wide default would
+                be a behaviour change for every query every feature issues,
+                not a decision one caller gets to make for everyone.
+                Callers that need it: a transaction that holds ``FOR SHARE``
+                for its own duration, where an unbounded wait on a
+                downstream conflict (e.g. a unique-index collision) would
+                also hold that lock unbounded (``create_workflow``, Story
+                4.8 AC1+AC2).
 
         Yields:
             The :class:`AsyncSession` ready for use. The transaction is
@@ -99,6 +115,16 @@ class BaseRepo:
                     await session.execute(
                         text("SELECT set_config('app.tenant_id', :tid, true)"),
                         {"tid": str(tenant_id)},
+                    )
+                if lock_timeout_ms is not None:
+                    # Same parameter-safe mechanism as `app.tenant_id` above
+                    # — `lock_timeout` is a standard Postgres GUC, settable
+                    # through `set_config` like any other. The explicit `ms`
+                    # suffix removes any ambiguity about the unit the string
+                    # is interpreted in.
+                    await session.execute(
+                        text("SELECT set_config('lock_timeout', :timeout, true)"),
+                        {"timeout": f"{lock_timeout_ms}ms"},
                     )
                 yield session
             except BaseException:

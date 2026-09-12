@@ -25,6 +25,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agentive_backend.infra.db.models import Workflow, WorkflowRun
 from agentive_backend.shared.repositories import WorkflowRunRepo
 
 pytestmark = pytest.mark.integration
@@ -204,6 +205,95 @@ async def test_claim_ignores_recent_and_terminal_runs(
     claimed_ids = {run.id for run in claimed}
     assert recent not in claimed_ids
     assert terminal not in claimed_ids
+
+
+@pytest.mark.asyncio
+async def test_claim_tolerates_a_run_never_checkpointed_via_the_orm(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 4.14 AC1/T1 — the reproduction of the intermittent
+    ``test_resume_after_sigkill_does_not_replay_node_a`` / ``jsonb_set``
+    failure, isolated from that test's subprocess/SIGKILL timing so it is
+    deterministic here.
+
+    ``seed_run`` (this file's other fixture) binds ``checkpoint`` through a
+    raw parameterized ``text()`` INSERT, where a Python ``None`` is sent by
+    psycopg as a genuine SQL ``NULL`` parameter — so every OTHER test in this
+    file that passes ``checkpoint=None`` has never exercised the real bug.
+
+    ``WorkflowRunRepo.create`` (the path every real run and
+    ``_crash_run_subprocess.py`` actually use) is different: its
+    ``checkpoint`` column is ``postgresql.JSONB`` with the SQLAlchemy default
+    ``none_as_null=False``, so binding the ORM attribute ``checkpoint=None``
+    serializes to the JSON literal ``'null'::jsonb`` — NOT SQL ``NULL``.
+    Verified directly before this test existed: ``checkpoint IS NULL`` is
+    ``false`` and ``jsonb_typeof(checkpoint)`` is ``'null'`` for such a row.
+
+    ``claim_stale_running``'s ``coalesce(checkpoint, '{}'::jsonb)`` only ever
+    substitutes on SQL ``NULL``; a JSON ``null`` is not SQL ``NULL``, so
+    ``jsonb_set('null'::jsonb, ...)`` reaches Postgres and raises
+    ``cannot set path in scalar`` — for the WHOLE claim statement, not just
+    this row, exactly like an unguarded ``::int`` cast would (the sibling bug
+    ``test_claim_tolerates_a_non_numeric_stored_counter`` above already
+    guards against).
+
+    In production this is not a test-only curiosity: any run that crashes
+    (OOM, SIGKILL, hardware loss) before its FIRST ``_sync_checkpoint_safely``
+    call lands has exactly this shape, and the next recovery sweep that
+    reaches it fails to claim ANY of up to 50 batched orphans.
+    """
+    repo = WorkflowRunRepo(session_factory=app_session_factory)
+    workflow_id = uuid4()
+    stale_at = datetime.now(UTC) - timedelta(seconds=600.0)
+
+    async with app_session_factory() as session:
+        session.add(
+            Workflow(
+                id=workflow_id,
+                name=f"claim-orm-test-{workflow_id}",
+                version=1,
+                dag={"nodes": [], "edges": []},
+                status="active",
+            )
+        )
+        await session.flush()
+        # `checkpoint=None` EXPLICITLY — omitting the kwarg entirely takes a
+        # different SQLAlchemy path (the column is left out of the INSERT's
+        # VALUES list, so Postgres applies its own column default: genuine
+        # SQL NULL, which does NOT reproduce the bug). Every real caller
+        # (`WorkflowRunRepo.create_in_session`'s `checkpoint=checkpoint`,
+        # defaulting the PARAMETER to `None` but always passing the KWARG)
+        # explicitly sets the attribute, which routes through the ORM's
+        # unit-of-work and the JSONB type's bind processor.
+        run = WorkflowRun(
+            workflow_id=workflow_id,
+            correlation_id=uuid4(),
+            status="running",
+            checkpoint=None,
+            last_checkpoint_at=stale_at,
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    try:
+        claimed = await repo.claim_stale_running(
+            older_than=datetime.now(UTC) - timedelta(seconds=300)
+        )
+
+        claimed_ids = {claimed_run.id for claimed_run in claimed}
+        assert run_id in claimed_ids
+        run_after = next(claimed_run for claimed_run in claimed if claimed_run.id == run_id)
+        assert run_after.checkpoint == {"recovery_attempts": 1}
+    finally:
+        async with app_session_factory() as session:
+            await session.execute(
+                text("DELETE FROM workflow_runs WHERE id = :id"), {"id": str(run_id)}
+            )
+            await session.execute(
+                text("DELETE FROM workflows WHERE id = :id"), {"id": str(workflow_id)}
+            )
+            await session.commit()
 
 
 @pytest.mark.asyncio

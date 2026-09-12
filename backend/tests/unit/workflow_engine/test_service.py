@@ -102,7 +102,14 @@ def _make_service(
     opened_sessions: list[AsyncMock] = []
 
     @asynccontextmanager
-    async def _with_tenant(_tenant_id: Any) -> AsyncIterator[AsyncMock]:
+    async def _with_tenant(
+        _tenant_id: Any, *, lock_timeout_ms: int | None = None
+    ) -> AsyncIterator[AsyncMock]:
+        # Story 4.14 T2 — `create_workflow` now calls `with_tenant(tenant_id,
+        # lock_timeout_ms=...)`; the mock must accept the kwarg to keep
+        # being source-compatible, the same reason `_tenant_id` itself is
+        # accepted without being asserted on here.
+        del lock_timeout_ms
         session_mock = AsyncMock()
         session_mock.flush = AsyncMock()
         session_mock.refresh = AsyncMock()

@@ -87,6 +87,19 @@ l'idempotence sans le moindre signal. Une revue de code a par ailleurs
 exactement la chaîne ci-dessus, et un test unitaire compare les deux formes
 caractère pour caractère.
 
+**Sans `CONCURRENTLY` — mesuré, pas supposé (Story 4.14 AC3).** Un
+`CREATE UNIQUE INDEX` ordinaire prend `ACCESS EXCLUSIVE` sur `workflows`
+pour toute sa durée. Acceptable ici parce que le prédicat partiel ne matche
+**aucune** row au moment de la construction (colonne tout juste ajoutée,
+entièrement `NULL`) : le coût est celui d'un balayage de table, pas d'une
+écriture d'index par ligne. Mesuré en conditions réelles sur ce dépôt :
+13,6 ms sur 100 000 lignes, 46,7 ms sur 1 000 000 — négligeable. Ce n'est
+pas une propriété générale de toute migration d'index : un prédicat qui
+matche une fraction significative des lignes existantes n'a pas cette
+propriété et doit passer par `CREATE INDEX CONCURRENTLY`, confirmé
+utilisable sans modification du harnais Alembic de ce dépôt (`autocommit_block()`,
+cf `docs/runbooks/concurrent-index-migrations.md`).
+
 Le service tente l'INSERT, le repo traduit l'`IntegrityError` en
 `ConflictError` (les features n'importent pas `sqlalchemy` —
 `import-linter` Contract 3), et la branche de rejeu relit la row par

@@ -7,6 +7,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 - [`dry-run-predictif.md`](./dry-run-predictif.md) — Dry Run predictif : probable_path, estimation coût/tokens, budget cap (Story 4.4)
 - [`event-bus-debug.md`](./event-bus-debug.md) — Debug du bus d'événements LISTEN/NOTIFY (Story 1.4)
 - [`hybrid-orchestration.md`](./hybrid-orchestration.md) — Orchestration hybride DSL → règles → LLM, seuil, `routing-stats` (Story 4.3)
+- [`concurrent-index-migrations.md`](./concurrent-index-migrations.md) — Construire un index Alembic sans `ACCESS EXCLUSIVE` (`autocommit_block()` + `CREATE INDEX CONCURRENTLY`), confirmé fonctionnel sur ce dépôt sans modification du harnais (Story 4.14)
 - [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)
 - [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
 - [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)

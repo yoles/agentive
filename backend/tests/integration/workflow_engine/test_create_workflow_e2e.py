@@ -17,7 +17,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentive_backend.shared.repositories import AgentTemplateRepo
+from agentive_backend.shared.exceptions import DependencyError
+from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo
 
 from .conftest import e2e_auth_headers as _auth_headers
 from .conftest import make_e2e_app as _make_app
@@ -417,3 +418,71 @@ async def test_create_workflow_two_concurrent_identical_requests_converge(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_losing_writer_fails_fast_on_a_stalled_winner(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 4.14 AC2 — the wait on ``uq_workflow_request_fingerprint`` must
+    be BOUNDED, not survive a winner whose transaction never commits.
+
+    Before this story, a losing writer blocked on the collision until the
+    winning transaction's `FOR SHARE`-holding transaction ended — with no
+    cap. This test manufactures exactly that stall deterministically (a
+    session that inserts the colliding row and is never committed for the
+    lifetime of the test) rather than relying on natural race timing, and
+    proves the loser gives up with a TYPED, retriable error
+    (:class:`DependencyError`, 503) once its own bounded wait expires —
+    not a raw driver exception, and not an indefinite hang.
+
+    ``lock_timeout_ms`` is set short (200ms) so the test itself stays fast;
+    the mechanism under test is `WorkflowRepo.with_tenant`'s
+    ``lock_timeout_ms=`` parameter and `create_in_session`'s translation of
+    the resulting ``OperationalError`` — the exact pair `create_workflow`
+    wires together in production, exercised here directly against the repo
+    rather than through the HTTP layer, since what matters is bounded above
+    the SQL, not the route.
+    """
+    fingerprint = "e" * 64
+    repo = WorkflowRepo(session_factory=app_session_factory)
+    dag_payload = {"nodes": [], "edges": []}
+
+    # Session A — the stalled "winner": inserts the colliding fingerprint
+    # and holds its transaction open across the whole test body, exactly
+    # mirroring a winning `create_workflow` transaction that has not yet
+    # committed.
+    async with app_session_factory() as winner_session:
+        await repo.create_in_session(
+            winner_session,
+            name="lock-timeout-winner",
+            dag=dag_payload,
+            request_fingerprint=fingerprint,
+        )
+        # Deliberately NOT committed — `winner_session` stays open, and so
+        # does its row lock, until this `async with` block exits below.
+
+        # Session B — the loser: same fingerprint, same tenant (`None`),
+        # bounded to a short wait.
+        with pytest.raises(DependencyError) as exc_info:
+            async with asyncio.timeout(5.0):  # outer safety net, not the mechanism under test
+                async with repo.with_tenant(None, lock_timeout_ms=200) as loser_session:
+                    await repo.create_in_session(
+                        loser_session,
+                        name="lock-timeout-loser",
+                        dag=dag_payload,
+                        request_fingerprint=fingerprint,
+                    )
+
+        assert exc_info.value.status == 503
+        assert exc_info.value.context["name"] == "lock-timeout-loser"
+
+        await winner_session.rollback()
+
+    # The winner's rollback releases the lock; a fresh attempt with no
+    # contention must succeed normally — proves the timeout path did not
+    # leave the fingerprint index or the repo in a broken state.
+    created = await repo.create(
+        name="lock-timeout-followup", dag=dag_payload, request_fingerprint=fingerprint
+    )
+    assert created.request_fingerprint == fingerprint

@@ -340,6 +340,33 @@ class Settings(BaseSettings):
         alias="AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_ENABLED",
     )
 
+    # ─── Story 4.14 — bounding the `FOR SHARE` wait on workflow creation ───
+    # Review of Story 4.8 (D3) — `create_workflow`'s single transaction
+    # (Story 4.8 AC2) holds `FOR SHARE` on every referenced `agent_templates`
+    # row for the duration of the transaction, including whatever it spends
+    # blocked on `uq_workflow_request_fingerprint` when a concurrent replay
+    # loses the race (Story 4.8 AC1). Nothing bounded that wait: a stalled
+    # winner left the loser parked indefinitely, and a concurrent
+    # `PUT /agents/templates/{id}` queued behind it for just as long.
+    #
+    # Scoped to THIS transaction alone via `SET LOCAL lock_timeout`
+    # (`WorkflowRepo.with_tenant`'s `lock_timeout_ms=` — mirror the existing
+    # `SET LOCAL app.tenant_id` pattern), not a role-wide `statement_timeout`:
+    # a global timeout is a behaviour change for every query the engine
+    # issues and is not a decision this single surface gets to make.
+    #
+    # 5.0s default: generous against the transaction's own worst case (one
+    # batch SELECT, pure-CPU validation, one INSERT — Story 4.8 Dev Notes),
+    # so ordinary contention never trips it, while still turning an
+    # indefinite wait into a typed, bounded failure.
+    workflow_create_lock_timeout_s: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=30.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S",
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

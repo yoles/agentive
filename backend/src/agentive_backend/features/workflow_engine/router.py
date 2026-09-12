@@ -292,7 +292,10 @@ async def create_workflow(
       translates only a `uq_workflow_request_fingerprint` unique violation
       into this path, and lets every other integrity failure surface as the
       500 it is instead of borrowing this code.
-    * 503 — lifespan state missing (session factory).
+    * 503 — lifespan state missing (session factory), or (Story 4.14 AC2) a
+      concurrent creation held the row lock this request was waiting on for
+      longer than ``AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S`` — retriable,
+      unlike the 409 above.
     """
     service = _build_workflow_service(request)
     result = await service.create_workflow(

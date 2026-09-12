@@ -486,7 +486,18 @@ class WorkflowService:
         warnings: list[DiversityWarning] = []
 
         try:
-            async with self._workflow_repo.with_tenant(tenant_id) as session:
+            # Story 4.14 AC2 — bound how long a LOSING replay can wait on
+            # `uq_workflow_request_fingerprint` (Story 4.8 AC1) while still
+            # holding `FOR SHARE` on every template this transaction
+            # resolved (AC2 below, step 5). Scoped to this transaction only
+            # (`lock_timeout_ms`, not a role-wide setting): unbounded before
+            # this, a stalled winner parked the loser indefinitely and
+            # queued any concurrent `PUT /agents/templates/{id}` behind it
+            # for just as long.
+            lock_timeout_ms = int(settings.workflow_create_lock_timeout_s * 1000)
+            async with self._workflow_repo.with_tenant(
+                tenant_id, lock_timeout_ms=lock_timeout_ms
+            ) as session:
                 # 5. Batch-resolve every agent_template_id, locked (AC2, AC3).
                 # ONE query for the whole DAG, `FOR SHARE` held until commit.
                 resolved = await self._template_repo.list_by_ids_in_session(
@@ -781,7 +792,15 @@ async def _load_templates(
 
     No lock here, unlike ``create_workflow``'s resolution: this is a read on
     a hot path, not the pre-write validation whose coherence 4.8 AC2 had to
-    guarantee.
+    guarantee. Verified, not assumed (Story 4.14 AC4): this transaction
+    closes before ``_gate_on_mise_en_place`` (real external I/O) even runs,
+    so a lock taken here would be released long before the ``workflow_runs``
+    INSERT it could only matter for — making a lock the wrong tool, not
+    merely an expensive one. Full accounting of what IS and is NOT caught by
+    the run-time checks in ``docs/runbooks/repositories-usage.md`` § *Batch
+    reads, and when to lock them*: the honest answer is narrower than "three
+    mechanisms cover it" — a same-call, no-crash template edit racing this
+    read is not caught by anything today.
 
     A missing template here is an INTERNAL INCONSISTENCY, not a client
     error: Story 4.1 validated every ``agent_template_id`` at creation and
