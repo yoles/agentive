@@ -1882,9 +1882,20 @@ class WorkflowExecutionService:
     async def _prior_duration_ms(self, run_id: UUID) -> int:
         """Executed time already persisted for this run, or ``0``.
 
-        Best-effort, like every other read on the settle path: losing the
-        earlier total costs accuracy on one metric, raising would cost the
-        interruption the operator asked for.
+        Called by EVERY writer of ``metrics.total_duration_ms`` — the settle
+        path and both terminal paths — because ``started_at`` is the start of
+        THIS execution segment in both drivers (deliberately, so a crash gap
+        is not billed as execution time). Without it the field means "time
+        since the run was last resumed", which is not what any reader wants
+        and not what its own comment claims.
+
+        Returns ``0`` when nothing was persisted before, so a run that never
+        paused is unaffected — and so a crash-resume, where no segment total
+        was ever written, keeps its Story 4.2 semantics exactly.
+
+        Best-effort, like every other read on these paths: losing the earlier
+        total costs accuracy on one metric, raising would cost the run its
+        terminal transition.
         """
         try:
             run = await self._workflow_run_repo.get_by_id(run_id)
@@ -2441,7 +2452,16 @@ class WorkflowExecutionService:
         declared_node_ids: Sequence[str] = (),
     ) -> None:
         ended_at = datetime.now(UTC)
-        total_duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+        # Segment + everything already billed. Review of 2026-09-12: only the
+        # pause/cancel path carried the prior total forward, so a run paused
+        # after ten minutes and completed two seconds later persisted
+        # `total_duration_ms = 2000` — a number that goes DOWN, and that
+        # contradicts the `per_node` map written beside it in the same JSONB
+        # (LangGraph's `node_metrics` channel accumulates across the pause, so
+        # the parts summed to ~600 s while the whole said 2 s). Comparability
+        # between the two is the stated point of the field.
+        total_duration_ms = max(int((ended_at - started_at).total_seconds() * 1000), 0)
+        total_duration_ms += await self._prior_duration_ms(run_id)
         node_metrics = state_values.get("node_metrics") or {}
         routing_decisions = state_values.get("routing_decisions") or {}
         metrics = _aggregate_metrics(
@@ -2594,7 +2614,10 @@ class WorkflowExecutionService:
         # hardcoded 0 made every failed run look instantaneous, so the AC4
         # metric could not be used to tell a fast failure from a run that
         # burned nine minutes before dying.
-        total_duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+        total_duration_ms = max(int((ended_at - started_at).total_seconds() * 1000), 0)
+        # Same accumulation as `_mark_completed` — a run that failed after a
+        # pause owes the same honest total as one that succeeded.
+        total_duration_ms += await self._prior_duration_ms(run_id)
         routing_decisions = state_values.get("routing_decisions") or {}
         metrics = _aggregate_metrics(
             node_metrics,

@@ -3646,3 +3646,90 @@ def test_failure_attempts_survives_a_context_that_is_not_the_expected_shape(atte
 
     assert isinstance(result, list)
     assert all(isinstance(entry, dict) for entry in result)
+
+
+# ─── Revue 2026-09-12 — `total_duration_ms` après une pause ────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_terminal_write_carries_the_duration_billed_before_the_pause(
+    outcome: str, event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Triple convergence of the 2026-09-12 review.
+
+    `started_at` is the start of THIS execution segment in both drivers —
+    deliberately, so a crash gap is not billed as execution time. Only the
+    pause/cancel path carried the earlier total forward, so a run that ran
+    ten minutes, paused, then finished in two seconds persisted
+    `total_duration_ms = 2000`: a number that goes DOWN, and that contradicts
+    the `per_node` map written beside it in the same JSONB (LangGraph's
+    `node_metrics` channel accumulates across the pause, so the parts summed
+    to ~600 s while the whole said 2 s). Comparability between the two is the
+    stated point of the field.
+    """
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    if outcome == "completed":
+        compiled = _FakeCompiledGraph(
+            updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}}}],
+            final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}},
+        )
+    else:
+        compiled = _FakeCompiledGraph(
+            updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}}}],
+            final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}},
+            raise_after_updates=True,
+            raise_exc=RuntimeError("node blew up"),
+        )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    # What a previous segment already billed, as persisted on the row.
+    run_repo.get_by_id.return_value = _workflow_run(
+        status="running", metrics={"total_duration_ms": 600_000}
+    )
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    terminal = next(
+        call
+        for call in run_repo.update_status.await_args_list
+        if call.kwargs.get("status") in ("completed", "error")
+    )
+    assert terminal.kwargs["metrics"]["total_duration_ms"] >= 600_000
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_is_unchanged_for_a_run_that_never_paused(
+    event_publish_mock: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The accumulation must not change Story 4.2's crash-resume semantics.
+
+    A run that never paused persisted no segment total, so
+    `_prior_duration_ms` returns 0 and the number stays what it always was.
+    That is what keeps this fix contained to the case it is about."""
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {"duration_ms": 5}}},
+    )
+    _patch_build_state_graph(monkeypatch, compiled)
+    service, run_repo, _wrepo = _control_service()
+    run_repo.get_by_id.return_value = _workflow_run(status="running", metrics={})
+
+    await service._drive_run(
+        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+    )
+
+    terminal = next(
+        call
+        for call in run_repo.update_status.await_args_list
+        if call.kwargs.get("status") == "completed"
+    )
+    # Seconds, not ten minutes: nothing was carried forward.
+    assert terminal.kwargs["metrics"]["total_duration_ms"] < 60_000
