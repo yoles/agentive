@@ -9,7 +9,7 @@ re-raises a domain :class:`ConflictError` so callers stay sqlalchemy-free.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import asc, select
@@ -19,6 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agentive_backend.infra.db.models import AgentInstance, AgentTemplate
 from agentive_backend.shared.exceptions import ConflictError
 from agentive_backend.shared.repositories.base import BaseRepo
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 
 class AgentTemplateRepo(BaseRepo):
@@ -40,6 +43,89 @@ class AgentTemplateRepo(BaseRepo):
             entity_id=template_id,
             context_key="template_id",
         )
+
+    async def list_by_ids(
+        self, template_ids: Collection[UUID], *, tenant_id: UUID | None = None
+    ) -> dict[UUID, AgentTemplate]:
+        """Batch-resolve templates by id — self-managed transaction (Story 4.8 AC3).
+
+        Wrapper over :meth:`list_by_ids_in_session` for callers with no
+        transaction to compose with (mirror the ``create`` /
+        ``create_in_session`` pairing above). Never locks: its caller is
+        ``workflow_engine.service._load_templates``, a hot read on the run
+        and dry-run paths, not a pre-write validation.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            return await self.list_by_ids_in_session(session, template_ids)
+
+    async def list_by_ids_in_session(
+        self,
+        session: AsyncSession,
+        template_ids: Collection[UUID],
+        *,
+        lock: bool = False,
+    ) -> dict[UUID, AgentTemplate]:
+        """Batch-resolve templates by id inside the caller's transaction.
+
+        Story 4.8 AC3 — replaces the N sequential ``get_by_id`` calls that
+        ``WorkflowService.create_workflow`` and
+        ``workflow_engine.service._load_templates`` both used to make, one
+        per DAG node. A 100-node workflow (the ``_MAX_NODES`` cap of Story
+        4.1) paid 100 round trips; it now pays one.
+
+        Returns a ``{id: template}`` map rather than a list: every caller
+        needs random access by id, and rebuilding the map at each call site
+        is how the two of them would drift. Ids absent from the result are
+        ids that do not exist — the CALLER decides what that means, because
+        the two callers disagree on purpose (a 422 at creation, where the id
+        comes from the client's body; a 500 at execution, where it comes
+        from a DAG the server itself validated).
+
+        ``sorted(set(...))`` deduplicates — several nodes may reference the
+        same template, and an ``IN`` list repeating an id is pure waste — and
+        makes the statement itself deterministic, which is worth having for
+        readable logs and stable query-plan caching.
+
+        What it does NOT do is guarantee a lock-acquisition order. An earlier
+        version of this docstring claimed it kept the query "deadlock-proof
+        the day someone needs ``FOR UPDATE``"; that was wrong and dangerously
+        so, because the next reader would have added ``FOR UPDATE`` on the
+        strength of it. Postgres acquires row locks in the order the chosen
+        PLAN emits rows, not in the order of the Python-side ``IN`` list. The
+        ``ORDER BY`` below is closer to load-bearing (``LockRows`` sits above
+        ``Sort``), but that too is a plan-shape assumption, not a promise.
+        Harmless today because ``FOR SHARE`` never conflicts with itself — if
+        you ever need ``FOR UPDATE`` here, establish the ordering properly
+        instead of trusting this sort.
+
+        Story 4.8 AC2 — ``lock=True`` emits ``FOR SHARE``, which blocks
+        concurrent ``UPDATE``/``DELETE`` on these rows until the caller
+        commits. That closes the window in which ``PUT /agents/templates/
+        {id}`` could rewrite a ``config`` between the moment
+        ``create_workflow`` validated against it and the moment it committed
+        the workflow referencing it — no foreign key can do the job, since
+        the ids live inside a JSONB document. This is the remedy the P-02
+        note on ``WorkflowRunRepo.get_by_id_in_session`` already named (D42)
+        and deferred "to Story 4.x".
+
+        ``lock=False`` by default so a plain reader never takes a lock it
+        did not ask for.
+        """
+        unique_ids = sorted(set(template_ids))
+        if not unique_ids:
+            # `IN ()` is a SQL syntax error in Postgres; SQLAlchemy renders a
+            # provably-false expression instead, so the query would be valid
+            # but pointless. Skip the round trip entirely — a DAG with no
+            # nodes is rejected upstream, but `_load_templates` can legitimately
+            # be handed an empty stored DAG.
+            return {}
+        stmt = (
+            select(AgentTemplate).where(AgentTemplate.id.in_(unique_ids)).order_by(AgentTemplate.id)
+        )
+        if lock:
+            stmt = stmt.with_for_update(read=True)
+        result = await session.execute(stmt)
+        return {row.id: row for row in result.scalars().all()}
 
     async def get_by_name_version(
         self,

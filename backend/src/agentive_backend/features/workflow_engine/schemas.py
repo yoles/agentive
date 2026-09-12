@@ -101,13 +101,24 @@ class DiversityWarning(BaseModel):
 
 
 class CreateWorkflowResponse(BaseModel):
-    """Response of ``POST /api/v1/workflows`` — 201 Created."""
+    """Response of ``POST /api/v1/workflows`` — 201 Created, or 200 on replay."""
 
     model_config = ConfigDict(extra="forbid")
 
     workflow_id: UUID
     version: int
     warnings: list[DiversityWarning] = Field(default_factory=list)
+    idempotent_replay: bool = Field(
+        default=False,
+        description=(
+            "True when this request was a replay of an earlier, identical one "
+            "(Story 4.8 AC1): nothing was created, and `workflow_id` is the id "
+            "of the workflow the FIRST request produced. The route answers 200 "
+            "rather than 201 in that case, so a client can tell without reading "
+            "the body. Defaults to False, which keeps every existing "
+            "construction of this model valid."
+        ),
+    )
 
 
 class StartRunRequest(BaseModel):

@@ -181,6 +181,54 @@ def _template_fingerprints(templates: Mapping[str, AgentTemplate]) -> dict[str, 
     }
 
 
+def _request_fingerprint(name: str, dag_payload: dict[str, Any]) -> str:
+    """Idempotence key of a ``POST /api/v1/workflows`` request (Story 4.8 AC1).
+
+    SHA-256 hex of the submitted ``{name, dag}``. Two byte-identical bodies
+    produce the same fingerprint, which is exactly the scenario AC1 describes
+    (a client replaying its request after a network timeout).
+
+    The converse does not hold, and the gap is in the safe direction: the
+    hash is taken over ``dag_payload``, the projection that gets stored, so
+    bodies that differ only where the projection erases the difference —
+    a ``name`` with surrounding whitespace (``CreateWorkflowRequest``
+    ``.strip()``s it), an omitted ``condition`` versus an explicit ``null``
+    — converge to one fingerprint and one workflow. Nothing is LOST in that
+    projection (``extra="forbid"`` on all three request models, and every
+    field they accept is projected), so two genuinely different DAGs can
+    never collide.
+
+    FULL 64 characters, never truncated — unlike :func:`_template_fingerprints`
+    six lines above, which cuts to ``[:16]``. The difference is not an
+    inconsistency: that one is a diagnostic comparator (did this node's config
+    drift while the run was stopped?), this one is a UNIQUENESS KEY backing a
+    unique index. Truncating a hash used as a key is how you manufacture
+    collisions, and a collision here would silently hand a caller someone
+    else's workflow.
+
+    ``sort_keys=True`` so key order inside ``dag_payload`` cannot change the
+    result; ``separators`` pinned so a future Python default cannot either.
+    ``ensure_ascii=False`` keeps a non-ASCII workflow name a single character
+    rather than an escape sequence — the value is hashed, never displayed, so
+    only stability matters, and ``.encode()`` makes the byte form explicit.
+
+    What this deliberately does NOT do is normalise the DAG. ``dag_payload``
+    preserves the submitted order of ``nodes`` and ``edges``, so two
+    semantically equivalent bodies listing the same nodes in a different order
+    are two different fingerprints, hence two workflows. Sorting them first
+    would turn idempotence into "isomorphic DAGs are the same workflow" — a
+    much stronger product rule that no AC asks for and that would surprise
+    anyone who built two pipelines out of the same bricks.
+    """
+    canonical = json.dumps(
+        {"name": name, "dag": dag_payload},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 # Applicative checkpoint preview — bounds `workflow_runs.checkpoint`'s
 # `node_outputs_preview` JSONB growth (an LLM node output can be arbitrarily
 # large). Mirror the `[:500]` convention used elsewhere for truncated
@@ -305,21 +353,66 @@ class WorkflowService:
         Pipeline (fail-fast, 422 RFC 7807 for ANY invalid DAG content — cf
         Dev Notes § "422 partout", ``get_by_id`` is used instead of
         ``require_by_id`` so a bad ``agent_template_id`` inside the body
-        never surfaces as a 404) :
+        never surfaces as a 404).
+
+        Story 4.8 split the pipeline in two, and the split is the point:
+
+        OUTSIDE any transaction, because none of it reads the database —
 
         1. Duplicate ``node_id``.
         2. Dangling edges (``from_node_id``/``to_node_id`` not declared).
-        3. Every ``agent_template_id`` must resolve to an existing template.
-        4. No cycle (``graphlib.TopologicalSorter``).
-        5. Every edge ``condition`` is syntactically valid AND its variable
+        3. No cycle (``graphlib.TopologicalSorter``).
+        4. Build the stored DAG payload and its request fingerprint.
+
+        INSIDE a SINGLE transaction, so that what is validated is what is
+        committed (4.8 AC2) —
+
+        5. Resolve every ``agent_template_id`` in ONE batch query (4.8 AC3),
+           holding ``FOR SHARE`` on the rows so a concurrent
+           ``PUT /agents/templates/{id}`` cannot rewrite a ``config`` between
+           this validation and the commit.
+        6. Every edge ``condition`` is syntactically valid AND its variable
            is exposed by the emitting node's ``output_contract.core``.
-        6. Non-blocking Contrôleur/Producteur LLM-diversity warning for every
+        7. Non-blocking Contrôleur/Producteur LLM-diversity warning for every
            edge incident (entering) a ``controleur`` node (AC4, D84) —
            NEVER raises, only appends to ``warnings``.
-        7. Persist atomically (row INSERT + outbox event, single transaction).
+        8. Persist atomically (row INSERT + outbox event, single transaction).
+
+        Two consequences of that split, both deliberate:
+
+        * A DAG that is BOTH cyclic and references an unknown template now
+          reports the cycle (it used to report the template). Both stay 422s
+          with the same RFC 7807 shape; only which one wins changed.
+        * No call to an EXTERNAL service runs under the ``FOR SHARE`` lock —
+          the window is a batch SELECT, pure-CPU validation, an INSERT and an
+          outbox row. **Never introduce an LLM or MCP call inside this
+          block**: it would make template writers wait on a provider.
+          The window is not instantaneous, though, and saying "nothing here
+          blocks" would be false: on a concurrent replay the loser's INSERT
+          waits on ``uq_workflow_request_fingerprint`` until the winner's
+          transaction ends, holding its template locks for that whole wait.
+          Bounded by a peer transaction that does no I/O of its own, so it is
+          short — but it is a wait, and no ``lock_timeout`` caps it.
+
+        Story 4.8 AC1 — a replayed request (same body, first response lost)
+        collides on ``uq_workflow_request_fingerprint``, which aborts the
+        whole transaction (so no second row AND no second event, by
+        construction rather than by a guard) and comes back as a
+        :class:`ConflictError`. The replay branch then returns the ORIGINAL
+        workflow with ``200 OK`` instead of ``201``.
+
+        What this method guarantees about templates ends at the commit. A
+        template rewritten one second later leaves the stored DAG stale, and
+        no lock can prevent that; three mechanisms already cover that
+        horizon — ``start_run`` re-evaluates diversity at run start,
+        :func:`_template_fingerprints` records what each node actually ran so
+        a resume can detect drift, and :func:`_load_templates` raises if a
+        template vanished outright.
 
         Raises:
-            ValidationError: any of steps 1-5 fails (422 RFC 7807).
+            ValidationError: any of steps 1-3, 5 or 6 fails (422 RFC 7807).
+            ConflictError: a fingerprint collision whose original row could
+                not be re-read (409) — see the replay branch.
         """
         dag = WorkflowDag(
             nodes=tuple(
@@ -333,6 +426,8 @@ class WorkflowService:
                 for e in edges
             ),
         )
+
+        # ─── Structural validation — no DB read, so no transaction ───
 
         # 1. Duplicate node ids.
         duplicates = find_duplicate_node_ids(dag)
@@ -358,26 +453,7 @@ class WorkflowService:
                 },
             )
 
-        # 3. Every agent_template_id must exist — 422, not 404 (Dev Notes).
-        templates: dict[str, AgentTemplate] = {}
-        for node in dag.nodes:
-            template = await self._template_repo.get_by_id(
-                node.agent_template_id, tenant_id=tenant_id
-            )
-            if template is None:
-                raise ValidationError(
-                    detail=(
-                        f"Node '{node.node_id}' references unknown agent_template_id "
-                        f"'{node.agent_template_id}'"
-                    ),
-                    context={
-                        "node_id": node.node_id,
-                        "agent_template_id": str(node.agent_template_id),
-                    },
-                )
-            templates[node.node_id] = template
-
-        # 4. Cycle detection.
+        # 3. Cycle detection.
         cycle = detect_cycle(dag)
         if cycle is not None:
             raise ValidationError(
@@ -385,54 +461,7 @@ class WorkflowService:
                 context={"cycle_node_ids": cycle},
             )
 
-        # 5. Branching-condition DSL syntax + AC3 variable-exposure check.
-        for edge in dag.edges:
-            if edge.condition is None:
-                continue
-            try:
-                parsed = parse_condition(edge.condition)
-            except DomainValidationError as exc:
-                raise ValidationError(
-                    detail=(
-                        f"Invalid branching condition on edge "
-                        f"'{edge.from_node_id} -> {edge.to_node_id}': {exc}"
-                    ),
-                    context={
-                        "from_node_id": edge.from_node_id,
-                        "to_node_id": edge.to_node_id,
-                        "condition": edge.condition,
-                    },
-                ) from exc
-
-            emitter = templates[edge.from_node_id]
-            emitter_config = emitter.config if isinstance(emitter.config, dict) else {}
-            output_contract = emitter_config.get("output_contract")
-            output_contract = output_contract if isinstance(output_contract, dict) else {}
-            core_vars = output_contract.get("core")
-            core_vars = core_vars if isinstance(core_vars, dict) else {}
-            if parsed.field not in core_vars:
-                raise ValidationError(
-                    detail=(
-                        f"Condition on edge '{edge.from_node_id} -> {edge.to_node_id}' "
-                        f"references variable 'output.{parsed.field}', not exposed by node "
-                        f"'{edge.from_node_id}'s output_contract.core"
-                    ),
-                    context={
-                        "from_node_id": edge.from_node_id,
-                        "to_node_id": edge.to_node_id,
-                        "variable": parsed.field,
-                    },
-                )
-
-        # 6. Controller/producer LLM diversity — non-blocking (AC4, D84).
-        # Only edges INCOMING to a `controleur` node are considered
-        # (producer_node_id -> controller_node_id) — never outgoing edges.
-        # A duplicated (from_node_id, to_node_id) pair is checked once —
-        # the DAG doesn't forbid duplicate edges, but the same producer ->
-        # controller pair shouldn't surface the same warning twice.
-        warnings = _diversity_warnings(dag.edges, templates)
-
-        # 7-9. Persist atomically (row INSERT + outbox event) + post-commit notify.
+        # 4. Stored payload + idempotence key (Story 4.8 AC1).
         event_type = WorkflowCreatedEvent.event_type
         dag_payload: dict[str, Any] = {
             "nodes": [
@@ -448,25 +477,142 @@ class WorkflowService:
                 for e in dag.edges
             ],
         }
+        fingerprint = _request_fingerprint(name, dag_payload)
 
-        async with self._workflow_repo.with_tenant(tenant_id) as session:
-            workflow = await self._workflow_repo.create_in_session(
-                session,
-                name=name,
-                dag=dag_payload,
-                version=1,
-                tenant_id=tenant_id,
+        # Bound before the `try` even though the only `ConflictError` emitter
+        # in the block is step 8, which runs after step 7 has assigned it. A
+        # future step raising earlier would turn the replay branch into a
+        # `NameError`; this is the one-line insurance against that.
+        warnings: list[DiversityWarning] = []
+
+        try:
+            async with self._workflow_repo.with_tenant(tenant_id) as session:
+                # 5. Batch-resolve every agent_template_id, locked (AC2, AC3).
+                # ONE query for the whole DAG, `FOR SHARE` held until commit.
+                resolved = await self._template_repo.list_by_ids_in_session(
+                    session,
+                    [node.agent_template_id for node in dag.nodes],
+                    lock=True,
+                )
+                # The 422 stays per-node and reports the FIRST offending node
+                # in declaration order — the batch changed the query, not the
+                # error contract. Iterating `resolved` instead would make the
+                # reported node depend on Postgres' return order.
+                templates: dict[str, AgentTemplate] = {}
+                for node in dag.nodes:
+                    template = resolved.get(node.agent_template_id)
+                    if template is None:
+                        raise ValidationError(
+                            detail=(
+                                f"Node '{node.node_id}' references unknown agent_template_id "
+                                f"'{node.agent_template_id}'"
+                            ),
+                            context={
+                                "node_id": node.node_id,
+                                "agent_template_id": str(node.agent_template_id),
+                            },
+                        )
+                    templates[node.node_id] = template
+
+                # 6. Branching-condition DSL syntax + AC3 variable-exposure check.
+                for edge in dag.edges:
+                    if edge.condition is None:
+                        continue
+                    try:
+                        parsed = parse_condition(edge.condition)
+                    except DomainValidationError as exc:
+                        raise ValidationError(
+                            detail=(
+                                f"Invalid branching condition on edge "
+                                f"'{edge.from_node_id} -> {edge.to_node_id}': {exc}"
+                            ),
+                            context={
+                                "from_node_id": edge.from_node_id,
+                                "to_node_id": edge.to_node_id,
+                                "condition": edge.condition,
+                            },
+                        ) from exc
+
+                    emitter = templates[edge.from_node_id]
+                    emitter_config = emitter.config if isinstance(emitter.config, dict) else {}
+                    output_contract = emitter_config.get("output_contract")
+                    output_contract = output_contract if isinstance(output_contract, dict) else {}
+                    core_vars = output_contract.get("core")
+                    core_vars = core_vars if isinstance(core_vars, dict) else {}
+                    if parsed.field not in core_vars:
+                        raise ValidationError(
+                            detail=(
+                                f"Condition on edge '{edge.from_node_id} -> {edge.to_node_id}' "
+                                f"references variable 'output.{parsed.field}', not exposed by node "
+                                f"'{edge.from_node_id}'s output_contract.core"
+                            ),
+                            context={
+                                "from_node_id": edge.from_node_id,
+                                "to_node_id": edge.to_node_id,
+                                "variable": parsed.field,
+                            },
+                        )
+
+                # 7. Controller/producer LLM diversity — non-blocking (AC4, D84).
+                # Only edges INCOMING to a `controleur` node are considered
+                # (producer_node_id -> controller_node_id) — never outgoing edges.
+                # A duplicated (from_node_id, to_node_id) pair is checked once —
+                # the DAG doesn't forbid duplicate edges, but the same producer ->
+                # controller pair shouldn't surface the same warning twice.
+                warnings = _diversity_warnings(dag.edges, templates)
+
+                # 8. Persist atomically (row INSERT + outbox event).
+                workflow = await self._workflow_repo.create_in_session(
+                    session,
+                    name=name,
+                    dag=dag_payload,
+                    version=1,
+                    tenant_id=tenant_id,
+                    request_fingerprint=fingerprint,
+                )
+                event = WorkflowCreatedEvent(
+                    workflow_id=workflow.id,
+                    name=name,
+                    version=workflow.version,
+                    node_count=len(dag.nodes),
+                    actor="system",
+                    tenant_id=tenant_id,
+                )
+                # ORDER MATTERS (Story 4.8 AC1): the INSERT flushes first, so a
+                # fingerprint collision aborts the transaction BEFORE this line
+                # ever runs. That is what makes "no second event" a property of
+                # the code's shape rather than a guard someone could delete.
+                event_id = await publish(event_type, event, session=session)
+                # commit happens at __aexit__ if no exception is raised.
+        except ConflictError:
+            # Story 4.8 AC1 — this exact request already produced a workflow.
+            # Re-read it in a FRESH transaction (the one above is aborted) and
+            # hand back the original instead of creating a twin.
+            existing = await self._workflow_repo.get_by_request_fingerprint(
+                fingerprint, tenant_id=tenant_id
             )
-            event = WorkflowCreatedEvent(
-                workflow_id=workflow.id,
+            if existing is None:
+                # The row collided with is gone between the failed INSERT and
+                # this read. Surface the 409 rather than retrying: a retry
+                # loop here would race the same deletion forever.
+                raise
+            _log.info(
+                "workflow_create_idempotent_replay",
+                workflow_id=str(existing.id),
                 name=name,
-                version=workflow.version,
-                node_count=len(dag.nodes),
-                actor="system",
-                tenant_id=tenant_id,
+                request_fingerprint=fingerprint,
             )
-            event_id = await publish(event_type, event, session=session)
-            # commit happens at __aexit__ if no exception is raised.
+            # `warnings` is recomputed from the CURRENT templates, not restored
+            # from the original creation — they are never persisted, and a
+            # diversity warning is an observation about the present state
+            # rather than a property of the row. Same reason `start_run`
+            # re-evaluates them at run start.
+            return CreateWorkflowResponse(
+                workflow_id=existing.id,
+                version=existing.version,
+                warnings=warnings,
+                idempotent_replay=True,
+            )
 
         # ─── Post-commit: best-effort NOTIFY ───
         await notify_best_effort(event_id, event_type)
@@ -478,12 +624,14 @@ class WorkflowService:
             version=workflow.version,
             node_count=len(dag.nodes),
             warning_count=len(warnings),
+            request_fingerprint=fingerprint,
         )
 
         return CreateWorkflowResponse(
             workflow_id=workflow.id,
             version=workflow.version,
             warnings=warnings,
+            idempotent_replay=False,
         )
 
 
@@ -618,14 +766,22 @@ def _dag_from_stored(payload: dict[str, Any]) -> WorkflowDag:
 async def _load_templates(
     template_repo: AgentTemplateRepo, dag_payload: dict[str, Any], *, tenant_id: UUID | None
 ) -> dict[str, AgentTemplate]:
-    """Preload every node's :class:`AgentTemplate` — one query per node
-    (dette assumée, mirror 4.1/4.8's N sequential queries; cf Dev Notes §
-    "Résolution batch").
+    """Preload every node's :class:`AgentTemplate` — ONE batch query for the
+    whole DAG (Story 4.8 AC3).
+
+    This used to issue one query per node, and said so under a "dette
+    assumée" pointing at Story 4.8. It is the hotter of the two N+1s that
+    story closed: ``create_workflow`` paid its N round trips once per
+    workflow, this one pays them on every run AND every dry-run.
 
     Module-level (Story 4.4 T3.1 — promoted from a ``WorkflowExecutionService``
     private method, same behavior, no logic change) so :class:`.dry_run.DryRunService`
     can reuse it without duplicating the loop: one implementation, two callers,
     mirror the ``resolve_deterministic_targets`` extraction of Story 4.3 T4.1.
+
+    No lock here, unlike ``create_workflow``'s resolution: this is a read on
+    a hot path, not the pre-write validation whose coherence 4.8 AC2 had to
+    guarantee.
 
     A missing template here is an INTERNAL INCONSISTENCY, not a client
     error: Story 4.1 validated every ``agent_template_id`` at creation and
@@ -636,10 +792,27 @@ async def _load_templates(
     workflow id was wrong, and inviting them to retry forever. 500 instead:
     the id in the URL is fine, the server's data is not.
     """
+    nodes = dag_payload.get("nodes", [])
+    # Parse every id up front, but keep the parse failure inside this
+    # function's documented contract (review P7). Batching made the parsing
+    # eager, and a bare `KeyError`/`ValueError` from a malformed stored node
+    # would escape as a body-less 500 — where the per-node loop it replaced
+    # used to reach the `InternalError` below first. A corrupt stored DAG is
+    # the same class of server-side inconsistency either way; it must keep
+    # the same RFC 7807 shape.
+    try:
+        node_ids = [UUID(node["agent_template_id"]) for node in nodes]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise InternalError(
+            detail="workflow DAG stores a malformed agent_template_id — stored DAG is inconsistent",
+            context={"error": str(exc)},
+        ) from exc
+    resolved = await template_repo.list_by_ids(node_ids, tenant_id=tenant_id)
+    # Walk the DAG in declaration order, not the resolved map: the node
+    # reported as inconsistent must not depend on Postgres' return order.
     templates: dict[str, AgentTemplate] = {}
-    for node in dag_payload.get("nodes", []):
-        template_id = UUID(node["agent_template_id"])
-        template = await template_repo.get_by_id(template_id, tenant_id=tenant_id)
+    for node, template_id in zip(nodes, node_ids, strict=True):
+        template = resolved.get(template_id)
         if template is None:
             raise InternalError(
                 detail=(

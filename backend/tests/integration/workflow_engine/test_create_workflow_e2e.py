@@ -8,6 +8,7 @@ here, not the archetype-registry skeleton.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from uuid import uuid4
 
@@ -254,3 +255,165 @@ async def test_create_workflow_diversity_warning_is_non_blocking(
             text("SELECT COUNT(*) FROM workflows WHERE name = 'diversity-flow'")
         )
         assert int(result.scalar_one()) == 1
+
+
+# ─── Story 4.8 AC1 — idempotence on replay ─────────────────────────────
+
+
+def _dag_body(name: str, tpl_a: Any, tpl_b: Any) -> dict[str, Any]:
+    return {
+        "name": name,
+        "nodes": [
+            {"node_id": "a", "agent_template_id": str(tpl_a.id)},
+            {"node_id": "b", "agent_template_id": str(tpl_b.id)},
+        ],
+        "edges": [{"from_node_id": "a", "to_node_id": "b"}],
+    }
+
+
+async def _count_workflows(factory: async_sessionmaker[AsyncSession], *, name: str) -> int:
+    async with factory() as session:
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM workflows WHERE name = :n"), {"n": name}
+        )
+        return int(result.scalar_one())
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_replayed_body_creates_one_row_and_one_event(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 4.8 AC1 — the whole point of the story, end to end on real
+    Postgres: the same body posted twice yields 201 then 200, the SAME
+    workflow_id, exactly one row and exactly one outbox event."""
+    tpl_a = await _create_template(app_session_factory)
+    tpl_b = await _create_template(app_session_factory)
+    app = _make_app(session_factory=app_session_factory)
+    body = _dag_body("replayed-pipeline", tpl_a, tpl_b)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/api/v1/workflows", headers=_auth_headers(), json=body)
+        second = await client.post("/api/v1/workflows", headers=_auth_headers(), json=body)
+
+    assert first.status_code == 201, first.text
+    assert first.json()["idempotent_replay"] is False
+
+    # 200, not 201: nothing was created. The status code is what tells a
+    # client which of the two happened without reading the body.
+    assert second.status_code == 200, second.text
+    assert second.json()["idempotent_replay"] is True
+    assert second.json()["workflow_id"] == first.json()["workflow_id"]
+    assert second.json()["version"] == first.json()["version"]
+
+    assert await _count_workflows(seed_session_factory, name="replayed-pipeline") == 1
+    assert (
+        await _count_outbox(
+            seed_session_factory,
+            "workflow_engine.workflow.created",
+            workflow_id=first.json()["workflow_id"],
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_same_dag_under_a_different_name_is_a_new_workflow(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1 — the fingerprint covers `{name, dag}`, so the name remains the
+    escape hatch for deliberately creating a twin pipeline."""
+    tpl_a = await _create_template(app_session_factory)
+    tpl_b = await _create_template(app_session_factory)
+    app = _make_app(session_factory=app_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/api/v1/workflows", headers=_auth_headers(), json=_dag_body("twin-one", tpl_a, tpl_b)
+        )
+        second = await client.post(
+            "/api/v1/workflows", headers=_auth_headers(), json=_dag_body("twin-two", tpl_a, tpl_b)
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["idempotent_replay"] is False
+    assert second.json()["workflow_id"] != first.json()["workflow_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_same_name_with_a_different_dag_is_a_new_workflow(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1 — and the converse: the uniqueness rule is on the PAIR, so it is
+    not a rename of `uq_agent_template`'s name-based constraint."""
+    tpl_a = await _create_template(app_session_factory)
+    tpl_b = await _create_template(app_session_factory)
+    app = _make_app(session_factory=app_session_factory)
+    solo = {
+        "name": "same-name",
+        "nodes": [{"node_id": "a", "agent_template_id": str(tpl_a.id)}],
+        "edges": [],
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/api/v1/workflows", headers=_auth_headers(), json=solo)
+        second = await client.post(
+            "/api/v1/workflows", headers=_auth_headers(), json=_dag_body("same-name", tpl_a, tpl_b)
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["workflow_id"] != first.json()["workflow_id"]
+    assert await _count_workflows(seed_session_factory, name="same-name") == 2
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_two_concurrent_identical_requests_converge(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Story 4.8 AC1 — the ONLY test that distinguishes the mechanism that was
+    built from the one that was rejected.
+
+    A sequential replay (the test above) passes just as well with a naive
+    pre-`SELECT` dedup. Two CONCURRENT identical requests do not: under
+    `READ COMMITTED` neither transaction sees the other's uncommitted row, so
+    a pre-`SELECT` would let both INSERT. Only insert-first + unique-index
+    collision converges — which is why the code does that.
+
+    Neither ordering is presumed: whichever request loses the race is the one
+    that answers 200.
+    """
+    tpl_a = await _create_template(app_session_factory)
+    tpl_b = await _create_template(app_session_factory)
+    app = _make_app(session_factory=app_session_factory)
+    body = _dag_body("concurrent-pipeline", tpl_a, tpl_b)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        left, right = await asyncio.gather(
+            client.post("/api/v1/workflows", headers=_auth_headers(), json=body),
+            client.post("/api/v1/workflows", headers=_auth_headers(), json=body),
+        )
+
+    assert sorted([left.status_code, right.status_code]) == [200, 201], (
+        f"{left.status_code}/{left.text} vs {right.status_code}/{right.text}"
+    )
+    assert left.json()["workflow_id"] == right.json()["workflow_id"]
+    assert [left.json()["idempotent_replay"], right.json()["idempotent_replay"]].count(True) == 1
+
+    assert await _count_workflows(seed_session_factory, name="concurrent-pipeline") == 1
+    assert (
+        await _count_outbox(
+            seed_session_factory,
+            "workflow_engine.workflow.created",
+            workflow_id=left.json()["workflow_id"],
+        )
+        == 1
+    )

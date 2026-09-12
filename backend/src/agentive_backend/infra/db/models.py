@@ -202,6 +202,48 @@ class Workflow(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Story 4.8 AC1 — SHA-256 hex of the creation request's `{name, dag}`,
+    # the key that makes a replayed `POST /api/v1/workflows` idempotent.
+    #
+    # Nullable for two distinct populations, and only the first is benign:
+    # rows predating this story (never backfilled — see the migration), and
+    # rows written through `WorkflowRepo.create`/`create_in_session` without
+    # the kwarg, whose default is still `None`. The latter are permanently
+    # exempt from the partial index, so pass the fingerprint on any path that
+    # is meant to be idempotent.
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        # Story 4.8 AC1 — the uniqueness rule behind idempotent replay.
+        #
+        # Declared HERE and not only in migration `20260912_000002`, contrary
+        # to what an earlier revision of this comment claimed: SQLAlchemy
+        # 2.0.49 (the pinned version) does express both halves, via
+        # `postgresql_nulls_not_distinct` and `postgresql_where`, and
+        # compiles to the migration's raw SQL character for character. The
+        # migration still issues it by hand — that is fine, the two agree —
+        # but the DECLARATION has to exist in `Base.metadata`, because
+        # `alembic/env.py` points autogenerate at that metadata: an index
+        # present in the database and absent from the models is emitted as a
+        # `DROP INDEX` by the next `alembic revision --autogenerate`, which
+        # would silently switch idempotence off.
+        #
+        # PARTIAL (`WHERE request_fingerprint IS NOT NULL`) because under
+        # `NULLS NOT DISTINCT` two NULLs are EQUAL, so a total index would
+        # reject the second fingerprint-less row on any base carrying more
+        # than one of them. `NULLS NOT DISTINCT` itself is what keeps the
+        # index operative in the single-tenant MVP, where `tenant_id IS NULL`
+        # on every row — the bug `20260508000000` had to fix after the fact
+        # on `uq_agent_template`.
+        Index(
+            "uq_workflow_request_fingerprint",
+            "request_fingerprint",
+            "tenant_id",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+            postgresql_where=text("request_fingerprint IS NOT NULL"),
+        ),
+    )
 
 
 class WorkflowRun(Base):

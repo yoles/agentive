@@ -82,6 +82,23 @@ def _make_service(
     workflow_run_repo = AsyncMock()
     workflow_run_repo.list_by_workflow = AsyncMock(return_value=[])
     template_repo = AsyncMock()
+
+    # Story 4.8 T5 — `_load_templates` resolves the stored DAG in ONE
+    # `list_by_ids` call. This bridge delegates back to `get_by_id` so the
+    # existing per-test stubs (`template_repo.get_by_id.return_value = ...`)
+    # keep expressing what they meant. A TEST DOUBLE, not evidence that the
+    # code batches — `tests/unit/repositories/test_agent_repo.py` and the
+    # Postgres-real suites assert that directly.
+    async def _list_by_ids(template_ids: Any, *, tenant_id: Any | None = None) -> dict[UUID, Any]:
+        resolved: dict[UUID, Any] = {}
+        for tid in set(template_ids):
+            template = await template_repo.get_by_id(tid, tenant_id=tenant_id)
+            if template is not None:
+                resolved[tid] = template
+        return resolved
+
+    template_repo.list_by_ids = AsyncMock(side_effect=_list_by_ids)
+
     service = DryRunService(
         workflow_repo=workflow_repo,
         workflow_run_repo=workflow_run_repo,

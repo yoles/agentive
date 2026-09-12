@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError
 
-from agentive_backend.shared.exceptions import NotFoundError
+from agentive_backend.shared.exceptions import ConflictError, NotFoundError
 from agentive_backend.shared.repositories import WorkflowRepo, WorkflowRunRepo
 
 from .conftest import make_session_factory_mock
@@ -447,3 +449,165 @@ async def test_update_status_stamps_activity_when_asked_to() -> None:
 
     set_clause = _rendered(session).split("SET", 1)[1].split("WHERE", 1)[0]
     assert "last_checkpoint_at=now()" in set_clause.replace(" ", "").lower()
+
+
+# ─── Story 4.8 AC1 — idempotence plumbing ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_workflow_create_in_session_persists_the_request_fingerprint() -> None:
+    """AC1 — the idempotence key reaches the ORM row, not just the signature."""
+    _, session = make_session_factory_mock()
+    repo = WorkflowRepo(session_factory=lambda: None)
+
+    await repo.create_in_session(
+        session, name="ingest", dag={"nodes": []}, request_fingerprint="a" * 64
+    )
+
+    added = session.add.call_args.args[0]
+    assert added.request_fingerprint == "a" * 64
+
+
+def _pg_integrity_error(*, sqlstate: str, constraint: str | None) -> IntegrityError:
+    """An `IntegrityError` shaped like the one psycopg actually raises.
+
+    Story 4.8 review P2. The repo decides whether a flush failure is an
+    idempotent replay by reading `orig.sqlstate` and
+    `orig.diag.constraint_name`, so a test double built as
+    `IntegrityError("INSERT", {}, Exception("duplicate key"))` carries none
+    of the information the decision is made on — it can only ever prove that
+    *something* was caught. These doubles carry both fields.
+    """
+
+    class _Diag:
+        constraint_name = constraint
+
+    class _Orig(Exception):
+        def __init__(self) -> None:
+            super().__init__("duplicate key value violates unique constraint")
+            self.sqlstate = sqlstate
+            self.diag = _Diag()
+
+    return IntegrityError("INSERT", {}, _Orig())
+
+
+@pytest.mark.asyncio
+async def test_workflow_create_in_session_translates_a_unique_violation() -> None:
+    """AC1 — the repo, not the feature, owns the `sqlalchemy` vocabulary
+    (import-linter Contract 3). A duplicate fingerprint must surface as a
+    domain `ConflictError` so `create_workflow` can turn it into a replay."""
+    _, session = make_session_factory_mock()
+    session.flush = AsyncMock(
+        side_effect=_pg_integrity_error(
+            sqlstate="23505", constraint="uq_workflow_request_fingerprint"
+        )
+    )
+    repo = WorkflowRepo(session_factory=lambda: None)
+
+    with pytest.raises(ConflictError) as exc_info:
+        await repo.create_in_session(
+            session, name="ingest", dag={"nodes": []}, request_fingerprint="b" * 64
+        )
+
+    assert exc_info.value.context["request_fingerprint"] == "b" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sqlstate", "constraint", "label"),
+    [
+        ("23502", None, "not-null violation"),
+        ("23503", "workflows_tenant_id_fkey", "foreign-key violation"),
+        ("23514", "ck_workflows_status", "check violation"),
+        ("23505", "some_other_unique_index", "unique violation on ANOTHER index"),
+    ],
+)
+async def test_workflow_create_in_session_does_not_disguise_other_integrity_failures(
+    sqlstate: str, constraint: str | None, label: str
+) -> None:
+    """Review P2 — the `ConflictError` this repo raises does not merely get
+    reported: it STEERS `create_workflow` into its idempotent-replay branch.
+    So it must mean a fingerprint collision and nothing else.
+
+    A blanket `except IntegrityError` answered a genuine server fault with
+    `409 "already created by an identical request"`, asserting a duplicate
+    that never existed. Anything that is not a unique violation on
+    `uq_workflow_request_fingerprint` must propagate untouched to the 500 it
+    deserves — including a unique violation on a DIFFERENT index, which is
+    why the last case exists.
+    """
+    _, session = make_session_factory_mock()
+    session.flush = AsyncMock(
+        side_effect=_pg_integrity_error(sqlstate=sqlstate, constraint=constraint)
+    )
+    repo = WorkflowRepo(session_factory=lambda: None)
+
+    with pytest.raises(IntegrityError):
+        await repo.create_in_session(
+            session, name="ingest", dag={"nodes": []}, request_fingerprint="b" * 64
+        )
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_by_request_fingerprint_filters_on_the_full_index_key() -> None:
+    """Review P1 — the predicate must be `(request_fingerprint, tenant_id)`,
+    the FULL key of `uq_workflow_request_fingerprint`, not the fingerprint
+    alone.
+
+    RLS cannot make up the difference: `tenant_isolation` is
+    `tenant_id IS NULL OR tenant_id = current_setting(...)`, so a tenant-bound
+    session sees its own rows AND every global one, while the index makes
+    `(fp, NULL)` and `(fp, X)` two legal rows. Filtering on the fingerprint
+    alone hands `scalar_one_or_none()` two rows — `MultipleResultsFound`, a
+    raw sqlalchemy error escaping into feature code — or silently returns the
+    global workflow to a tenant that does not own it.
+    """
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalar_one_or_none.return_value = None
+    repo = WorkflowRepo(session_factory=factory)
+
+    assert await repo.get_by_request_fingerprint("c" * 64) is None
+
+    rendered = str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "workflows.request_fingerprint = '" + "c" * 64 + "'" in rendered
+    # The MVP passes `tenant_id=None`, which SQLAlchemy renders as `IS NULL`
+    # rather than a comparison — the tenant half must be present either way.
+    assert "workflows.tenant_id IS NULL" in rendered
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_by_request_fingerprint_scopes_a_bound_tenant() -> None:
+    """Review P1, the multi-tenant half: given an explicit tenant, the
+    predicate names it, so a global row carrying the same fingerprint can
+    neither be returned nor collide with it."""
+    factory, session = make_session_factory_mock()
+    session.execute.return_value.scalar_one_or_none.return_value = None
+    repo = WorkflowRepo(session_factory=factory)
+    tenant_id = uuid4()
+
+    assert await repo.get_by_request_fingerprint("c" * 64, tenant_id=tenant_id) is None
+
+    rendered = str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert f"workflows.tenant_id = '{tenant_id}'" in rendered
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_by_request_fingerprint_returns_the_row_when_it_exists() -> None:
+    """Review P8 — T6.7 asked for "finds / does not find" and only the
+    `None` branch was covered. The found branch is the one the whole replay
+    depends on: `create_workflow` returns THIS row's id and version to the
+    client instead of creating a twin."""
+    factory, session = make_session_factory_mock()
+    existing = object()
+    session.execute.return_value.scalar_one_or_none.return_value = existing
+    repo = WorkflowRepo(session_factory=factory)
+
+    assert await repo.get_by_request_fingerprint("d" * 64) is existing

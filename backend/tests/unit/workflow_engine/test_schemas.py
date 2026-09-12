@@ -500,3 +500,25 @@ def test_handoff_stats_response_ratio_is_none_when_nothing_was_replaced() -> Non
         workflow_id=uuid4(), runs_counted=3, raw_tokens_replaced=0, summary_tokens=0
     )
     assert response.reduction_ratio_pct is None
+
+
+# ─── Story 4.8 AC1 — CreateWorkflowResponse.idempotent_replay ──────────
+
+
+def test_create_workflow_response_defaults_to_not_a_replay() -> None:
+    """The default keeps every pre-4.8 construction of this model valid, and
+    False (rather than an absent key) is what a client branches on."""
+    from agentive_backend.features.workflow_engine.schemas import CreateWorkflowResponse
+
+    response = CreateWorkflowResponse(workflow_id=uuid4(), version=1)
+
+    assert response.idempotent_replay is False
+    assert response.warnings == []
+
+
+def test_create_workflow_response_still_forbids_extra_fields() -> None:
+    """Adding a field must not have loosened the model."""
+    from agentive_backend.features.workflow_engine.schemas import CreateWorkflowResponse
+
+    with pytest.raises(ValidationError):
+        CreateWorkflowResponse(workflow_id=uuid4(), version=1, unexpected="nope")  # type: ignore[call-arg]

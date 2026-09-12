@@ -5,6 +5,8 @@
   conditions, and surfaces a non-blocking Contrôleur/Producteur LLM-diversity
   warning (FR15, D84). No DAG-builder UI exists — the body is built by the
   caller (Postman, tests, or a future client, out of scope here).
+  Idempotent on replay (Story 4.8 AC1): an identical body submitted twice
+  creates one workflow and answers ``200`` the second time, not ``201``.
 * ``POST /workflows/{workflow_id}/runs`` — start a run of an existing,
   active workflow (Story 4.2 AC1). Returns immediately — execution happens
   in a fire-and-forget background task.
@@ -248,25 +250,60 @@ def _build_execution_service(request: Request) -> WorkflowExecutionService:
     "/workflows",
     response_model=CreateWorkflowResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_200_OK: {"model": CreateWorkflowResponse},
+        # Declared so the 409 the docstring documents is actually visible in
+        # the OpenAPI schema — a generated client cannot handle a code the
+        # spec never mentions (review P5). No `model`: the RFC 7807 body is
+        # produced by the global `AgentiveError` handler, not by this route.
+        status.HTTP_409_CONFLICT: {
+            "description": "Fingerprint collision whose original row could not be re-read."
+        },
+    },
     summary="Create a workflow from a client-submitted DAG (Story 4.1)",
 )
-async def create_workflow(request: Request, body: CreateWorkflowRequest) -> CreateWorkflowResponse:
-    """201 on success — ``warnings`` may be non-empty (never blocking, AC4).
+async def create_workflow(
+    request: Request, response: Response, body: CreateWorkflowRequest
+) -> CreateWorkflowResponse:
+    """``201`` on creation, ``200`` on an idempotent replay (Story 4.8 AC1).
+
+    ``warnings`` may be non-empty on either (never blocking, AC4).
+
+    The two codes are not cosmetic, and the reasoning is the one already
+    written for ``cancel_workflow_run`` below: the status code is what tells
+    a client which of the two happened without inspecting the body. A replay
+    created nothing, so announcing ``201 Created`` would make "I created a
+    workflow" and "I got my earlier one back" indistinguishable — and the
+    ``workflow_id`` returned is the FIRST request's, not a new one.
+    ``idempotent_replay`` carries the same answer in the body.
 
     Errors :
-    * 422 — duplicate ``node_id``, dangling edge, unknown ``agent_template_id``,
-      cycle, invalid branching-condition syntax, or a condition referencing a
-      variable not exposed by the emitting node's ``output_contract.core``
-      (RFC 7807).
+    * 422 — duplicate ``node_id``, dangling edge, cycle, unknown
+      ``agent_template_id``, invalid branching-condition syntax, or a
+      condition referencing a variable not exposed by the emitting node's
+      ``output_contract.core`` (RFC 7807). Note the order: since Story 4.8 the
+      structural checks run before any DB read, so a DAG that is both cyclic
+      and references an unknown template reports the cycle.
+    * 409 — a fingerprint collision whose original row could not be re-read,
+      i.e. it was deleted between the failed INSERT and the lookup. Surfaced
+      rather than retried in a loop: a retry would race the same deletion
+      forever. No DELETE endpoint exists today, so nothing is known to
+      trigger it — and, since review P2, nothing ELSE can either: the repo
+      translates only a `uq_workflow_request_fingerprint` unique violation
+      into this path, and lets every other integrity failure surface as the
+      500 it is instead of borrowing this code.
     * 503 — lifespan state missing (session factory).
     """
     service = _build_workflow_service(request)
-    return await service.create_workflow(
+    result = await service.create_workflow(
         name=body.name,
         nodes=body.nodes,
         edges=body.edges,
         tenant_id=None,  # Story 4.1 anti-scope — single-tenant MVP.
     )
+    if result.idempotent_replay:
+        response.status_code = status.HTTP_200_OK
+    return result
 
 
 @router.post(

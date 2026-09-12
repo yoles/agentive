@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from agentive_backend.shared.repositories import AgentInstanceRepo, AgentTemplateRepo
 
@@ -147,3 +149,98 @@ async def test_agent_instance_list_by_workflow_run_executes_select_with_order() 
     # P-19 (CR 2026-05-10) — secondary sort sur id pour déterminisme tests
     # (cas Story 4.x where 2 INSERT batchés dans même tx auraient created_at identique).
     assert "agent_instances.id" in sql_text
+
+
+# ─── Story 4.8 AC3 — batch resolution ──────────────────────────────────
+
+
+def _scalars(session: object, rows: list[object]) -> None:
+    """Point the mocked session's next `execute` at ``rows``."""
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = rows
+    session.execute.return_value = result  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_agent_template_list_by_ids_returns_a_map_keyed_by_id() -> None:
+    """AC3 — every caller needs random access by id; rebuilding the map at
+    each call site is how the two callers would drift."""
+    factory, session = make_session_factory_mock()
+    a, b = SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4())
+    _scalars(session, [a, b])
+    repo = AgentTemplateRepo(session_factory=factory)
+
+    resolved = await repo.list_by_ids([a.id, b.id])
+
+    assert resolved == {a.id: a, b.id: b}
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agent_template_list_by_ids_deduplicates_repeated_ids() -> None:
+    """AC3 — several DAG nodes may reference the same template; an `IN` list
+    repeating an id is pure waste."""
+    factory, session = make_session_factory_mock()
+    shared = SimpleNamespace(id=uuid4())
+    _scalars(session, [shared])
+    repo = AgentTemplateRepo(session_factory=factory)
+
+    await repo.list_by_ids([shared.id, shared.id, shared.id])
+
+    rendered = str(
+        session.execute.await_args.args[0].compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert rendered.count(str(shared.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_template_list_by_ids_skips_the_query_on_an_empty_input() -> None:
+    """`IN ()` is a SQL syntax error in Postgres; SQLAlchemy renders a
+    provably-false expression instead, so the query would be valid but
+    pointless. Don't pay the round trip."""
+    factory, session = make_session_factory_mock()
+    repo = AgentTemplateRepo(session_factory=factory)
+
+    assert await repo.list_by_ids([]) == {}
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_template_list_by_ids_in_session_does_not_lock_by_default() -> None:
+    """A plain reader must never take a lock it did not ask for — the
+    execution path (`_load_templates`) goes through this door."""
+    _, session = make_session_factory_mock()
+    _scalars(session, [])
+    repo = AgentTemplateRepo(session_factory=lambda: None)
+
+    await repo.list_by_ids_in_session(session, [uuid4()])
+
+    rendered = str(session.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    assert "FOR SHARE" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_agent_template_list_by_ids_in_session_emits_for_share_when_locked() -> None:
+    """AC2 — this is the assertion that proves the TOCTOU window is closed.
+
+    A timing-based test (create a workflow, race a `PUT` against it with
+    sleeps) would pass by luck and fail in CI for unrelated reasons. What
+    actually has to be true is that the resolution query carries `FOR SHARE`,
+    so a concurrent `UPDATE`/`DELETE` on those rows blocks until the workflow
+    INSERT commits. Assert that, on the compiled SQL — the same technique
+    `test_workflow_repo.py` already uses for `claim_stale_running`.
+    """
+    _, session = make_session_factory_mock()
+    _scalars(session, [])
+    repo = AgentTemplateRepo(session_factory=lambda: None)
+
+    await repo.list_by_ids_in_session(session, [uuid4()], lock=True)
+
+    rendered = str(session.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    assert "FOR SHARE" in rendered
+    # ...and NOT `FOR UPDATE`: concurrent workflow creations referencing the
+    # same templates must not serialise against each other.
+    assert "FOR UPDATE" not in rendered

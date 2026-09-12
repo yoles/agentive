@@ -23,3 +23,7 @@ Structure attendue : `NNN-short-slug.md` (ex: `001-starter-template.md`, `002-ev
 ### Sprint 1 — refactoring
 
 - [`module-naming.md`](./module-naming.md) — **Revue DDD 2026-07** : suppression des préfixes de planning `mN` des feature modules et du namespace d'events (préfixe event = nom du package) ; table de correspondance PRD ↔ code ; backfill `outbox_events` ; vigilance frontière `agent_configurator`/`agent_registry`.
+
+### Sprint 2 — moteur de workflows
+
+- [`workflow-creation-idempotency.md`](./workflow-creation-idempotency.md) — **Story 4.8** : idempotence de `POST /api/v1/workflows` par empreinte de contenu SHA-256 sous index unique **partiel** `NULLS NOT DISTINCT` ; pourquoi ni `Idempotency-Key` ni pré-`SELECT` ; `200` + `idempotent_replay` sur rejeu ; conséquences assumées (unicité `(name, dag)` permanente, empreinte sur la forme soumise, rows antérieures hors idempotence).

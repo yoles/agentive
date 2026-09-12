@@ -13,10 +13,12 @@ from uuid import UUID
 
 from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from agentive_backend.infra.db.models import Workflow, WorkflowRun
+from agentive_backend.shared.exceptions import ConflictError
 from agentive_backend.shared.repositories.base import BaseRepo
 
 # Key inside the applicative ``checkpoint`` JSONB counting how many times the
@@ -25,6 +27,38 @@ from agentive_backend.shared.repositories.base import BaseRepo
 # rewrites the whole dict after every completed node, so a run that actually
 # makes progress resets its own counter for free.
 RECOVERY_ATTEMPTS_KEY = "recovery_attempts"
+
+# Name of the partial unique index declared on ``Workflow.__table_args__``
+# and created by migration ``20260912_000002``. Story 4.8 AC1 keys idempotent
+# replay on a violation of THIS index and nothing else.
+REQUEST_FINGERPRINT_INDEX = "uq_workflow_request_fingerprint"
+
+# Postgres ``unique_violation``. Anything else that arrives as an
+# ``IntegrityError`` (23502 not-null, 23503 foreign-key, 23514 check, ...) is
+# a server fault, not a replay.
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def _is_request_fingerprint_violation(exc: IntegrityError) -> bool:
+    """True only for a duplicate key on ``uq_workflow_request_fingerprint``.
+
+    Story 4.8 review P2. ``create_in_session``'s ``ConflictError`` is not
+    merely reported to the client — it routes ``create_workflow`` into the
+    idempotent-replay branch, so it must mean one thing and only one thing.
+    A blanket ``except IntegrityError`` would answer a NOT NULL or FK failure
+    with "already created by an identical request".
+
+    Read through the DBAPI exception rather than the message text: psycopg
+    exposes ``sqlstate`` and ``diag.constraint_name`` on the original error.
+    Both are checked, and a driver that exposes neither (or a non-Postgres
+    backend) yields ``False`` — the conservative answer, since being wrong
+    that way surfaces the real error instead of hiding it behind a 409.
+    """
+    orig = exc.orig
+    if getattr(orig, "sqlstate", None) != _UNIQUE_VIOLATION_SQLSTATE:
+        return False
+    diag = getattr(orig, "diag", None)
+    return getattr(diag, "constraint_name", None) == REQUEST_FINGERPRINT_INDEX
 
 
 class WorkflowRepo(BaseRepo):
@@ -53,6 +87,40 @@ class WorkflowRepo(BaseRepo):
             context_key="workflow_id",
         )
 
+    async def get_by_request_fingerprint(
+        self, fingerprint: str, *, tenant_id: UUID | None = None
+    ) -> Workflow | None:
+        """Fetch the workflow a creation request already produced (Story 4.8 AC1).
+
+        Mirror ``AgentTemplateRepo.get_by_name_version`` — a lookup on a
+        natural key rather than on the PK. Self-managed transaction ON
+        PURPOSE: its only caller is ``WorkflowService.create_workflow``'s
+        replay branch, which runs AFTER the INSERT transaction was aborted
+        by the unique-index violation. There is no live session to compose
+        with at that point, and a Postgres transaction poisoned by an error
+        would refuse this SELECT anyway.
+
+        The predicate is the FULL key of ``uq_workflow_request_fingerprint``
+        — ``(request_fingerprint, tenant_id)`` — not the fingerprint alone,
+        and RLS is not enough to make up the difference. The
+        ``tenant_isolation`` policy is ``tenant_id IS NULL OR tenant_id =
+        current_setting('app.tenant_id')``, so a tenant-bound session sees
+        its own rows AND every global one. Since the index makes ``(fp,
+        NULL)`` and ``(fp, X)`` two legal rows, filtering on the fingerprint
+        alone would hand ``scalar_one_or_none()`` two rows and raise
+        ``MultipleResultsFound`` — a raw sqlalchemy error escaping into
+        feature code that ``import-linter`` Contract 3 keeps sqlalchemy-free
+        — or, if the tenant's own row were gone, silently return the GLOBAL
+        workflow to a tenant that does not own it.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = select(Workflow).where(
+                Workflow.request_fingerprint == fingerprint,
+                Workflow.tenant_id == tenant_id,
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
     async def list_active(
         self, *, tenant_id: UUID | None = None, limit: int = 100
     ) -> list[Workflow]:
@@ -69,12 +137,23 @@ class WorkflowRepo(BaseRepo):
         version: int = 1,
         status: str = "active",
         tenant_id: UUID | None = None,
+        request_fingerprint: str | None = None,
     ) -> Workflow:
         """Convenience wrapper — self-managed transaction.
 
         Use :meth:`create_in_session` from inside an existing transaction
         when you need to compose the INSERT with another write (e.g.
         publishing an outbox event atomically, Story 4.1 T2).
+
+        ``request_fingerprint`` defaults to ``None`` for backward
+        compatibility, but a ``None`` here is not free: the unique index is
+        PARTIAL on ``request_fingerprint IS NOT NULL``, so the row it writes
+        is permanently exempt from the idempotence of Story 4.8 AC1 and a
+        replay against it creates a twin. Omit the argument only for a
+        creation path that is deliberately not idempotent.
+
+        Raises:
+            ConflictError: see :meth:`create_in_session`.
         """
         async with self.with_tenant(tenant_id) as session:
             return await self.create_in_session(
@@ -84,6 +163,7 @@ class WorkflowRepo(BaseRepo):
                 version=version,
                 status=status,
                 tenant_id=tenant_id,
+                request_fingerprint=request_fingerprint,
             )
 
     async def create_in_session(
@@ -95,6 +175,7 @@ class WorkflowRepo(BaseRepo):
         version: int = 1,
         status: str = "active",
         tenant_id: UUID | None = None,
+        request_fingerprint: str | None = None,
     ) -> Workflow:
         """INSERT inside the caller's transaction — caller owns commit.
 
@@ -102,6 +183,35 @@ class WorkflowRepo(BaseRepo):
         Used by ``WorkflowService.create_workflow`` to publish
         ``workflow_engine.workflow.created`` in the same transaction as the
         row INSERT (atomicity with the outbox pattern, Story 1.4).
+
+        Story 4.8 T2.1 — ``request_fingerprint`` is the idempotence key of
+        ``POST /api/v1/workflows`` (AC1), and the ``IntegrityError`` it can
+        raise is translated here into a domain :class:`ConflictError` for the
+        same reason as in ``AgentTemplateRepo``: feature code must stay free
+        of ``sqlalchemy`` imports (``import-linter`` Contract 3).
+
+        That translation is DELIBERATELY NARROW, and this is where this
+        method stops mirroring ``AgentTemplateRepo.create_in_session``.
+        There, a blanket ``except IntegrityError`` is harmless: the caller
+        surfaces the 409 and stops. Here the ``ConflictError`` STEERS
+        ``create_workflow`` into its replay branch, so mislabelling a
+        NOT NULL / FK / CHECK failure as "already created by an identical
+        request" would answer a genuine server fault with a 409 asserting a
+        duplicate that never existed. We therefore match on SQLSTATE 23505
+        (``unique_violation``) AND on the index name, and let anything else
+        propagate untouched to the 500 it deserves.
+
+        Note that the flush failing ABORTS the caller's whole transaction —
+        that is not a side effect to work around but the mechanism AC1 relies
+        on. ``create_workflow`` publishes its outbox event AFTER this call in
+        the same transaction, so a collision guarantees no second event was
+        written without needing a guard to say so.
+
+        Raises:
+            ConflictError: If ``(request_fingerprint, tenant_id)`` already
+                exists, i.e. this exact creation request already produced a
+                workflow. The caller turns that into an idempotent replay.
+            IntegrityError: Any OTHER constraint violation, re-raised as-is.
         """
         workflow = Workflow(
             name=name,
@@ -109,9 +219,18 @@ class WorkflowRepo(BaseRepo):
             dag=dag,
             status=status,
             tenant_id=tenant_id,
+            request_fingerprint=request_fingerprint,
         )
         session.add(workflow)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            if not _is_request_fingerprint_violation(exc):
+                raise
+            raise ConflictError(
+                detail=f"Workflow '{name}' was already created by an identical request",
+                context={"name": name, "request_fingerprint": request_fingerprint},
+            ) from exc
         await session.refresh(workflow)
         return workflow
 

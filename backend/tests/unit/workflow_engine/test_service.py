@@ -31,6 +31,7 @@ from agentive_backend.features.workflow_engine.schemas import (
 from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
     WorkflowService,
+    _request_fingerprint,
 )
 from agentive_backend.shared.contracts.events import WorkflowRunMiseEnPlaceRefusedEvent
 from agentive_backend.shared.correlation import set_correlation_id
@@ -91,17 +92,29 @@ def _make_service(
     templates_by_id: dict[UUID, SimpleNamespace],
 ) -> tuple[WorkflowService, AsyncMock, AsyncMock]:
     """Returns (service, workflow_repo, template_repo)."""
-    session_mock = AsyncMock()
-    session_mock.flush = AsyncMock()
-    session_mock.refresh = AsyncMock()
-    session_mock.add = MagicMock()
+    # Story 4.8 review P3 — a FRESH session object per `with_tenant` entry,
+    # and a record of how many times it was entered. The harness used to
+    # yield one shared `session_mock` forever, which made
+    # `assert resolve_session is insert_session` (the assertion advertised as
+    # the proof of AC2's single transactional window) pass just as happily
+    # against two separate transactions. Identity only proves anything if
+    # distinct transactions have distinct identities.
+    opened_sessions: list[AsyncMock] = []
 
     @asynccontextmanager
     async def _with_tenant(_tenant_id: Any) -> AsyncIterator[AsyncMock]:
+        session_mock = AsyncMock()
+        session_mock.flush = AsyncMock()
+        session_mock.refresh = AsyncMock()
+        session_mock.add = MagicMock()
+        opened_sessions.append(session_mock)
         yield session_mock
 
     workflow_repo = AsyncMock()
     workflow_repo.with_tenant = _with_tenant
+    # Exposed so tests can assert on the NUMBER of transactions opened, which
+    # is the other half of the same property.
+    workflow_repo.opened_sessions = opened_sessions
 
     async def _mock_create(
         _session: object,
@@ -111,6 +124,7 @@ def _make_service(
         version: int = 1,
         status: str = "active",
         tenant_id: Any | None = None,
+        request_fingerprint: str | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             id=uuid4(),
@@ -119,6 +133,7 @@ def _make_service(
             version=version,
             status=status,
             tenant_id=tenant_id,
+            request_fingerprint=request_fingerprint,
             created_at=datetime.now(UTC),
         )
 
@@ -130,6 +145,16 @@ def _make_service(
         return templates_by_id.get(template_id)
 
     template_repo.get_by_id = AsyncMock(side_effect=_get_by_id)
+
+    # Story 4.8 T6.1 — `create_workflow` resolves the whole DAG in ONE locked
+    # batch query instead of N `get_by_id` calls. Both are stubbed: `get_by_id`
+    # still serves the execution-path helpers exercised elsewhere in this file.
+    async def _list_by_ids_in_session(
+        _session: object, template_ids: Any, *, lock: bool = False
+    ) -> dict[UUID, Any]:
+        return {tid: templates_by_id[tid] for tid in set(template_ids) if tid in templates_by_id}
+
+    template_repo.list_by_ids_in_session = AsyncMock(side_effect=_list_by_ids_in_session)
 
     service = WorkflowService(workflow_repo=workflow_repo, template_repo=template_repo)
     return service, workflow_repo, template_repo
@@ -523,6 +548,344 @@ async def test_create_workflow_duplicate_edge_produces_single_warning(
     assert len(response.warnings) == 1
 
 
+# ─── Story 4.8 AC1 — idempotence on replay ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_replay_returns_the_original_without_publishing(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC1 — a fingerprint collision is a replay, not a failure: return the
+    workflow the FIRST request created, and publish nothing."""
+    tpl = _template()
+    service, wrepo, _trepo = _make_service({tpl.id: tpl})
+    original = SimpleNamespace(id=uuid4(), version=1)
+    wrepo.create_in_session = AsyncMock(side_effect=ConflictError(detail="already created"))
+    wrepo.get_by_request_fingerprint = AsyncMock(return_value=original)
+
+    response = await service.create_workflow(
+        name="replayed",
+        nodes=[WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+        edges=[],
+    )
+
+    assert response.idempotent_replay is True
+    assert response.workflow_id == original.id
+    assert response.version == original.version
+    # No second row is the repo's business; no second EVENT is this method's,
+    # and it holds because `publish` sits after the flush that collided.
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_nominal_path_is_not_flagged_as_a_replay(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC1 — the flag must be False on creation, not merely absent: a client
+    branching on it would otherwise read a missing key as a replay."""
+    tpl = _template()
+    service, _wrepo, _trepo = _make_service({tpl.id: tpl})
+
+    response = await service.create_workflow(
+        name="fresh",
+        nodes=[WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+        edges=[],
+    )
+
+    assert response.idempotent_replay is False
+    event_publish_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_replay_whose_original_vanished_raises_409(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC1 — the row collided with is gone between the failed INSERT and the
+    re-read. Surface the 409; never loop retrying, which would race the same
+    deletion forever."""
+    tpl = _template()
+    service, wrepo, _trepo = _make_service({tpl.id: tpl})
+    wrepo.create_in_session = AsyncMock(side_effect=ConflictError(detail="already created"))
+    wrepo.get_by_request_fingerprint = AsyncMock(return_value=None)
+
+    with pytest.raises(ConflictError):
+        await service.create_workflow(
+            name="ghost",
+            nodes=[WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+            edges=[],
+        )
+
+    wrepo.create_in_session.assert_awaited_once()
+    event_publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_passes_a_stable_fingerprint_to_the_insert(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC1 — the value persisted is the fingerprint of the submitted body, and
+    two identical submissions produce the same one."""
+    tpl = _template()
+    service, wrepo, _trepo = _make_service({tpl.id: tpl})
+
+    kwargs = {
+        "name": "stable",
+        "nodes": [WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+        "edges": [],
+    }
+    await service.create_workflow(**kwargs)  # type: ignore[arg-type]
+    first = wrepo.create_in_session.await_args.kwargs["request_fingerprint"]
+    await service.create_workflow(**kwargs)  # type: ignore[arg-type]
+    second = wrepo.create_in_session.await_args.kwargs["request_fingerprint"]
+
+    assert first == second
+    assert first == _request_fingerprint(
+        "stable",
+        {"nodes": [{"node_id": "a", "agent_template_id": str(tpl.id)}], "edges": []},
+    )
+
+
+# ─── Story 4.8 — `_request_fingerprint` ────────────────────────────────
+
+
+def test_request_fingerprint_is_a_full_length_deterministic_sha256() -> None:
+    """Never truncated, unlike `_template_fingerprints`: this one backs a
+    unique index, and a shortened hash manufactures collisions."""
+    payload = {"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+
+    digest = _request_fingerprint("wf", payload)
+
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+    assert digest == _request_fingerprint("wf", payload)
+
+
+def test_request_fingerprint_matches_its_frozen_golden_vector() -> None:
+    """Review P10 — the ONE test that protects the fingerprints already in
+    the database.
+
+    Every other test here compares `_request_fingerprint` against itself, so
+    they all stay green through a change that alters the hash: the production
+    value moves, the expected value moves with it, nothing fails — and every
+    fingerprint persisted before the change silently stops matching. The
+    unique index becomes dead weight and replays start creating twins, with
+    no signal anywhere.
+
+    This vector is a LITERAL. If it fails, the hash function or the
+    `dag_payload` projection changed, and that is a migration problem (every
+    stored `workflows.request_fingerprint` is now stale), not a test to
+    update. Re-freeze it only together with a backfill plan.
+    """
+    payload = {
+        "nodes": [
+            {"node_id": "ingest", "agent_template_id": "11111111-1111-4111-8111-111111111111"},
+            {"node_id": "review", "agent_template_id": "22222222-2222-4222-8222-222222222222"},
+        ],
+        "edges": [{"from_node_id": "ingest", "to_node_id": "review", "condition": None}],
+    }
+
+    assert (
+        _request_fingerprint("golden-pipeline", payload)
+        == "f399d9188b1cc281f46ad364f5f5e522581443c8add9bf8e493231d419194230"
+    )
+
+
+def test_request_fingerprint_changes_when_the_name_changes() -> None:
+    payload = {"nodes": [{"node_id": "a", "agent_template_id": str(uuid4())}], "edges": []}
+
+    assert _request_fingerprint("wf-a", payload) != _request_fingerprint("wf-b", payload)
+
+
+def test_request_fingerprint_changes_when_the_dag_changes() -> None:
+    tid = str(uuid4())
+    one = {"nodes": [{"node_id": "a", "agent_template_id": tid}], "edges": []}
+    two = {
+        "nodes": [
+            {"node_id": "a", "agent_template_id": tid},
+            {"node_id": "b", "agent_template_id": tid},
+        ],
+        "edges": [],
+    }
+
+    assert _request_fingerprint("wf", one) != _request_fingerprint("wf", two)
+
+
+def test_request_fingerprint_ignores_dict_key_insertion_order() -> None:
+    """`sort_keys=True` is what makes this true — the guard against a
+    fingerprint that depends on how the payload dict happened to be built."""
+    tid = str(uuid4())
+    forward = {"nodes": [{"node_id": "a", "agent_template_id": tid}], "edges": []}
+    reversed_keys = {"edges": [], "nodes": [{"agent_template_id": tid, "node_id": "a"}]}
+
+    assert _request_fingerprint("wf", forward) == _request_fingerprint("wf", reversed_keys)
+
+
+def test_request_fingerprint_distinguishes_reordered_nodes() -> None:
+    """Deliberate NON-normalisation (AC1): two semantically equivalent bodies
+    listing their nodes in a different order are two different requests.
+    Canonicalising the DAG would turn idempotence into "isomorphic DAGs are
+    the same workflow", a much stronger rule no AC asks for."""
+    a = {"node_id": "a", "agent_template_id": str(uuid4())}
+    b = {"node_id": "b", "agent_template_id": str(uuid4())}
+
+    assert _request_fingerprint("wf", {"nodes": [a, b], "edges": []}) != _request_fingerprint(
+        "wf", {"nodes": [b, a], "edges": []}
+    )
+
+
+def test_request_fingerprint_accepts_a_non_ascii_name() -> None:
+    """`ensure_ascii=False` + explicit `.encode()` — a unicode name must hash,
+    not raise."""
+    payload: dict[str, Any] = {"nodes": [], "edges": []}
+
+    assert len(_request_fingerprint("workflow-résumé-日本", payload)) == 64
+
+
+# ─── Story 4.8 AC2 — one transactional window ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_resolves_templates_inside_the_insert_transaction(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC2 — the window is single: exactly ONE transaction is opened, and the
+    session handed to the template resolution is the same object the INSERT
+    is written through.
+
+    Both halves are needed, and the harness has to cooperate for either to
+    mean anything (review P3): `_make_service` now yields a distinct session
+    per `with_tenant` entry, so `is` genuinely discriminates, and it records
+    the entries, so a refactor that resolved in one transaction and inserted
+    in a second fails on the count even if it somehow passed on identity."""
+    tpl = _template()
+    service, wrepo, trepo = _make_service({tpl.id: tpl})
+
+    await service.create_workflow(
+        name="one-window",
+        nodes=[WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+        edges=[],
+    )
+
+    assert len(wrepo.opened_sessions) == 1, (
+        f"AC2 requires ONE transaction; {len(wrepo.opened_sessions)} were opened"
+    )
+    resolve_session = trepo.list_by_ids_in_session.await_args.args[0]
+    insert_session = wrepo.create_in_session.await_args.args[0]
+    assert resolve_session is insert_session
+    # ...and it is locked, so a concurrent `PUT /agents/templates/{id}` waits
+    # for the commit instead of slipping between validation and INSERT.
+    assert trepo.list_by_ids_in_session.await_args.kwargs["lock"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_reports_the_cycle_when_a_template_is_also_unknown(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC2 — precedence change, locked deliberately. Structural checks moved
+    out of the transaction (they read nothing), so the cycle is now found
+    first. Both remain 422s; only which one wins changed. This test exists so
+    a future rewrite cannot flip it back unnoticed."""
+    service, wrepo, trepo = _make_service({})  # no template resolves
+
+    with pytest.raises(ValidationError, match="cycle"):
+        await service.create_workflow(
+            name="cyclic-and-unknown",
+            nodes=[
+                WorkflowNodeRequest(node_id="a", agent_template_id=uuid4()),
+                WorkflowNodeRequest(node_id="b", agent_template_id=uuid4()),
+            ],
+            edges=[
+                WorkflowEdgeRequest(from_node_id="a", to_node_id="b"),
+                WorkflowEdgeRequest(from_node_id="b", to_node_id="a"),
+            ],
+        )
+
+    # Nothing was read: the structural pass never opens a transaction.
+    trepo.list_by_ids_in_session.assert_not_awaited()
+    wrepo.create_in_session.assert_not_awaited()
+    event_publish_mock.assert_not_awaited()
+
+
+# ─── Story 4.8 AC3 — batch resolution at creation ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_resolves_all_nodes_in_a_single_query(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC3 — one `IN` query for the whole DAG, whatever the node count."""
+    a, b, c = _template(), _template(), _template()
+    service, _wrepo, trepo = _make_service({a.id: a, b.id: b, c.id: c})
+
+    await service.create_workflow(
+        name="three-nodes",
+        nodes=[
+            WorkflowNodeRequest(node_id="x", agent_template_id=a.id),
+            WorkflowNodeRequest(node_id="y", agent_template_id=b.id),
+            WorkflowNodeRequest(node_id="z", agent_template_id=c.id),
+        ],
+        edges=[],
+    )
+
+    trepo.list_by_ids_in_session.assert_awaited_once()
+    assert list(trepo.list_by_ids_in_session.await_args.args[1]) == [a.id, b.id, c.id]
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_two_nodes_sharing_a_template_get_the_same_row(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC3 — a template referenced twice is still resolved once, and both
+    nodes see the same object (the map is keyed by id, not by node)."""
+    shared = _template(archetype="controleur", llm_model="claude-3-5-sonnet-20241022")
+    producer = _template(archetype="producteur", llm_model="claude-3-5-sonnet-20241022")
+    service, _wrepo, trepo = _make_service({shared.id: shared, producer.id: producer})
+
+    response = await service.create_workflow(
+        name="shared-template",
+        nodes=[
+            WorkflowNodeRequest(node_id="p", agent_template_id=producer.id),
+            WorkflowNodeRequest(node_id="c1", agent_template_id=shared.id),
+            WorkflowNodeRequest(node_id="c2", agent_template_id=shared.id),
+        ],
+        edges=[
+            WorkflowEdgeRequest(from_node_id="p", to_node_id="c1"),
+            WorkflowEdgeRequest(from_node_id="p", to_node_id="c2"),
+        ],
+    )
+
+    trepo.list_by_ids_in_session.assert_awaited_once()
+    # Both controller nodes resolved to the same row, so both raise the
+    # identical-LLM warning against the shared producer.
+    assert {w.controller_node_id for w in response.warnings} == {"c1", "c2"}
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_reports_the_first_unknown_template_in_declaration_order(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """AC3 — the batch changed the QUERY, not the error contract. Iterating
+    the resolved map instead would make the reported node depend on
+    Postgres' return order."""
+    known = _template()
+    missing_first, missing_second = uuid4(), uuid4()
+    service, _wrepo, _trepo = _make_service({known.id: known})
+
+    with pytest.raises(ValidationError) as exc_info:
+        await service.create_workflow(
+            name="two-missing",
+            nodes=[
+                WorkflowNodeRequest(node_id="ok", agent_template_id=known.id),
+                WorkflowNodeRequest(node_id="first-bad", agent_template_id=missing_first),
+                WorkflowNodeRequest(node_id="second-bad", agent_template_id=missing_second),
+            ],
+            edges=[],
+        )
+
+    assert exc_info.value.context["node_id"] == "first-bad"
+    assert exc_info.value.context["agent_template_id"] == str(missing_first)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # WorkflowExecutionService — Story 4.2 T10.1
 # ═══════════════════════════════════════════════════════════════════════
@@ -698,6 +1061,23 @@ def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, Asyn
     workflow_run_repo.update_status = AsyncMock(return_value=1)
     template_repo = AsyncMock()
 
+    # Story 4.8 T5 — `_load_templates` now resolves the whole stored DAG in ONE
+    # `list_by_ids` call. This bridge delegates back to `get_by_id` so the ~40
+    # existing call sites that stub `template_repo.get_by_id.return_value`
+    # keep expressing what they meant. It is a TEST DOUBLE, not evidence that
+    # the code batches: that is asserted directly by
+    # `test_start_run_resolves_every_template_in_one_batch_query`, by the AC3
+    # repo tests, and by the Postgres-real e2e suite.
+    async def _list_by_ids(template_ids: Any, *, tenant_id: Any | None = None) -> dict[UUID, Any]:
+        resolved: dict[UUID, Any] = {}
+        for tid in set(template_ids):
+            template = await template_repo.get_by_id(tid, tenant_id=tenant_id)
+            if template is not None:
+                resolved[tid] = template
+        return resolved
+
+    template_repo.list_by_ids = AsyncMock(side_effect=_list_by_ids)
+
     mise_en_place_service = AsyncMock()
     mise_en_place_service.run_checks = AsyncMock(return_value=_all_passed_mise_en_place_report())
 
@@ -781,7 +1161,9 @@ async def test_start_run_returns_201_immediately_without_awaiting_drive_run(
 
 
 @pytest.mark.asyncio
-async def test_start_run_preloads_templates_per_dag_node(event_publish_mock: AsyncMock) -> None:
+async def test_start_run_resolves_every_template_in_one_batch_query(
+    event_publish_mock: AsyncMock,
+) -> None:
     set_correlation_id(str(uuid4()))
     workflow_id = uuid4()
     template_id = uuid4()
@@ -797,10 +1179,13 @@ async def test_start_run_preloads_templates_per_dag_node(event_publish_mock: Asy
 
     await service.start_run(workflow_id=workflow_id, run_input={"seed": 1})
 
-    # `get_by_id` + explicit 500, NOT `require_by_id` + 404: a template that
-    # vanished is a server-side inconsistency, and this endpoint's 404 already
-    # means "unknown workflow_id".
-    template_repo.get_by_id.assert_awaited_once_with(template_id, tenant_id=None)
+    # Story 4.8 AC3 — ONE batch query for the whole DAG, not one per node.
+    # Asserted on `list_by_ids` rather than through the harness bridge, so a
+    # regression back to N sequential reads fails here.
+    template_repo.list_by_ids.assert_awaited_once_with([template_id], tenant_id=None)
+    # A resolution that returns nothing is an explicit 500, NOT `require_by_id`
+    # + 404: a template that vanished is a server-side inconsistency, and this
+    # endpoint's 404 already means "unknown workflow_id".
     # The caller's input is stamped on the row so a crash before LangGraph's
     # first checkpoint can still be restarted from START (AC3).
     create_kwargs = workflow_run_repo.create_in_session.await_args.kwargs
