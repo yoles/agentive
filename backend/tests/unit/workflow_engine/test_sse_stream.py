@@ -381,3 +381,47 @@ def test_routing_escalated_event_type_matches_the_run_event_pattern() -> None:
     """It must still match the subscription pattern so it reaches the SSE
     client at all (T7's whole point: streamed "for free")."""
     assert _RUN_EVENT_PATTERN.fullmatch("workflow_engine.workflow_run.routing_escalated")
+
+
+# ─── Revue 2026-09-12 — le seul appel DB non gardé du chemin SSE ───────
+
+
+@pytest.mark.asyncio
+async def test_stream_survives_a_database_blip_during_the_repoll(
+    monkeypatch: pytest.MonkeyPatch, captured_handler: dict[str, Any]
+) -> None:
+    """The loop's single `except` catches the BUILTIN `TimeoutError` around
+    `queue.get()`. `sqlalchemy.exc.TimeoutError` — what pool exhaustion
+    raises — is NOT a subclass of it, and neither is `OperationalError` from a
+    failover. So a blip propagated out of the generator long after the
+    response headers were sent: no RFC 7807 body is possible there, the client
+    just saw the connection end — the silent end the deadline block declares
+    unacceptable. And it was fleet-wide: every open stream re-polls on the
+    same cadence, so one hiccup dropped all of them at once.
+    """
+    import sqlalchemy.exc
+
+    # The premise, asserted rather than assumed.
+    assert not issubclass(sqlalchemy.exc.TimeoutError, TimeoutError)
+
+    monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.2)
+    run = _run()
+    repo = _repo(run)
+    calls = {"n": 0}
+
+    async def _flaky(_run_id: UUID, **_kw: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:  # the opening read succeeds, every re-poll blips
+            raise sqlalchemy.exc.TimeoutError("QueuePool limit reached")
+        return run
+
+    repo.get_by_id = AsyncMock(side_effect=_flaky)
+
+    frames = await _drain(_stream_run_events(run, repo))
+
+    # The stream stayed up and closed on a definitive frame of its own accord.
+    assert frames[-1]["event"] == "state"
+    assert '"reason": "stream_timeout"' in frames[-1]["data"]
+    assert calls["n"] > 1  # the blip really was exercised

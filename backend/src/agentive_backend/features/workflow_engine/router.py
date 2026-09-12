@@ -549,6 +549,38 @@ def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, st
     return {"event": "state", "data": json.dumps(payload, default=str)}
 
 
+async def _reload_run_safely(
+    workflow_run_repo: WorkflowRunRepo, run_id: UUID
+) -> WorkflowRun | None:
+    """Re-read the row for the SSE loop, never raising into the generator.
+
+    This is the ONLY database call on the streaming path, and it was the only
+    unguarded one (review of 2026-09-12). The loop's single `except` catches
+    the BUILTIN `TimeoutError` around `queue.get()`, and
+    `sqlalchemy.exc.TimeoutError` — what a pool exhaustion raises — is NOT a
+    subclass of it (`SQLAlchemyError` -> `Exception`, verified). Neither is
+    `OperationalError` from a failover or a pgbouncer restart. So a blip
+    propagated straight out of the generator, long after the response headers
+    were sent: no RFC 7807 body is possible there, the client just sees the
+    connection end — precisely the silent end the deadline block below
+    declares unacceptable.
+
+    Worse, it was fleet-wide and self-amplifying: every open stream re-polls
+    on the same cadence, so one ten-second hiccup dropped all of them at once,
+    and browser `EventSource` reconnects them ~3 s later into the route
+    handler's own read.
+
+    Swallowing is right here because the poll is a RECONCILIATION, not the
+    source of truth: the next tick redoes it, and the events keep flowing in
+    the meantime.
+    """
+    try:
+        return await workflow_run_repo.get_by_id(run_id)
+    except Exception:
+        _log.warning("workflow_engine.sse_status_repoll_failed", run_id=str(run_id))
+        return None
+
+
 def _state_signature(run: WorkflowRun) -> tuple[str, str | None]:
     """The part of a row a `state` frame actually carries, for comparison.
 
@@ -594,7 +626,7 @@ async def _stream_run_events(
     # run could transition between the route handler's initial load and here.
     sub = await subscribe(_RUN_EVENT_PATTERN, _handler)
     try:
-        current = await workflow_run_repo.get_by_id(run_id)
+        current = await _reload_run_safely(workflow_run_repo, run_id)
         latest = current if current is not None else run
         yield _state_event(latest)
         if latest.status in _TERMINAL_STATUSES:
@@ -645,7 +677,7 @@ async def _stream_run_events(
                 # was this poll, and it was looking only for the end.
                 if loop.time() >= next_repoll:
                     next_repoll = loop.time() + _STATUS_REPOLL_INTERVAL_S
-                    current = await workflow_run_repo.get_by_id(run_id)
+                    current = await _reload_run_safely(workflow_run_repo, run_id)
                     if current is not None and _state_signature(current) != last_state:
                         last_state = _state_signature(current)
                         yield _state_event(current, reason="status_repoll")
@@ -660,7 +692,7 @@ async def _stream_run_events(
         # Deadline reached. Always close on a definitive frame rather than
         # just returning — a silent end is indistinguishable, client-side,
         # from a stream still waiting for the next event.
-        current = await workflow_run_repo.get_by_id(run_id)
+        current = await _reload_run_safely(workflow_run_repo, run_id)
         if current is not None:
             yield _state_event(current, reason="stream_timeout")
         else:
