@@ -271,13 +271,50 @@ async def test_the_worker_purges_through_a_real_checkpointer(
 
 # ─── AC3 — the partial expression index is actually used ───────────────
 
+#: Hours between two consecutive seeded runs of the same workflow. Chosen so
+#: that a minority of a workflow's runs fall inside the 90-day window the
+#: metrics aggregates read — see the seeding comment in ``bulk_runs``.
+_HOURS_PER_RUN = 6
+
+
+async def _assert_statistics_landed(
+    owner_session_factory: async_sessionmaker[AsyncSession],
+    workflow_id: UUID,
+    seeded: int,
+) -> None:
+    """Fail loudly if the ``ANALYZE`` did not actually refresh statistics.
+
+    ``ANALYZE`` on a table the connected role does not own is a **silent**
+    no-op (a ``WARNING``, then success), so the only way to know it worked is
+    to read the statistics back. The planner's own estimate is the honest
+    probe: ask it how many rows it expects for the workflow we just seeded,
+    and require that it is in the right order of magnitude. A stale or absent
+    entry yields the no-statistics default (an estimate of 1), which is
+    exactly the state that produced the flaky plan assertions.
+    """
+    async with owner_session_factory() as session:
+        rows = (
+            await session.execute(
+                text("EXPLAIN (FORMAT JSON) SELECT 1 FROM workflow_runs WHERE workflow_id = :wf"),
+                {"wf": str(workflow_id)},
+            )
+        ).scalar_one()
+    estimate = rows[0]["Plan"]["Plan Rows"]
+    assert estimate >= seeded // 10, (
+        f"ANALYZE did not refresh statistics for workflow_runs: the planner "
+        f"estimates {estimate} rows for a workflow that was just seeded with "
+        f"{seeded}. ANALYZE is a silent no-op for a role that does not own "
+        f"the table — check that this fixture still runs it as agentive_owner."
+    )
+
 
 @pytest.fixture
 async def bulk_runs(
     migrated_db: str,
     app_session_factory: async_sessionmaker[AsyncSession],
+    owner_session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[Callable[[int], Awaitable[UUID]]]:
-    """Seed N runs of ONE workflow, then ``ANALYZE``.
+    """Seed N runs of ONE workflow, then ``ANALYZE`` **as the table owner**.
 
     The ``EXPLAIN`` assertions below are claims
     about what the PLANNER chooses, and a planner with no statistics on an
@@ -286,6 +323,22 @@ async def bulk_runs(
     leave behind, i.e. of the test ORDER. Seeding a realistic row count and
     refreshing the statistics is what makes the assertion mean what its name
     says.
+
+    The refresh must run as ``agentive_owner``. ``ANALYZE`` requires table
+    ownership (or ``MAINTAIN``, which ``agentive_app`` does not hold), and
+    for a role without it Postgres does **not** raise: it emits
+    ``WARNING: permission denied to analyze "workflow_runs", skipping it``
+    and reports success. Running it through ``app_session_factory`` — as
+    this fixture originally did — therefore refreshed nothing at all while
+    appearing to work, leaving the planner on whatever statistics autovacuum
+    happened to have written. That is precisely the dependency on test order
+    the paragraph above says this fixture exists to remove, and it made
+    ``test_the_windowed_metrics_aggregate_uses_the_composite_index`` fail in
+    3 of 6 full-suite runs while passing 8/8 in isolation.
+
+    ``_assert_statistics_landed`` closes the hole rather than documenting it:
+    a silent no-op now fails the fixture with its own diagnosis, instead of
+    surfacing later as an unstable assertion about a query plan.
     """
     workflow_ids: list[UUID] = []
 
@@ -306,6 +359,21 @@ async def bulk_runs(
             # `generate_series` rather than N round trips: most rows terminal
             # (the realistic shape the partial index is sized against), a
             # minority `running` and stale.
+            #
+            # `started_at` is spread `_HOURS_PER_RUN` apart — roughly three
+            # years across the default 5 000 rows — so that only ~7 % of a
+            # workflow's runs fall inside the 90-day window. That spread is
+            # load-bearing, not decoration: the composite index exists
+            # because "the window bounded how many rows those endpoints
+            # AGGREGATE, not how many they READ" (migration
+            # `20260913_000002`), i.e. its whole value is `started_at`
+            # narrowing the rows already matched by `workflow_id`. Seeding
+            # every run inside the window — as this fixture originally did,
+            # one minute apart — makes the windowed predicate match 100 % of
+            # the workflow's rows, and a sequential scan is then genuinely
+            # the cheaper plan. The assertion below only ever passed because
+            # the broken ANALYZE left the planner estimating one matching
+            # row; with real statistics it correctly chose a Seq Scan.
             await session.execute(
                 text(
                     "INSERT INTO workflow_runs "
@@ -314,18 +382,19 @@ async def bulk_runs(
                     "SELECT gen_random_uuid(), :wf, "
                     "       CASE WHEN i % 50 = 0 THEN 'running' ELSE 'completed' END, "
                     "       gen_random_uuid(), "
-                    "       now() - (i || ' minutes')::interval, "
-                    "       now() - (i || ' minutes')::interval, "
+                    "       now() - (i * :hours || ' hours')::interval, "
+                    "       now() - (i * :hours || ' hours')::interval, "
                     "       CASE WHEN i % 50 = 0 THEN NULL "
-                    "            ELSE now() - (i || ' minutes')::interval END "
+                    "            ELSE now() - (i * :hours || ' hours')::interval END "
                     "FROM generate_series(1, :n) AS i"
                 ),
-                {"wf": str(workflow_id), "n": count},
+                {"wf": str(workflow_id), "n": count, "hours": _HOURS_PER_RUN},
             )
             await session.commit()
-        async with app_session_factory() as session:
+        async with owner_session_factory() as session:
             await session.execute(text("ANALYZE workflow_runs"))
             await session.commit()
+        await _assert_statistics_landed(owner_session_factory, workflow_id, count)
         workflow_ids.append(workflow_id)
         return workflow_id
 
@@ -340,6 +409,15 @@ async def bulk_runs(
             text("DELETE FROM workflows WHERE id = ANY(CAST(:ids AS uuid[]))"),
             {"ids": [str(wid) for wid in workflow_ids]},
         )
+        await session.commit()
+
+    # Now that the ANALYZE above actually runs, leave the statistics agreeing
+    # with the rows that remain: otherwise the table would keep describing
+    # thousands of runs for a workflow this teardown just removed, and THIS
+    # fixture would become a source of the cross-test plan drift it exists to
+    # prevent.
+    async with owner_session_factory() as session:
+        await session.execute(text("ANALYZE workflow_runs"))
         await session.commit()
 
 
@@ -383,7 +461,15 @@ async def test_the_windowed_metrics_aggregate_uses_the_composite_index(
     partial index is scoped to ``status = 'running'`` while these aggregates
     read terminal rows. Postgres therefore still read every run of the
     workflow and filtered afterwards — the full scan the AC exists to
-    remove."""
+    remove.
+
+    The assertion only means something because ``bulk_runs`` spreads
+    ``started_at`` over years: the index earns its keep by letting the window
+    narrow the rows already matched on ``workflow_id``, so a fixture that
+    seeds every run inside the window leaves it nothing to do and a Seq Scan
+    is then the correct plan. See the seeding comment in ``bulk_runs`` — that
+    premise, plus an ``ANALYZE`` that silently did nothing, is what made this
+    test fail in 3 of 6 full-suite runs while passing in isolation."""
     workflow_id = await bulk_runs(5_000)
 
     async with app_session_factory() as session:
