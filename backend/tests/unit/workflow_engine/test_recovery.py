@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -55,7 +56,12 @@ def event_publish_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
     yield pub_mock
 
 
-def _stale_run(*, checkpoint: dict[str, Any] | None = None) -> SimpleNamespace:
+def _stale_run(
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    control_signal: str | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid4(),
         workflow_id=uuid4(),
@@ -64,6 +70,10 @@ def _stale_run(*, checkpoint: dict[str, Any] | None = None) -> SimpleNamespace:
         checkpoint=checkpoint,
         started_at=datetime.now(UTC),
         last_checkpoint_at=None,
+        # Story 4.9 AC6/T6.3 — `_abandon_one` now reads both to decide
+        # whether a pending operator `cancel` outranks the anti-poison cap.
+        control_signal=control_signal,
+        metrics=metrics if metrics is not None else {},
     )
 
 
@@ -463,6 +473,129 @@ async def test_run_once_abandons_a_run_past_the_attempt_cap(
 
 
 @pytest.mark.asyncio
+async def test_run_once_abandons_a_poisoned_run_with_pending_cancel_as_cancelled(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Story 4.9 AC6/T6.3 — an operator's `cancel`, already accepted (202)
+    but never observed (nothing resumed the run long enough to reach a
+    superstep boundary), must win over the anti-poison cap: the run settles
+    `cancelled`, not `error`, and the event on the bus is the one the
+    operator was actually promised."""
+    run = _stale_run(
+        checkpoint={"recovery_attempts": MAX_RECOVERY_ATTEMPTS + 1},
+        control_signal="cancel",
+    )
+    worker, workflow_run_repo = _make_worker(stale_runs=[run])
+
+    summary = await worker.run_once()
+
+    assert summary.abandoned_count == 1
+    worker._workflow_execution_service._resume_run.assert_not_called()
+
+    status_kwargs = workflow_run_repo.update_status.await_args.kwargs
+    assert status_kwargs["status"] == "cancelled"
+
+    event_type = event_publish_mock.await_args.args[0]
+    assert event_type == "workflow_engine.workflow_run.cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_once_abandons_a_poisoned_run_with_pending_pause_as_error(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """A pending `pause` carries no such promise — it implies "resumable
+    later", which a poison run is not. It still gets `error`, exactly like
+    no pending signal at all."""
+    run = _stale_run(
+        checkpoint={"recovery_attempts": MAX_RECOVERY_ATTEMPTS + 1},
+        control_signal="pause",
+    )
+    worker, workflow_run_repo = _make_worker(stale_runs=[run])
+
+    summary = await worker.run_once()
+
+    assert summary.abandoned_count == 1
+    status_kwargs = workflow_run_repo.update_status.await_args.kwargs
+    assert status_kwargs["status"] == "error"
+
+    event_type = event_publish_mock.await_args.args[0]
+    assert event_type == "workflow_engine.workflow_run.failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observed_signal", "expected_signal_guard", "expected_unset_guard"),
+    [
+        ("cancel", "cancel", False),
+        ("pause", "pause", False),
+        (None, None, True),
+    ],
+)
+async def test_abandon_guards_its_settle_write_on_the_signal_it_observed(
+    observed_signal: str | None,
+    expected_signal_guard: str | None,
+    expected_unset_guard: bool,
+) -> None:
+    """`claim_stale_running` COMMITS and
+    releases its `FOR UPDATE SKIP LOCKED` lock before returning, so
+    `run.control_signal` is a snapshot from an already-committed
+    transaction. Guarding the settle write on `only_if_status="running"`
+    alone could not protect it: the status does not move during the window,
+    only the signal does. Two races, both opened by this same lot:
+
+    * `cancel` -> sweep claims -> operator RETRACTS (answered 200) -> the
+      run was settled `cancelled` anyway, publishing a cancellation event
+      for a request that was explicitly withdrawn;
+    * a `cancel` arriving AFTER the claim was never honored, and
+      `clear_control=True` then ERASED it — the operator's 202 evaporating
+      with no event and no log.
+
+    The guard must therefore mirror whatever signal was observed, including
+    its ABSENCE (`only_if_control_signal=None` means "no guard", so the
+    NULL case needs its own flag). `service.py`'s `_observe_control` settle
+    write has carried the same guard since review lot 9 F2."""
+    run = _stale_run(
+        checkpoint={"recovery_attempts": MAX_RECOVERY_ATTEMPTS + 1},
+        control_signal=observed_signal,
+    )
+    worker, workflow_run_repo = _make_worker(stale_runs=[run])
+
+    await worker.run_once()
+
+    kwargs = workflow_run_repo.update_status.await_args.kwargs
+    assert kwargs["only_if_status"] == "running"
+    assert kwargs["only_if_control_signal"] == expected_signal_guard
+    assert kwargs["only_if_control_signal_unset"] is expected_unset_guard
+
+
+@pytest.mark.asyncio
+async def test_abandon_publishes_nothing_when_the_signal_moved_under_the_sweep(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """The other half of P-05: when the guard above rejects the write
+    (rowcount 0), the run must be left exactly as it was — no terminal
+    status, no lifecycle event — so the next sweep re-claims it and reads
+    the CURRENT signal. Publishing here is what produced a `cancelled`
+    event for a retracted cancellation."""
+    run = _stale_run(
+        checkpoint={"recovery_attempts": MAX_RECOVERY_ATTEMPTS + 1},
+        control_signal="cancel",
+    )
+    worker, workflow_run_repo = _make_worker(stale_runs=[run])
+    # The signal moved between the claim and the settle: the guarded
+    # UPDATE matches no row.
+    workflow_run_repo.update_status = AsyncMock(return_value=0)
+
+    summary = await worker.run_once()
+
+    event_publish_mock.assert_not_awaited()
+    workflow_run_repo.update_checkpoint.assert_not_awaited()
+    # And the summary must not claim an abandonment that never happened —
+    # the ordinary outcome of a contended sweep now that the guard exists.
+    assert summary.abandoned_count == 0
+
+
+@pytest.mark.asyncio
 async def test_run_once_still_resumes_at_the_attempt_cap(
     event_publish_mock: AsyncMock,
 ) -> None:
@@ -496,6 +629,46 @@ async def test_run_once_tolerates_a_non_numeric_attempt_counter(
 
 
 # ─── Intent gap 2 — shutdown cancels instead of burying ────────────────
+
+
+@pytest.mark.asyncio
+async def test_stop_timeout_reports_measured_time_and_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator reading this WARNING during an incident needs the time
+    that actually elapsed, which no constant can give: the second
+    `_STOP_CANCEL_TIMEOUT_S` is only spent when `_cancel_resume_tasks()`
+    both had in-flight resumes and timed out on them, so a fixed
+    grace+cancel+cancel figure over-reports every shutdown without them
+    exactly as a grace+cancel figure under-reported the ones with."""
+    from agentive_backend.features.workflow_engine import recovery as recovery_module
+
+    monkeypatch.setattr(recovery_module, "_STOP_GRACE_S", 0.01)
+    monkeypatch.setattr(recovery_module, "_STOP_CANCEL_TIMEOUT_S", 0.02)
+    logged: dict[str, Any] = {}
+    monkeypatch.setattr(
+        recovery_module._log, "warning", lambda event, **kw: logged.update(event=event, **kw)
+    )
+
+    async def _ignores_cancellation_briefly() -> None:
+        # Outlasts both shrunk windows (0.01s + 0.02s) so `stop()` genuinely
+        # times out, but still finite so this task never leaks past the test.
+        for _ in range(5):
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.05)
+
+    worker, _repo = _make_worker(stale_runs=[])
+    worker._task = asyncio.create_task(_ignores_cancellation_briefly())
+
+    await worker.stop()
+
+    assert logged["event"] == "workflow_engine.recovery_worker_stop_timeout"
+    # The budget stays the worst case: grace + cancel + cancel.
+    assert logged["budget_s"] == pytest.approx(0.01 + 0.02 + 0.02)
+    # And `elapsed_s` is a real clock reading. No resumes were in flight, so
+    # it must fall short of the budget rather than repeat it.
+    assert logged["elapsed_s"] == pytest.approx(0.01 + 0.02, abs=0.05)
+    assert logged["elapsed_s"] < logged["budget_s"]
 
 
 @pytest.mark.asyncio
@@ -588,7 +761,7 @@ def test_a_value_outside_the_sane_domain_is_refused(kwargs: dict[str, float]) ->
 
 
 def test_the_handoff_timeout_default_matches_the_settings_default() -> None:
-    """P-16 — `.env.example` and `Settings` are the deployed truth; this
+    """`.env.example` and `Settings` are the deployed truth; this
     module's static fallback must not drift from them."""
     assert Settings().workflow_handoff_summary_timeout_s == _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT
 

@@ -429,7 +429,13 @@ class DryRunService:
         self._settings = settings
 
     async def dry_run(
-        self, *, workflow_id: UUID, task_input: dict[str, Any], tenant_id: UUID | None = None
+        self,
+        *,
+        workflow_id: UUID,
+        task_input: dict[str, Any],
+        tenant_id: UUID | None = None,
+        exclude_node_ids: frozenset[str] = frozenset(),
+        allow_inactive: bool = False,
     ) -> DryRunResponse:
         """Compute the Dry Run estimate for ``workflow_id`` (AC1).
 
@@ -440,16 +446,35 @@ class DryRunService:
         Run makes zero real LLM call, so it can never learn what a
         particular input would have produced.
 
+        ``exclude_node_ids`` (Story 4.12 AC5) — nodes to leave OUT of the
+        estimate entirely: not counted in ``agents_involved``, not priced,
+        not folded into any total. Built for ``resume``'s Mise en Place gate
+        (Story 4.6 ``IG2``), which used to re-price the workflow's ENTIRE
+        DAG against the budget cap on every resume — re-charging work a
+        paused run had already executed and paid for. The caller passes the
+        node ids a paused run's own checkpoint already lists as completed;
+        an empty set (the default) reproduces the exact pre-4.12 behaviour
+        for every other caller (``start_run``'s own ``budget_available``
+        check, and ``POST /workflows/{id}/dry-run`` itself).
+
+        ``allow_inactive`` prices a workflow that is no longer ``active``.
+        Only a RESUME sets it: deactivation governs whether a workflow can be
+        LAUNCHED, and an already-started run is past that question — what it
+        needs costed is its remaining work. Without it the resume's own
+        pre-flight refused the run its estimate was for, which is how
+        "deactivation does not stop in-flight runs" was undone by the gate
+        that only exists to price them.
+
         Raises:
             NotFoundError: ``workflow_id`` does not reference an existing
                 workflow (404 — the URL's primary resource).
             ValidationError: the workflow exists but ``status != "active"``
-                (422 — mirror ``WorkflowExecutionService.start_run``,
-                ``service.py:655-659``).
+                and ``allow_inactive`` is false (422 — mirror
+                ``WorkflowExecutionService.start_run``).
         """
         del task_input  # see docstring — accepted for request-shape parity only
         workflow = await self._workflow_repo.require_by_id(workflow_id, tenant_id=tenant_id)
-        if workflow.status != "active":
+        if workflow.status != "active" and not allow_inactive:
             raise ValidationError(
                 detail=f"Workflow '{workflow_id}' is not active (status={workflow.status!r})",
                 context={"workflow_id": str(workflow_id), "status": workflow.status},
@@ -511,6 +536,11 @@ class DryRunService:
                 probable_path_cost = (probable_path_cost or Decimal("0")) + cost
 
         for node_id in result.agents_involved:
+            if node_id in exclude_node_ids:
+                # Story 4.12 AC5 — already executed (and already billed) by
+                # a paused run being resumed; not part of the REMAINING
+                # work this estimate exists to price.
+                continue
             template = templates[node_id]
             model = str(template.config.get("llm_model") or _DEFAULT_LLM_MODEL)
             # Per-FIELD fallback (review fix P3): a node can have measured

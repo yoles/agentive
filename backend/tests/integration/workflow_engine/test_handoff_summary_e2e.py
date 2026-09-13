@@ -163,6 +163,29 @@ async def test_handoff_summary_e2e_linear_chain(
         row = await _poll_run_status(seed_session_factory, run_id, terminal={"completed", "error"})
         assert row["status"] == "completed", row
 
+        # Story 4.13 AC1 — a NEGATIVE value under `metrics["handoffs"]`
+        # (corruption, never written by real code) must not poison this
+        # workflow's aggregate for every OTHER run: `jsonb_typeof` answers
+        # `'number'` for -100 exactly as for 100, and `sum()` propagated it
+        # straight to `HandoffStatsResponse`'s `Field(ge=0)` — a 500 for the
+        # whole workflow, from one corrupted row, before this story.
+        async with seed_session_factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO workflow_runs "
+                    "(id, workflow_id, status, correlation_id, metrics) "
+                    "VALUES (:id, :wf, 'completed', :cid, "
+                    "CAST(:m AS jsonb))"
+                ),
+                {
+                    "id": uuid4(),
+                    "wf": workflow_id,
+                    "cid": uuid4(),
+                    "m": '{"handoffs": {"raw_tokens_replaced": -100, "summary_tokens": -1}}',
+                },
+            )
+            await session.commit()
+
         stats_resp = await client.get(
             f"/api/v1/workflows/{workflow_id}/handoff-stats", headers=_auth_headers()
         )
@@ -256,7 +279,11 @@ async def test_handoff_summary_e2e_linear_chain(
 
     stats = stats_resp.json()
     assert stats["workflow_id"] == workflow_id
-    assert stats["runs_counted"] == 1
+    # 2 runs now (the real one + the synthetic negative-value row above),
+    # but the totals below are UNCHANGED from the single-run case — the
+    # negative row clamps to 0 and contributes nothing, rather than
+    # subtracting from the real run's figures or crashing the endpoint.
+    assert stats["runs_counted"] == 2
     assert stats["raw_tokens_replaced"] == 1000
     assert stats["summary_tokens"] == 100
     assert stats["reduction_ratio_pct"] == round((1 - 100 / 1000) * 100, 1)

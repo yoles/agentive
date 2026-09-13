@@ -370,10 +370,28 @@ async def test_routing_stats_endpoint_reports_ratio_and_null_for_empty_workflow(
         assert stats_resp.status_code == 200, stats_resp.text
         stats = stats_resp.json()
         assert stats["workflow_id"] == workflow_id
+        assert stats["window_days"] == 90  # Story 4.10 AC4 default
         assert stats["runs_counted"] == 1
         assert stats["deterministic"] == 0
         assert stats["llm_escalated"] == 1
         assert stats["deterministic_pct"] == 0.0
+
+        # Story 4.10 AC4 — a client-supplied window overrides the default,
+        # and the response says so rather than leaving it to be inferred.
+        narrow_resp = await client.get(
+            f"/api/v1/workflows/{workflow_id}/routing-stats?window_days=1",
+            headers=_auth_headers(),
+        )
+        assert narrow_resp.status_code == 200
+        assert narrow_resp.json()["window_days"] == 1
+        assert narrow_resp.json()["runs_counted"] == 1  # the run above just completed
+
+        # And a window param outside [1, 3650] is a 422, not silently clamped.
+        invalid_resp = await client.get(
+            f"/api/v1/workflows/{workflow_id}/routing-stats?window_days=0",
+            headers=_auth_headers(),
+        )
+        assert invalid_resp.status_code == 422
 
         # An empty (no run) workflow reports `null`, never a ZeroDivisionError.
         empty_create_resp = await client.post(
@@ -413,6 +431,12 @@ async def test_routing_stats_endpoint_reports_ratio_and_null_for_empty_workflow(
                 '{"routing": {}}',  # `routing` present but empty
                 '{"routing": {"deterministic": "oops", "llm_escalated": null}}',  # non-numeric
                 '{"routing": {"deterministic": 1.5, "llm_escalated": 2.9}}',  # fractional
+                # Story 4.13 AC1 — a NEGATIVE value: `jsonb_typeof` answers
+                # `'number'` for -100 exactly as for 100 (a sign is not a
+                # type), so this used to reach `sum()` and break the
+                # response's `Field(ge=0)` — a 500 for every OTHER run of
+                # the workflow, not just this corrupted one.
+                '{"routing": {"deterministic": -100, "llm_escalated": -1}}',
             ):
                 await session.execute(
                     text(
@@ -429,8 +453,10 @@ async def test_routing_stats_endpoint_reports_ratio_and_null_for_empty_workflow(
         )
         assert mixed_resp.status_code == 200, mixed_resp.text
         mixed = mixed_resp.json()
-        assert mixed["runs_counted"] == 5
+        assert mixed["runs_counted"] == 6
         # Only the fractional row contributes: floor(1.5) + the real run's 0.
+        # The negative row clamps to 0 and contributes nothing (not -100).
         assert mixed["deterministic"] == 1
         # floor(2.9) = 2, plus the real escalation from the run above.
+        # The negative row's -1 clamps to 0, not subtracted from the total.
         assert mixed["llm_escalated"] == 3

@@ -46,6 +46,7 @@ budgeting (same "Snapshot ... — verify against" posture as
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from types import MappingProxyType
@@ -99,8 +100,42 @@ _PROVIDER_PRICING: Final[tuple[tuple[str, ModelPricing], ...]] = (
 KNOWN_PROVIDERS: Final[tuple[str, ...]] = tuple(name for name, _pricing in _PROVIDER_PRICING)
 
 
+#: Story 4.12 AC6 / D98 (Story 4.9) — OWNERSHIP, independent of pricing-table
+#: completeness. A model released after this file's last pricing snapshot
+#: (or a dated variant nobody has added yet) used to make `provider_for_model`
+#: return `None`, which `domain.provider_chain.resolve_provider_chain` reads
+#: as "unknown, never rotate, never flag `incoherent`" — so a `provider_chain`
+#: whose head does not serve the template's `llm_model` sailed through
+#: unrotated, the router sent the model to the wrong provider verbatim at
+#: index 0, and the node died on a `fatal` 400 the retry dispatcher correctly
+#: refuses to retry. Prefix-matched rather than another exact table: a
+#: provider's model-naming families are stable across releases even when
+#: individual model ids are not, and this only needs to answer "whose API
+#: would accept this name", never "how much does it cost" — pricing
+#: completeness stays `dry_run.py`'s separate, already-handled concern
+#: (`model_price_unresolved`).
+#
+# `claude-` stays a bare stem: a trademarked product name, so a third-party
+# family colliding with it is not a realistic concern.
+_MODEL_OWNER_PREFIXES: Final[tuple[tuple[str, str], ...]] = (
+    ("claude-", "anthropic"),
+    ("o1-", "openai"),
+    ("o3-", "openai"),
+    ("o4-", "openai"),
+)
+
+#: "GPT" is a GENERIC term, unlike `claude`, so a bare `gpt-` stem also
+#: claims third-party families like `gpt-oss-*`, `gpt-neox` and `gpt-j` —
+#: which would rotate OpenAI to the head of the chain and post a model
+#: OpenAI has never heard of to its API, a `fatal` 400 the dispatcher
+#: refuses to retry. Requiring a DIGIT separates them without re-listing a
+#: generation on every release: `gpt-4`, `gpt-3.5-turbo` and an unreleased
+#: `gpt-6` match, the families above do not.
+_OPENAI_GPT_FAMILY_RE: Final = re.compile(r"^gpt-\d")
+
+
 def provider_for_model(model: str) -> str | None:
-    """The provider that OWNS ``model``, or ``None`` if no table knows it.
+    """The provider that OWNS ``model``, or ``None`` if nothing recognises it.
 
     Lives here because this is the layer that holds the tables, and because
     two features need the exact same answer: the Mise en Place pre-flight
@@ -108,11 +143,20 @@ def provider_for_model(model: str) -> str | None:
     must predict what the runtime DOES, and that is only true by construction
     when both read the same function.
 
-    ``None`` is not a failure — an unknown model simply cannot be reasoned
-    about, and no caller may fail a run on that alone.
+    Checks the exact pricing-table keys FIRST (the common case, and the only
+    source that can also answer "how much"), then falls back to
+    :data:`_MODEL_OWNER_PREFIXES` for a model this file has not priced yet.
+    ``None`` is still possible — a name matching no known provider's family —
+    and is not a failure: an unknown model simply cannot be reasoned about,
+    and no caller may fail a run on that alone.
     """
     for provider, pricing in _PROVIDER_PRICING:
         if model in pricing:
+            return provider
+    if _OPENAI_GPT_FAMILY_RE.match(model):
+        return "openai"
+    for prefix, provider in _MODEL_OWNER_PREFIXES:
+        if model.startswith(prefix):
             return provider
     return None
 

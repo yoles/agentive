@@ -33,4 +33,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Story 4.11 AC7/T7.1 — `DROP COLUMN` takes `ACCESS EXCLUSIVE` on
+    # `workflow_runs`, which can run against LIVE traffic during a staging
+    # rollback (`infra/scripts/deploy-staging.sh` applies migrations before
+    # swapping the backend). Without a bound, a live writer holding even a
+    # row-level lock on this table parks this DDL — and every subsequent
+    # statement against `workflow_runs`, reads included — until that writer
+    # finishes. `lock_timeout` turns an indefinite park into a typed,
+    # bounded failure (`psycopg.errors.LockNotAvailable`) instead. Mirrors
+    # the 5s default `AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S` already
+    # established for the same class of wait (Story 4.14 AC2).
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_column("workflow_runs", "last_checkpoint_at")

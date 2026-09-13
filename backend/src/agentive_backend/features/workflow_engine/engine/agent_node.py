@@ -108,6 +108,44 @@ DEFAULT_RETRY_SETTINGS: Final = RetrySettings(base_delay_s=1.0, max_delay_s=30.0
 # is logged.
 MAX_UPSTREAM_OUTPUT_CHARS: Final = 50_000
 
+# Story 4.13 AC2 — appended to a single entry's value when IT ALONE exceeds
+# `MAX_UPSTREAM_OUTPUT_CHARS` and gets truncated rather than evicted (see
+# `_serialize_upstream`). A literal marker, not a warning log alone: the
+# model reading the prompt must be able to tell truncated content from
+# content that simply ended there.
+_UPSTREAM_TRUNCATION_MARKER: Final = "...[TRUNCATED]"
+
+
+def _truncate_to_escaped_budget(value_json: str, budget: int) -> str:
+    """The longest prefix of ``value_json`` whose JSON-ESCAPED form, plus
+    :data:`_UPSTREAM_TRUNCATION_MARKER`, still fits in ``budget`` characters.
+
+    The prefix is re-serialized as a string VALUE by the caller, so every
+    ``"`` and ``\\`` in it doubles after the cut: sizing against the
+    unescaped text under-counts by the escape expansion (measured up to
+    1.5x on backslash-dense content, 2x in the limit).
+
+    Binary search, not shrink-until-it-fits: the expansion factor is
+    content-dependent (2x a quote, 6x a control character), so subtracting
+    the overshoot is O(n) on a 50 000-character string where this is
+    O(log n).
+
+    ``budget`` covers the escaped content only — the caller's
+    ``wrapper_overhead`` already pays for this value's own two quotes,
+    which is what ``- 2`` discounts. If even the marker alone exceeds
+    ``budget`` the marker is still returned.
+    """
+    low, high = 0, len(value_json)
+    while low < high:
+        mid = (low + high + 1) // 2
+        candidate = json.dumps(value_json[:mid] + _UPSTREAM_TRUNCATION_MARKER, ensure_ascii=False)
+        if len(candidate) - 2 <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return value_json[:low] + _UPSTREAM_TRUNCATION_MARKER
+
+
 # Appended to every node's system prompt (`_guarded_system_prompt`). The
 # wrapping in `_build_user_message` marks the boundary; this is what tells the
 # model the boundary MEANS something. Kept short and imperative — it competes
@@ -306,9 +344,29 @@ def _serialize_upstream(
     The cap is the real fix. On a linear DAG this payload grows by one full
     node output per step, so total prompt tokens across a run grow
     QUADRATICALLY with node count — unbounded cost and, eventually, a
-    context-window failure on the last node. When the cap is exceeded the
-    OLDEST outputs are dropped first (the nearest upstream ones are the most
-    likely to matter) and the drop is logged, never silent.
+    context-window failure on the last node.
+
+    Story 4.13 AC2 revisited two things review of the eviction itself found
+    disproportionate to what a single bad entry should cost:
+
+    * **Eviction order** — the LARGEST entry is evicted first, not the
+      OLDEST. "Oldest first" was a proxy for "least relevant", and Story
+      4.7's handoff summaries made it measurably worse: survivors are now
+      heterogeneous (a short summary next to a large raw fallback whose own
+      summarization failed), so arrival order stopped tracking size or
+      relevance. Sizing the eviction on the actual budget consumer also
+      means one oversized entry no longer forces every OTHER, well-behaved
+      entry out before itself.
+    * **A lone oversized entry is truncated, never evicted to nothing** —
+      before this story, an entry that alone exceeds the cap was dropped
+      just like any other once it was the last one left, leaving the node
+      with `upstream_outputs: {}` — NO context — after every entry that
+      WOULD have fit was already sacrificed to make room for it. It now
+      keeps a marked prefix of that one entry instead (see
+      `_UPSTREAM_TRUNCATION_MARKER`), so the node always sees something
+      when there was anything to see.
+
+    Either way, the drop/truncation is logged, never silent.
     """
     raw_outputs = state.get("node_outputs") or {}
     handoffs: dict[str, Any] = {}
@@ -316,7 +374,11 @@ def _serialize_upstream(
     if prefer_handoffs:
         raw_handoffs = state.get("handoffs")
         handoffs = raw_handoffs if isinstance(raw_handoffs, dict) else {}
-        outputs = {}
+        # `Any`, not the narrower type mypy would otherwise infer from the
+        # loop below: Story 4.13 AC2's single-entry truncation replaces one
+        # entry's value with a plain `str`, a legal value this dict must
+        # accept alongside the `dict[str, Any] | None` node outputs.
+        outputs: dict[str, Any] = {}
         for nid, raw in raw_outputs.items():
             view = _handoff_view(handoffs.get(nid))
             if view is None:
@@ -327,22 +389,62 @@ def _serialize_upstream(
     else:
         outputs = dict(raw_outputs)
     dropped: list[str] = []
+    truncated_node_id: str | None = None
+    # Sized once, then kept in step with `outputs`. Re-measuring every
+    # surviving entry on every eviction is O(N^2) serializations of
+    # multi-KB payloads, synchronously, inside an async node executor on
+    # the hot path of every node of every run.
+    entry_sizes = {
+        nid: len(json.dumps(value, ensure_ascii=False)) for nid, value in outputs.items()
+    }
     while outputs:
         serialized = json.dumps(outputs, ensure_ascii=False, sort_keys=True)
         if len(serialized) <= MAX_UPSTREAM_OUTPUT_CHARS:
             break
-        # `node_outputs` preserves completion order, so the first key is the
-        # furthest upstream.
-        dropped.append(next(iter(outputs)))
-        del outputs[dropped[-1]]
+        if len(outputs) == 1:
+            # Story 4.13 AC2 — a SINGLE surviving entry that alone exceeds
+            # the cap used to be evicted just like any other, leaving the
+            # node with `upstream_outputs: {}` — NO context at all, after
+            # every OTHER entry (which fit fine on its own) was already
+            # dropped to make room for this one. Truncating its value
+            # instead means the node still sees SOMETHING: a prefix of the
+            # one entry that would not fit, clearly marked as cut.
+            (only_node_id,) = outputs
+            truncated_node_id = only_node_id
+            value_json = json.dumps(outputs[only_node_id], ensure_ascii=False, sort_keys=True)
+            wrapper_overhead = len(json.dumps({only_node_id: ""}, ensure_ascii=False))
+            # Spent in ESCAPED characters — that is what the re-serialization
+            # below writes. See `_truncate_to_escaped_budget`.
+            budget = max(MAX_UPSTREAM_OUTPUT_CHARS - wrapper_overhead, 0)
+            outputs[only_node_id] = _truncate_to_escaped_budget(value_json, budget)
+            serialized = json.dumps(outputs, ensure_ascii=False, sort_keys=True)
+            break
+        # Story 4.13 AC2/T2.1 — evict the LARGEST entry first, not the
+        # OLDEST. "Oldest first" was a proxy for "least relevant", and
+        # Story 4.7's handoff summaries made it a worse one: a short
+        # summary could be evicted before a large raw fallback (its own
+        # summarization having failed) purely because the summary happened
+        # to survive from an earlier superstep. Sizing the eviction on what
+        # is actually consuming the budget also means ONE oversized entry
+        # no longer forces every other, well-behaved entry out first.
+        largest = max(outputs, key=lambda nid: entry_sizes[nid])
+        dropped.append(largest)
+        del entry_sizes[largest]
+        del outputs[largest]
     else:
         serialized = "{}"
 
-    if dropped:
+    if dropped or truncated_node_id is not None:
         _log.warning(
             "workflow_engine.upstream_outputs_truncated",
             node_id=node_id,
             dropped_nodes=dropped,
+            # Story 4.13 AC2/T2.3 — explicit rather than inferred: an
+            # operator reading this log must not have to reconstruct
+            # "dropped everything, including the entry that PARTIALLY
+            # survives" from `dropped_nodes` alone.
+            truncated_node_id=truncated_node_id,
+            result_empty=not outputs,
             cap_chars=MAX_UPSTREAM_OUTPUT_CHARS,
         )
 
@@ -356,7 +458,14 @@ def _serialize_upstream(
     # Both figures stay ROUTER-MEASURED, read back from the producer's own
     # `handoffs` entry: no tokenizer is introduced here, which the story
     # forbids and which nothing in this repo provides.
+    # A truncated entry only PARTIALLY reached the model, a third state the
+    # dropped/survived test above does not model — its key is still in
+    # `outputs`, so it would contribute its full token counts. Excluded
+    # rather than prorated: these are router-measured counts and there is no
+    # tokenizer here to measure what fraction survived the cut.
     surviving = substituted & outputs.keys()
+    if truncated_node_id is not None:
+        surviving = surviving - {truncated_node_id}
     if not surviving:
         return serialized, None
     raw_tokens = 0

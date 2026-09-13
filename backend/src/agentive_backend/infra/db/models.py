@@ -302,6 +302,54 @@ class WorkflowRun(Base):
     control_requested_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
+    # Story 4.10 AC1 — stamped by `CheckpointRetentionWorker` once this run's
+    # LangGraph checkpoint history (`checkpoints`/`checkpoint_writes`/
+    # `checkpoint_blobs`, migration `20260910_000001`) has been purged via
+    # `AsyncPostgresSaver.adelete_thread`. `NULL` means either "not old
+    # enough yet" or "predates this story" — both read identically (nothing
+    # purged), which is correct: a purge worker that ran once is idempotent
+    # against either. Never set back to `NULL`: a purge is not reversible,
+    # so nothing in this codebase un-stamps it.
+    checkpoint_purged_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        # Story 4.10 AC3 — `WorkflowRunRepo.claim_stale_running` filters
+        # `status = 'running'` and orders by
+        # `COALESCE(last_checkpoint_at, started_at)`, and until this story
+        # the only index on this table was `ix_workflow_runs_workflow`
+        # (`workflow_id`) — every sweep tick (every 30s, per API replica) ran
+        # a full seq scan + sort once the table stopped being tiny.
+        #
+        # PARTIAL (`WHERE status = 'running'`) rather than total: the sweep
+        # only ever reads `running` rows, which shrink toward a small,
+        # roughly-constant fraction of the table as it grows (most rows are
+        # terminal) — a total index would pay to maintain entries the sweep
+        # never reads. EXPRESSION on the same `COALESCE` the query itself
+        # orders by, so the index's sort order matches the query's `ORDER
+        # BY` exactly rather than merely narrowing the row set.
+        #
+        # Declared here (not only in the migration) for the same reason as
+        # `uq_workflow_request_fingerprint` (Story 4.8 P4): an index present
+        # in the database and absent from `Base.metadata` is a `DROP INDEX`
+        # waiting for the next `alembic revision --autogenerate`.
+        Index(
+            "ix_workflow_runs_stale_running",
+            func.coalesce(last_checkpoint_at, started_at),
+            postgresql_where=text("status = 'running'"),
+        ),
+        # Serves the windowed metrics aggregates (`aggregate_routing_modes` /
+        # `aggregate_token_reduction`), whose predicate is
+        # `workflow_id = ? AND started_at >= ?`. Neither existing index can:
+        # `ix_workflow_runs_workflow` covers only the first column, and the
+        # partial index above is scoped to `status = 'running'` while these
+        # aggregates read TERMINAL rows — so the window bounded what was
+        # aggregated, never what was scanned. `DESC` because every consumer
+        # reads a trailing window. Declared here as well as in the migration,
+        # same reason as its sibling above.
+        Index("ix_workflow_runs_workflow_started", "workflow_id", started_at.desc()),
+    )
 
 
 class AgentTemplate(Base):

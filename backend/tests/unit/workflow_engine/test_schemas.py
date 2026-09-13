@@ -6,6 +6,7 @@ Covers the schema-level defensive validations added on review: whitespace-only
 
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 import pytest
@@ -263,6 +264,69 @@ def test_start_run_request_blank_reason_without_force_is_accepted() -> None:
     assert StartRunRequest(reason="   ").force is False
 
 
+# ─── StartRunRequest.input size bound (Story 4.9 AC2/T2.1) ─────────────
+
+
+def test_start_run_request_input_within_the_size_bound_is_accepted() -> None:
+    request = StartRunRequest(input={"task": "x" * 1000})
+    assert len(request.input["task"]) == 1000
+
+
+def test_start_run_request_oversized_input_is_rejected() -> None:
+    # `_MAX_RUN_INPUT_BYTES` is 262_144; comfortably over it once serialized.
+    with pytest.raises(ValidationError, match="input is too large"):
+        StartRunRequest(input={"task": "x" * 300_000})
+
+
+def test_start_run_request_input_at_the_size_bound_is_accepted() -> None:
+    from agentive_backend.features.workflow_engine.schemas import _MAX_RUN_INPUT_BYTES
+
+    overhead = len(json.dumps({"k": ""}).encode("utf-8"))
+    value = "x" * (_MAX_RUN_INPUT_BYTES - overhead)
+    request = StartRunRequest(input={"k": value})
+    assert len(json.dumps(request.input).encode("utf-8")) == _MAX_RUN_INPUT_BYTES
+
+
+@pytest.mark.parametrize(
+    ("label", "char"),
+    [("French accented", "é"), ("Cyrillic", "ж"), ("CJK", "漢"), ("emoji", "🙂")],
+)
+def test_non_ascii_input_is_measured_as_it_travels_not_as_escapes(label: str, char: str) -> None:
+    """The guard measured
+    `json.dumps(value)`, whose default `ensure_ascii=True` expands every
+    non-ASCII character into a 6-byte `\\uXXXX` escape BEFORE
+    `.encode("utf-8")` weighs it. 100 000 `é` weigh 200 009 bytes on the
+    wire and measured 600 009, so a 195 KiB French body — well under the
+    documented 256 KiB — was refused with a 422 quoting a number the client
+    could not reconcile with anything it had sent. On a francophone product
+    that is a live, user-visible defect; the bound tests above all used
+    `"x" * N`, pure ASCII, where the two encodings coincide."""
+    from agentive_backend.features.workflow_engine.schemas import _MAX_RUN_INPUT_BYTES
+
+    # A payload comfortably under the cap on the wire, but over it once
+    # every character is escaped.
+    char_bytes = len(char.encode("utf-8"))
+    count = (_MAX_RUN_INPUT_BYTES - 100) // char_bytes
+    value = char * count
+    wire_bytes = len(json.dumps({"k": value}, ensure_ascii=False).encode("utf-8"))
+    escaped_bytes = len(json.dumps({"k": value}).encode("utf-8"))
+
+    assert wire_bytes <= _MAX_RUN_INPUT_BYTES, "precondition: legitimate on the wire"
+    assert escaped_bytes > _MAX_RUN_INPUT_BYTES, f"precondition: {label} inflates when escaped"
+
+    request = StartRunRequest(input={"k": value})
+    assert request.input["k"] == value
+
+
+def test_input_that_cannot_be_serialized_raises_a_validation_error_not_a_500() -> None:
+    """`json.dumps` raises `TypeError` (not `ValueError`) on a
+    non-serializable value, and pydantic does NOT convert a `TypeError`
+    raised inside a validator into a validation error — it escaped as a
+    500."""
+    with pytest.raises(ValidationError, match="not JSON-serializable"):
+        StartRunRequest(input={"k": object()})
+
+
 # ─── Mise en Place schemas (Story 4.5 T5.1, T5.4) ──────────────────────
 
 
@@ -454,7 +518,7 @@ def test_handoff_stats_response_accepts_a_computed_ratio() -> None:
     assert response.reduction_ratio_pct == 80.0
 
 
-# ─── Revue du 2026-09-12 (P-16) — le domaine réel de la réponse ────────────
+# ─── Revue du 2026-09-12 — le domaine réel de la réponse ────────────
 
 
 def test_handoff_stats_response_refuses_negative_token_counts() -> None:
@@ -475,7 +539,7 @@ def test_handoff_stats_response_refuses_negative_token_counts() -> None:
 
 
 def test_handoff_stats_response_allows_a_negative_ratio() -> None:
-    """P-10 — a negative ratio is not corruption, it is a real and reportable
+    """a negative ratio is not corruption, it is a real and reportable
     outcome: the summaries came out BIGGER than the outputs they replaced.
     Clamping it would erase the only signal saying the optimization costs more
     than it saves, so the schema accepts it and `_aggregate_handoffs` warns."""

@@ -244,8 +244,10 @@ async def test_system_prompt_carries_the_injection_policy() -> None:
 async def test_upstream_outputs_are_capped_dropping_the_oldest_first() -> None:
     """On a linear DAG this payload grows by one full node output per step —
     quadratic total prompt cost across a run, and eventually a context-window
-    failure on the last node. The nearest upstream outputs are the most
-    likely to matter, so the furthest go first."""
+    failure on the last node. Two entries tied in size: the tie resolves to
+    completion order (the furthest-upstream one goes first), same outcome
+    as the pre-4.13 "oldest first" rule — but see the test below for what
+    actually governs eviction now that sizes differ."""
     router = _router(_completion())
     big = "x" * 30_000
     state = {
@@ -263,6 +265,147 @@ async def test_upstream_outputs_are_capped_dropping_the_oldest_first() -> None:
     assert '"recent"' in content, "the nearest upstream output must survive"
     assert '"old"' not in content, "the furthest upstream output must be dropped first"
     assert len(content) < MAX_UPSTREAM_OUTPUT_CHARS + 5_000
+
+
+@pytest.mark.asyncio
+async def test_upstream_outputs_are_capped_dropping_the_largest_first() -> None:
+    """Story 4.13 AC2/T2.1 — eviction is sized on the actual budget
+    consumer, not on arrival order. The OLDEST entry here is SMALL and
+    survives; a MORE RECENT entry is LARGE and is evicted first — the
+    opposite of what a pure "oldest first" rule would have done, and
+    exactly the scenario Story 4.7's handoff summaries made common (a
+    short summary sitting next to a large raw fallback whose own
+    summarization failed)."""
+    router = _router(_completion())
+    small = "x" * 100
+    big = "x" * 55_000
+    state = {
+        "task_input": {},
+        # `oldest` is the furthest upstream (small); `newest` is the nearest
+        # (large). A pure recency rule would keep `newest` and drop `oldest`
+        # first — the reverse of what must happen here.
+        "node_outputs": {"oldest": {"v": small}, "newest": {"v": big}},
+        "node_metrics": {},
+    }
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="z"
+    )
+
+    content = router.complete.await_args.args[0][0].content
+    assert '"oldest"' in content, "the SMALL, older entry must survive"
+    assert '"newest"' not in content, "the LARGE entry is evicted regardless of recency"
+
+
+@pytest.mark.asyncio
+async def test_a_lone_oversized_upstream_entry_is_truncated_not_evicted_to_nothing() -> None:
+    """Story 4.13 AC2/T2.2 — before this story, a SINGLE entry that alone
+    exceeds the cap was evicted just like any other once every other entry
+    (which would have fit) was already sacrificed to make room for it,
+    leaving the node with NO upstream context at all. It now keeps a marked
+    prefix of that one entry instead."""
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"huge": {"v": "x" * (MAX_UPSTREAM_OUTPUT_CHARS * 2)}},
+        "node_metrics": {},
+    }
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="z"
+    )
+
+    content = router.complete.await_args.args[0][0].content
+    assert '"huge"' in content, "the node must still see SOMETHING, not upstream_outputs: {}"
+    assert "TRUNCATED" in content
+    assert len(content) < MAX_UPSTREAM_OUTPUT_CHARS + 5_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        # The shape the test above uses: a plain run of `x`, which JSON
+        # escapes to itself. It is the ONE shape that cannot reveal P-01.
+        ("no escapable characters", {"v": "x" * (MAX_UPSTREAM_OUTPUT_CHARS * 2)}),
+        # A realistically structured LLM output: thousands of short string
+        # fields, hence thousands of quote characters. Measured 1.18x cap.
+        ("quote-dense", {f"k{i}": f"value-{i}" for i in range(8_000)}),
+        # Windows paths / escaped JSON payloads. Measured 1.48x cap — every
+        # backslash doubles, and `\` is the worst ordinary case.
+        ("backslash-dense", {"p": "C:\\dir\\sub\\file " * 20_000}),
+        # Control characters expand 6x (`\u000b`), the true worst case.
+        ("control-character-dense", {"c": "\v" * (MAX_UPSTREAM_OUTPUT_CHARS * 2)}),
+    ],
+)
+async def test_a_lone_truncated_entry_respects_the_cap_whatever_it_contains(
+    label: str, value: dict[str, object]
+) -> None:
+    """The single-entry truncation branch sized
+    its slice against the UNESCAPED JSON text, then stored that slice back as
+    a string value which the final `json.dumps` re-escaped: every `"` became
+    `\\"`, every `\\` became `\\\\`. The `break` immediately after meant
+    nothing re-checked the result, so `MAX_UPSTREAM_OUTPUT_CHARS` stopped
+    being a bound on the one path Story 4.13 AC2 added to guarantee a node
+    sees SOMETHING — the context-window failure and unbounded prompt cost the
+    cap exists to prevent were reachable again.
+
+    Parametrised over escape density on purpose: the pre-existing test used
+    `"x" * N`, a value with ZERO escapable characters, which is exactly the
+    input for which the buggy arithmetic happened to be correct."""
+    router = _router(_completion())
+    state = {"task_input": {}, "node_outputs": {"huge": value}, "node_metrics": {}}
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="z"
+    )
+
+    content = router.complete.await_args.args[0][0].content
+    assert '"huge"' in content, "the node must still see SOMETHING, not upstream_outputs: {}"
+    assert "TRUNCATED" in content
+    # The serialized upstream block is what the cap governs; `content` also
+    # carries the surrounding prompt scaffolding, so allow for that but NOT
+    # for a multiple of the cap.
+    assert len(content) < MAX_UPSTREAM_OUTPUT_CHARS + 5_000, (
+        f"{label}: escape expansion blew the cap — {len(content)} chars "
+        f"for a {MAX_UPSTREAM_OUTPUT_CHARS} cap"
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncation_log_names_the_truncated_node_and_is_never_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 4.13 AC2/T2.3 — an operator reading
+    `workflow_engine.upstream_outputs_truncated` must not have to infer
+    "dropped everything, including the entry that partially survives" from
+    `dropped_nodes` alone. `truncated_node_id` names it explicitly, and
+    `result_empty` — now provably always `False` when anything was ever
+    logged, since a lone oversized entry is truncated rather than dropped —
+    stays as an explicit, checkable guarantee rather than an implicit one."""
+    from agentive_backend.features.workflow_engine.engine import agent_node as agent_node_module
+
+    logged: dict[str, Any] = {}
+    monkeypatch.setattr(
+        agent_node_module._log,
+        "warning",
+        lambda event, **kw: logged.update(event=event, **kw),
+    )
+    router = _router(_completion())
+    state = {
+        "task_input": {},
+        "node_outputs": {"huge": {"v": "x" * (MAX_UPSTREAM_OUTPUT_CHARS * 2)}},
+        "node_metrics": {},
+    }
+
+    await execute_agent_node(
+        state, template=SimpleNamespace(config={}), llm_router=router, node_id="z"
+    )
+
+    assert logged["event"] == "workflow_engine.upstream_outputs_truncated"
+    assert logged["truncated_node_id"] == "huge"
+    assert logged["dropped_nodes"] == []
+    assert logged["result_empty"] is False
 
 
 @pytest.mark.asyncio
@@ -1057,7 +1200,7 @@ def _handoff_state() -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_consumer_prompt_carries_the_summary_but_never_the_engines_bookkeeping() -> None:
-    """P-4 — `_serialize_upstream` used to substitute the WHOLE `handoffs`
+    """`_serialize_upstream` used to substitute the WHOLE `handoffs`
     entry, so the next agent's prompt carried `"raw_output_tokens_replaced":
     1000, "summary_input_tokens": 30, …` inside `<tool_output>`: the engine's
     billing bookkeeping handed to an agent as business content. Noise paid for
@@ -1089,7 +1232,7 @@ async def test_consumer_prompt_carries_the_summary_but_never_the_engines_bookkee
 async def test_a_corrupt_handoff_entry_falls_back_to_that_nodes_raw_output(
     corrupt: Any,
 ) -> None:
-    """P-5 — T3.3's literal `… or raw`. The shipped `handoffs.get(nid, raw)`
+    """T3.3's literal `… or raw`. The shipped `handoffs.get(nid, raw)`
     substituted whatever was stored, so a corrupt entry reached the prompt as
     itself instead of degrading to the raw output AC2 promises."""
     state = _handoff_state()
@@ -1105,7 +1248,7 @@ async def test_a_corrupt_handoff_entry_falls_back_to_that_nodes_raw_output(
 
 @pytest.mark.asyncio
 async def test_a_handoffs_channel_of_the_wrong_type_does_not_fail_every_node() -> None:
-    """P-5 — `state.get("handoffs") or {}` only guards `None`. A checkpoint
+    """`state.get("handoffs") or {}` only guards `None`. A checkpoint
     holding a LIST here (corruption, or a future migration following the
     epic's literal `handoffs[]` prose) raised `AttributeError` on the hot
     path, failing EVERY node of the run rather than degrading one entry."""
@@ -1124,7 +1267,7 @@ async def test_a_handoffs_channel_of_the_wrong_type_does_not_fail_every_node() -
 async def test_a_mistyped_opt_out_value_is_logged_not_just_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """P-11 — strict is right, SILENT is not. `config` is a free JSONB blob:
+    """strict is right, SILENT is not. `config` is a free JSONB blob:
     no schema declares this key, so a UI serializing booleans as strings wrote
     `"true"`, kept getting summaries, and nothing anywhere related cause to
     effect. `_resolve_llm_params`, cited as the model for this posture, logs

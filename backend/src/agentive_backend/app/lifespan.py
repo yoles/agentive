@@ -33,6 +33,7 @@ from agentive_backend.features.workflow_engine.recovery import (
     WorkflowRecoveryWorker,
     derive_stale_threshold_s,
 )
+from agentive_backend.features.workflow_engine.retention import CheckpointRetentionWorker
 from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
 from agentive_backend.features.workflow_engine.service import (
     WorkflowExecutionService,
@@ -104,6 +105,11 @@ _CHECKPOINT_POOL_MIN_SIZE = 1
 _CHECKPOINT_POOL_MAX_SIZE = 10
 _CHECKPOINT_POOL_MAX_LIFETIME_S = 30 * 60.0
 _CHECKPOINT_POOL_OPEN_TIMEOUT_S = 10.0
+
+# Shutdown budget for cancelling in-flight runs. Sized against the same
+# `stop_grace_period: 30s` the workers' own budgets are sized against, and
+# deliberately smaller than what remains of it after they have all stopped.
+_CANCEL_INFLIGHT_TIMEOUT_S = 5.0
 
 
 def _workflow_checkpoint_dsn() -> str:
@@ -758,6 +764,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise
     app.state.workflow_recovery_worker = workflow_recovery_worker
 
+    # Story 4.10 AC1/AC2 — checkpoint blob retention + stale-`paused` alert.
+    # Same `checkpointer` as the recovery worker above, so it needs the same
+    # teardown ordering (stopped before `workflow_exit_stack.aclose()`).
+    checkpoint_retention_worker = CheckpointRetentionWorker(
+        checkpointer=workflow_checkpointer,
+        session_factory=session_factory,
+        interval_s=settings.workflow_checkpoint_retention_interval_s,
+        retention_days=settings.workflow_checkpoint_retention_days,
+        paused_alert_after_days=settings.workflow_paused_run_alert_after_days,
+    )
+    try:
+        await checkpoint_retention_worker.start()
+    except Exception:
+        log.exception("agentive_checkpoint_retention_worker_start_failed")
+        with contextlib.suppress(Exception):
+            await workflow_recovery_worker.stop()
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        with contextlib.suppress(Exception):
+            await workflow_exit_stack.aclose()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.checkpoint_retention_worker = checkpoint_retention_worker
+
     # Best-effort startup event — a transient DB hiccup must not prevent the
     # app from serving traffic (the worker will replay any orphaned writes
     # next time the publish path succeeds).
@@ -833,7 +865,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(Exception):
                 await workflow_recovery_worker.stop()
             with contextlib.suppress(Exception):
-                cancelled = await cancel_inflight_runs()
+                # Story 4.10 — same ordering constraint as the recovery
+                # worker above: it holds the same `checkpointer`.
+                await checkpoint_retention_worker.stop()
+            with contextlib.suppress(Exception):
+                # Bounded: this is the one step of the sequence that does
+                # unbounded DB work (a write per in-flight run) with no
+                # budget of its own, while every worker around it caps its
+                # own shutdown. Against a slow or unreachable database it
+                # alone could push the sequence past `stop_grace_period` and
+                # earn a SIGKILL mid-teardown — orphaning exactly the
+                # `running` rows the recovery sweep then has to reclaim, and
+                # which the concurrency cap counts until it does.
+                cancelled = await asyncio.wait_for(
+                    cancel_inflight_runs(), timeout=_CANCEL_INFLIGHT_TIMEOUT_S
+                )
                 if cancelled:
                     log.info("agentive_cancelled_inflight_runs", count=cancelled)
             with contextlib.suppress(Exception):

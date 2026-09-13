@@ -89,6 +89,27 @@ def downgrade() -> None:
     # dropping the column discards the request, and the run proceeds to
     # completion — which is precisely what the restored code would have done
     # with it.
+    #
+    # Story 4.11 AC7/T7.1 — the reconciliation above is NOT enough by
+    # itself against LIVE traffic (`infra/scripts/deploy-staging.sh` can run
+    # this while the previous deploy's backend, still running a 4.6 driver,
+    # is mid-superstep). A driver can settle a pending `pause` — writing
+    # `status = 'paused'` — in the WINDOW between the reconciliation UPDATE
+    # above and the `DROP COLUMN` below, producing exactly the row this
+    # migration's own docstring calls unacceptable: immobile forever, since
+    # the restored code has no notion of `paused` to reclaim it.
+    #
+    # `LOCK TABLE ... IN EXCLUSIVE MODE` closes the window: it conflicts
+    # with the `ROW EXCLUSIVE` lock any INSERT/UPDATE/DELETE needs, so no
+    # other transaction can write a NEW `paused` row once it is held — held
+    # for the rest of THIS transaction, past the `DROP COLUMN` below.
+    # Ordinary reads are untouched (Postgres MVCC needs no lock for
+    # `SELECT`). `lock_timeout` (same 5s default as
+    # `AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S`, Story 4.14 AC2) makes
+    # acquiring it fail fast and typed if a live writer already holds a
+    # conflicting lock, instead of this migration parking indefinitely.
+    op.execute("SET LOCAL lock_timeout = '5s'")
+    op.execute("LOCK TABLE workflow_runs IN EXCLUSIVE MODE")
     op.execute(sa.text("UPDATE workflow_runs SET status = 'running' WHERE status = 'paused'"))
     op.execute(sa.text("UPDATE workflow_runs SET status = 'error' WHERE status = 'cancelled'"))
     op.drop_column("workflow_runs", "control_requested_at")

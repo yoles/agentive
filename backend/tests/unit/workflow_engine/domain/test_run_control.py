@@ -1,9 +1,10 @@
-"""Pure transition table for run control — Story 4.6 T2.5, AC1.
+"""Pure transition table for run control — Story 4.6 T2.5, AC1 (extended by
+Story 4.9 AC6/T6.4-T6.5 for `cancel`'s self-override and the `retract` action).
 
 The whole point of :mod:`domain.run_control` is that the 409 decision is
 made in ONE place, by a pure function, so it can be tested exhaustively
 rather than by sampling: the matrix below is the full cartesian product of
-3 actions x 5 statuses, with no hole for an implementation to slip through.
+4 actions x 5 statuses, with no hole for an implementation to slip through.
 """
 
 from __future__ import annotations
@@ -29,13 +30,17 @@ _LEGAL: dict[tuple[RunAction, str], Transition] = {
     ("pause", "running"): Transition(
         allowed_from=("running",), signal="pause", immediate_status=None
     ),
-    # `overrides=("pause",)` — a cancel may replace a pause the driver has
-    # not reached yet. The reverse is deliberately NOT true.
+    # `overrides=("pause", "cancel")` — a cancel may replace a pending pause
+    # (the driver has not reached it yet) AND replay itself idempotently
+    # (Story 4.9 AC6/T6.4 — a replayed `POST /cancel` re-stamps
+    # `control_requested_at` instead of 409ing on a request that IS
+    # proceeding correctly). The reverse (`pause` overriding anything) is
+    # deliberately NOT true.
     ("cancel", "running"): Transition(
         allowed_from=("running", "paused"),
         signal="cancel",
         immediate_status=None,
-        overrides=("pause",),
+        overrides=("pause", "cancel"),
     ),
     ("cancel", "paused"): Transition(
         allowed_from=("running", "paused"), signal=None, immediate_status="cancelled"
@@ -43,9 +48,19 @@ _LEGAL: dict[tuple[RunAction, str], Transition] = {
     ("resume", "paused"): Transition(
         allowed_from=("paused",), signal=None, immediate_status="running"
     ),
+    # Story 4.9 AC6/T6.5 — retraction. Legal only from `running` (the only
+    # status a pending signal can exist under); the repo's additional
+    # `control_signal IS NOT NULL` guard is untestable through this pure
+    # function, which only ever sees `status`.
+    ("retract", "running"): Transition(
+        allowed_from=("running",),
+        signal=None,
+        immediate_status=None,
+        retracts_signal=True,
+    ),
 }
 
-_ACTIONS: tuple[RunAction, ...] = ("pause", "resume", "cancel")
+_ACTIONS: tuple[RunAction, ...] = ("pause", "resume", "cancel", "retract")
 
 
 @pytest.mark.parametrize(("action", "status"), sorted(itertools.product(_ACTIONS, RUN_STATUSES)))
@@ -60,10 +75,11 @@ def test_resolve_transition_when_every_action_status_pair_should_match_the_ac1_m
     assert resolve_transition(action, status) == expected
 
 
-def test_resolve_transition_when_matrix_is_enumerated_should_cover_fifteen_pairs() -> None:
-    """Guard against a status being added without extending the matrix."""
+def test_resolve_transition_when_matrix_is_enumerated_should_cover_twenty_pairs() -> None:
+    """Guard against a status (or action) being added without extending the matrix."""
     assert len(RUN_STATUSES) == 5
-    assert len(list(itertools.product(_ACTIONS, RUN_STATUSES))) == 15
+    assert len(_ACTIONS) == 4
+    assert len(list(itertools.product(_ACTIONS, RUN_STATUSES))) == 20
 
 
 @pytest.mark.parametrize(
@@ -72,6 +88,7 @@ def test_resolve_transition_when_matrix_is_enumerated_should_cover_fifteen_pairs
         ("pause", "paused", ("running",)),
         ("resume", "running", ("paused",)),
         ("cancel", "completed", ("running", "paused")),
+        ("retract", "paused", ("running",)),
     ],
 )
 def test_resolve_transition_when_illegal_should_carry_allowed_from_in_context(
@@ -113,7 +130,7 @@ def test_allowed_from_when_read_should_agree_with_the_transition_table() -> None
     function that decides what is legal — is what makes this a check rather
     than a restatement of the same literal.
     """
-    for action in ("pause", "resume", "cancel"):
+    for action in ("pause", "resume", "cancel", "retract"):
         legal = tuple(
             status
             for status in RUN_STATUSES

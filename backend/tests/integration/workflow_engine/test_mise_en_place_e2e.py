@@ -257,8 +257,9 @@ async def test_start_run_blocked_by_unreachable_mcp_tool(
 
         # ...but the refusal IS traced in the outbox (review BS2): with no
         # row to persist the report on, the trace would otherwise vanish the
-        # moment the 503 was returned. Keyed on `workflow_id` — this event
-        # deliberately carries no `run_id`, because there is no run.
+        # moment the 503 was returned. Keyed on `workflow_id` — `run_id`
+        # stays `None` on THIS path (Story 4.12 AC4 populates it only from
+        # `resume`, where a run genuinely exists), because there is no run.
         events = (
             (
                 await session.execute(
@@ -278,7 +279,7 @@ async def test_start_run_blocked_by_unreachable_mcp_tool(
         assert payload["failed_checks"] == ["mcp_tools_reachable"]
         assert payload["retryable"] is True
         assert payload["mise_en_place"]["all_passed"] is False
-        assert "run_id" not in payload
+        assert payload["run_id"] is None
         # And no `started` event leaked out for a launch that never happened.
         assert not any(e["event_type"].endswith("run.started") for e in events)
 

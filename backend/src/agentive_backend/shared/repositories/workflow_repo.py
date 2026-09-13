@@ -6,12 +6,13 @@ ALL DB access must go through these classes — features must never import
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, update
+from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,12 @@ from agentive_backend.shared.repositories.base import BaseRepo
 # rewrites the whole dict after every completed node, so a run that actually
 # makes progress resets its own counter for free.
 RECOVERY_ATTEMPTS_KEY = "recovery_attempts"
+
+# Key for the cluster-wide advisory lock the checkpoint purge holds. Arbitrary
+# but FIXED: every replica must name the same integer or the lease excludes
+# nobody. Kept here, beside the only method that takes it, so a second
+# advisory lock cannot be added elsewhere with a colliding value by accident.
+CHECKPOINT_PURGE_LOCK_KEY = 4_100_000_001
 
 # Name of the partial unique index declared on ``Workflow.__table_args__``
 # and created by migration ``20260912_000002``. Story 4.8 AC1 keys idempotent
@@ -69,6 +76,11 @@ def _is_request_fingerprint_violation(exc: IntegrityError) -> bool:
 # translated, so a different Postgres timeout elsewhere is never mistaken
 # for this one.
 _LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+# Upper bound of the `INTEGER` the metrics aggregates cast into. Clamped
+# BEFORE the narrowing cast, which would otherwise raise `22003` and abort
+# the whole aggregate. See `WorkflowRunRepo._non_negative_metrics_count`.
+_METRICS_COUNT_CEILING = 2_147_483_647
 
 
 def _is_lock_timeout(exc: OperationalError) -> bool:
@@ -407,6 +419,68 @@ class WorkflowRunRepo(BaseRepo):
         await session.refresh(run)
         return run
 
+    async def count_running(
+        self,
+        workflow_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
+        alive_since: datetime | None = None,
+    ) -> int:
+        """How many runs of ``workflow_id`` currently sit ``running``
+        (Story 4.9 AC2). Self-managed session — an early, best-effort
+        admission check called BEFORE the (expensive) Mise en Place gate,
+        so a request already over the concurrency cap does not pay for
+        MCP probes or a Dry Run just to be refused. Racy by construction
+        against a concurrent create/resume; :meth:`count_running_in_session`
+        is the authoritative check taken in the same transaction as the
+        write.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            return await self.count_running_in_session(
+                session, workflow_id=workflow_id, alive_since=alive_since
+            )
+
+    async def count_running_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        workflow_id: UUID,
+        alive_since: datetime | None = None,
+    ) -> int:
+        """Same count as :meth:`count_running`, taken in the caller's own
+        transaction — the authoritative check, run immediately before the
+        row write it gates (``create_in_session``'s INSERT, or
+        ``update_status_in_session``'s resume UPDATE) so the window between
+        counting and writing is as small as this repo's transactions get.
+
+        Still not a hard linearizability guarantee: two concurrent callers
+        in ``READ COMMITTED`` can both count the same value before either
+        commits its write, same as every other count-then-act check in this
+        module. Closing that race needs a serialized lock (e.g. an advisory
+        lock keyed on ``workflow_id``) that AC2 never asked for — this is a
+        mechanical ceiling against runaway bursts, not a linearizable quota.
+
+        ``alive_since`` excludes ``running`` rows whose driver has gone
+        silent for longer than it — the same ``COALESCE(last_checkpoint_at,
+        started_at)`` staleness :meth:`claim_stale_running` uses, so both
+        answer "is this run still being driven?" the same way. Without it a
+        crashed process's rows counted against the cap until the recovery
+        sweep reclaimed them (~1548 s at default settings), which turned one
+        backend crash into ~26 minutes of 429 on every affected workflow.
+        ``None`` counts every ``running`` row.
+        """
+        stmt = (
+            select(func.count())
+            .select_from(WorkflowRun)
+            .where(WorkflowRun.workflow_id == workflow_id, WorkflowRun.status == "running")
+        )
+        if alive_since is not None:
+            stmt = stmt.where(
+                func.coalesce(WorkflowRun.last_checkpoint_at, WorkflowRun.started_at) >= alive_since
+            )
+        result = await session.execute(stmt)
+        return result.scalar_one()
+
     async def update_status(
         self,
         run_id: UUID,
@@ -416,6 +490,7 @@ class WorkflowRunRepo(BaseRepo):
         metrics: dict[str, Any] | None = None,
         only_if_status: str | None = None,
         only_if_control_signal: str | None = None,
+        only_if_control_signal_unset: bool = False,
         clear_control: bool = False,
         touch_last_checkpoint: bool = False,
         tenant_id: UUID | None = None,
@@ -472,6 +547,7 @@ class WorkflowRunRepo(BaseRepo):
                 metrics=metrics,
                 only_if_status=only_if_status,
                 only_if_control_signal=only_if_control_signal,
+                only_if_control_signal_unset=only_if_control_signal_unset,
                 clear_control=clear_control,
                 touch_last_checkpoint=touch_last_checkpoint,
             )
@@ -486,6 +562,7 @@ class WorkflowRunRepo(BaseRepo):
         metrics: dict[str, Any] | None = None,
         only_if_status: str | None = None,
         only_if_control_signal: str | None = None,
+        only_if_control_signal_unset: bool = False,
         clear_control: bool = False,
         touch_last_checkpoint: bool = False,
     ) -> int:
@@ -530,6 +607,10 @@ class WorkflowRunRepo(BaseRepo):
         ``cancel`` to replace a pending ``pause``; letting the escalation
         through without the symmetric guard on the settle side is what
         opened it.
+
+        ``only_if_control_signal_unset`` is the same compare-and-set for a
+        caller that read NO signal: ``only_if_control_signal=None`` cannot
+        express it, since ``None`` already means "do not guard".
         """
         values: dict[str, Any] = {"status": status}
         if ended_at is not None:
@@ -546,6 +627,8 @@ class WorkflowRunRepo(BaseRepo):
             stmt = stmt.where(WorkflowRun.status == only_if_status)
         if only_if_control_signal is not None:
             stmt = stmt.where(WorkflowRun.control_signal == only_if_control_signal)
+        if only_if_control_signal_unset:
+            stmt = stmt.where(WorkflowRun.control_signal.is_(None))
         result = await session.execute(stmt)
         # ``rowcount`` is exposed by SQLAlchemy CursorResult (DML executions)
         # but the static type is Result[Any]; getattr keeps mypy strict happy.
@@ -611,6 +694,17 @@ class WorkflowRunRepo(BaseRepo):
         of the default "no signal pending". The domain owns which ones (see
         ``domain.run_control.Transition.overrides``); the repo only applies
         them. Empty keeps the strict first-writer-wins guard.
+
+        ``control_requested_at`` moves only when the SIGNAL changes. It
+        answers "how long has this request been waiting?", which is what a
+        caller reads to tell a request the driver has simply not reached yet
+        from one whose driver is dead. A replayed request — the same signal
+        written again, which ``overrides`` deliberately permits so a retrying
+        client gets 202 rather than 409 — is the same request retried, not a
+        new one, so re-stamping it would peg the field at "just now" for
+        exactly the client behaviour that replay support exists to serve. An
+        ESCALATION (``pause`` -> ``cancel``) genuinely is a new request and
+        does move it.
         """
         pending_ok: ColumnElement[bool] = WorkflowRun.control_signal.is_(None)
         if overrides:
@@ -622,20 +716,68 @@ class WorkflowRunRepo(BaseRepo):
                 WorkflowRun.status == only_if_status,
                 pending_ok,
             )
-            .values(control_signal=signal, control_requested_at=func.now())
+            .values(
+                control_signal=signal,
+                control_requested_at=case(
+                    (
+                        WorkflowRun.control_signal.is_distinct_from(signal),
+                        func.now(),
+                    ),
+                    else_=WorkflowRun.control_requested_at,
+                ),
+            )
         )
         result = await session.execute(stmt)
         rowcount = getattr(result, "rowcount", None)
         return int(rowcount or 0)
 
-    # There is deliberately NO standalone `clear_control()`. Every path that
-    # consumes or invalidates a signal also changes the status, so each one
+    # There is deliberately NO standalone, UNCONDITIONAL `clear_control()`.
+    # Every path that CONSUMES a signal also changes the status, so each one
     # uses `update_status(..., clear_control=True)` and gets the two writes in
     # ONE statement. A separate unconditional `UPDATE ... WHERE id = :id`
     # would have no status guard and no signal guard, so a caller "cleaning
     # up" a signal it had just consumed would also erase one written
     # microseconds earlier by a concurrent request — answering that caller
     # 202 for a cancellation that then never happens.
+    #
+    # `retract_control_in_session` below is NOT that method: it is
+    # conditional on `control_signal IS NOT NULL` (Story 4.9 AC6/T6.5),
+    # which closes exactly the gap the paragraph above warns about — a
+    # retraction only ever clears a signal that is STILL there to clear, so
+    # it cannot erase one a concurrent request writes afterwards, and it
+    # never touches `status`.
+
+    async def retract_control_in_session(
+        self, session: AsyncSession, run_id: UUID, *, only_if_status: str = "running"
+    ) -> int:
+        """Clear a pending, not-yet-observed `pause`/`cancel` (Story 4.9
+        AC6/T6.5) — "I asked for the wrong thing, undo it before the driver
+        acts on it."
+
+        Compare-and-set on TWO conditions, mirroring
+        :meth:`request_control_in_session`'s own discipline in reverse:
+
+        * ``status = only_if_status`` — a run that already settled (the
+          driver observed the signal and moved on, or reached a terminal
+          status by itself) has nothing left to retract.
+        * ``control_signal IS NOT NULL`` — nothing pending means nothing to
+          clear; a 0 here answers the same way a stale request does.
+
+        Never touches ``status`` — retraction is purely a signal-column
+        operation, unlike every other write in this class.
+        """
+        stmt = (
+            update(WorkflowRun)
+            .where(
+                WorkflowRun.id == run_id,
+                WorkflowRun.status == only_if_status,
+                WorkflowRun.control_signal.is_not(None),
+            )
+            .values(control_signal=None, control_requested_at=None)
+        )
+        result = await session.execute(stmt)
+        rowcount = getattr(result, "rowcount", None)
+        return int(rowcount or 0)
 
     async def get_control_signal(
         self, run_id: UUID, *, tenant_id: UUID | None = None
@@ -743,6 +885,61 @@ class WorkflowRunRepo(BaseRepo):
             else_=cast(literal("{}"), JSONB),
         )
 
+    @staticmethod
+    def _non_negative_metrics_count(metrics_key: str, field: str) -> Any:
+        """One ``metrics[(metrics_key, field)]`` value, floored to a
+        non-negative int — ``0`` for anything else: missing, non-numeric,
+        or (Story 4.13 AC1) NEGATIVE.
+
+        Shared by :meth:`aggregate_routing_modes` and
+        :meth:`aggregate_token_reduction` — a single copy specifically so
+        the two cannot drift the way they had: both carried the identical
+        ``jsonb_typeof(...) = 'number'`` guard (closing the non-numeric/
+        fractional case, Story 4.3/4.7), and both left it silently open to
+        a NEGATIVE JSON number, which the guard's own type check accepts
+        (a sign is not a type) and ``floor``/``sum`` propagate straight
+        through to the response's ``Field(ge=0)`` — a 500 for every OTHER
+        run of the workflow, from one corrupted row.
+
+        The clamp is deliberately SILENT, like its sibling guard's
+        treatment of a non-numeric value — not a rejected/logged row. A
+        negative token count or a negative routing tally cannot be
+        partially salvaged into a meaningful positive number, so folding it
+        to ``0`` (i.e. "this row contributed nothing knowable") is the same
+        answer the aggregate already gives a row with no ``routing``/
+        ``handoffs`` key at all. Consistency with the existing corruption
+        handling was chosen over inventing a second, differently-shaped
+        response (reject + log) for a sibling failure mode of the same
+        field.
+
+        The clamp runs in ``numeric`` space, BEFORE the cast to ``INTEGER``,
+        and bounds both sides. Clamping after the cast defends nothing:
+        ``CAST(... AS INTEGER)`` is evaluated first and raises
+        ``22003 numeric_value_out_of_range`` on a value outside int32,
+        aborting the statement for every other row. ``jsonb`` stores numbers
+        as ``numeric``, so only the narrowing cast can overflow.
+
+        Both bounds live in the result expression, never in the outer
+        condition: ``jsonb_typeof(...) = 'number' AND <arithmetic>`` would
+        let the planner evaluate the arithmetic against a non-numeric value
+        in whatever order it likes, which is the hazard the outer guard
+        exists to avoid.
+        """
+        path = WorkflowRun.metrics[(metrics_key, field)]
+        return case(
+            (
+                func.jsonb_typeof(path) == "number",
+                cast(
+                    func.least(
+                        func.greatest(func.floor(cast(path.astext, Numeric)), literal(0)),
+                        literal(_METRICS_COUNT_CEILING),
+                    ),
+                    Integer,
+                ),
+            ),
+            else_=literal(0),
+        )
+
     async def claim_stale_running(
         self, *, older_than: datetime, limit: int = 50
     ) -> list[WorkflowRun]:
@@ -804,11 +1001,180 @@ class WorkflowRunRepo(BaseRepo):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @asynccontextmanager
+    async def purge_lease(self) -> AsyncIterator[bool]:
+        """Hold a cluster-wide lease on the checkpoint purge, or report that
+        somebody else has it.
+
+        Yields ``True`` when this process may purge, ``False`` when another
+        already is. A Postgres SESSION-level advisory lock rather than a
+        transaction-level one, because the pass it guards spans many
+        transactions: the claim, each ``adelete_thread``, and each marker
+        write are separate units, and a purge is only safe to duplicate in
+        the sense that nothing corrupts — two processes still issue the same
+        deletes twice and contend on ``checkpoint_writes``/``checkpoint_blobs``.
+
+        Why a lock at all: ``list_purgeable`` takes no row locks, and that
+        is deliberate — a purge stamps ``checkpoint_purged_at`` only AFTER
+        the delete succeeds, so a crash in between leaves the run eligible
+        for a harmless retry instead of marking blobs purged that still
+        exist. Claiming rows up front would trade that safety for exclusion.
+        This lease buys the exclusion without touching the ordering.
+
+        Released explicitly, and by Postgres anyway if the process dies —
+        so a crashed replica cannot wedge the purge the way a claimed-row
+        scheme would.
+        """
+        async with self._session_factory() as session:
+            acquired = bool(
+                (
+                    await session.execute(
+                        text("SELECT pg_try_advisory_lock(:key)"),
+                        {"key": CHECKPOINT_PURGE_LOCK_KEY},
+                    )
+                ).scalar_one()
+            )
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    with suppress(Exception):
+                        await session.execute(
+                            text("SELECT pg_advisory_unlock(:key)"),
+                            {"key": CHECKPOINT_PURGE_LOCK_KEY},
+                        )
+
+    async def list_purgeable(
+        self,
+        *,
+        terminal_statuses: Sequence[str],
+        older_than: datetime,
+        limit: int = 1000,
+        exclude_run_ids: Sequence[UUID] = (),
+    ) -> list[WorkflowRun]:
+        """Terminal runs whose checkpoint history has not been purged yet,
+        ended before ``older_than`` (Story 4.10 AC1).
+
+        ``terminal_statuses`` is a parameter, not a literal in this method,
+        because ``shared/`` cannot import ``domain.run_control.TERMINAL_STATUSES``
+        (``import-linter`` Contract 2 — the layering runs app → features →
+        infra → shared, never the reverse). The caller
+        (``CheckpointRetentionWorker``, a feature-layer module) supplies it.
+
+        Read-only — unlike :meth:`claim_stale_running`, nothing here takes
+        ``FOR UPDATE SKIP LOCKED``. Claiming rows up front would require
+        stamping them BEFORE the delete, and the marker is deliberately
+        written after: a crash in between then leaves the run eligible for a
+        harmless retry rather than marking blobs purged that still exist.
+        Exclusion between replicas comes from :meth:`purge_lease` instead,
+        which buys it without touching that ordering — the worker is started
+        unconditionally in every process, so nothing else would.
+
+        ``exclude_run_ids`` skips runs the caller already failed to purge in
+        this pass. A successful purge stamps ``checkpoint_purged_at`` and so
+        drops out of this query; a FAILED one does not, so a batching caller
+        without this parameter re-claims the same failing rows every
+        iteration. Mirror of ``MemoryArchivalWorker``'s ``failed_ids``.
+        """
+        async with self.with_tenant(None) as session:
+            stmt = (
+                select(WorkflowRun)
+                .where(
+                    WorkflowRun.status.in_(terminal_statuses),
+                    WorkflowRun.ended_at.is_not(None),
+                    WorkflowRun.ended_at < older_than,
+                    WorkflowRun.checkpoint_purged_at.is_(None),
+                )
+                .order_by(WorkflowRun.ended_at)
+                .limit(limit)
+            )
+            if exclude_run_ids:
+                stmt = stmt.where(WorkflowRun.id.not_in(exclude_run_ids))
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def mark_checkpoint_purged(self, run_id: UUID) -> int:
+        """Stamp ``checkpoint_purged_at = now()`` (Story 4.10 AC1) — called
+        only after :meth:`~.retention.CheckpointRetentionWorker`'s
+        ``adelete_thread`` call actually succeeds, so a crash between the
+        two leaves the run eligible for (harmless) re-purging on the next
+        pass rather than falsely marked done.
+
+        Returns the ``rowcount``: 0 means the run disappeared between
+        :meth:`list_purgeable` and this write, reachable because
+        ``workflow_runs.workflow_id`` carries ``ondelete="CASCADE"``.
+        """
+        async with self.with_tenant(None) as session:
+            result = await session.execute(
+                update(WorkflowRun)
+                .where(WorkflowRun.id == run_id)
+                .values(checkpoint_purged_at=func.now())
+            )
+            # `rowcount` is exposed by SQLAlchemy CursorResult (DML) but the
+            # static type is Result[Any]; getattr keeps mypy strict happy —
+            # same shape as `update_status_in_session`.
+            rowcount = getattr(result, "rowcount", None)
+            return int(rowcount) if rowcount is not None else 0
+
+    async def count_stale_paused(
+        self, *, older_than: datetime
+    ) -> tuple[int, UUID | None, datetime | None]:
+        """``(count, oldest_run_id, oldest_last_checkpoint_at)`` for
+        ``paused`` runs whose ``last_checkpoint_at`` predates ``older_than``
+        (Story 4.10 AC2) — read-only, no action taken.
+
+        ``last_checkpoint_at`` is the best available proxy for "since when
+        has this run been paused": there is no dedicated ``paused_at``
+        column, and a run's last real checkpoint write happens immediately
+        before the driver settles a pending ``pause`` (interruption takes
+        effect AT the next superstep boundary, which is exactly where a
+        checkpoint just committed) — so a stale ``last_checkpoint_at`` on a
+        `paused` run means "idle since roughly when it paused", not merely
+        "idle since its last node ran".
+        """
+        staleness = func.coalesce(WorkflowRun.last_checkpoint_at, WorkflowRun.started_at)
+        async with self.with_tenant(None) as session:
+            count_stmt = select(func.count()).where(
+                WorkflowRun.status == "paused", staleness < older_than
+            )
+            count = (await session.execute(count_stmt)).scalar_one()
+            if count == 0:
+                return 0, None, None
+            # A second, targeted query for WHICH run is oldest — simpler
+            # than pairing `count` with an `ORDER BY`-dependent value via a
+            # window function for something read once per sweep tick.
+            oldest_stmt = (
+                select(WorkflowRun.id, staleness)
+                .where(WorkflowRun.status == "paused", staleness < older_than)
+                .order_by(staleness)
+                .limit(1)
+            )
+            # `.first()`, not `.one()`: the two statements run in READ
+            # COMMITTED with separate snapshots, so `count > 0` does not
+            # guarantee this one still matches a row — the last stale run
+            # being resumed or cancelled in between would raise
+            # `NoResultFound` out of the whole retention pass.
+            oldest = (await session.execute(oldest_stmt)).first()
+            if oldest is None:
+                return 0, None, None
+            return int(count), oldest[0], oldest[1]
+
     async def aggregate_routing_modes(
-        self, workflow_id: UUID, *, tenant_id: UUID | None = None
+        self, workflow_id: UUID, *, since: datetime, tenant_id: UUID | None = None
     ) -> tuple[int, int, int]:
-        """``(runs_counted, deterministic, llm_escalated)`` across every run
-        of ``workflow_id`` (Story 4.3 AC3 T10.1).
+        """``(runs_counted, deterministic, llm_escalated)`` across runs of
+        ``workflow_id`` started at or after ``since`` (Story 4.3 AC3 T10.1;
+        windowed by Story 4.10 AC4).
+
+        ``since`` is REQUIRED, not defaulted to "the beginning of time" —
+        Story 4.10 AC4 found this aggregate's cost growing linearly with a
+        workflow's ENTIRE historical run count, a number the caller (not the
+        operator) controls. Silently defaulting the window here would let a
+        future call site reintroduce the same unbounded scan by omission;
+        the caller (``router.py``) computes it from
+        ``settings.workflow_routing_stats_window_days`` (or a client-chosen
+        override, same bounds) so the decision stays visible at the one call
+        site that matters.
 
         Tolerant of rows that predate this story (``metrics`` has no
         ``routing`` key at all — every Story 4.1/4.2 run already in the
@@ -826,24 +1192,23 @@ class WorkflowRunRepo(BaseRepo):
         a single fractional value made ``GET /routing-stats`` return 500 for
         the entire workflow, which is precisely the poisoning this guard is
         here to prevent.
+
+        Story 4.13 AC1 — neither this guard nor its cast rejects a NEGATIVE
+        number, which ``sum()`` then propagates straight to the response's
+        ``Field(ge=0)`` — a 500 for every OTHER run of the workflow, from
+        one corrupted row. See :meth:`_non_negative_metrics_count`, which
+        both this method and :meth:`aggregate_token_reduction` now share.
         """
 
         def _routing_count(key: str) -> Any:
-            path = WorkflowRun.metrics[("routing", key)]
-            return case(
-                (
-                    func.jsonb_typeof(path) == "number",
-                    cast(func.floor(cast(path.astext, Numeric)), Integer),
-                ),
-                else_=literal(0),
-            )
+            return self._non_negative_metrics_count("routing", key)
 
         async with self.with_tenant(tenant_id) as session:
             stmt = select(
                 func.count(),
                 func.coalesce(func.sum(_routing_count("deterministic")), literal(0)),
                 func.coalesce(func.sum(_routing_count("llm_escalated")), literal(0)),
-            ).where(WorkflowRun.workflow_id == workflow_id)
+            ).where(WorkflowRun.workflow_id == workflow_id, WorkflowRun.started_at >= since)
             result = await session.execute(stmt)
             row = result.one()
             return int(row[0]), int(row[1]), int(row[2])
@@ -859,18 +1224,15 @@ class WorkflowRunRepo(BaseRepo):
         corrupted or fractional value must not poison the whole workflow's
         aggregate), reading ``metrics["handoffs"]`` instead of
         ``metrics["routing"]``. Tolerant of rows that predate this story
-        (no ``handoffs`` key at all) the same way.
+        (no ``handoffs`` key at all) the same way. Story 4.13 AC1 — and, as
+        of this story, of a NEGATIVE value the same way too; see
+        :meth:`_non_negative_metrics_count`, shared with the method above so
+        the two guards cannot drift the way they had (both left this exact
+        gap open, independently, until now).
         """
 
         def _handoff_count(key: str) -> Any:
-            path = WorkflowRun.metrics[("handoffs", key)]
-            return case(
-                (
-                    func.jsonb_typeof(path) == "number",
-                    cast(func.floor(cast(path.astext, Numeric)), Integer),
-                ),
-                else_=literal(0),
-            )
+            return self._non_negative_metrics_count("handoffs", key)
 
         async with self.with_tenant(tenant_id) as session:
             stmt = select(

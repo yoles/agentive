@@ -44,8 +44,11 @@ from agentive_backend.shared.exceptions import ConflictError
 
 #: What a caller can ask for. NOT the same vocabulary as
 #: :data:`ControlSignal`: ``resume`` is never a signal (there is no live
-#: driver to observe it — it starts a new one).
-RunAction = Literal["pause", "resume", "cancel"]
+#: driver to observe it — it starts a new one). ``retract`` (Story 4.9
+#: AC6/T6.5) is a THIRD kind, alongside a deferred signal and an immediate
+#: status move: it clears a pending ``pause``/``cancel`` before the driver
+#: ever observes it, and never touches ``status``.
+RunAction = Literal["pause", "resume", "cancel", "retract"]
 
 #: What gets written to ``workflow_runs.control_signal`` for a LIVE run,
 #: to be observed by the driver at its next superstep boundary.
@@ -142,6 +145,14 @@ class Transition:
     #: overrides a pending ``pause``, never the reverse. A pause must not be
     #: able to revoke a cancellation someone was already told they had.
     overrides: tuple[ControlSignal, ...] = ()
+    #: Story 4.9 AC6/T6.5 — True only for ``retract``. A THIRD effect shape,
+    #: distinct from both ``signal`` (DEFERRED) and ``immediate_status``
+    #: (IMMEDIATE): it writes neither, clearing whatever ``control_signal``
+    #: is currently pending instead. Kept as its own field rather than
+    #: overloading ``signal``/``immediate_status`` with a sentinel, since
+    #: "clear the pending signal" is not a value either of those two fields
+    #: is meant to hold.
+    retracts_signal: bool = False
 
 
 # The AC1 table, verbatim and exhaustive: (action, status) -> what it does.
@@ -154,18 +165,38 @@ class Transition:
 # `_ALLOWED_FROM` whose comment claimed to be "derived from the table above
 # so the two can never disagree" while being a literal nobody kept in sync.
 # Adding a pair here now updates every 409 message by construction.
-#: One entry: (signal to write, immediate status, pending signals it may replace).
-_Effect = tuple[ControlSignal | None, RunStatus | None, tuple[ControlSignal, ...]]
+#: One entry: (signal to write, immediate status, pending signals it may
+#: replace, whether the action RETRACTS a pending signal instead).
+_Effect = tuple[ControlSignal | None, RunStatus | None, tuple[ControlSignal, ...], bool]
 
 _EFFECTS: Final[dict[tuple[RunAction, RunStatus], _Effect]] = {
-    ("pause", "running"): ("pause", None, ()),
+    ("pause", "running"): ("pause", None, (), False),
     # `cancel` may replace a pending `pause` — see `Transition.overrides`.
-    ("cancel", "running"): ("cancel", None, ("pause",)),
+    # Story 4.9 AC6/T6.4 — it may also replace (i.e. re-stamp) a pending
+    # `cancel`: a client that replays `POST /cancel` (network timeout,
+    # double-click, gateway retry) while the first request still sits
+    # unobserved used to get a 409 for an annulation that IS proceeding
+    # correctly — the one response most likely to make an operator retry
+    # harder or escalate. Self-override is safe here specifically because
+    # `cancel`'s effect is idempotent: re-writing the SAME signal changes
+    # nothing about what the driver will do at its next superstep boundary,
+    # only `control_requested_at` moves forward. Contrast `pause`, which
+    # stays first-writer-wins (no entry lets `pause` override `pause`) —
+    # replaying a request whose ANSWER never changes is harmless; the same
+    # reasoning would not extend to two DIFFERENT actions racing.
+    ("cancel", "running"): ("cancel", None, ("pause", "cancel"), False),
     # No driver is running for a paused run, so nobody would ever observe a
     # signal here — the cancellation has to be terminal on the spot (200,
     # not 202: the code IS the message about whether the effect is deferred).
-    ("cancel", "paused"): (None, "cancelled", ()),
-    ("resume", "paused"): (None, "running", ()),
+    ("cancel", "paused"): (None, "cancelled", (), False),
+    ("resume", "paused"): (None, "running", (), False),
+    # Story 4.9 AC6/T6.5 — legal only from `running`, mirroring where a
+    # pending signal can even exist: `pause`/`cancel` only ever write one
+    # while the run is live. The repo write additionally requires
+    # `control_signal IS NOT NULL` (nothing to retract otherwise), which
+    # this table cannot express — that guard lives in
+    # `WorkflowRunRepo.retract_control_in_session`.
+    ("retract", "running"): (None, None, (), True),
 }
 
 #: Per-action set of legal starting statuses, in declaration order. Answers
@@ -181,8 +212,9 @@ _TRANSITIONS: Final[dict[tuple[RunAction, RunStatus], Transition]] = {
         signal=signal,
         immediate_status=immediate,
         overrides=overrides,
+        retracts_signal=retracts_signal,
     )
-    for (action, status), (signal, immediate, overrides) in _EFFECTS.items()
+    for (action, status), (signal, immediate, overrides, retracts_signal) in _EFFECTS.items()
 }
 
 

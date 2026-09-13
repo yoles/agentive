@@ -22,12 +22,14 @@ import contextlib
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from agentive_backend.features.workflow_engine.domain.error_policy import MAX_RUNTIME_RETRIES
 from agentive_backend.features.workflow_engine.engine.agent_node import NODE_TIMEOUT_S
 from agentive_backend.shared.contracts.events import (
+    WorkflowRunCancelledEvent,
     WorkflowRunFailedEvent,
     WorkflowRunResumedEvent,
 )
@@ -44,8 +46,27 @@ if TYPE_CHECKING:
 _log = get_logger(__name__)
 
 # Same shutdown envelope as `MemoryArchivalWorker` (Story 3.3, P5) — a hung
-# pass gets a cooperative window first, then a bounded cancellation, both
-# comfortably under the lifespan's own 5s shutdown drain budget.
+# pass gets a cooperative window first, then a bounded cancellation.
+#
+# Story 4.9 AC6/T6.7 — the "comfortably under 5s" this comment used to claim
+# was never true, and the honest count matters because `docker-compose*.yml`
+# set no `stop_grace_period` (Docker's own default: SIGKILL at 10s). `stop()`
+# spends its two constants TWICE, sequentially, not once:
+#
+#   1. `_cancel_resume_tasks()` — up to `_STOP_CANCEL_TIMEOUT_S` (3.0s),
+#      cancelling in-flight resumes and awaiting them.
+#   2. THEN the main loop task gets `_STOP_GRACE_S` (2.0s) to finish on its
+#      own, and if it hasn't, a SECOND `_STOP_CANCEL_TIMEOUT_S` (3.0s) after
+#      cancelling it.
+#
+# Worst case: 3.0 + 2.0 + 3.0 = **8.0s**, not "comfortably under 5s" — and
+# this is only ONE of several workers `app.lifespan`'s shutdown sequence
+# stops one after another (`memory_archival_worker`, the outbox `worker`,
+# each with their own grace+cancel budget). `docker-compose*.yml` now sets
+# `stop_grace_period: 30s` on the `backend` service (Story 4.9 T6.7) —
+# generous against this worker's own 8s plus the others', not a tight fit to
+# this one number alone. Auditing every OTHER worker's shutdown budget for
+# the same honesty is a separate piece of work, not repeated here.
 _STOP_GRACE_S = 2.0
 _STOP_CANCEL_TIMEOUT_S = 3.0
 
@@ -355,6 +376,8 @@ class WorkflowRecoveryWorker:
         the checkpointer under these very tasks and every one of them died on
         a closed connection, i.e. as ``error``.
         """
+        # Measured, not asserted — see `_report_shutdown`.
+        started_at = asyncio.get_running_loop().time()
         self._stopping.set()
         await self._cancel_resume_tasks()
         task, self._task = self._task, None
@@ -366,7 +389,11 @@ class WorkflowRecoveryWorker:
                     task.cancel()
                     done, _pending = await asyncio.wait({task}, timeout=_STOP_CANCEL_TIMEOUT_S)
                 finished = bool(done)
-            self._report_shutdown(task, finished=finished)
+            self._report_shutdown(
+                task,
+                finished=finished,
+                elapsed_s=asyncio.get_running_loop().time() - started_at,
+            )
         _log.info("workflow_engine.recovery_worker_stopped")
 
     async def _cancel_resume_tasks(self) -> None:
@@ -385,11 +412,19 @@ class WorkflowRecoveryWorker:
             )
 
     @staticmethod
-    def _report_shutdown(task: asyncio.Task[None], *, finished: bool) -> None:
+    def _report_shutdown(
+        task: asyncio.Task[None], *, finished: bool, elapsed_s: float | None = None
+    ) -> None:
         if not finished:
+            # `elapsed_s` is a clock reading, not a constant: the budget
+            # below is a worst case that only materialises when
+            # `_cancel_resume_tasks()` both had in-flight resumes and timed
+            # out on them. Both are logged — what happened, and what was
+            # allowed.
             _log.warning(
                 "workflow_engine.recovery_worker_stop_timeout",
-                timeout_s=_STOP_GRACE_S + _STOP_CANCEL_TIMEOUT_S,
+                elapsed_s=round(elapsed_s, 3) if elapsed_s is not None else None,
+                budget_s=_STOP_CANCEL_TIMEOUT_S + _STOP_GRACE_S + _STOP_CANCEL_TIMEOUT_S,
             )
             return
         if task.cancelled():
@@ -434,8 +469,12 @@ class WorkflowRecoveryWorker:
             attempts = _recovery_attempts(run.checkpoint)
             try:
                 if attempts > MAX_RECOVERY_ATTEMPTS:
-                    await self._abandon_one(run, attempts=attempts)
-                    abandoned_count += 1
+                    # `_abandon_one` declines to write when its
+                    # compare-and-set finds the run already terminal or its
+                    # signal moved — counting those would report abandonments
+                    # that never happened.
+                    if await self._abandon_one(run, attempts=attempts):
+                        abandoned_count += 1
                 else:
                     await self._resume_one(run, attempts=attempts)
                     resume_triggered_count += 1
@@ -464,59 +503,131 @@ class WorkflowRecoveryWorker:
         )
         return summary
 
-    async def _abandon_one(self, run: WorkflowRun, *, attempts: int) -> None:
+    async def _abandon_one(self, run: WorkflowRun, *, attempts: int) -> bool:
         """Mark a poison run ``error`` instead of resuming it again (AC3 cap).
+
+        Returns whether the run was actually settled — ``False`` when the
+        compare-and-set below declines the write.
 
         A run that has been claimed :data:`MAX_RECOVERY_ATTEMPTS` times
         without a single node landing in between is not recovering — it is
         looping. Left alone it would be re-resumed every
         ``stale_threshold_s`` forever, each attempt spending real LLM budget.
+
+        Story 4.9 AC6/T6.3 — precedence when the run ALSO carries a pending
+        ``control_signal="cancel"`` (an operator's ``202`` already accepted,
+        never observed because nothing resumed the run long enough to reach
+        a superstep boundary): the operator's cancellation wins over the
+        anti-poison cap. Settling the run ``cancelled`` rather than ``error``
+        keeps the promise that ``202`` made, and is honest — this run WAS
+        cancelled, by request, not merely given up on. A pending ``pause``
+        carries no such promise (an operator who asked to pause a poison run
+        still gets `error`, exactly as before): pausing implies "resumable
+        later", which a poison run is not.
+
+        Story 4.9/4.11 AC2/T6.2 — the pending-`pause` case above (not
+        honored, run abandoned `error` anyway) still erases the signal via
+        `clear_control=True` below with no event and no log of its own.
+        Same documented NO-OP decision as `service.py`'s
+        `_mark_completed`/`_mark_failed` — see that docstring for the
+        rationale; not repeated at all four sites so it cannot drift.
         """
-        error_summary = (
-            f"Recovery abandoned after {attempts} consecutive attempts with no node progress."
-        )
-        checkpoint = dict(run.checkpoint) if isinstance(run.checkpoint, dict) else {}
-        checkpoint["last_error"] = error_summary
+        honoring_pending_cancel = run.control_signal == "cancel"
         ended_at = datetime.now(UTC)
+
+        if honoring_pending_cancel:
+            final_status = "cancelled"
+            checkpoint = dict(run.checkpoint) if isinstance(run.checkpoint, dict) else {}
+        else:
+            final_status = "error"
+            error_summary = (
+                f"Recovery abandoned after {attempts} consecutive attempts with no node progress."
+            )
+            checkpoint = dict(run.checkpoint) if isinstance(run.checkpoint, dict) else {}
+            checkpoint["last_error"] = error_summary
 
         rowcount = await self._workflow_run_repo.update_status(
             run.id,
-            status="error",
+            status=final_status,
             ended_at=ended_at,
             only_if_status="running",
+            # Guard on the SIGNAL as well as the status, like
+            # `_observe_control`'s settle write. `claim_stale_running` commits
+            # and releases its `FOR UPDATE SKIP LOCKED` lock before returning,
+            # so `run.control_signal` is a snapshot from an already-committed
+            # transaction; the status stays `running` across the whole window,
+            # so only a signal guard catches a `retract` or an escalation that
+            # landed after the claim. On rejection the next sweep re-claims
+            # and reads the current signal.
+            only_if_control_signal=run.control_signal,
+            only_if_control_signal_unset=run.control_signal is None,
             # Terminal transition — it consumes any control request the run
             # was still carrying, so an abandoned run does not advertise a
             # pause that will never happen (Story 4.6 T1.4).
             clear_control=True,
         )
         if rowcount == 0:
-            # A resume spawned by an earlier sweep finished between this
-            # sweep's claim and now — the run is already terminal, and
-            # publishing `failed` for it would contradict the row.
-            _log.info("workflow_engine.recovery_abandon_skipped", run_id=str(run.id))
-            return
+            # Either a resume from an earlier sweep already finished the run
+            # (publishing here would contradict the row), or the control
+            # signal moved under us. `observed_control_signal` separates the
+            # two for whoever reads this.
+            _log.info(
+                "workflow_engine.recovery_abandon_skipped",
+                run_id=str(run.id),
+                observed_control_signal=run.control_signal,
+                intended_status=final_status,
+            )
+            return False
         await self._workflow_run_repo.update_checkpoint(
             run.id, checkpoint=checkpoint, last_checkpoint_at=ended_at
         )
 
-        event_type = WorkflowRunFailedEvent.event_type
         async with self._workflow_run_repo.with_tenant(None) as session:
-            event = WorkflowRunFailedEvent(
-                run_id=run.id,
-                workflow_id=run.workflow_id,
-                # Story 4.6 AC3 gave this event an `error_type` so an
-                # alerting consumer can filter without parsing prose — and
-                # `_mark_failed` sets it while THIS publisher, the second of
-                # the two, left it null (review of 2026-09-12). Abandoning a
-                # poison run after `MAX_RECOVERY_ATTEMPTS` is arguably the
-                # most alert-worthy `failed` in the system, and it was the
-                # one an `error_type` filter missed. A sentinel rather than
-                # an exception class name, because there is no exception
-                # here: nothing raised, the worker gave up.
-                error_type="RecoveryAbandoned",
-                failed_node_id=_resumed_from_node_id(run.checkpoint),
-                error_summary=error_summary,
-            )
+            if honoring_pending_cancel:
+                # Same shape `request_run_control`'s IMMEDIATE `cancel` path
+                # publishes (`_control_event`) — an audit consumer must not
+                # have to know whether an operator's cancel landed via a live
+                # driver or via this sweep to find it.
+                metrics = run.metrics if isinstance(run.metrics, dict) else {}
+                # Every numeric shape a JSONB round trip can return: `int`
+                # alone silently reported 0 ms for a run that had executed
+                # for hours. `bool` is excluded explicitly because
+                # `isinstance(True, int)` is True.
+                raw_duration = metrics.get("total_duration_ms")
+                duration_ms = (
+                    int(raw_duration)
+                    if isinstance(raw_duration, int | float | Decimal)
+                    and not isinstance(raw_duration, bool)
+                    else 0
+                )
+                event_type = WorkflowRunCancelledEvent.event_type
+                event: WorkflowRunCancelledEvent | WorkflowRunFailedEvent = (
+                    WorkflowRunCancelledEvent(
+                        run_id=run.id,
+                        workflow_id=run.workflow_id,
+                        cancelled_at_node_id=_resumed_from_node_id(run.checkpoint),
+                        total_duration_ms=max(duration_ms, 0),
+                    )
+                )
+            else:
+                event_type = WorkflowRunFailedEvent.event_type
+                event = WorkflowRunFailedEvent(
+                    run_id=run.id,
+                    workflow_id=run.workflow_id,
+                    # Story 4.6 AC3 gave this event an `error_type` so an
+                    # alerting consumer can filter without parsing prose —
+                    # and `_mark_failed` sets it while THIS publisher, the
+                    # second of the two, left it null (review of
+                    # 2026-09-12). Abandoning a poison run after
+                    # `MAX_RECOVERY_ATTEMPTS` is arguably the most
+                    # alert-worthy `failed` in the system, and it was the
+                    # one an `error_type` filter missed. A sentinel rather
+                    # than an exception class name, because there is no
+                    # exception here: nothing raised, the worker gave up.
+                    error_type="RecoveryAbandoned",
+                    failed_node_id=_resumed_from_node_id(run.checkpoint),
+                    error_summary=checkpoint["last_error"],
+                )
             event_id = await publish(
                 event_type, event, session=session, correlation_id=run.correlation_id
             )
@@ -527,7 +638,9 @@ class WorkflowRecoveryWorker:
             run_id=str(run.id),
             workflow_id=str(run.workflow_id),
             attempts=attempts,
+            honored_pending_cancel=honoring_pending_cancel,
         )
+        return True
 
     async def _resume_one(self, run: WorkflowRun, *, attempts: int) -> None:
         """Publish ``resumed`` BEFORE relaunching (AC3 literal ordering),

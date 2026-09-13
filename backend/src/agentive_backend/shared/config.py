@@ -367,6 +367,85 @@ class Settings(BaseSettings):
         alias="AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S",
     )
 
+    # ─── Story 4.9 AC2 — load bounds on run creation/resume ───
+    # No cap existed on how many runs of one workflow can be `running` at
+    # once: `POST /runs` in a burst (or a client retry loop) could exhaust
+    # the LLM provider pool or process memory with no typed refusal — only
+    # eventual, opaque provider/DB errors. Per-workflow rather than global:
+    # one noisy workflow must not starve every other workflow's admission
+    # budget, and a global counter would need its own re-justification for
+    # the same reason a per-template `tool_ids` cap beat a global one.
+    # Explicitly NOT a cost/rate-limiting policy (Story 9.4/9.5 own that) —
+    # this is a mechanical ceiling on concurrent DB rows and in-flight
+    # background tasks, nothing more.
+    workflow_max_concurrent_running_runs: int = Field(
+        default=20,
+        ge=1,
+        le=1000,
+        alias="AGENTIVE_WORKFLOW_MAX_CONCURRENT_RUNS",
+    )
+
+    # ─── Story 4.10 AC1 — checkpoint blob retention ───
+    # `checkpoints`/`checkpoint_writes`/`checkpoint_blobs` (migration
+    # `20260910_000001`) are never purged by any code in this repo — a
+    # terminal run's full node-output history (up to 500 chars of it
+    # previewed in the applicative `checkpoint` JSONB, the REST persisted
+    # here without a size cap) accumulates forever. 90 days mirrors the
+    # `audit_events` retention precedent (`architecture.md` § *Authentication
+    # & Security*) rather than inventing a second, unrelated number.
+    workflow_checkpoint_retention_days: int = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        alias="AGENTIVE_WORKFLOW_CHECKPOINT_RETENTION_DAYS",
+    )
+    # How often `CheckpointRetentionWorker` sweeps for purgeable runs.
+    # Daily, like `MemoryArchivalWorker` (Story 3.3) — this is a housekeeping
+    # job, not a latency-sensitive one, and there is no operational reason
+    # to poll it more often than once a day.
+    workflow_checkpoint_retention_interval_s: float = Field(
+        default=86_400.0,
+        gt=0.0,
+        le=604_800.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_WORKFLOW_CHECKPOINT_RETENTION_INTERVAL_S",
+    )
+
+    # ─── Story 4.10 AC2 — alerting on immortal `paused` runs ───
+    # A `paused` run is deliberately excluded from `claim_stale_running`
+    # (nothing should auto-resume a run a human explicitly suspended) and
+    # `ended_at` stays NULL, so nothing ever expires it. Decision taken
+    # (T2.1): ALERT, not automatic TTL/cancellation — silently cancelling a
+    # run an operator paused on purpose (e.g. "fix a bad namespace, resume
+    # next week") is a hard-to-reverse, surprising action for this codebase
+    # to take unprompted; a log-based alert an operator can act on is not.
+    # 7 days default: long enough that a normal maintenance pause never
+    # triggers it, short enough that a genuinely forgotten run is caught
+    # well before it becomes a "why does this workflow have 40 stuck runs"
+    # incident.
+    workflow_paused_run_alert_after_days: int = Field(
+        default=7,
+        ge=1,
+        le=3650,
+        alias="AGENTIVE_WORKFLOW_PAUSED_RUN_ALERT_AFTER_DAYS",
+    )
+
+    # ─── Story 4.10 AC4 — bounding the `routing-stats` aggregation ───
+    # `GET /workflows/{id}/routing-stats` aggregated `metrics` JSONB over
+    # EVERY run of a workflow, with no window: a workflow with 200k runs paid
+    # a cost proportional to a number entirely within the CALLER's control
+    # (how many times they hit `POST /runs`), not the operator's. 90 days —
+    # same retention precedent as the checkpoint window above — turns the
+    # metric from an all-time proportion into a trailing-window one; the
+    # response says which (`window_days`), so a consumer never has to guess
+    # what changed.
+    workflow_routing_stats_window_days: int = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        alias="AGENTIVE_WORKFLOW_ROUTING_STATS_WINDOW_DAYS",
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

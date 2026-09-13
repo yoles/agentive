@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -246,7 +247,7 @@ async def test_aggregate_routing_modes_returns_counts_from_row() -> None:
     factory, session = make_session_factory_mock()
     session.execute.return_value.one.return_value = (5, 3, 2)
     repo = WorkflowRunRepo(session_factory=factory)
-    result = await repo.aggregate_routing_modes(uuid4())
+    result = await repo.aggregate_routing_modes(uuid4(), since=datetime.now(UTC))
     assert result == (5, 3, 2)
     session.execute.assert_awaited_once()
 
@@ -257,7 +258,7 @@ async def test_aggregate_routing_modes_zero_when_no_runs() -> None:
     factory, session = make_session_factory_mock()
     session.execute.return_value.one.return_value = (0, 0, 0)
     repo = WorkflowRunRepo(session_factory=factory)
-    result = await repo.aggregate_routing_modes(uuid4())
+    result = await repo.aggregate_routing_modes(uuid4(), since=datetime.now(UTC))
     assert result == (0, 0, 0)
 
 
@@ -275,7 +276,8 @@ async def test_aggregate_routing_modes_statement_carries_its_guards() -> None:
     session.execute.return_value.one.return_value = (0, 0, 0)
     repo = WorkflowRunRepo(session_factory=factory)
     workflow_id = uuid4()
-    await repo.aggregate_routing_modes(workflow_id)
+    since = datetime.now(UTC)
+    await repo.aggregate_routing_modes(workflow_id, since=since)
 
     # Compiled WITHOUT `literal_binds`: the JSONB path operands carry a
     # `JSONPathType`, which has no literal renderer. The bound parameters are
@@ -285,6 +287,10 @@ async def test_aggregate_routing_modes_statement_carries_its_guards() -> None:
 
     assert "workflow_runs.workflow_id" in sql
     assert workflow_id in compiled.params.values()
+    # Story 4.10 AC4 — the window bound must be part of the compiled
+    # statement, not applied after the fact in Python.
+    assert "workflow_runs.started_at" in sql
+    assert since in compiled.params.values()
     # Count the CALLS, not the substring — SQLAlchemy names the bound
     # parameter after the function, so a bare `count("jsonb_typeof")` also
     # counts `%(jsonb_typeof_1)s` and reads 4.
@@ -292,6 +298,17 @@ async def test_aggregate_routing_modes_statement_carries_its_guards() -> None:
     assert sql.count("floor(") == 2
     assert "numeric" in sql
     assert "coalesce" in sql
+    # Story 4.13 AC1 — a negative value must clamp to 0, not merely pass
+    # the type guard: without `GREATEST`, `sum()` propagates it straight to
+    # the response's `Field(ge=0)`.
+    assert sql.count("greatest(") == 2
+    # the UPPER bound, in `numeric` space and
+    # BEFORE the narrowing cast. Without it `CAST(... AS INTEGER)` is
+    # evaluated first and raises `22003` on an out-of-range JSON number,
+    # aborting the aggregate for every other run of the workflow — the
+    # same poisoning the clamp above exists to stop, through the other door.
+    assert sql.count("least(") == 2
+    assert 2_147_483_647 in compiled.params.values()
     # Column order is load-bearing — the caller unpacks it positionally.
     # SQLAlchemy dedupes identical bind params, so each path is bound once
     # even though it appears in both the type guard and the cast.
@@ -344,8 +361,77 @@ async def test_aggregate_token_reduction_statement_carries_its_guards() -> None:
     assert sql.count("floor(") == 2
     assert "numeric" in sql
     assert "coalesce" in sql
+    # Story 4.13 AC1 — same clamp as `aggregate_routing_modes`, from the
+    # same shared helper (`_non_negative_metrics_count`).
+    assert sql.count("greatest(") == 2
+    # and the same upper bound, for the same
+    # reason. The shared helper is what guarantees the two cannot drift.
+    assert sql.count("least(") == 2
+    assert 2_147_483_647 in compiled.params.values()
     paths = [v for v in compiled.params.values() if isinstance(v, tuple)]
     assert paths == [("handoffs", "raw_tokens_replaced"), ("handoffs", "summary_tokens")]
+
+
+def test_count_running_can_exclude_runs_whose_driver_went_silent() -> None:
+    """A crashed process leaves its runs `running` until the recovery sweep
+    reclaims them — ~1548 s at default settings. Counting those against the
+    concurrency cap turned one backend crash into ~26 minutes of 429 on
+    every affected workflow. The predicate is the same
+    `COALESCE(last_checkpoint_at, started_at)` staleness the sweep itself
+    uses, so the cap and the sweep agree on "alive" by construction."""
+    repo = WorkflowRunRepo(session_factory=MagicMock())
+    session = MagicMock()
+    captured: list[Any] = []
+    session.execute = AsyncMock(side_effect=lambda stmt: captured.append(stmt) or MagicMock())
+
+    asyncio.run(
+        repo.count_running_in_session(
+            session, workflow_id=uuid4(), alive_since=datetime(2026, 9, 13, tzinfo=UTC)
+        )
+    )
+
+    sql = str(captured[0].compile(dialect=postgresql.dialect())).lower()
+    assert "coalesce" in sql
+    assert "last_checkpoint_at" in sql
+    assert "started_at" in sql
+
+
+def test_count_running_without_a_cutoff_counts_every_running_row() -> None:
+    """`alive_since=None` must reproduce the unfiltered count exactly — the
+    freshness filter is the caller's decision, not the repo's default."""
+    repo = WorkflowRunRepo(session_factory=MagicMock())
+    session = MagicMock()
+    captured: list[Any] = []
+    session.execute = AsyncMock(side_effect=lambda stmt: captured.append(stmt) or MagicMock())
+
+    asyncio.run(repo.count_running_in_session(session, workflow_id=uuid4()))
+
+    sql = str(captured[0].compile(dialect=postgresql.dialect())).lower()
+    assert "coalesce" not in sql
+
+
+def test_request_control_moves_the_clock_only_when_the_signal_changes() -> None:
+    """`control_requested_at` answers "how long has this been waiting?",
+    which is what separates a request the driver has not reached yet from
+    one whose driver is dead. A replayed request — the same signal written
+    again, which `overrides` permits so a retrying client gets 202 rather
+    than 409 — is the same request retried, so re-stamping it would peg the
+    field at "just now" for exactly the client behaviour replay support
+    exists to serve."""
+    repo = WorkflowRunRepo(session_factory=MagicMock())
+    session = MagicMock()
+    captured: list[Any] = []
+    session.execute = AsyncMock(side_effect=lambda stmt: captured.append(stmt) or MagicMock())
+
+    asyncio.run(
+        repo.request_control_in_session(
+            session, uuid4(), signal="cancel", overrides=("pause", "cancel")
+        )
+    )
+
+    sql = str(captured[0].compile(dialect=postgresql.dialect())).lower()
+    assert "case when" in sql
+    assert "is distinct from" in sql
 
 
 # ─── Story 4.6 review lot 12 — the control predicates, as SQL ──────────

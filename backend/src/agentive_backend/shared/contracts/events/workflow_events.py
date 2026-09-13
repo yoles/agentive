@@ -45,7 +45,17 @@ Events shipped to date:
   and no ``force`` was given. It exists because AC2 forbids creating a
   ``workflow_runs`` row for a refused launch, so the report has nowhere to
   be persisted on that table; the outbox is where the refusal is traced
-  instead. Carries no ``run_id`` — there is no run.
+  instead. Optional ``run_id`` (Story 4.12 AC4) — ``None`` from
+  ``start_run`` (there is no run), populated from ``resume`` (Story 4.6
+  ``IG2`` re-runs this same gate on an existing, ``paused`` run).
+* ``workflow_engine.workflow_run.resume_mise_en_place_evaluated`` (Story
+  4.12 AC3) — every ``resume`` that actually proceeds (cleanly or via
+  ``force``) publishes its OWN gate outcome here. ``workflow_runs
+  .mise_en_place`` (Story 4.5 AC1) stays the run's immutable LAUNCH
+  record — Story 4.12 decided against overwriting it on each resume,
+  which would destroy that audit artifact — so this is where "the report
+  that actually authorized THIS resume" lives instead, mirroring how a
+  refusal already lives in the outbox rather than on the row.
 
 Naming note (D91 point 3): the epic's literal AC3 wording ("workflow_resumed")
 does not fit ``shared/event_bus/naming.py``'s strict 3-segment
@@ -225,13 +235,21 @@ class WorkflowRunMiseEnPlaceRefusedEvent(BaseModel):
     publishes its sibling ``mise_en_place_bypassed`` there — a refusal is
     exactly as much an auditable decision as a bypass.
 
-    Deliberately carries NO ``run_id``: there is no run, and the shape says
-    so rather than fabricating one.
+    ``run_id`` (Story 4.12 AC4) — ``None`` on the ``start_run`` path this
+    event was designed for (there really is no run, exactly as the
+    paragraph above says), but POPULATED on the ``resume`` path (Story 4.6
+    ``IG2`` re-runs this same gate on an EXISTING, still-``paused`` run):
+    without it, a workflow with several paused runs published
+    indistinguishable refusals — an alerting consumer could see that
+    something was refused, never which run stayed stuck. Optional rather
+    than a second event type, because the two refusals differ in exactly
+    one fact (whether a run already exists), not in shape or meaning.
     """
 
     event_type: ClassVar[str] = "workflow_engine.workflow_run.mise_en_place_refused"
 
     workflow_id: UUID
+    run_id: UUID | None = None
     #: Codes of the checks that failed, i.e. why the launch was refused.
     failed_checks: list[str] = Field(default_factory=list)
     #: Human-readable summary — the same text the caller received in the
@@ -244,6 +262,43 @@ class WorkflowRunMiseEnPlaceRefusedEvent(BaseModel):
     #: what a started run's `workflow_runs.mise_en_place` would have held.
     mise_en_place: dict[str, Any] = Field(default_factory=dict)
     actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
+class WorkflowRunResumeMiseEnPlaceEvaluatedEvent(BaseModel):
+    """Published every time a ``resume`` re-runs the Mise en Place gate and
+    the run actually proceeds — cleanly, or via ``force`` (Story 4.12 AC3).
+
+    ``workflow_runs.mise_en_place`` (Story 4.5 AC1) is written exactly once,
+    at LAUNCH, and Story 4.12 decided to keep it that way rather than
+    overwrite it on every resume: doing so would destroy the launch record
+    Story 4.5 built as an audit artifact, silently replacing "what let this
+    run start" with "what let it last resume". A resumed run authorized by
+    a DIFFERENT report three days and two red checks later than its launch
+    is common (an environment decays while a run sits ``paused``), and that
+    report needs somewhere to exist — this event, mirroring how a refused
+    launch already lives in the outbox rather than on the row
+    (``mise_en_place_refused``) because AC2 forbade a row for it too.
+
+    Distinct from ``mise_en_place_bypassed``, not a replacement for it: that
+    event stays reserved for the explicit-human-override audit trail
+    (NFR8) and fires only when ``bypassed`` is true. This one fires on
+    EVERY successful resume, bypassed or not, because "which report
+    authorized this" is a question worth answering even when nothing was
+    overridden.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.resume_mise_en_place_evaluated"
+
+    run_id: UUID
+    workflow_id: UUID
+    all_passed: bool
+    bypassed: bool = False
+    failed_checks: list[str] = Field(default_factory=list)
+    #: The full report as persisted-shaped JSON — same shape
+    #: `workflow_runs.mise_en_place` uses, so a consumer already reading
+    #: that column recognises this without learning a second format.
+    mise_en_place: dict[str, Any] = Field(default_factory=dict)
     tenant_id: UUID | None = None
 
 
@@ -286,6 +341,30 @@ class WorkflowRunCancelRequestedEvent(BaseModel):
 
     run_id: UUID
     workflow_id: UUID
+    actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    tenant_id: UUID | None = None
+
+
+class WorkflowRunControlRetractedEvent(BaseModel):
+    """Published when a caller withdraws a control request before the driver
+    observed it.
+
+    Counterpart to the ``*_requested`` events above, and the reason this one
+    exists: those are durable outbox rows, so without a matching record an
+    auditor replaying the bus sees a cancellation requested on a run that
+    then completed normally, with nothing saying anyone withdrew it or who.
+    The disappearance of ``control_signal`` from the SSE ``state`` frame
+    reaches only a client connected at that moment — not an audit.
+
+    ``retracted_signal`` is what was pending, not what was asked for: the
+    request being undone is the payload's subject.
+    """
+
+    event_type: ClassVar[str] = "workflow_engine.workflow_run.control_retracted"
+
+    run_id: UUID
+    workflow_id: UUID
+    retracted_signal: str
     actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
     tenant_id: UUID | None = None
 

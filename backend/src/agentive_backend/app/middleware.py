@@ -25,9 +25,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agentive_backend.shared.auth import verify_token
 from agentive_backend.shared.correlation import (
+    _correlation_id_var,
     get_correlation_id,
     new_correlation_id,
-    set_correlation_id,
 )
 from agentive_backend.shared.event_bus import publish_and_commit
 from agentive_backend.shared.logging import get_logger
@@ -105,15 +105,63 @@ class CorrelationIdMiddleware:
         request = Request(scope, receive=receive)
         incoming = request.headers.get(CORRELATION_HEADER)
         cid = _parse_incoming_correlation_id(incoming) or new_correlation_id()
-        set_correlation_id(cid)
+        # Story 4.9 T7.1 — reset in `finally`, mirroring `app.lifespan`'s and
+        # `OutboxWorker`'s own use of this same ContextVar (both reach past
+        # `shared.correlation`'s public wrappers for the same reason: only
+        # the raw `Token` from `.set()` lets a caller restore the PRIOR
+        # value rather than merely clearing it, which matters here because
+        # nothing before this middleware runs, but it is what keeps a bound
+        # value from surviving past the request it belongs to on any ASGI
+        # caller that does not give every request its own Task — this
+        # repo's own test suite drives the app directly over
+        # `httpx.ASGITransport` without one. A spawned background task
+        # (`asyncio.create_task`, e.g. `start_run`'s fire-and-forget
+        # `_drive_run`) still inherits `cid` correctly: it copies the
+        # current context at CREATION time, which happens before this
+        # reset ever runs.
+        token = _correlation_id_var.set(cid)
+
+        correlation_header_lower = CORRELATION_HEADER.lower().encode()
 
         async def send_with_correlation_header(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = [*message.get("headers", []), (CORRELATION_HEADER.encode(), cid.encode())]
+                # Story 4.9 T7.2 — a downstream handler that already set
+                # this header (an error path re-raising a response some
+                # other layer built, a future proxied/composed response)
+                # used to get a SECOND `X-Correlation-ID` line rather than
+                # this one replacing it. HTTP headers are case-insensitive
+                # (RFC 7230 §3.2), so the existing one is dropped by name,
+                # not by exact byte match, before this middleware's value
+                # is appended — this middleware is the authority on this
+                # header for every response it wraps.
+                existing = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != correlation_header_lower
+                ]
+                headers = [*existing, (CORRELATION_HEADER.encode(), cid.encode())]
                 message = {**message, "headers": headers}
             await send(message)
 
-        await self.app(scope, receive, send_with_correlation_header)
+        try:
+            await self.app(scope, receive, send_with_correlation_header)
+        except Exception:
+            # Logged HERE because the `finally` below unbinds the ContextVar
+            # that `shared.logging` reads, and an exception no handler claims
+            # only reaches `ServerErrorMiddleware` — which sits OUTSIDE this
+            # middleware and emits the 500 traceback — after that. Without
+            # this line the one log an operator most needs to correlate is
+            # the only one without a `correlation_id`. Re-raised immediately:
+            # the response stays Starlette's to produce.
+            _log.exception(
+                "unhandled_exception",
+                path=scope.get("path"),
+                method=scope.get("method"),
+                correlation_id=cid,
+            )
+            raise
+        finally:
+            _correlation_id_var.reset(token)
 
 
 async def _publish_token_used_event(

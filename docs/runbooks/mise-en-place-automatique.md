@@ -220,6 +220,61 @@ AGENTIVE_DRY_RUN_BUDGET_CAP_USD=50.0
 check can ping several servers in parallel on the hot path of every
 workflow launch, and one bad server must not freeze it for 10s+.
 
+## Resuming a paused run (Story 4.6 `IG2`, extended by Story 4.12)
+
+`POST /workflows/runs/{run_id}/resume` re-runs the SAME four checks against
+an EXISTING run — an environment can decay while a run sits `paused` (a
+rotated key, a decommissioned MCP server, a spent budget), and an ungated
+resume walked straight into it. Story 4.12 closed six gaps this branching
+exposed, none of them defects in `IG2` itself:
+
+- **AC1 — a deactivated workflow.** `_load_resume_context` now refuses
+  (422) exactly like `start_run` does for the same condition
+  (`workflow.status != "active"`), instead of the outcome depending on
+  whether `AGENTIVE_DRY_RUN_BUDGET_CAP_USD` happened to be set. The row
+  stays `paused` — reactivate the workflow to resume it, nothing is
+  cancelled automatically.
+- **AC2 — retryable taxonomy.** A check that RAISES (rather than
+  returning a `CheckResult`) used to answer `retryable=True`
+  unconditionally, so a permanently broken prerequisite (a deleted
+  `tool_servers` row still referenced by an assignment, `NotFoundError`)
+  produced an eternal 503 no retry could ever clear. `_coerce_outcome` now
+  classifies by exception TYPE (`infra/llm/pricing.py`-adjacent taxonomy in
+  `mise_en_place.py::_PERMANENT_CHECK_EXCEPTION_TYPES`) — permanent errors
+  (`NotFoundError`/`ValidationError`/`BusinessRuleError`/`ForbiddenError`/
+  `AuthError`/`ConflictError`) answer `retryable=False` (422); anything
+  else, including an unclassified type, keeps the original `retryable=True`
+  (503) — failing open toward "retryable" is the safe default for a type
+  this list has not seen yet.
+- **AC3 — which report authorized this resume.**
+  `workflow_runs.mise_en_place` stays the run's IMMUTABLE launch record —
+  never overwritten by a resume, to keep the audit artifact Story 4.5
+  built. A resume's own gate outcome (bypassed or not) is instead published
+  as `workflow_engine.workflow_run.resume_mise_en_place_evaluated` in the
+  outbox, on EVERY resume that proceeds — mirror of how a REFUSED launch
+  already lives in the outbox rather than on a row it is not allowed to
+  create.
+- **AC4 — naming the stuck run.** `workflow_engine.workflow_run
+  .mise_en_place_refused` carries an optional `run_id`, populated only on
+  the `resume` path (still `None` from `start_run` — there really is no
+  run there). A workflow with several paused runs now lets an alerting
+  consumer tell which one a given refusal is about.
+- **AC5 — pricing only the remaining work.** See the entry above: the
+  budget check's Dry Run now excludes nodes the paused run already
+  executed (read from `workflow_runs.checkpoint["node_statuses"]`), instead
+  of re-pricing the entire DAG from scratch on every resume.
+- **AC6 — models newer than the pricing snapshot.** `provider_for_model`
+  (`infra/llm/pricing.py`) used to answer `None` for any `llm_model` not an
+  exact key in `ANTHROPIC_MODEL_PRICING`/`OPENAI_MODEL_PRICING` — which
+  `domain.provider_chain.resolve_provider_chain` reads as "unknown, never
+  rotate, never flag `incoherent`". A model released after the last pricing
+  snapshot update now still resolves an owner via a naming-family prefix
+  fallback (`claude-*` → anthropic, `gpt-*`/`o1-*`/`o3-*`/`o4-*` → openai),
+  so chain rotation and the `llm_providers_configured` check keep working
+  even before someone gets around to pricing the new model. Pricing
+  completeness (whether the Dry Run can put a DOLLAR figure on it) remains
+  a separate, already-handled concern — `model_price_unresolved`.
+
 ## Known gaps (Dev Notes § Divergences assumées)
 
 - `llm_providers_configured` checks key PRESENCE, not a real provider ping.
@@ -227,6 +282,17 @@ workflow launch, and one bad server must not freeze it for 10s+.
   access control.
 - `budget_available` compares against ONE global cap, not Story 9.4's real
   per-department/per-workflow budget tracking (backlog).
+- **Story 4.12 AC5** — on `resume`, this check now estimates only the
+  REMAINING work (nodes the paused run has not yet executed, read from
+  `workflow_runs.checkpoint`), not the whole DAG re-priced from scratch.
+  Before this story a resume could be refused for a budget the run had
+  already spent most of. This makes the Story 4.6 anti-scope line ("Budget
+  caps, arrêt automatique sur dépassement | Story 9.4") half-honest rather
+  than fully so: a run CAN now be prevented from continuing for a budget
+  reason, but only as a pre-flight REFUSAL at `resume` time (a human gets a
+  422/503 and can retry or adjust the cap) — there is still no automatic
+  mid-run cutoff, no per-department/per-workflow tracking, and no action
+  taken once a run is already `running`. That remains Story 9.4's job.
 - No UI surfaces the report yet — Epic 6 (Chat Interface), same as every
   Epic 4 story to date. This endpoint's response already carries everything
   a future Dialog would need.

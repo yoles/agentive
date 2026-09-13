@@ -35,4 +35,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Story 4.11 AC7/T7.1 — see `20260910_000000`'s downgrade for why a
+    # `lock_timeout` guards every `DROP COLUMN` on this table.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_column("workflow_runs", "mise_en_place")

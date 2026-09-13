@@ -39,12 +39,14 @@ def _run(
     checkpoint: dict[str, Any] | None = None,
     run_id: UUID | None = None,
     control_signal: str | None = None,
+    control_requested_at: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=run_id or uuid4(),
         status=status,
         checkpoint=checkpoint,
         control_signal=control_signal,
+        control_requested_at=control_requested_at,
     )
 
 
@@ -230,7 +232,7 @@ async def test_stream_reports_a_pause_whose_event_was_dropped(
     # one-hour CI stall with no diagnostic, not a failure. With it, the
     # regression closes on a `stream_timeout` frame and the assertion below
     # fails in under a second, saying exactly what went wrong.
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.5)
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 0.5)
     running = _run()
     paused = _run(status="paused", run_id=running.id, checkpoint={"last_node_id": "b"})
 
@@ -249,7 +251,7 @@ async def test_stream_reports_a_pending_control_signal_whose_event_was_dropped(
     it, which is precisely the window T5.5 exists to make visible."""
     monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.5)  # cf T1 above
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 0.5)  # cf T1 above
     running = _run()
     requested = _run(run_id=running.id, control_signal="pause")
 
@@ -267,7 +269,7 @@ async def test_repoll_does_not_repeat_a_state_frame_that_has_not_changed(
     second must not turn the stream into a state-frame firehose."""
     monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.08)
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 0.08)
     run = _run()
 
     frames = await _drain(_stream_run_events(run, _repo(run)))
@@ -291,7 +293,7 @@ async def test_deadline_closes_the_stream_with_a_final_state_frame(
     waiting."""
     monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 3600.0)
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.05)
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 0.05)
     run = _run()
 
     frames = await _drain(_stream_run_events(run, _repo(run)))
@@ -313,7 +315,7 @@ async def test_a_busy_stream_is_not_cut_short_by_event_volume(
     stream. The timing half is covered by the deadline test above.
     """
     monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 30.0)
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 30.0)
     # Bigger than the burst — this test is about the deadline, not about the
     # drop policy (which `test_handler_drops_...` covers on its own).
     monkeypatch.setattr(router_module, "_EVENT_QUEUE_MAXSIZE", 512)
@@ -406,7 +408,7 @@ async def test_stream_survives_a_database_blip_during_the_repoll(
 
     monkeypatch.setattr(router_module, "_QUEUE_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(router_module, "_STATUS_REPOLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(router_module, "_MAX_STREAM_DURATION_S", 0.2)
+    monkeypatch.setattr(router_module, "_max_stream_duration_s", lambda: 0.2)
     run = _run()
     repo = _repo(run)
     calls = {"n": 0}
@@ -425,3 +427,64 @@ async def test_stream_survives_a_database_blip_during_the_repoll(
     assert frames[-1]["event"] == "state"
     assert '"reason": "stream_timeout"' in frames[-1]["data"]
     assert calls["n"] > 1  # the blip really was exercised
+
+
+# ─── Story 4.9 AC6/T6.1 — `control_requested_at` observability ─────────
+
+
+def test_state_event_carries_control_requested_at_alongside_the_signal() -> None:
+    when = datetime(2026, 9, 13, 12, 0, 0, tzinfo=UTC)
+    run = _run(control_signal="pause", control_requested_at=when)
+
+    payload = _state_event(run)["data"]
+
+    assert '"control_signal": "pause"' in payload
+    assert "control_requested_at" in payload
+    assert "2026-09-13" in payload
+
+
+def test_state_event_omits_control_requested_at_when_nothing_is_pending() -> None:
+    run = _run(control_signal=None, control_requested_at=None)
+
+    payload = _state_event(run)["data"]
+
+    assert "control_signal" not in payload
+    assert "control_requested_at" not in payload
+
+
+# ─── Story 4.9 AC6/T6.6 — SSE ceiling reconciled with the stale threshold ──
+
+
+def test_max_stream_duration_stays_above_the_stale_threshold_at_every_legal_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact inversion this story closes: at the settings' own `le`
+    ceilings, `derive_stale_threshold_s` used to exceed the hardcoded
+    3600 s ceiling this function replaces — a client could receive
+    `stream_timeout` on a run the recovery worker did not even consider
+    orphaned yet."""
+    from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
+
+    worst_case_stale_threshold_s = derive_stale_threshold_s(
+        base_delay_s=60.0,
+        max_delay_s=300.0,
+        escalation_timeout_s=60.0,
+        handoff_summary_timeout_s=45.0,
+    )
+    # The premise: this is the inversion that motivated T6.6 in the first
+    # place. If this stops being true (settings' `le` ceilings moved down),
+    # the assertion below is still correct, just no longer load-bearing.
+    assert worst_case_stale_threshold_s > 3600.0
+
+    monkeypatch.setattr(router_module.settings, "workflow_retry_base_delay_s", 60.0)
+    monkeypatch.setattr(router_module.settings, "workflow_retry_max_delay_s", 300.0)
+    monkeypatch.setattr(router_module.settings, "routing_escalation_timeout_s", 60.0)
+    monkeypatch.setattr(router_module.settings, "workflow_handoff_summary_timeout_s", 45.0)
+
+    assert router_module._max_stream_duration_s() > worst_case_stale_threshold_s
+
+
+def test_max_stream_duration_keeps_the_one_hour_floor_at_default_settings() -> None:
+    """No regression for the common case — default settings still get the
+    ~1h ceiling documented since Story 4.2."""
+    assert router_module._max_stream_duration_s() >= 3600.0

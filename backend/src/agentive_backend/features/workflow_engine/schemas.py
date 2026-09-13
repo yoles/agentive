@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 from uuid import UUID
@@ -19,6 +20,32 @@ from agentive_backend.features.workflow_engine.domain.mise_en_place import (
 # more than a...").
 _MAX_NODES = 100
 _MAX_EDGES = 200
+
+# Story 4.9 AC2/T2.1 — `StartRunRequest.input` had no size bound at all: a
+# client could submit an arbitrarily large `task_input` JSON body, which
+# every node in the workflow then carries in its prompt. 256 KiB is
+# generous against any realistic seed input (structured task parameters,
+# not file payloads — those belong in the memory/knowledge system, Epic 3)
+# while still turning an unbounded body into a typed 422 rather than an
+# oversized LLM prompt discovered only at run time.
+_MAX_RUN_INPUT_BYTES = 262_144
+
+
+def _reject_oversized_input(value: dict[str, Any]) -> dict[str, Any]:
+    # `ensure_ascii=False` measures the JSON as it actually TRAVELS. The
+    # default expands each non-ASCII character to a 6-byte `\uXXXX` escape
+    # before `.encode()` weighs it, so 200 KB of accented text measured
+    # 600 KB and was refused well under the documented cap.
+    try:
+        size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        # pydantic does not convert a `TypeError` raised in a validator into
+        # a validation error — unconverted it escapes as a 500.
+        raise ValueError(f"input is not JSON-serializable: {exc}") from exc
+    if size > _MAX_RUN_INPUT_BYTES:
+        raise ValueError(f"input is too large ({size} bytes; max {_MAX_RUN_INPUT_BYTES} bytes)")
+    return value
+
 
 # LangGraph reserves `__start__`/`__end__` (and other dunder-wrapped names)
 # for its own graph sentinels: `StateGraph.add_node` REFUSES them. Without
@@ -139,6 +166,8 @@ class StartRunRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     force: bool = False
     reason: str | None = Field(default=None, max_length=2000)
+
+    _check_input_size = field_validator("input", mode="after")(_reject_oversized_input)
 
     @model_validator(mode="after")
     def _reason_requires_force(self) -> StartRunRequest:
@@ -272,7 +301,9 @@ class StartRunResponse(BaseModel):
 class RoutingStatsResponse(BaseModel):
     """Response of ``GET /api/v1/workflows/{workflow_id}/routing-stats``
     (Story 4.3 AC3 T10.2) — ``% routages déterministes vs LLM`` aggregated
-    across every run of the workflow.
+    across runs of the workflow started within ``window_days`` (Story 4.10
+    AC4 — previously EVERY run ever, a cost proportional to a number the
+    caller controls, not the operator).
 
     ``deterministic_pct`` is ``None`` when ``deterministic + llm_escalated
     == 0`` — a legitimate state (no decision point was ever reached, e.g. a
@@ -283,8 +314,13 @@ class RoutingStatsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workflow_id: UUID
-    #: EVERY run of this workflow, whatever its status — including runs that
-    #: predate Story 4.3, runs still `running`, and runs that failed. It is
+    #: How many trailing days `runs_counted`/`deterministic`/`llm_escalated`
+    #: cover — Story 4.10 AC4 turned this from an all-time proportion into a
+    #: trailing-window one, so the response says which rather than leaving a
+    #: client to assume the old, unbounded meaning still holds.
+    window_days: int = Field(ge=1)
+    #: EVERY run of this workflow started within the window, whatever its
+    #: status — including runs still `running` and runs that failed. It is
     #: therefore NOT the denominator of `deterministic_pct`: a workflow can
     #: legitimately report many runs counted and zero decisions. The ratio's
     #: denominator is `deterministic + llm_escalated`, which counts DECISIONS,

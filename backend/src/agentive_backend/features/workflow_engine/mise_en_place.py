@@ -31,7 +31,14 @@ from agentive_backend.features.workflow_engine.domain.mise_en_place import (
 from agentive_backend.features.workflow_engine.domain.provider_chain import resolve_provider_chain
 from agentive_backend.infra.llm.pricing import KNOWN_PROVIDERS, provider_for_model
 from agentive_backend.infra.mcp.client import discover_tools
-from agentive_backend.shared.exceptions import NotFoundError
+from agentive_backend.shared.exceptions import (
+    AuthError,
+    BusinessRuleError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
@@ -74,6 +81,38 @@ _MAX_CONCURRENT_PROBES: Final = 8
 #: is live — `{"namespace": "x", "optin": false}` means ENABLED there, and
 #: only `namespace: null` means off.
 _CONTROLEUR_ARCHETYPE: Final = "controleur"
+
+#: Story 4.12 AC2 — exception TYPES that mean "this will never succeed by
+#: itself", as opposed to a transient blip (a timeout, a dropped
+#: connection, a momentarily-unreachable dependency). `_coerce_outcome`
+#: used to answer `retryable=True` unconditionally for every check that
+#: raised instead of returning a `CheckResult` — so a `NotFoundError` from
+#: a `tool_servers` row deleted out from under a still-referencing
+#: `agent_template_tools` assignment produced an eternal 503 that no retry
+#: could ever clear (`_gate_on_mise_en_place`'s `error_cls = DependencyError
+#: if retryable else BusinessRuleError` already distinguishes the two — it
+#: only ever received `True` from here).
+#:
+#: Every member here is a client/business-rule error in
+#: `shared/exceptions.py` — the thing referenced does not exist, or the
+#: request itself is invalid, or the actor lacks rights to it. None of
+#: those change by waiting and asking again. Deliberately NOT
+#: `DependencyError`/`InternalError`/builtin `TimeoutError`/`OSError` (a
+#: downed MCP server, a DB hiccup, a network blip) — those keep the
+#: existing `retryable=True` default, and so does any OTHER, unclassified
+#: exception type: failing open toward "retryable" is the safe default
+#: here, since misclassifying a permanent failure as retryable costs an
+#: operator a 503 that does not clear (annoying, self-correcting once they
+#: read the check detail), while misclassifying a transient one as
+#: permanent hands back a 422 that is flatly wrong.
+_PERMANENT_CHECK_EXCEPTION_TYPES: Final[tuple[type[BaseException], ...]] = (
+    NotFoundError,
+    ValidationError,
+    BusinessRuleError,
+    ForbiddenError,
+    AuthError,
+    ConflictError,
+)
 
 
 def _config_of(template: AgentTemplate) -> Mapping[str, Any]:
@@ -205,8 +244,15 @@ class MiseEnPlaceService:
         templates: Mapping[str, AgentTemplate],
         task_input: dict[str, Any],
         tenant_id: UUID | None,
+        already_executed_node_ids: frozenset[str] = frozenset(),
+        allow_inactive_workflow: bool = False,
     ) -> MiseEnPlaceReport:
         """Run all four checks in parallel and assemble the report (AC1).
+
+        ``already_executed_node_ids`` (Story 4.12 AC5) — forwarded to
+        ``budget_available``'s Dry Run so a ``resume`` prices only the
+        REMAINING work of a paused run, not its entire DAG re-charged from
+        scratch. Empty for ``start_run`` (nothing has executed yet).
 
         NEVER raises — neither on a failing check (a ``MiseEnPlaceReport``
         with ``all_passed=False`` is a normal, valid return value) nor on a
@@ -237,7 +283,15 @@ class MiseEnPlaceService:
         outcomes = await asyncio.gather(
             self._bounded(self._check_tools(templates, tenant_id=tenant_id)),
             self._bounded(self._check_namespaces(templates, tenant_id=tenant_id)),
-            self._bounded(self._check_budget(workflow_id, task_input, tenant_id=tenant_id)),
+            self._bounded(
+                self._check_budget(
+                    workflow_id,
+                    task_input,
+                    tenant_id=tenant_id,
+                    already_executed_node_ids=already_executed_node_ids,
+                    allow_inactive_workflow=allow_inactive_workflow,
+                )
+            ),
             self._bounded(self._check_llm_providers(templates)),
             return_exceptions=True,
         )
@@ -267,6 +321,10 @@ class MiseEnPlaceService:
             check_code=code,
             error_type=type(outcome).__name__,
         )
+        # Story 4.12 AC2 — was an unconditional `True`. See
+        # `_PERMANENT_CHECK_EXCEPTION_TYPES`'s module comment for the
+        # taxonomy and why an unclassified type still defaults `True`.
+        retryable = not isinstance(outcome, _PERMANENT_CHECK_EXCEPTION_TYPES)
         return CheckResult(
             code=code,
             passed=False,
@@ -278,9 +336,7 @@ class MiseEnPlaceService:
                 f"Consulter les logs serveur (check {code}) puis relancer ; "
                 "utiliser force=true pour passer outre en connaissance de cause"
             ),
-            # A timeout or an infrastructure hiccup may well clear on its
-            # own — this is the one failure shape worth retrying (BS5).
-            retryable=True,
+            retryable=retryable,
         )
 
     async def _check_tools(
@@ -490,7 +546,13 @@ class MiseEnPlaceService:
         )
 
     async def _check_budget(
-        self, workflow_id: UUID, task_input: dict[str, Any], *, tenant_id: UUID | None
+        self,
+        workflow_id: UUID,
+        task_input: dict[str, Any],
+        *,
+        tenant_id: UUID | None,
+        already_executed_node_ids: frozenset[str] = frozenset(),
+        allow_inactive_workflow: bool = False,
     ) -> CheckResult:
         """``budget_available`` (AC1) — reuse ``DryRunService.dry_run()``
         (Story 4.4, zero real LLM call) for ``cost_estimate_usd`` and compare
@@ -516,7 +578,11 @@ class MiseEnPlaceService:
             )
 
         response = await self._dry_run_service.dry_run(
-            workflow_id=workflow_id, task_input=task_input, tenant_id=tenant_id
+            workflow_id=workflow_id,
+            task_input=task_input,
+            tenant_id=tenant_id,
+            exclude_node_ids=already_executed_node_ids,
+            allow_inactive=allow_inactive_workflow,
         )
         cost = (
             Decimal(response.cost_estimate_usd) if response.cost_estimate_usd is not None else None

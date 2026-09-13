@@ -550,8 +550,60 @@ async def test_check_budget_passes_dry_run_service_the_same_task_input() -> None
         tenant_id=None,
     )
     dry_run_service.dry_run.assert_awaited_once_with(
-        workflow_id=workflow_id, task_input={"seed": 1}, tenant_id=None
+        workflow_id=workflow_id,
+        task_input={"seed": 1},
+        tenant_id=None,
+        exclude_node_ids=frozenset(),
+        allow_inactive=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_check_budget_forwards_already_executed_node_ids_to_dry_run() -> None:
+    """Story 4.12 AC5 — the plumbing that lets a `resume` price only its
+    REMAINING work: whatever `run_checks` is given must reach
+    `DryRunService.dry_run` unchanged."""
+    service, *_repos, dry_run_service = _make_service(
+        settings=_settings(budget_cap_usd=Decimal("50"))
+    )
+    workflow_id = uuid4()
+
+    await service.run_checks(
+        workflow_id=workflow_id,
+        templates={},
+        task_input={},
+        tenant_id=None,
+        already_executed_node_ids=frozenset({"a", "b"}),
+    )
+
+    dry_run_service.dry_run.assert_awaited_once_with(
+        workflow_id=workflow_id,
+        task_input={},
+        tenant_id=None,
+        exclude_node_ids=frozenset({"a", "b"}),
+        allow_inactive=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_budget_lets_a_resume_price_an_inactive_workflow() -> None:
+    """Deactivation governs LAUNCH, not continuation: a run that is already
+    under way still has to be costed, and the Dry Run is the only thing that
+    can cost it. Refusing here is how the pre-flight built to price a resume
+    ended up refusing the run it was pricing."""
+    service, *_repos, dry_run_service = _make_service(
+        settings=_settings(budget_cap_usd=Decimal("50"))
+    )
+
+    await service.run_checks(
+        workflow_id=uuid4(),
+        templates={},
+        task_input={},
+        tenant_id=None,
+        allow_inactive_workflow=True,
+    )
+
+    assert dry_run_service.dry_run.await_args.kwargs["allow_inactive"] is True
 
 
 # ─── llm_providers_configured ────────────────────────────────────────────
@@ -1021,6 +1073,34 @@ async def test_run_checks_when_tool_server_lookup_raises_should_report_it_as_fai
     check = next(c for c in report.checks if c.code == "mcp_tools_reachable")
     assert check.passed is False
     assert "NotFoundError" in check.detail
+    # Story 4.12 AC2 — a deleted `tool_servers` row is PERMANENT: no retry
+    # brings it back. Before this story every coerced exception answered
+    # `retryable=True`, so `_gate_on_mise_en_place` (`error_cls =
+    # DependencyError if retryable else BusinessRuleError`) turned this into
+    # an eternal 503 rather than the 422 a caller could actually act on.
+    assert check.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_run_checks_when_a_check_raises_a_transient_error_stays_retryable() -> None:
+    """The other half of the taxonomy: a type NOT in the permanent list
+    (here, a bare `TimeoutError` — an infrastructure hiccup) keeps the
+    original `retryable=True` behaviour."""
+    service, _tt, _ts, _ns, dry_run_service = _make_service(
+        settings=_settings(budget_cap_usd=Decimal("50"))
+    )
+    dry_run_service.dry_run = AsyncMock(side_effect=TimeoutError("db slow"))
+
+    report = await service.run_checks(
+        workflow_id=uuid4(),
+        templates={"a": _template(llm_model="claude-sonnet-4-6")},
+        task_input={},
+        tenant_id=None,
+    )
+
+    check = next(c for c in report.checks if c.code == "budget_available")
+    assert check.passed is False
+    assert check.retryable is True
 
 
 # ─── BaseException from the MCP probe (review P4) ────────────────────────

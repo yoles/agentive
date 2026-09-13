@@ -770,3 +770,63 @@ def test_handoff_averages_tolerate_corrupt_shapes() -> None:
         )["a"].input_tokens
         == 0
     )
+
+
+# ─── Story 4.12 AC5 — exclude_node_ids scopes the estimate to remaining work ──
+
+
+@pytest.mark.asyncio
+async def test_dry_run_excludes_already_executed_nodes_from_the_estimate() -> None:
+    """A resumed run must not have its already-billed node re-priced
+    against the budget cap. `exclude_node_ids={"a"}` must remove `a`
+    entirely — not zero its cost, remove it — from `agents_involved`,
+    `token_estimate_per_provider` and the totals."""
+    tpl_a, tpl_b = uuid4(), uuid4()
+    dag = {
+        "nodes": [
+            {"node_id": "a", "agent_template_id": str(tpl_a)},
+            {"node_id": "b", "agent_template_id": str(tpl_b)},
+        ],
+        "edges": [{"from_node_id": "a", "to_node_id": "b"}],
+    }
+    service, workflow_repo, _run_repo, template_repo = _make_service()
+    workflow_repo.require_by_id.return_value = _workflow(dag=dag)
+
+    async def _get_by_id(template_id: UUID, *, tenant_id: Any | None = None) -> SimpleNamespace:
+        return _template(template_id=template_id, llm_model="claude-sonnet-4-6")
+
+    template_repo.get_by_id = AsyncMock(side_effect=_get_by_id)
+
+    full = await service.dry_run(workflow_id=uuid4(), task_input={})
+    partial = await service.dry_run(
+        workflow_id=uuid4(), task_input={}, exclude_node_ids=frozenset({"a"})
+    )
+
+    assert {a.node_id for a in full.agents_involved} == {"a", "b"}
+    assert {a.node_id for a in partial.agents_involved} == {"b"}
+    assert partial.cost_estimate_usd is not None
+    assert full.cost_estimate_usd is not None
+    assert Decimal(partial.cost_estimate_usd) < Decimal(full.cost_estimate_usd)
+    # Exactly half the tokens (both nodes priced identically) — not merely
+    # a smaller number, THE remaining half.
+    assert (
+        partial.token_estimate_per_provider["anthropic"].input_tokens
+        == full.token_estimate_per_provider["anthropic"].input_tokens // 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_exclude_node_ids_defaults_to_empty_and_changes_nothing() -> None:
+    """The default (no caller passes `exclude_node_ids`) must reproduce the
+    exact pre-4.12 behaviour — `start_run`'s own budget check and
+    `POST /workflows/{id}/dry-run` both rely on this."""
+    template_id = uuid4()
+    service, workflow_repo, _run_repo, template_repo = _make_service()
+    workflow_repo.require_by_id.return_value = _workflow(dag=_single_node_dag(template_id))
+    template_repo.get_by_id.return_value = _template(
+        template_id=template_id, llm_model="claude-sonnet-4-6"
+    )
+
+    response = await service.dry_run(workflow_id=uuid4(), task_input={})
+
+    assert len(response.agents_involved) == 1

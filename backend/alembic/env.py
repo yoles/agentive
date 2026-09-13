@@ -48,7 +48,22 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # One transaction PER MIGRATION, not one for the whole invocation.
+    # Several migrations issue `SET LOCAL lock_timeout` to bound their own
+    # DDL, and `SET LOCAL` is scoped to the transaction — under a single
+    # shared transaction the first one to set it imposes it on every
+    # migration that runs after it in the same `alembic upgrade`/`downgrade`,
+    # so unrelated DDL on unrelated tables aborts with `LockNotAvailable`
+    # under any contention and rolls back the whole chain.
+    #
+    # It also means a failing migration no longer rolls back the ones that
+    # already succeeded before it — which is what the `alembic_version`
+    # stamp already implied per-migration anyway.
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        transaction_per_migration=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

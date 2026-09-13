@@ -54,10 +54,11 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 from sse_starlette.sse import EventSourceResponse
 
 from agentive_backend.features.workflow_engine.domain.run_control import (
@@ -65,6 +66,7 @@ from agentive_backend.features.workflow_engine.domain.run_control import (
     TERMINAL_STATUSES,
 )
 from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
+from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
 from agentive_backend.features.workflow_engine.schemas import (
     CreateWorkflowRequest,
     CreateWorkflowResponse,
@@ -142,7 +144,47 @@ _QUEUE_POLL_INTERVAL_S = 1.0
 # immediately, so a chatty run burned the whole budget in seconds — and then
 # the generator returned with no terminal event and no error, leaving the
 # client waiting forever on a stream that was already closed.
-_MAX_STREAM_DURATION_S = 3600.0
+#
+# Story 4.9 AC6/T6.6 — this ~1h floor and `recovery.derive_stale_threshold_s`
+# (the recovery worker's own "how long can a healthy node stay silent"
+# ceiling) were never reconciled. At the settings' `le` values in place when
+# this was written — `workflow_retry_base_delay_s<=60`,
+# `...max_delay_s<=300`, `routing_escalation_timeout_s<=60`,
+# `workflow_handoff_summary_timeout_s<=45` — the derived stale threshold
+# reaches **3675 s**, past the 3600 s this constant hardcoded: a client could
+# receive `stream_timeout` with `status: "running"` on a run the recovery
+# worker does not even consider orphaned yet. The 4% margin between 3450 and
+# 3600 s the review measured before this fix was never chosen by anyone; it
+# was what the settings happened to allow at the time.
+#
+# Reconciled by DERIVING this ceiling from the same formula rather than
+# guarding it with a test alone — a test alone would need updating by hand
+# every time either side's defaults move, exactly the drift that produced
+# the 3675-vs-3600 inversion. `_stream_duration_headroom_s` on top of the
+# derived threshold absorbs the recovery worker's own poll cadence
+# (`interval_s`, default 30 s) plus scheduling slack, so the stream always
+# outlives the point where a healthy run could first be reclaimed.
+_MAX_STREAM_DURATION_FLOOR_S = 3600.0
+_STREAM_DURATION_HEADROOM_S = 120.0
+
+
+def _max_stream_duration_s() -> float:
+    """The SSE ceiling for THIS process's actual settings (Story 4.9
+    AC6/T6.6) — never less than the ~1h floor above, and never less than
+    the recovery worker's own worst-case stale threshold plus headroom.
+
+    Computed per call (settings do not change within a process's lifetime,
+    but nothing here assumes a specific import order, unlike a module-level
+    constant computed once at import time would).
+    """
+    stale_threshold_s = derive_stale_threshold_s(
+        base_delay_s=settings.workflow_retry_base_delay_s,
+        max_delay_s=settings.workflow_retry_max_delay_s,
+        escalation_timeout_s=settings.routing_escalation_timeout_s,
+        handoff_summary_timeout_s=settings.workflow_handoff_summary_timeout_s,
+    )
+    return max(_MAX_STREAM_DURATION_FLOOR_S, stale_threshold_s + _STREAM_DURATION_HEADROOM_S)
+
 
 # How often the loop re-reads `workflow_runs.status` while idle. The run's
 # authoritative status lives in the row, not in the event stream (cf
@@ -380,15 +422,37 @@ async def dry_run_workflow(
     response_model=RoutingStatsResponse,
     summary="Aggregate hybrid-routing decisions for a workflow (Story 4.3 AC3)",
 )
-async def get_workflow_routing_stats(workflow_id: UUID, request: Request) -> RoutingStatsResponse:
-    """``% routages déterministes vs LLM``, aggregated in SQL over every run
-    of ``workflow_id`` — never a Prometheus label (unbounded cardinality,
-    Dev Notes § Divergences assumées).
+async def get_workflow_routing_stats(
+    workflow_id: UUID,
+    request: Request,
+    window_days: int | None = Query(
+        default=None,
+        ge=1,
+        le=3650,
+        description=(
+            "Trailing window, in days, over which to aggregate (Story 4.10 "
+            "AC4). Defaults to AGENTIVE_WORKFLOW_ROUTING_STATS_WINDOW_DAYS "
+            "(90) when omitted."
+        ),
+    ),
+) -> RoutingStatsResponse:
+    """``% routages déterministes vs LLM``, aggregated in SQL over runs of
+    ``workflow_id`` started within the last ``window_days`` days — never a
+    Prometheus label (unbounded cardinality, Dev Notes § Divergences
+    assumées).
+
+    Story 4.10 AC4 — previously aggregated over EVERY run ever, a cost
+    proportional to a number the CALLER controls (how many times they hit
+    ``POST /runs``), not the operator. Bounded to a trailing window instead
+    of a materialized rollup: simpler, and honest about what the number now
+    means (a recent proportion, not an all-time one) rather than papering
+    over the change with a cache.
 
     Errors:
     * 404 — ``workflow_id`` unknown (the URL's primary resource, mirror the
       404-vs-422 decision of Story 4.2's ``POST /workflows/{workflow_id}/runs``,
       not Story 4.1's ``POST /workflows``).
+    * 422 — ``window_days`` outside ``[1, 3650]``.
     * 503 — lifespan state missing (session factory).
     """
     session_factory = getattr(request.app.state, "session_factory", None)
@@ -400,14 +464,18 @@ async def get_workflow_routing_stats(workflow_id: UUID, request: Request) -> Rou
     workflow_repo = WorkflowRepo(session_factory=session_factory)
     await workflow_repo.require_by_id(workflow_id)
 
+    effective_window_days = window_days or settings.workflow_routing_stats_window_days
+    since = datetime.now(UTC) - timedelta(days=effective_window_days)
+
     workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
     runs_counted, deterministic, llm_escalated = await workflow_run_repo.aggregate_routing_modes(
-        workflow_id
+        workflow_id, since=since
     )
     total = deterministic + llm_escalated
     deterministic_pct = round(deterministic / total * 100, 1) if total > 0 else None
     return RoutingStatsResponse(
         workflow_id=workflow_id,
+        window_days=effective_window_days,
         runs_counted=runs_counted,
         deterministic=deterministic,
         llm_escalated=llm_escalated,
@@ -597,6 +665,32 @@ async def cancel_workflow_run(
     return result
 
 
+@router.post(
+    "/workflows/runs/{run_id}/retract",
+    response_model=RunControlResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Retract a pending, not-yet-observed pause/cancel request (Story 4.9 AC6)",
+)
+async def retract_workflow_run_control(run_id: UUID, request: Request) -> RunControlResponse:
+    """``200`` — applied immediately: unlike ``pause``/``cancel``, there is no
+    driver-side effect to defer, only a column to clear before anyone reads it.
+
+    Legal only from ``running`` AND only while a ``pause``/``cancel`` is
+    still pending (``control_signal IS NOT NULL``) — an operator who asked
+    for the wrong thing a moment ago and wants to undo it before the driver
+    ever observes the request.
+
+    Errors:
+    * 404 — ``run_id`` unknown.
+    * 409 — the run is not ``running``, or nothing is currently pending (the
+      driver already observed it, or none was ever requested). The RFC 7807
+      ``context`` carries the same fields the other three control routes do.
+    * 503 — lifespan state missing.
+    """
+    service = _build_execution_service(request)
+    return await service.request_run_control(run_id=run_id, action="retract", tenant_id=None)
+
+
 def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, str]:
     """Build the ``state`` frame — AC1's catch-up payload.
 
@@ -631,6 +725,20 @@ def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, st
     control_signal = getattr(run, "control_signal", None)
     if isinstance(control_signal, str):
         payload["control_signal"] = control_signal
+        # Story 4.9 AC6/T6.1 — `control_requested_at` was written on every
+        # pause/cancel request and read by NOTHING: no SSE frame, no 409
+        # context, no metric. A client watching this stream had no way to
+        # tell "just asked" from "asked 25 minutes ago and the driver may be
+        # dead" (the ~1548s worst case documented in the run-control
+        # runbook). Only emitted alongside `control_signal` — the two are
+        # always written and cleared together (`clear_control`), so one
+        # without the other never happens.
+        control_requested_at = getattr(run, "control_requested_at", None)
+        if control_requested_at is not None:
+            # Explicit `.isoformat()`: the `default=str` fallback below would
+            # render a `datetime` space-separated with no `T`, diverging from
+            # the ISO-8601 the 409 context on this same surface emits.
+            payload["control_requested_at"] = control_requested_at.isoformat()
     if reason is not None:
         payload["reason"] = reason
     return {"event": "state", "data": json.dumps(payload, default=str)}
@@ -740,7 +848,7 @@ async def _stream_run_events(
         # real client disconnect, raising `GeneratorExit` — caught by
         # nothing here, so the `finally` still unsubscribes.
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _MAX_STREAM_DURATION_S
+        deadline = loop.time() + _max_stream_duration_s()
         next_repoll = loop.time() + _STATUS_REPOLL_INTERVAL_S
 
         while loop.time() < deadline:

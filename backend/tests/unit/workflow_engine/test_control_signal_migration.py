@@ -100,3 +100,42 @@ def test_downgrade_still_drops_both_columns(recorded_downgrade: _RecordingOp) ->
         "workflow_runs.control_requested_at",
         "workflow_runs.control_signal",
     ]
+
+
+# ─── Story 4.11 AC7/T7.1 — guarding the downgrade against live traffic ──
+
+
+def test_downgrade_sets_a_lock_timeout_before_locking_the_table(
+    recorded_downgrade: _RecordingOp,
+) -> None:
+    """Without this, a live writer already holding a conflicting lock parks
+    the `LOCK TABLE` statement below indefinitely — the exact failure mode
+    this story closes."""
+    statements = [sql for kind, sql in recorded_downgrade.calls if kind == "execute"]
+    assert any("lock_timeout" in sql.lower() for sql in statements)
+
+
+def test_downgrade_locks_the_table_before_reconciling_status(
+    recorded_downgrade: _RecordingOp,
+) -> None:
+    """THE fix: without this lock, a live 4.6 driver can write a NEW
+    `status = 'paused'` row in the window between the reconciliation UPDATE
+    and the `DROP COLUMN` that follows it — producing exactly the immobile
+    row this migration's reconciliation exists to prevent. Held for the
+    whole transaction, the lock closes that window rather than merely
+    reordering statements around it."""
+    statements = [sql for kind, sql in recorded_downgrade.calls if kind == "execute"]
+    lock_index = next(i for i, sql in enumerate(statements) if "lock table" in sql.lower())
+    reconcile_index = next(
+        i for i, sql in enumerate(statements) if "set status = 'running'" in sql.lower()
+    )
+    assert lock_index < reconcile_index
+
+
+def test_downgrade_table_lock_is_exclusive_mode(recorded_downgrade: _RecordingOp) -> None:
+    """`EXCLUSIVE` (not a weaker mode): it must conflict with `ROW
+    EXCLUSIVE`, the lock every INSERT/UPDATE/DELETE takes — a weaker mode
+    would let a live driver keep writing `paused` rows through it."""
+    statements = [sql for kind, sql in recorded_downgrade.calls if kind == "execute"]
+    lock_stmt = next(sql for sql in statements if "lock table" in sql.lower())
+    assert "exclusive" in lock_stmt.lower()
