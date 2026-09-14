@@ -246,6 +246,14 @@ gen-api-types: up ## Génère les types TS depuis le schéma OpenAPI du backend
 # AGGREGATES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+.PHONY: check-stories
+check-stories: ## Vérifie la cohérence des statuts story <-> sprint-status.yaml
+	# Action 7 de la rétrospective Epic 4. Ce défaut est apparu SEPT fois
+	# (epics 1 et 2) et avait déjà été corrigé à la main en rétro Epic 3 sans
+	# garde-fou — il est donc revenu à l'identique. D'où un contrôle, pas une
+	# bonne intention.
+	@python3 scripts/check_story_status.py
+
 .PHONY: test
 test: test-backend test-frontend ## Tests backend + frontend
 

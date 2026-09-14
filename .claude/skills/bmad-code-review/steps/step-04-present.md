@@ -24,9 +24,21 @@
      - List each with title + detail + location (if available).
 
    - **Defer**: "Pre-existing issues surfaced by this review (not caused by current changes):"
-     - List each with title + detail.
+     - List each with title + detail + **its carrier story key** (assigned in step 3b).
+
+     **CLOSING GATE -- do not skip.** A review MUST NOT be reported as complete while any
+     `defer` has no carrier story. If one does, stop and resolve it first: either create the
+     carrier story now (and register it in `sprint-status.yaml`), or reclassify the finding as
+     `patch` / `reject` with a reason. Reporting "3 defer consigned" without a carrier per
+     finding is precisely how this project lost debt twice -- once for two epics, once for three
+     days -- and both times it was found by accident rather than by the process.
+
+     Also verify Rule B held: if the reviewed story is a hardening story, every carrier must sit
+     OUTSIDE its epic. A carrier inside the same epic means the epic has no stable closing
+     condition.
 
 3. Summary line: **X** intent_gap, **Y** bad_spec, **Z** patch, **W** defer findings. **R** findings rejected as noise.
+   When `W > 0`, the line MUST also name the carrier story of each `defer`.
 
 4. If clean review (zero findings across all layers after triage): state that N findings were raised but all were classified as noise, or that no findings were raised at all (as applicable).
 
