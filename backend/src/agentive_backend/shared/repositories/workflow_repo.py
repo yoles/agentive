@@ -351,14 +351,21 @@ class WorkflowRunRepo(BaseRepo):
         *,
         tenant_id: UUID | None = None,
         limit: int = 100,
+        status: str | None = None,
     ) -> list[WorkflowRun]:
+        """Les runs d'un workflow, du plus récent au plus ancien.
+
+        ``status`` filtre EN SQL, et ce n'est pas une commodité : filtrer
+        après la troncature fait que ``limit`` compte des runs qui seront
+        jetés. Vingt runs en échec récents masquaient ainsi un historique
+        `completed` arbitrairement long, et l'appelant retombait sur son
+        estimation heuristique en croyant n'avoir aucune mesure.
+        """
         async with self.with_tenant(tenant_id) as session:
-            stmt = (
-                select(WorkflowRun)
-                .where(WorkflowRun.workflow_id == workflow_id)
-                .order_by(WorkflowRun.started_at.desc())
-                .limit(limit)
-            )
+            stmt = select(WorkflowRun).where(WorkflowRun.workflow_id == workflow_id)
+            if status is not None:
+                stmt = stmt.where(WorkflowRun.status == status)
+            stmt = stmt.order_by(WorkflowRun.started_at.desc()).limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -394,6 +401,7 @@ class WorkflowRunRepo(BaseRepo):
         status: str = "running",
         checkpoint: dict[str, Any] | None = None,
         mise_en_place: dict[str, Any] | None = None,
+        acknowledgement: dict[str, Any] | None = None,
         tenant_id: UUID | None = None,
     ) -> WorkflowRun:
         """INSERT inside the caller's transaction — caller owns commit.
@@ -414,6 +422,12 @@ class WorkflowRunRepo(BaseRepo):
         callers that predate that story. Optional keyword, default-``None``,
         so the sole existing caller (``WorkflowExecutionService.start_run``,
         confirmed by grep — no other call site) stays source-compatible.
+
+        ``acknowledgement`` (Story 5.1 AC2) — same shape of keyword, same
+        reason, and deliberately written HERE rather than by a later
+        ``UPDATE``: the client may connect to the SSE stream the instant the
+        ``201`` lands, so the row must already carry what the first frame
+        has to say. Unlike ``checkpoint``, it is never rewritten.
         """
         run = WorkflowRun(
             workflow_id=workflow_id,
@@ -421,6 +435,7 @@ class WorkflowRunRepo(BaseRepo):
             status=status,
             checkpoint=checkpoint,
             mise_en_place=mise_en_place,
+            acknowledgement=acknowledgement,
             tenant_id=tenant_id,
         )
         session.add(run)

@@ -23,6 +23,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID
 
+from agentive_backend.features.workflow_engine.acknowledgement import (
+    Acknowledgement,
+    build_acknowledgement,
+    node_duration_samples,
+)
 from agentive_backend.features.workflow_engine.domain import (
     DomainValidationError,
     RoutingRule,
@@ -57,6 +62,7 @@ from agentive_backend.features.workflow_engine.metrics import (
 )
 from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
 from agentive_backend.features.workflow_engine.schemas import (
+    AcknowledgementOut,
     CreateWorkflowResponse,
     DiversityWarning,
     MiseEnPlaceCheckOut,
@@ -1268,6 +1274,13 @@ def _aggregate_metrics(
         # this story" posture, but as an absent key rather than a fabricated
         # default, since "never attempted" and "attempted for free" are
         # different facts.
+        # Story 5.1 T6.3 (tranché en revue) — les incohérences d'un plan de
+        # délégation, remontées depuis `agent_node`. Clé ABSENTE quand il n'y
+        # a rien à dire : c'est ce qui fait de sa présence un signal, même
+        # posture que `handoff_summary_tokens` juste en dessous.
+        contract_problems = metric.get("contract_problems")
+        if isinstance(contract_problems, list) and contract_problems:
+            node_per_node["contract_problems"] = [str(problem) for problem in contract_problems]
         handoff_entry = handoffs.get(node_id)
         if isinstance(handoff_entry, dict):
             node_per_node["handoff_summary_tokens"] = {
@@ -1450,6 +1463,22 @@ class WorkflowExecutionService:
             reason=reason,
         )
 
+        # Story 5.1 AC2 — l'accusé de réception, composé APRÈS la porte de
+        # Mise en Place (un lancement refusé ne crée aucune row, donc n'a
+        # rien à accuser) et AVANT l'INSERT, dont il fait partie. Aucun appel
+        # LLM sur ce chemin : l'AC promet une première frame SSE en moins de
+        # deux secondes.
+        acknowledgement = await self._build_acknowledgement(
+            workflow_id=workflow_id, templates=templates, tenant_id=tenant_id
+        )
+        # Validé ICI, avant l'INSERT — pas à la construction de la réponse.
+        # `AcknowledgementOut` est `extra="forbid"` avec `eta_minutes >= 1` :
+        # validé après coup, une sortie invalide rendait un 500 alors que le
+        # run était DÉJÀ persisté et en cours d'exécution, sans `run_id` rendu
+        # à l'appelant pour l'observer ou l'annuler. Échouer avant l'écriture
+        # laisse le système dans l'état où il était.
+        acknowledgement_out = AcknowledgementOut(**acknowledgement.to_payload())
+
         event_type = WorkflowRunStartedEvent.event_type
         async with self._workflow_run_repo.with_tenant(tenant_id) as session:
             # Authoritative recount (Story 4.9 AC2/T2.2), scoped to the SAME
@@ -1481,9 +1510,13 @@ class WorkflowExecutionService:
                 # the persisted shape, and un-queryable via
                 # `mise_en_place->>'all_passed'`. One shape, both surfaces.
                 mise_en_place=_mise_en_place_out(report).model_dump(mode="json"),
+                acknowledgement=acknowledgement.to_payload(),
             )
             event = WorkflowRunStartedEvent(
-                run_id=run.id, workflow_id=workflow_id, tenant_id=tenant_id
+                run_id=run.id,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                acknowledgement=acknowledgement.to_payload(),
             )
             event_id = await publish(
                 event_type, event, session=session, correlation_id=correlation_id
@@ -1535,6 +1568,79 @@ class WorkflowExecutionService:
             status="running",
             warnings=warnings,
             mise_en_place=_mise_en_place_out(report),
+            acknowledgement=acknowledgement_out,
+        )
+
+    async def _build_acknowledgement(
+        self,
+        *,
+        workflow_id: UUID,
+        templates: Mapping[str, AgentTemplate],
+        tenant_id: UUID | None,
+    ) -> Acknowledgement:
+        """Compose l'accusé de réception d'un run qui démarre (Story 5.1 AC2).
+
+        Une seule lecture DB pour estimer la durée d'un node depuis les runs
+        passés, bornée DEUX fois : en volume par
+        ``acknowledgement_history_limit``, et en TEMPS par
+        ``acknowledgement_history_timeout_s``.
+
+        La borne de temps n'est pas décorative. Cette lecture est sur le
+        chemin SYNCHRONE du ``POST /runs``, donc devant le budget de deux
+        secondes de l'AC2 : un ``except Exception`` attrape les erreurs, jamais
+        la LENTEUR. C'est la posture de ``MiseEnPlaceService._bounded``, qui
+        borne chaque check pour exactement cette raison.
+
+        Le filtre ``status="completed"`` est poussé en SQL et non appliqué
+        après coup : sinon ``limit`` compte des runs destinés à être jetés, et
+        vingt échecs récents suffisent à masquer tout l'historique mesuré.
+
+        **La lecture d'historique ne peut pas faire échouer un lancement.**
+        L'estimation retombe sur l'heuristique si elle échoue, et le run
+        démarre. C'est la posture de ``_reload_run_safely`` sur le flux SSE :
+        ce qui est une RÉCONCILIATION, et non la source de vérité, n'a pas le
+        droit de remonter en erreur.
+
+        Ce qui N'EST PAS gardé, délibérément : la lecture de ``template.name``.
+        ``agent_templates.name`` est ``NOT NULL`` et ``_load_templates`` a déjà
+        refusé un DAG référençant une row absente — un template sans nom
+        n'existe pas. Mettre un ``getattr(..., "")`` ici défendrait contre
+        l'impossible et rendrait « Je mobilise . » en silence.
+
+        ``settings`` est lu ici et non mémorisé dans ``__init__`` — mirror de
+        ``RoutingSettings`` (cf ``_execute``), pour qu'une surcharge de
+        fixture reste honnête.
+        """
+        node_ids = list(templates)
+        agent_names = [template.name for template in templates.values()]
+        samples: dict[str, list[float]] = {}
+        try:
+            async with asyncio.timeout(settings.acknowledgement_history_timeout_s):
+                history = await self._workflow_run_repo.list_by_workflow(
+                    workflow_id,
+                    tenant_id=tenant_id,
+                    limit=settings.acknowledgement_history_limit,
+                    status="completed",
+                )
+            samples = node_duration_samples(history)
+        except Exception as exc:
+            # Le TYPE est nommé et la trace conservée en debug. Sans eux, un
+            # basculement de toute la flotte en `heuristic` restait visible
+            # mais non diagnosticable — on savait que ça tombait, pas
+            # pourquoi. `TimeoutError` y compris : c'est le cas que le
+            # `except` d'origine ne pouvait PAS attraper, faute de borne.
+            _log.warning(
+                "workflow_engine.acknowledgement_history_unavailable",
+                workflow_id=str(workflow_id),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            _log.debug("acknowledgement history read failed", exc_info=True)
+        return build_acknowledgement(
+            agent_names=agent_names,
+            node_ids=node_ids,
+            duration_samples=samples,
+            default_node_duration_s=settings.acknowledgement_default_node_duration_s,
         )
 
     async def request_run_control(

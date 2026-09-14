@@ -270,6 +270,25 @@ class MiseEnPlaceReportOut(BaseModel):
     bypass_reason: str | None = None
 
 
+class AcknowledgementOut(BaseModel):
+    """L'accusé de réception d'un run (Story 5.1 AC2).
+
+    ``eta_source`` n'est pas cosmétique : ``"history"`` signifie que CHAQUE
+    node du DAG avait au moins une durée mesurée sur un run passé ; dès qu'un
+    seul est retombé sur le défaut de configuration, c'est ``"heuristic"``.
+    Un lecteur qui budgète doit pouvoir distinguer les deux — c'est ce que
+    la revue du Dry Run a imposé à ses propres estimations
+    (``no_execution_history``, ``node_estimate_from_fallback``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    agents: list[str]
+    eta_minutes: int = Field(ge=1)
+    eta_source: Literal["history", "heuristic"]
+
+
 class StartRunResponse(BaseModel):
     """Response of ``POST /api/v1/workflows/{workflow_id}/runs`` — 201 Created.
 
@@ -288,6 +307,13 @@ class StartRunResponse(BaseModel):
     ``workflow_runs.mise_en_place``, always present (a 201 is only reached
     once the hook ran, whether every check passed or a failure was bypassed
     via ``force``).
+
+    ``acknowledgement`` (Story 5.1 AC2) — « Compris. Je mobilise [agents].
+    ETA ~[X] min. ». Le même objet que la colonne, que la frame SSE ``state``
+    et que l'event ``started`` : une seule valeur, calculée une fois, rendue
+    sur les trois surfaces. Présent ici parce que le dogfooding de Sprint 2
+    se fait en client HTTP (décision de John, 2026-09-14) : un appelant en
+    ``curl`` obtient l'accusé sans avoir à ouvrir un flux SSE.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -296,6 +322,7 @@ class StartRunResponse(BaseModel):
     status: Literal["running"] = "running"
     warnings: list[DiversityWarning] = Field(default_factory=list)
     mise_en_place: MiseEnPlaceReportOut
+    acknowledgement: AcknowledgementOut
 
 
 class RoutingStatsResponse(BaseModel):

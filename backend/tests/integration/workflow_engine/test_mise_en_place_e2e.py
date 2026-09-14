@@ -4,7 +4,7 @@ Real Postgres (testcontainers) + a REAL unreachable MCP stdio server
 (a nonexistent binary — fails fast via ``FileNotFoundError``, no need to
 wait out a real discovery timeout). Unlike every other e2e test in this
 package, these tests wire the REAL :class:`MiseEnPlaceService` (see
-``_wire_execution_service_with_real_mise_en_place`` below) rather than
+``.conftest.wire_execution_service_with_real_mise_en_place``) rather than
 ``.conftest.wire_execution_service``'s always-pass stub — that stub exists
 precisely so tests of OTHER stories don't have to care about this hook,
 which makes it the wrong fixture for testing the hook itself.
@@ -38,28 +38,19 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
-from agentive_backend.features.workflow_engine.mise_en_place import (
-    MiseEnPlaceService,
-    MiseEnPlaceSettings,
-)
-from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
-from agentive_backend.features.workflow_engine.service import WorkflowExecutionService
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.testing import MockProvider
 from agentive_backend.shared.llm.types import Completion
 from agentive_backend.shared.repositories import (
     AgentTemplateRepo,
     AgentTemplateToolRepo,
-    NamespaceRepo,
     ToolRepo,
     ToolServerRepo,
-    WorkflowRepo,
-    WorkflowRunRepo,
 )
 
 from .conftest import e2e_auth_headers as _auth_headers
 from .conftest import make_e2e_app as _make_app
+from .conftest import wire_execution_service_with_real_mise_en_place
 
 pytestmark = pytest.mark.integration
 
@@ -148,61 +139,6 @@ async def _assign_unreachable_tool(
         )
 
 
-def _wire_execution_service_with_real_mise_en_place(
-    app: Any,
-    *,
-    tool_ping_timeout_s: float = 2.0,
-    budget_cap_usd: Decimal | None = None,
-) -> None:
-    """Mirror ``app.lifespan``'s Story 4.5 wiring (T7.1) on a hand-built
-    test app — the REAL :class:`MiseEnPlaceService`, not
-    ``.conftest.wire_execution_service``'s always-pass stub.
-
-    Call AFTER ``session_factory``/``workflow_checkpointer``/``llm_router``
-    are on ``app.state`` (same precondition as ``.conftest.wire_execution_service``).
-    """
-    session_factory = app.state.session_factory
-    app.state.routing_rules = load_routing_rules()
-
-    dry_run_service = DryRunService(
-        workflow_repo=WorkflowRepo(session_factory=session_factory),
-        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
-        template_repo=AgentTemplateRepo(session_factory=session_factory),
-        settings=DryRunSettings(
-            history_limit=20,
-            fallback_input_tokens=500,
-            fallback_output_tokens=500,
-            budget_cap_usd=budget_cap_usd,
-        ),
-    )
-    mise_en_place_service = MiseEnPlaceService(
-        template_tool_repo=AgentTemplateToolRepo(session_factory=session_factory),
-        tool_server_repo=ToolServerRepo(session_factory=session_factory),
-        namespace_repo=NamespaceRepo(session_factory=session_factory),
-        dry_run_service=dry_run_service,
-        settings=MiseEnPlaceSettings(
-            tool_ping_timeout_s=tool_ping_timeout_s,
-            check_timeout_s=15.0,
-            budget_cap_usd=budget_cap_usd,
-            # Fixed True — this test suite is about `mcp_tools_reachable`
-            # and the bypass/no-op paths, not about provider-key presence
-            # (covered by `test_mise_en_place_service.py`'s unit tests).
-            anthropic_api_key_present=True,
-            openai_api_key_present=True,
-        ),
-    )
-    app.state.workflow_execution_service = WorkflowExecutionService(
-        workflow_repo=WorkflowRepo(session_factory=session_factory),
-        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
-        template_repo=AgentTemplateRepo(session_factory=session_factory),
-        tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
-        llm_router=app.state.llm_router,
-        checkpointer=app.state.workflow_checkpointer,
-        routing_rules=app.state.routing_rules,
-        mise_en_place_service=mise_en_place_service,
-    )
-
-
 async def _create_workflow(client: httpx.AsyncClient, *, template_id: UUID, name: str) -> str:
     resp = await client.post(
         "/api/v1/workflows",
@@ -231,7 +167,7 @@ async def test_start_run_blocked_by_unreachable_mcp_tool(
     app.state.llm_router = LLMRouter(
         providers={"mock": MockProvider("mock", [])}, default_chain=["mock"]
     )
-    _wire_execution_service_with_real_mise_en_place(app)
+    wire_execution_service_with_real_mise_en_place(app)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -298,7 +234,7 @@ async def test_start_run_bypasses_unreachable_tool_with_force(
     app.state.workflow_checkpointer = workflow_checkpointer
     provider = MockProvider("mock", [_completion(json.dumps({"status": "done"}))])
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
-    _wire_execution_service_with_real_mise_en_place(app)
+    wire_execution_service_with_real_mise_en_place(app)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -361,7 +297,7 @@ async def test_start_run_healthy_workflow_passes_every_check(
     app.state.workflow_checkpointer = workflow_checkpointer
     provider = MockProvider("mock", [_completion(json.dumps({"status": "done"}))])
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
-    _wire_execution_service_with_real_mise_en_place(app)
+    wire_execution_service_with_real_mise_en_place(app)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -431,7 +367,7 @@ async def test_mise_en_place_check_never_triggers_a_real_provider_call(
     app.state.workflow_checkpointer = workflow_checkpointer
     provider = MockProvider("mock", [_completion(json.dumps({"status": "done"}))])
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
-    _wire_execution_service_with_real_mise_en_place(app)
+    wire_execution_service_with_real_mise_en_place(app)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

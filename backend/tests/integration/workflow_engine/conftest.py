@@ -8,6 +8,7 @@ workflows router).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -137,4 +138,81 @@ def wire_execution_service(app: Any) -> None:
         checkpointer=app.state.workflow_checkpointer,
         routing_rules=app.state.routing_rules,
         mise_en_place_service=always_pass_mise_en_place_service(),
+    )
+
+
+def wire_execution_service_with_real_mise_en_place(
+    app: Any,
+    *,
+    tool_ping_timeout_s: float = 2.0,
+    budget_cap_usd: Decimal | None = None,
+) -> None:
+    """Mirror ``app.lifespan``'s Story 4.5 wiring (T7.1) on a hand-built
+    test app — the REAL :class:`MiseEnPlaceService`, not
+    :func:`wire_execution_service`'s always-pass stub.
+
+    Vit ici depuis la Story 5.1 : `test_dev_lead_e2e.py` en a besoin pour
+    prouver qu'un namespace manquant FAIT REFUSER le lancement — la raison
+    d'être de l'ordre « namespaces avant templates » du provisioning. Le
+    dupliquer aurait donné deux câblages à garder d'accord avec
+    `app.lifespan`.
+
+    Call AFTER ``session_factory``/``workflow_checkpointer``/``llm_router``
+    are on ``app.state`` (same precondition as ``.conftest.wire_execution_service``).
+    """
+    from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
+    from agentive_backend.features.workflow_engine.mise_en_place import (
+        MiseEnPlaceService,
+        MiseEnPlaceSettings,
+    )
+    from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
+    from agentive_backend.features.workflow_engine.service import WorkflowExecutionService
+    from agentive_backend.shared.repositories import (
+        AgentTemplateRepo,
+        AgentTemplateToolRepo,
+        NamespaceRepo,
+        ToolServerRepo,
+        WorkflowRepo,
+        WorkflowRunRepo,
+    )
+
+    session_factory = app.state.session_factory
+    app.state.routing_rules = load_routing_rules()
+
+    dry_run_service = DryRunService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        settings=DryRunSettings(
+            history_limit=20,
+            fallback_input_tokens=500,
+            fallback_output_tokens=500,
+            budget_cap_usd=budget_cap_usd,
+        ),
+    )
+    mise_en_place_service = MiseEnPlaceService(
+        template_tool_repo=AgentTemplateToolRepo(session_factory=session_factory),
+        tool_server_repo=ToolServerRepo(session_factory=session_factory),
+        namespace_repo=NamespaceRepo(session_factory=session_factory),
+        dry_run_service=dry_run_service,
+        settings=MiseEnPlaceSettings(
+            tool_ping_timeout_s=tool_ping_timeout_s,
+            check_timeout_s=15.0,
+            budget_cap_usd=budget_cap_usd,
+            # Fixed True — this test suite is about `mcp_tools_reachable`
+            # and the bypass/no-op paths, not about provider-key presence
+            # (covered by `test_mise_en_place_service.py`'s unit tests).
+            anthropic_api_key_present=True,
+            openai_api_key_present=True,
+        ),
+    )
+    app.state.workflow_execution_service = WorkflowExecutionService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
+        llm_router=app.state.llm_router,
+        checkpointer=app.state.workflow_checkpointer,
+        routing_rules=app.state.routing_rules,
+        mise_en_place_service=mise_en_place_service,
     )

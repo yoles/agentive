@@ -13,6 +13,7 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 - [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
 - [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)
 - [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) — Hook pré-workflow (4 checks, blocage/bypass `force`) (Story 4.5)
+- [`pole-dev.md`](./pole-dev.md) — Pôle Dev : provisionner (`make seed-dev`), lancer une demande au Dev Lead en HTTP, lire l'accusé de réception et la décomposition (Story 5.1)
 - [`observability.md`](./observability.md) — Guide pratique observabilité : logs JSON, RFC 7807, correlation_id, redaction (Story 1.9)
 - [`repositories-usage.md`](./repositories-usage.md) — Utilisation Repository Pattern + RLS (Story 1.5)
 - [`rejeu-et-outils.md`](./rejeu-et-outils.md) — Rejeu d'un nœud et ré-appel des outils, non-idempotence, contrainte lecture seule en Sprint 2 (Story 5.0)

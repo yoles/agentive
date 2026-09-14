@@ -49,6 +49,7 @@ from agentive_backend.infra.mcp.tool_executor import (
     ToolInvocation,
     to_tool_definitions,
 )
+from agentive_backend.shared.contracts.dev_roles import validate_delegation_plan
 from agentive_backend.shared.contracts.handoff import HandoffSummary
 from agentive_backend.shared.exceptions import ValidationError
 from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
@@ -273,6 +274,58 @@ def _best_effort_json(raw_output: str) -> dict[str, Any] | None:
     except json.JSONDecodeError, TypeError, ValueError:
         return None
     return candidate if isinstance(candidate, dict) else None
+
+
+def _delegation_plan_problems(
+    node_output: dict[str, Any], *, config: Mapping[str, Any], node_id: str
+) -> list[str]:
+    """Les incohérences d'un plan de délégation, ou une liste vide.
+
+    **Pourquoi ici, et pourquoi sur le CONTRAT et non sur l'agent.** La Story
+    5.1 T6.3 exigeait qu'un ``target_role`` hors du jeu fermé « ne mente
+    pas », avec deux issues permises — refuser le node, ou marquer la
+    délégation — et une seule interdite : le silence. La revue a trouvé que
+    c'était la troisième qui tenait, ``validate_delegation_plan`` n'ayant
+    aucun appelant de production : un plan déléguant à ``devops_wizard``
+    était stocké, streamé et rapporté comme un succès ordinaire.
+
+    Le déclencheur est l'``output_contract.core`` du template — un contrat
+    qui déclare ``delegations`` ET ``plan`` —, jamais le nom de l'agent. Ce
+    n'est donc pas un point d'application inventé pour le Dev Lead : c'est le
+    moteur qui vérifie ce qu'un template a DÉCLARÉ produire. Un agent des
+    Stories 5.2 → 5.6 qui déclare le même contrat sera vérifié sans une
+    ligne de plus.
+
+    **Marquer, pas refuser.** ``validate_delegation_plan`` porte cette
+    posture dans sa propre docstring (« signale, ne corrige pas »), et tuer
+    un run sur une maladresse de format serait disproportionné quand le cas
+    non parsable est DÉJÀ traité ailleurs (repli ``raw_output`` + règle
+    ``no-parsable-output`` à 0.9). Ce qui est traité ici est le cas
+    « parsable mais incohérent », qui mérite d'être nommé, pas d'être fatal.
+
+    Le constat va dans ``node_metrics`` et non dans ``node_outputs`` : la
+    sortie du node est la réponse de l'agent, et y injecter un diagnostic du
+    moteur la ferait diverger de son propre contrat — ce que la revue venait
+    justement de reprocher au prompt (champs exigés, non déclarés).
+    """
+    if RAW_OUTPUT_KEY in node_output:
+        # Sortie non parsable : déjà signalée par le repli et sa règle de
+        # routage. Re-signaler ici dirait deux fois la même chose.
+        return []
+    contract = config.get("output_contract")
+    core = contract.get("core") if isinstance(contract, dict) else None
+    if not isinstance(core, dict) or "delegations" not in core or "plan" not in core:
+        return []
+
+    problems = validate_delegation_plan(node_output)
+    if problems:
+        _log.warning(
+            "workflow_engine.delegation_plan_incoherent",
+            node_id=node_id,
+            problem_count=len(problems),
+            problems=problems,
+        )
+    return problems
 
 
 def _guarded_system_prompt(system_prompt: str) -> str:
@@ -882,9 +935,14 @@ async def execute_agent_node(
     node_output: dict[str, Any] = (
         parsed_output if parsed_output is not None else {RAW_OUTPUT_KEY: completion.text}
     )
+    contract_problems = _delegation_plan_problems(node_output, config=config, node_id=node_id)
 
     node_metric: dict[str, Any] = {
         "duration_ms": duration_ms,
+        # Story 5.1 T6.3 (tranché en revue) — les incohérences d'un plan de
+        # délégation, NOMMÉES. Absent quand il n'y a rien à dire, pour que la
+        # présence de la clé soit elle-même le signal.
+        **({"contract_problems": contract_problems} if contract_problems else {}),
         # Story 5.0 AC4 — les totaux de la BOUCLE, pas ceux du dernier tour.
         # Un node n'est plus un appel facture mais N : prendre
         # `completion.input_tokens` rendrait invisible toute la depense des

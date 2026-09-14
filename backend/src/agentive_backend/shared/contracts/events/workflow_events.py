@@ -91,13 +91,25 @@ class WorkflowCreatedEvent(BaseModel):
 
 
 class WorkflowRunStartedEvent(BaseModel):
-    """Published when a run starts executing (Story 4.2 AC1)."""
+    """Published when a run starts executing (Story 4.2 AC1).
+
+    ``acknowledgement`` (Story 5.1 AC2) — « Compris. Je mobilise [agents].
+    ETA ~[X] min. », sous la forme ``{message, agents[], eta_minutes,
+    eta_source}``. Même contenu que la colonne ``workflow_runs.acknowledgement``
+    et que la frame SSE ``state`` : un client déjà attaché le reçoit ici, un
+    client qui s'attache plus tard le reçoit en rattrapage. Les deux chemins
+    doivent dire la même chose, sinon le client voit l'accusé changer sous
+    ses yeux selon l'instant où il s'est connecté.
+
+    ``None`` pour un run antérieur à cette story.
+    """
 
     event_type: ClassVar[str] = "workflow_engine.workflow_run.started"
 
     run_id: UUID
     workflow_id: UUID
     actor: str = Field(default="system", description="user_id or 'system' for unattended runs")
+    acknowledgement: dict[str, Any] | None = None
     tenant_id: UUID | None = None
 
 

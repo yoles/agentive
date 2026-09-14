@@ -77,6 +77,7 @@ def event_publish_and_commit_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator[A
 def _template(
     *,
     archetype: str = "producteur",
+    name: str | None = None,
     output_contract: dict[str, Any] | None = None,
     llm_model: str | None = None,
     temperature: float = 0.7,
@@ -88,7 +89,17 @@ def _template(
     if llm_model is not None:
         config["llm_model"] = llm_model
         config["llm_params"] = {"temperature": temperature, "max_tokens": max_tokens}
-    return SimpleNamespace(id=uuid4(), archetype=archetype, config=config)
+    template_id = uuid4()
+    # Story 5.1 — `name` manquait à ce faux alors que `agent_templates.name`
+    # est NOT NULL : aucun template réel n'en est dépourvu. L'accusé de
+    # réception (AC2) le lit pour composer « Je mobilise […] », et c'est ce
+    # qui a rendu le manque visible.
+    return SimpleNamespace(
+        id=template_id,
+        name=name if name is not None else f"tpl-{template_id}",
+        archetype=archetype,
+        config=config,
+    )
 
 
 def _make_service(
@@ -1285,7 +1296,9 @@ async def test_start_run_resolves_every_template_in_one_batch_query(
     )
     run = _workflow_run(workflow_id=workflow_id)
     workflow_run_repo.create_in_session.return_value = run
-    template_repo.get_by_id.return_value = SimpleNamespace(config={}, id=uuid4())
+    # `name` requis depuis la Story 5.1 : seul ce test passe par `start_run`,
+    # qui compose l'accusé de réception à partir des noms de templates.
+    template_repo.get_by_id.return_value = SimpleNamespace(config={}, id=uuid4(), name="tpl-a")
     service._drive_run = AsyncMock()  # type: ignore[method-assign]
 
     await service.start_run(workflow_id=workflow_id, run_input={"seed": 1})

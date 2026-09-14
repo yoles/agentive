@@ -191,6 +191,12 @@ migrate-new: _validate-msg ## Crée une nouvelle migration (usage: make migrate-
 migrate-init: ## Crée la migration initiale (manuel, pas autogenerate)
 	$(DC_DEV) run --rm backend uv run alembic revision -m "initial schema"
 
+.PHONY: seed-dev
+seed-dev: ## Provisionne le Pôle Dev (namespaces + agent-templates + workflow d'entrée) — Story 5.1
+	# Idempotent : une seconde exécution ne crée rien et ne duplique rien.
+	# Suppose les migrations appliquées (`make migrate`).
+	$(DC_DEV) run --rm backend uv run python -m scripts.seed_dev
+
 .PHONY: test-backend
 test-backend: ## Exécute les tests Python (parité CI : --network host + docker.sock + .import-linter)
 	# Mirror exact du job CI test-backend (.github/workflows/ci.yml:174-181) :

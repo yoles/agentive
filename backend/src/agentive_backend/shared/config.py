@@ -193,6 +193,47 @@ class Settings(BaseSettings):
         """An empty/whitespace env var means "unset", not "invalid decimal"."""
         return None if isinstance(value, str) and not value.strip() else value
 
+    # ─── Workflow Engine — Accusé de réception d'un run (Story 5.1) ───
+    # L'accusé « Compris. Je mobilise [agents]. ETA ~[X] min. » est calculé
+    # SANS aucun appel LLM, sur le chemin synchrone de
+    # `POST /workflows/{id}/runs` : ces deux réglages bornent ce calcul.
+    #
+    # Combien de runs passés on relit pour estimer la durée d'un node.
+    # `le=100` comme `dry_run_history_limit`, et pour la même raison : la
+    # lecture est synchrone dans le lancement d'un run, et l'AC2 promet une
+    # première frame SSE en moins de 2 s.
+    acknowledgement_history_limit: int = Field(
+        default=20, ge=1, le=100, alias="AGENTIVE_ACK_HISTORY_LIMIT"
+    )
+    # Le temps MAXIMUM que cette lecture a le droit de prendre. La borne de
+    # volume ci-dessus ne borne pas la latence : une base contendue, un
+    # autovacuum sur `workflow_runs`, un failover en cours, et la lecture
+    # traîne sans qu'aucun `except` ne s'en aperçoive — les exceptions
+    # attrapent les erreurs, jamais la lenteur. Dépassé, l'estimation retombe
+    # en `heuristic` et le run démarre : c'est une RÉCONCILIATION, elle n'a
+    # pas le droit de tenir le lancement en otage.
+    #
+    # 0.5 s : un quart du budget de 2 s de l'AC2, qui laisse la marge à la
+    # Mise en Place (elle, fait de l'I/O réseau) et à l'INSERT du run.
+    acknowledgement_history_timeout_s: float = Field(
+        default=0.5, gt=0, le=5.0, alias="AGENTIVE_ACK_HISTORY_TIMEOUT_S"
+    )
+    # Durée supposée d'un node quand l'historique ne dit rien — un workflow
+    # jamais exécuté, ou un node ajouté depuis. L'estimation est alors
+    # étiquetée `eta_source="heuristic"` : le Dry Run a dû apprendre en revue
+    # (`no_execution_history`, `node_estimate_from_fallback`) qu'un chiffre
+    # estimé qui se présente comme mesuré est pire que pas de chiffre.
+    #
+    # 60 s : l'ordre de grandeur d'un node LLM avec ses retries, sans outils.
+    # `le=3600` borne l'absurde — au-delà, l'ETA d'un DAG de taille normale
+    # se compte en heures et l'accusé cesse d'informer.
+    acknowledgement_default_node_duration_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=3600.0,
+        alias="AGENTIVE_ACK_DEFAULT_NODE_DURATION_S",
+    )
+
     # ─── Workflow Engine — Mise en Place automatique (Story 4.5) ───
     # Per-server MCP ping timeout for the `mcp_tools_reachable` check —
     # deliberately SHORTER than `infra/mcp/client.py`'s

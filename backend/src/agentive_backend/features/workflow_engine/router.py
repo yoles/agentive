@@ -709,9 +709,27 @@ def _state_event(run: WorkflowRun, *, reason: str | None = None) -> dict[str, st
     Deliberately NOT forwarded: ``node_outputs_preview`` (up to 500 chars
     per node — this frame must stay small) and ``recovery_attempts`` (an
     internal bookkeeping counter, not run state).
+
+    Story 5.1 AC2 — carries ``acknowledgement`` as well. This frame is sent
+    the instant a client connects, which is what makes "première frame en
+    moins de 2 s" true regardless of how far the run has already got.
     """
     checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
     payload: dict[str, Any] = {"run_id": str(run.id), "status": run.status}
+    # Story 5.1 AC2 — l'accusé de réception, sur le chemin de RATTRAPAGE.
+    # Lu sur la colonne dédiée et non dans `checkpoint` : ce dernier est
+    # remplacé en entier par `_sync_checkpoint` dès le premier node, donc un
+    # accusé qui y aurait vécu aurait disparu exactement au moment où ce
+    # rattrapage sert. Même posture défensive que les champs ci-dessous —
+    # `isinstance` avant d'émettre, JSONB libre.
+    # La clé est TOUJOURS présente, `null` si la colonne l'est — et non
+    # omise. Les trois surfaces qui rendent cet accusé (le 201, l'event
+    # `started`, cette frame) doivent avoir la même FORME, sinon un client
+    # écrit sur celle du 201 prend un `KeyError` au lieu d'un `null` sur tout
+    # run antérieur à la migration. Omettre la clé rendait aussi les tests
+    # illisibles : ils tombaient en `KeyError` plutôt qu'en échec nommé.
+    acknowledgement = getattr(run, "acknowledgement", None)
+    payload["acknowledgement"] = acknowledgement if isinstance(acknowledgement, dict) else None
     last_node_id = checkpoint.get("last_node_id")
     if isinstance(last_node_id, str):
         payload["last_node_id"] = last_node_id

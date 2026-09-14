@@ -142,6 +142,32 @@ class AgentTemplateRepo(BaseRepo):
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
 
+    async def get_latest_by_name(
+        self,
+        name: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> AgentTemplate | None:
+        """La row de plus haute ``version`` portant ce ``name``, ou ``None``.
+
+        Distincte de :meth:`get_by_name_version`, et pas par confort : la
+        contrainte d'unicité porte sur ``(name, version, tenant_id)`` et
+        ``update_in_session`` INCRÉMENTE ``version`` sur la row existante dès
+        qu'un ``system_prompt`` change. Un provisioning idempotent qui
+        chercherait ``(name, version=1)`` ne retrouverait donc plus un
+        template déjà configuré, et en créerait un SECOND — le doublon
+        silencieux que la Story 5.1 T2.3 doit rendre impossible.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(AgentTemplate)
+                .where(AgentTemplate.name == name)
+                .order_by(AgentTemplate.version.desc())
+                .limit(1)
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
     async def create(
         self,
         *,

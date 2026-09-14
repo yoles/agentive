@@ -191,6 +191,37 @@ class ToolRepo(BaseRepo):
         await session.refresh(tool)
         return tool
 
+    async def list_by_names(
+        self,
+        names: Sequence[str],
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, list[Tool]]:
+        """Les outils portant ces noms, groupés par nom (Story 5.1 T2.4).
+
+        Rend une LISTE par nom, jamais un outil : l'unicité déclarée est
+        ``(server_id, name)``, donc deux serveurs MCP peuvent exposer un
+        ``read_file`` chacun. Choisir « le premier » ferait dépendre
+        l'assignation de l'ordre de retour de Postgres ; c'est à l'appelant
+        de refuser l'ambiguïté, ce que fait le provisioning du Pôle Dev.
+
+        Un nom absent est absent de la réponse — pas une entrée vide : le
+        provisioning distingue « introuvable » de « ambigu » et ne rend pas
+        le même message.
+        """
+        unique = sorted({name for name in names if name})
+        if not unique:
+            # `IN ()` — même raison que `list_by_ids` : pas d'aller-retour
+            # pour une question vide.
+            return {}
+        async with self.with_tenant(tenant_id) as session:
+            stmt = select(Tool).where(Tool.name.in_(unique)).order_by(asc(Tool.name), asc(Tool.id))
+            result = await session.execute(stmt)
+            grouped: dict[str, list[Tool]] = {}
+            for tool in result.scalars().all():
+                grouped.setdefault(tool.name, []).append(tool)
+            return grouped
+
     async def list_by_server_in_session(
         self,
         session: AsyncSession,

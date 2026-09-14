@@ -286,6 +286,15 @@ class WorkflowRun(Base):
     # carrying the same report (review BS2). `None` only for runs predating
     # this story.
     mise_en_place: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Story 5.1 AC2 — l'accusé de réception rendu au client sur la PREMIÈRE
+    # frame SSE : `{message, agents[], eta_minutes, eta_source}`. Écrit une
+    # seule fois, dans l'INSERT du run, jamais réécrit.
+    #
+    # Colonne et non clé de `checkpoint` : `_sync_checkpoint` remplace ce
+    # dernier EN ENTIER dès que le premier node atterrit, donc l'accusé
+    # disparaîtrait de la frame de rattrapage exactement au moment où elle
+    # sert. `None` pour les runs antérieurs à cette story.
+    acknowledgement: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Story 4.6 AC1/AC2 — a PENDING pause/cancel REQUEST (`"pause"`,
     # `"cancel"`, or `NULL`), deliberately NOT a status.
     #
