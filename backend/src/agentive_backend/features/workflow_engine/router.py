@@ -182,6 +182,10 @@ def _max_stream_duration_s() -> float:
         max_delay_s=settings.workflow_retry_max_delay_s,
         escalation_timeout_s=settings.routing_escalation_timeout_s,
         handoff_summary_timeout_s=settings.workflow_handoff_summary_timeout_s,
+        # Story 5.0 — depuis la boucle d'outils, ce plafond plat REMPLACE
+        # `NODE_TIMEOUT_S` dans la dérivation : un nœud n'est plus un appel
+        # LLM mais N appels LLM et M appels d'outils, tous enfermés dedans.
+        tool_loop_max_wall_clock_s=settings.tool_loop_max_wall_clock_s,
     )
     return max(_MAX_STREAM_DURATION_FLOOR_S, stale_threshold_s + _STREAM_DURATION_HEADROOM_S)
 

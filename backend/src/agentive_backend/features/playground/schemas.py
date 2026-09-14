@@ -66,11 +66,16 @@ class RunPlaygroundRequest(BaseModel):
 class ToolInvocationLog(BaseModel):
     """A single tool call invoked during a Playground run.
 
-    Sprint 1 — Playground does not actually invoke tools (the LLM doesn't
-    receive tool definitions in tool_use formal format ; Story 4.x).
-    The shape is wired in the response payload so the frontend
-    ``OutputInspector`` tab can render an empty state today and full data
-    in Sprint 4+.
+    Populated for real since **Story 5.0** (D80). Until then this list
+    arrived hard-coded empty, under a comment deferring it to a "Story 4.x"
+    that never did it — three retrospectives in a row carried the debt. The
+    cause was never this field: the model was simply never told it had tools,
+    so ``finish_reason == "tool_use"`` — mapped by both adapters since Story
+    1.6 — could not physically occur.
+
+    ``arguments_redacted`` and ``result_summary`` are bounded on purpose:
+    this payload is returned over HTTP and a tool result is an unbounded
+    source of text.
     """
 
     model_config = ConfigDict(extra="ignore")

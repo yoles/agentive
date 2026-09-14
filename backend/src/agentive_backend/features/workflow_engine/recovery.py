@@ -115,6 +115,13 @@ _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT = 15.0
 # constructor's own default, never a `settings` read from this module.
 _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT = 20.0
 
+# Story 5.0 — le plafond d'horloge murale de la boucle d'outils, miroir de
+# `AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S` (`shared/config.py`), même posture que
+# les deux mirrors ci-dessus : un fallback STATIQUE pour le défaut du
+# constructeur, jamais une lecture de `settings` depuis ce module.
+# `test_recovery.py` l'assère contre `Settings()`, comme les autres.
+_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT = 180.0
+
 # Story 4.6 T8.4/T8.5 — the term this story ADDS, and the reason the whole
 # derivation had to be revisited.
 #
@@ -175,6 +182,7 @@ def derive_stale_threshold_s(
     max_delay_s: float,
     escalation_timeout_s: float,
     handoff_summary_timeout_s: float,
+    tool_loop_max_wall_clock_s: float,
 ) -> float:
     """Worst-case wall-clock for ONE node that writes no checkpoint throughout.
 
@@ -244,20 +252,72 @@ def derive_stale_threshold_s(
         ("max_delay_s", max_delay_s),
         ("escalation_timeout_s", escalation_timeout_s),
         ("handoff_summary_timeout_s", handoff_summary_timeout_s),
+        ("tool_loop_max_wall_clock_s", tool_loop_max_wall_clock_s),
     ):
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
 
+    # Story 5.0 — plancher, et pas une précaution : la boucle d'outils borne
+    # désormais l'exécution ENTIÈRE d'un nœud, appels LLM compris. Un plafond
+    # inférieur à ce qu'un nœud SANS outil peut légitimement prendre
+    # (`NODE_TIMEOUT_S` x la chaîne, soit 120 s en basculant d'un provider à
+    # l'autre) ne rendrait pas seulement ce seuil faux : il tuerait des nœuds
+    # sains. Refusé ici plutôt que subi — ce module est celui qui connaît les
+    # deux nombres.
+    _floor = NODE_TIMEOUT_S * _MAX_PROVIDER_CHAIN_LEN
+    if tool_loop_max_wall_clock_s < _floor:
+        raise ValueError(
+            f"tool_loop_max_wall_clock_s must be >= NODE_TIMEOUT_S x "
+            f"_MAX_PROVIDER_CHAIN_LEN ({_floor}), got {tool_loop_max_wall_clock_s!r}: "
+            "a node with no tools at all can legitimately take that long"
+        )
+
     return (
-        (NODE_TIMEOUT_S + escalation_timeout_s)
-        * _MAX_PROVIDER_CHAIN_LEN
-        * (1 + MAX_RUNTIME_RETRIES)
+        # Story 5.0 — `tool_loop_max_wall_clock_s` REMPLACE `NODE_TIMEOUT_S`
+        # dans ce terme, il ne s'y ajoute pas. Depuis la boucle d'outils, un
+        # nœud n'est plus UN appel LLM mais N appels LLM et M appels d'outils,
+        # tous enfermés dans ce plafond d'horloge murale (`run_tool_loop`,
+        # `asyncio.timeout`). `NODE_TIMEOUT_S` ne borne plus que l'un des N,
+        # et la chaîne de providers est déjà à l'intérieur du plafond.
+        #
+        # C'est le quatrième terme ajouté ici par une story qui a rajouté un
+        # appel (4.3 l'escalade, 4.6 les retries, 4.7 les résumés de passage),
+        # et le premier qui en RETIRE un : sans ça la formule multiplierait
+        # 8 itérations x 60 s x 2 providers x 4 tentatives, soit un seuil de
+        # ~4,8 h — exactement ce que le commentaire de `MAX_RUNTIME_RETRIES`
+        # ci-dessus qualifie de « défait le worker de recovery ».
+        tool_loop_max_wall_clock_s * (1 + MAX_RUNTIME_RETRIES)
+        # L'escalade de routage, UNE fois par exécution de nœud et non une
+        # fois par tentative — correction assumée, pas un effet de bord.
+        #
+        # La formule d'avant l'écrivait `(NODE_TIMEOUT_S + escalation) x
+        # chaîne x (1 + retries)`, donc la facturait HUIT fois. C'était une
+        # commodité d'écriture, jamais une affirmation : l'escalade vit dans
+        # le callable de routage de `graph_builder`, APRÈS le retour de
+        # `execute_agent_node` — dont les retries sont internes et déjà
+        # terminés. Un nœud qui retente trois fois sa complétion puis réussit
+        # escalade une seule fois. Reste multipliée par la chaîne, elle :
+        # cet appel-là passe bien par `LLMRouter.complete` sans
+        # `provider_chain=`, donc paie le timeout par provider.
+        #
+        # Pourquoi le corriger MAINTENANT plutôt que de le laisser tranquille.
+        # Sur-facturer ce terme était gratuit tant que le reste était petit ;
+        # ça ne l'est plus. À x8, la pire combinaison LÉGALE de tous les
+        # réglages donne une fenêtre de 69 min — au-delà de l'heure que ce
+        # module qualifie lui-même de « défait le worker de recovery ». À x2
+        # elle vaut 54 min, et le défaut passe de 37 à 33 min. La marge x2,5
+        # ci-dessous couvre toujours l'ensemble.
+        + escalation_timeout_s * _MAX_PROVIDER_CHAIN_LEN
         + _worst_case_backoff_s(base_delay_s=base_delay_s, max_delay_s=max_delay_s)
         + handoff_summary_timeout_s * _MAX_PROVIDER_CHAIN_LEN
     ) * _SAFETY_MARGIN
 
 
-# ≈ 1518 s at the default settings. Detection of a genuinely crashed run is
+# ≈ 1992 s (33 min) at the default settings, depuis la Story 5.0 — contre
+# ≈ 1618 s avant elle. Le plafond d'horloge murale de la boucle d'outils a
+# remplacé `NODE_TIMEOUT_S` dans le premier terme, et l'escalade y est
+# désormais comptée une fois par nœud au lieu de huit (cf le corps).
+# Detection of a genuinely crashed run is
 # therefore slower than the 375 s of Story 4.2 — that is the unavoidable
 # price of retries existing at all, and it is bounded, derived and
 # re-asserted by `test_recovery.py`'s invariants rather than guessed.
@@ -270,6 +330,7 @@ DEFAULT_STALE_THRESHOLD_S = derive_stale_threshold_s(
     max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
     escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
     handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+    tool_loop_max_wall_clock_s=_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
 )
 
 # A run whose resume keeps dying before completing a single node is a poison

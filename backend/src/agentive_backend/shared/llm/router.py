@@ -47,7 +47,7 @@ from agentive_backend.shared.llm.metrics import (
     LLM_TOKENS_TOTAL,
 )
 from agentive_backend.shared.llm.redaction import redact_secrets
-from agentive_backend.shared.llm.types import ChatMessage, Completion
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 from agentive_backend.shared.logging import get_logger
 
 _log = get_logger(__name__)
@@ -190,6 +190,7 @@ class LLMRouter:
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
         provider_chain: Sequence[str] | None = None,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         # P10 — refuse empty messages early instead of letting the SDK
         # round-trip a 400 BadRequest (fatal, no fallback). Same intent
@@ -246,6 +247,7 @@ class LLMRouter:
                     system=system,
                     stop=stop,
                     timeout_s=timeout_s,
+                    tools=tools,
                 )
             except Exception as exc:
                 last_error = exc

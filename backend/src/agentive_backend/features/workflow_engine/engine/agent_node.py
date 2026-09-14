@@ -7,8 +7,15 @@ time (T3.2) — LangGraph invokes ``execute_agent_node(state)`` only, so
 rather than threaded through the state.
 
 Anti-scope (D91 point 7, Dev Notes § Exécution d'un node): no ``{variable}``
-substitution in ``system_prompt``, no Push Memory, no tool calls — those are
-Playground-only features (FR48, Story 2.6/2.7/3.5). The defensive
+substitution in ``system_prompt``, no Push Memory — those are
+Playground-only features (FR48, Story 2.6/2.7/3.5). **Les appels d'outils,
+eux, ne sont plus hors périmètre depuis la Story 5.0** : un node dont le
+template porte des outils les propose au modèle et exécute la boucle, via
+le même composant partagé que le Playground (``shared/llm/tool_loop.py``,
+exécuteur ``infra/mcp/tool_executor.py``). Un node sans outils assignés
+fait exactement ce qu'il faisait avant : une complétion, un tour de boucle.
+⚠️ Un node rejoué après interruption **ré-appelle ses outils** : voir
+``docs/runbooks/rejeu-et-outils.md``. The defensive
 model/temperature/max_tokens resolution and best-effort JSON parsing below
 are duplicated from ``PlaygroundService`` rather than imported —
 ``.import-linter`` Contract 1 forbids ``features.workflow_engine`` from
@@ -20,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -35,11 +43,18 @@ from agentive_backend.features.workflow_engine.engine.handoff import (
 )
 from agentive_backend.features.workflow_engine.metrics import WORKFLOW_NODE_RETRIES_TOTAL
 from agentive_backend.infra.llm.pricing import provider_for_model
+from agentive_backend.infra.mcp.tool_executor import (
+    McpToolExecutor,
+    ResolvedTool,
+    ToolInvocation,
+    to_tool_definitions,
+)
 from agentive_backend.shared.contracts.handoff import HandoffSummary
 from agentive_backend.shared.exceptions import ValidationError
 from agentive_backend.shared.llm.exceptions import LLMAllProvidersFailedError
 from agentive_backend.shared.llm.security import wrap_external_input
-from agentive_backend.shared.llm.types import ChatMessage
+from agentive_backend.shared.llm.tool_loop import ToolLoopResult, run_tool_loop
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
@@ -653,12 +668,19 @@ async def _complete_with_retry(
     system: str,
     provider_chain: list[str] | None,
     retry_settings: RetrySettings,
-) -> tuple[Completion, int]:
+    resolved_tools: Mapping[str, ResolvedTool] | None = None,
+) -> tuple[ToolLoopResult, int, list[ToolInvocation]]:
     """Call the router, retrying the WHOLE chain per ``error_policy`` (D13).
 
-    Returns ``(completion, attempts)`` — the attempt count travels back so
-    the node metric can record that a node cost, say, four full chain
-    traversals rather than one.
+    Returns ``(loop_result, attempts, invocations)``.
+
+    Story 5.0 — the completion became a :class:`ToolLoopResult` because a node
+    is no longer one billed call but N: the aggregate must travel back, or the
+    run's totals silently omit every intermediate turn. Two reviews already had
+    to impose that rule here (IG1 of the 4.3 review on routing escalation, P-2
+    of the 4.7 review on handoff summaries); a third omission of the same
+    family would be indefensible. ``invocations`` travels for the same reason
+    the attempt count does — so the node metric can say what it actually did.
 
     **Retry, fallback and intra-provider retry are three different things**
     (see ``domain/error_policy.py``'s table). This loop is the middle one: it
@@ -696,14 +718,39 @@ async def _complete_with_retry(
     attempt = 0
     while True:
         try:
-            completion = await llm_router.complete(
-                messages,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                timeout_s=NODE_TIMEOUT_S,
-                provider_chain=provider_chain,
+            # Story 5.0 AC2 — la boucle d'outils remplace l'appel unique.
+            # Sans outil resolu elle degenere en EXACTEMENT un appel : un
+            # node sans outils assignes se comporte donc comme avant cette
+            # story, et ne paie rien pour cette machinerie.
+            #
+            # A L'INTERIEUR de la boucle de retry, pas autour : un echec
+            # provider en milieu de boucle doit rejouer l'interaction du
+            # node, pas seulement son dernier tour. Consequence assumee et
+            # documentee (AC5) : les outils deja appeles le seront une
+            # seconde fois, et un appel d'outil n'est pas necessairement
+            # idempotent.
+            executor = McpToolExecutor(resolved=resolved_tools or {})
+            tool_definitions = to_tool_definitions(resolved_tools or {})
+
+            async def _call_llm(
+                msgs: Sequence[ChatMessage], tools: Sequence[ToolDefinition] | None
+            ) -> Completion:
+                return await llm_router.complete(
+                    msgs,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system,
+                    timeout_s=NODE_TIMEOUT_S,
+                    provider_chain=provider_chain,
+                    tools=tools,
+                )
+
+            loop_result = await run_tool_loop(
+                complete=_call_llm,
+                messages=messages,
+                tools=tool_definitions or None,
+                execute=executor,
             )
         except LLMAllProvidersFailedError as exc:
             if _chain_ended_fatally(exc):
@@ -763,7 +810,7 @@ async def _complete_with_retry(
             await asyncio.sleep(delay)
             attempt += 1
         else:
-            return completion, attempt + 1
+            return loop_result, attempt + 1, list(executor.invocations)
 
 
 async def execute_agent_node(
@@ -772,6 +819,7 @@ async def execute_agent_node(
     template: AgentTemplate,
     llm_router: LLMRouter,
     node_id: str,
+    resolved_tools: Mapping[str, ResolvedTool] | None = None,
     retry_settings: RetrySettings | None = None,
     has_downstream: bool = False,
     handoff_settings: HandoffSettings | None = None,
@@ -811,7 +859,7 @@ async def execute_agent_node(
     provider_chain = _resolve_chain(config, llm_router, node_id=node_id, model=model)
 
     started = time.monotonic()
-    completion, llm_attempts = await _complete_with_retry(
+    loop_result, llm_attempts, tool_invocations = await _complete_with_retry(
         llm_router,
         [ChatMessage(role="user", content=user_message)],
         config=config,
@@ -822,7 +870,9 @@ async def execute_agent_node(
         system=system_prompt,
         provider_chain=provider_chain,
         retry_settings=retry_settings or DEFAULT_RETRY_SETTINGS,
+        resolved_tools=resolved_tools,
     )
+    completion = loop_result.completion
     # Includes the backoff waits, deliberately: this is the wall-clock cost
     # of the node, and the recovery worker's staleness threshold is derived
     # against the same worst case.
@@ -835,13 +885,20 @@ async def execute_agent_node(
 
     node_metric: dict[str, Any] = {
         "duration_ms": duration_ms,
-        "input_tokens": completion.input_tokens,
-        "output_tokens": completion.output_tokens,
+        # Story 5.0 AC4 — les totaux de la BOUCLE, pas ceux du dernier tour.
+        # Un node n'est plus un appel facture mais N : prendre
+        # `completion.input_tokens` rendrait invisible toute la depense des
+        # tours intermediaires. C'est la TROISIEME fois que cette regle se
+        # pose ici — IG1 de la revue 4.3 (escalade de routage) et P-2 de la
+        # 4.7 (resumes de passage) ont toutes deux livre une depense qui
+        # n'apparaissait nulle part avant d'etre corrigees en revue.
+        "input_tokens": loop_result.total_input_tokens,
+        "output_tokens": loop_result.total_output_tokens,
         # JSONB has no Decimal — mirror `Completion._serialize_decimal`'s
         # str() conversion (the engine's default json serializer raises
         # TypeError on a raw Decimal).
         "cost_usd": (
-            str(completion.cost_estimate_usd) if completion.cost_estimate_usd is not None else None
+            str(loop_result.total_cost_usd) if loop_result.total_cost_usd is not None else None
         ),
         "model_used": completion.model,
         "provider": completion.provider,
@@ -851,6 +908,24 @@ async def execute_agent_node(
         # see that cost (the router's own metrics are per-provider-attempt
         # and carry no node identity).
         "llm_attempts": llm_attempts,
+        # Story 5.0 AC4/T6.3 — meme raison que `llm_attempts` juste au-dessus :
+        # c'est le seul endroit ou un operateur voit qu'un node a couté N
+        # appels d'outils, et combien de tours de boucle il a fallu. Zero sur
+        # un node sans outils, donc la forme du metric ne change pas pour les
+        # workflows anterieurs a cette story.
+        "tool_calls": loop_result.tool_calls_made,
+        "tool_loop_iterations": loop_result.iterations,
+        # Le NOM des outils appelés, dans l'ordre, et le nombre d'exécutions
+        # qui ont échoué ou expiré. Un compteur seul ne dit pas QUEL outil a
+        # coûté le node ni si la boucle a tourné sur des erreurs — un modèle
+        # qui rappelle huit fois un outil en échec consomme ses huit tours et
+        # rend quand même un texte : sans ça, le node ressort « réussi » et
+        # personne ne voit pourquoi il a coûté ce prix.
+        # Les ARGUMENTS ne sont délibérément PAS repliés ici : `node_metrics`
+        # est persisté en JSONB et relu par l'UI, et un argument d'outil est
+        # une entrée externe non maîtrisée (NFR9).
+        "tool_names": [inv.tool_name for inv in tool_invocations],
+        "tool_failures": sum(1 for inv in tool_invocations if inv.status != "success"),
     }
 
     node_update: dict[str, Any] = {

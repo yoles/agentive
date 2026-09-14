@@ -29,6 +29,7 @@ import string
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
@@ -43,6 +44,13 @@ from agentive_backend.features.playground.schemas import (
     PushMemoryUsage,
     RunPlaygroundResponse,
     TokenUsage,
+    ToolInvocationLog,
+)
+from agentive_backend.infra.mcp.tool_executor import (
+    McpToolExecutor,
+    ResolvedTool,
+    ToolInvocation,
+    to_tool_definitions,
 )
 from agentive_backend.shared.contracts.events import PlaygroundRunCompletedEvent
 from agentive_backend.shared.event_bus import notify_best_effort, publish
@@ -50,7 +58,8 @@ from agentive_backend.shared.exceptions import (
     DependencyError,
     ValidationError,
 )
-from agentive_backend.shared.llm.types import ChatMessage
+from agentive_backend.shared.llm.tool_loop import run_tool_loop
+from agentive_backend.shared.llm.types import ChatMessage, Completion
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.memory.push_memory import DEFAULT_SIMILARITY_THRESHOLD
 
@@ -253,6 +262,10 @@ class _LLMOutcome:
     # subclass (not ``Exception``, since Python 3.8), and this field now
     # also carries it on the cancellation path.
     error: BaseException | None
+    # Story 5.0 AC6 — les appels d'outils REELLEMENT effectues pendant ce run.
+    # Ferme D80 : ce champ arrivait vide en dur (`tool_invocations=[]`) parce
+    # que le modele n'apprenait jamais qu'il avait des outils.
+    tool_invocations: list[ToolInvocation] = dc_field(default_factory=list)
 
 
 class PlaygroundService:
@@ -267,9 +280,14 @@ class PlaygroundService:
         push_memory_provider: PushMemoryProvider | None = None,
     ) -> None:
         # P-24 (fix-batch 2026-08-31) — a ``tool_repo`` param used to be
-        # accepted here and stored unused ; Sprint 1 never resolves tool
-        # calls (D80), so nothing in this service touches the tools table
-        # directly. Removed rather than kept "for later" (YAGNI).
+        # accepted here and stored unused, back when nothing resolved tool
+        # calls at all. Removed rather than kept "for later" (YAGNI).
+        #
+        # Story 5.0 — tool calls ARE resolved now, and the decision still
+        # holds: `_assignment_repo` already reaches the tools it needs
+        # (`list_resolved_for_template_in_session` joins the server in), so a
+        # second repository would have been the redundant dependency P-24
+        # removed.
         self._template_repo = template_repo
         self._assignment_repo = assignment_repo
         self._llm_router = llm_router
@@ -320,9 +338,12 @@ class PlaygroundService:
 
         # 1. Load the template snapshot in memory — NO INSERT into
         #    agent_instances (AC2 isolation). 404 if the template is missing.
-        config_snapshot, assigned_tools, archetype = await self._load_config_and_tools(
-            template_id, tenant_id
-        )
+        (
+            config_snapshot,
+            assigned_tools,
+            archetype,
+            resolved_rows,
+        ) = await self._load_config_and_tools(template_id, tenant_id)
         # 2. Resolve how many assigned tools this run activates (validates
         #    enabled_tool_ids against the template's assignments).
         tools_activated_count = self._count_activated_tools(
@@ -346,6 +367,24 @@ class PlaygroundService:
         )
         # 4. Call the LLM, capturing the outcome (never raising inline) so the
         #    audit is published exactly once regardless of success/failure.
+        # Story 5.0 AC2 — seuls les outils ACTIVES pour ce run sont offerts au
+        # modele. `enabled_tool_ids=None` veut dire « tous les assignes »,
+        # meme semantique que `_count_activated_tools`, qui a deja valide la
+        # liste et leve un 422 sur un outil non assigne.
+        enabled = set(enabled_tool_ids) if enabled_tool_ids is not None else None
+        resolved_tools = {
+            tool.name: ResolvedTool(
+                tool_id=tool.id,
+                server_id=server.id,
+                name=tool.name,
+                description=tool.description,
+                input_schema=dict(tool.input_schema or {}),
+                transport=server.transport,
+                connection_config=dict(server.connection_config or {}),
+            )
+            for tool, server in resolved_rows
+            if enabled is None or tool.id in enabled
+        }
         outcome = await self._complete(
             config_snapshot=config_snapshot,
             prompt_resolved=prompt_resolved,
@@ -353,6 +392,7 @@ class PlaygroundService:
             timeout_seconds=timeout_seconds,
             template_id=template_id,
             max_tokens=max_tokens,
+            resolved_tools=resolved_tools,
         )
         # P9 (revue 3.5) : AFTER `_complete`, not before. `_complete` still
         # raises inline for an invalid stored `temperature` (422), and the
@@ -431,7 +471,20 @@ class PlaygroundService:
             cost_estimate_usd=outcome.cost_estimate_usd,
             model_used=outcome.model_used,
             provider_used=outcome.provider_used,
-            tool_invocations=[],  # Sprint 1 — D80 defer Story 4.x
+            # Story 5.0 AC6 — D80 FERMEE. Ce champ arrivait vide en dur parce
+            # que le modele n'apprenait jamais qu'il avait des outils.
+            tool_invocations=[
+                ToolInvocationLog(
+                    tool_id=inv.tool_id,
+                    tool_name=inv.tool_name,
+                    server_id=inv.server_id,
+                    arguments_redacted=inv.arguments,
+                    result_summary=inv.result_summary,
+                    duration_ms=inv.duration_ms,
+                    status=inv.status,
+                )
+                for inv in outcome.tool_invocations
+            ],
             duration_ms_total=duration_ms_total,
             push_memory=push_memory_usage,
         )
@@ -440,7 +493,7 @@ class PlaygroundService:
 
     async def _load_config_and_tools(
         self, template_id: UUID, tenant_id: UUID | None
-    ) -> tuple[dict[str, Any], list[tuple[Any, Any]], str]:
+    ) -> tuple[dict[str, Any], list[tuple[Any, Any]], str, list[tuple[Any, Any]]]:
         """Load the template config snapshot + its tool assignments + its
         archetype (Story 3.5 T9.3 : same query, no extra DB round-trip) in a
         single session. 404 ``NotFoundError`` if the template is missing."""
@@ -451,7 +504,14 @@ class PlaygroundService:
             assigned_tools = await self._assignment_repo.list_by_template_in_session(
                 session, template_id
             )
-        return config_snapshot, assigned_tools, archetype
+            # Story 5.0 AC2 — la MEME session : offrir un outil ne demande que
+            # la ligne `Tool`, l'APPELER demande le `transport` et la
+            # `connection_config` du serveur, une table plus loin. Une
+            # jointure, pas une requete par outil.
+            resolved_rows = await self._assignment_repo.list_resolved_for_template_in_session(
+                session, template_id
+            )
+        return config_snapshot, assigned_tools, archetype, resolved_rows
 
     @staticmethod
     def _count_activated_tools(
@@ -711,6 +771,7 @@ class PlaygroundService:
         timeout_seconds: float,
         template_id: UUID,
         max_tokens: int,
+        resolved_tools: dict[str, ResolvedTool] | None = None,
     ) -> _LLMOutcome:
         """Call ``LLMRouter.complete`` and capture the outcome. On any provider
         failure (H-02 fix-batch 2026-09-02: not just ``LLMError``, see the
@@ -718,7 +779,9 @@ class PlaygroundService:
         ``status="llm_error"`` (zeroed usage, requested model, no provider)
         plus the :class:`DependencyError` for the caller to re-raise after
         the single audit publish — so the failure is always audited exactly
-        once (Sprint 1: no formal tool_use — D80 Story 4.x). On cancellation
+        once. Since Story 5.0 this drives the tool loop rather than a single
+        completion, so a failure anywhere in the loop lands here identically.
+        On cancellation
         the outcome carries ``status="cancelled"`` with ``None`` usage
         (IG-01 / H-04, genuinely unknown, not zero).
 
@@ -762,15 +825,32 @@ class PlaygroundService:
         messages: list[ChatMessage] = [
             ChatMessage(role="user", content=json.dumps(arguments, ensure_ascii=False)),
         ]
-        try:
-            completion = await self._llm_router.complete(
-                messages,
+        # Story 5.0 AC2 — la boucle d'outils remplace l'appel unique. Sans
+        # outil active elle degenere en EXACTEMENT un appel, donc un run sans
+        # outil ne paie rien pour cette machinerie et son comportement est
+        # inchange.
+        executor = McpToolExecutor(resolved=resolved_tools or {})
+        tool_definitions = to_tool_definitions(resolved_tools or {})
+
+        async def _call(msgs: Sequence[ChatMessage], tools: Any) -> Completion:
+            return await self._llm_router.complete(
+                msgs,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 system=prompt_resolved,
                 timeout_s=timeout_seconds,
+                tools=tools,
             )
+
+        try:
+            loop_result = await run_tool_loop(
+                complete=_call,
+                messages=messages,
+                tools=tool_definitions or None,
+                execute=executor,
+            )
+            completion = loop_result.completion
         except asyncio.CancelledError as exc:
             # P-11 (fix-batch 2026-08-31) — a disconnected client cancels
             # this coroutine while the LLM call is in flight. Without this
@@ -835,12 +915,19 @@ class PlaygroundService:
         return _LLMOutcome(
             status="success",
             raw_output=completion.text,
-            input_tokens=completion.input_tokens,
-            output_tokens=completion.output_tokens,
-            cost_estimate_usd=completion.cost_estimate_usd,
+            # Story 5.0 AC4 — les totaux de la BOUCLE, pas ceux du dernier
+            # tour : chaque iteration est un appel LLM facture. Prendre
+            # `completion.input_tokens` rendrait invisible toute la depense
+            # des tours intermediaires — l'erreur exacte que l'IG1 de la
+            # revue 4.3 et le P-2 de la 4.7 ont deja eu a corriger ici meme,
+            # sur l'escalade de routage puis sur les resumes de passage.
+            input_tokens=loop_result.total_input_tokens,
+            output_tokens=loop_result.total_output_tokens,
+            cost_estimate_usd=loop_result.total_cost_usd,
             model_used=completion.model,
             provider_used=completion.provider,
             error=None,
+            tool_invocations=list(executor.invocations),
         )
 
     async def _publish_audit_event(

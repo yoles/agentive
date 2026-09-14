@@ -24,13 +24,14 @@ from agentive_backend.shared.exceptions import (
     ValidationError,
 )
 from agentive_backend.shared.llm.exceptions import LLMError
-from agentive_backend.shared.llm.types import Completion
+from agentive_backend.shared.llm.types import Completion, ToolCall
 
 
 def _make_service(
     *,
     template: Any | None,
     assigned_tools: list[tuple[Any, Any]] | None = None,
+    resolved_tools: list[tuple[Any, Any]] | None = None,
     completion: Completion | None = None,
     completion_raises: Exception | None = None,
     push_memory_provider: Any | None = None,
@@ -58,6 +59,15 @@ def _make_service(
 
     assignment_repo = MagicMock()
     assignment_repo.list_by_template_in_session = AsyncMock(return_value=assigned_tools or [])
+    # Story 5.0 AC2 — le double doit porter la forme du VRAI objet. Sans
+    # cette ligne, `list_resolved_for_template_in_session` rend un MagicMock
+    # auto-cree, non awaitable, et le service part en TypeError avant meme
+    # d'appeler le modele. Rend [] par defaut : la grande majorite de ces
+    # tests n'exerce aucun outil, et offrir des outils changerait ce qu'ils
+    # mesurent.
+    assignment_repo.list_resolved_for_template_in_session = AsyncMock(
+        return_value=resolved_tools or []
+    )
 
     llm_router = MagicMock()
     if completion_raises is not None:
@@ -85,6 +95,11 @@ def _completion(text: str = "ok", **overrides: Any) -> Completion:
         finish_reason=overrides.get("finish_reason", "stop"),
         latency_ms=overrides.get("latency_ms", 100.0),
         cost_estimate_usd=overrides.get("cost_estimate_usd", Decimal("0.001")),
+        # Story 5.0 — ce helper énumère ses champs, donc un override non listé
+        # est SILENCIEUSEMENT ignoré. Sans cette ligne, un test passant
+        # `tool_calls=` construisait une Completion sans outil demandé et
+        # prouvait le contraire de ce qu'il annonçait.
+        tool_calls=overrides.get("tool_calls", ()),
     )
 
 
@@ -1474,3 +1489,82 @@ async def test_push_memory_optin_must_be_a_real_boolean_true(
     )
     assert result.push_memory is None
     provider.relevant_chunks.assert_not_awaited()
+
+
+# ─── Story 5.0 AC6 — D80 fermée : tool_invocations réellement peuplé ─────
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_uses_a_tool_reports_it_in_tool_invocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC6 — le symptôme littéral de D80.
+
+    `tool_invocations` arrivait vide EN DUR (`tool_invocations=[]`), avec un
+    commentaire renvoyant à une Story 4.x qui ne l'a jamais fait. La cause
+    n'était pas ce champ : c'est que le modèle n'apprenait jamais qu'il avait
+    des outils, donc `finish_reason == "tool_use"` — déjà mappé par les deux
+    adaptateurs depuis la Story 1.6 — ne pouvait physiquement pas survenir.
+
+    Ce test fait le tour complet : le modèle demande un outil, MCP est appelé,
+    le résultat revient, et l'appel figure dans la réponse.
+    """
+    tool = MagicMock()
+    tool.id, tool.name = uuid4(), "grep"
+    tool.description, tool.input_schema = "cherche", {"type": "object"}
+    server = MagicMock()
+    server.id, server.transport = uuid4(), "stdio"
+    server.connection_config = {"command": "x"}
+
+    call = ToolCall(id="t1", name="grep", arguments={"q": "TODO"})
+    template_id = uuid4()
+    template = MagicMock()
+    template.config = {"system_prompt": "fais le travail", "llm_model": "claude-sonnet-4-6"}
+    service, llm_router = _make_service(
+        template=template,
+        assigned_tools=[(tool, MagicMock())],
+        resolved_tools=[(tool, server)],
+        completion=_completion("fini"),
+    )
+    # Premier tour : le modèle demande l'outil. Second : il conclut.
+    llm_router.complete = AsyncMock(
+        side_effect=[_completion("je cherche", tool_calls=(call,)), _completion("fini")]
+    )
+    monkeypatch.setattr(
+        "agentive_backend.infra.mcp.tool_executor.call_tool",
+        AsyncMock(
+            return_value={"content": [{"type": "text", "text": "src/a.py:12"}], "isError": False}
+        ),
+    )
+
+    response = await service.run(
+        template_id=template_id, arguments={}, enabled_tool_ids=None, timeout_seconds=30.0
+    )
+
+    assert len(response.tool_invocations) == 1, "D80 : ce champ ne doit plus arriver vide"
+    invocation = response.tool_invocations[0]
+    assert invocation.tool_name == "grep"
+    assert invocation.tool_id == tool.id
+    assert invocation.server_id == server.id
+    assert invocation.status == "success"
+    assert "src/a.py:12" in invocation.result_summary
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_tools_still_costs_exactly_one_llm_call() -> None:
+    """Le cas majoritaire ne doit rien payer pour cette machinerie : sans
+    outil résolu, la boucle dégénère en un appel et le comportement
+    d'avant la Story 5.0 est strictement conservé."""
+    template_id = uuid4()
+    template = MagicMock()
+    template.config = {"system_prompt": "fais le travail", "llm_model": "claude-sonnet-4-6"}
+    service, llm_router = _make_service(template=template, completion=_completion("ok"))
+
+    await service.run(
+        template_id=template_id, arguments={}, enabled_tool_ids=None, timeout_seconds=30.0
+    )
+
+    assert llm_router.complete.await_count == 1
+    # Et aucun outil n'est offert : `None`, pas une liste vide — certains
+    # providers refusent une liste d'outils vide.
+    assert llm_router.complete.await_args.kwargs["tools"] is None

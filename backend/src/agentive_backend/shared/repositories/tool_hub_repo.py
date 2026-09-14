@@ -222,6 +222,39 @@ class AgentTemplateToolRepo(BaseRepo):
         result = await session.execute(stmt)
         return [(tool, assigned_at) for tool, assigned_at in result.all()]
 
+    async def list_resolved_for_template_in_session(
+        self,
+        session: AsyncSession,
+        template_id: UUID,
+    ) -> list[tuple[Tool, ToolServer]]:
+        """Assigned tools joined with the server that can actually run them
+        (Story 5.0 AC2).
+
+        :meth:`list_by_template_in_session` returns the ``Tool`` rows, which
+        carry the name, description and input schema — everything needed to
+        OFFER a tool to a model, and nothing needed to CALL it. Calling needs
+        the server's ``transport`` and ``connection_config``, which live one
+        table away.
+
+        A single join rather than a fetch-per-tool: a template with eight
+        assigned tools would otherwise issue nine queries on the hot path of
+        every run — the N+1 shape this repo has already had to close three
+        times (Story 4.8 AC3, and its third site found in review).
+
+        Returns ORM rows, not a domain object: ``shared`` cannot import
+        ``infra`` (Contract 2), and the executor's ``ResolvedTool`` lives in
+        ``infra/mcp``. The calling feature does that last projection.
+        """
+        stmt = (
+            select(Tool, ToolServer)
+            .join(AgentTemplateTool, AgentTemplateTool.tool_id == Tool.id)
+            .join(ToolServer, ToolServer.id == Tool.server_id)
+            .where(AgentTemplateTool.agent_template_id == template_id)
+            .order_by(asc(Tool.name), asc(Tool.id))
+        )
+        result = await session.execute(stmt)
+        return [(tool, server) for tool, server in result.all()]
+
     async def replace_in_session(
         self,
         session: AsyncSession,

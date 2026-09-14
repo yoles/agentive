@@ -16,7 +16,8 @@ from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any, ClassVar, Final, cast
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import SecretStr
 
@@ -31,7 +32,13 @@ from agentive_backend.shared.llm.exceptions import (
     LLMProviderUnavailableError,
 )
 from agentive_backend.shared.llm.redaction import redact_secrets
-from agentive_backend.shared.llm.types import ChatMessage, Completion, FinishReason
+from agentive_backend.shared.llm.types import (
+    ChatMessage,
+    Completion,
+    FinishReason,
+    ToolCall,
+    ToolDefinition,
+)
 
 # Re-exported under the historical name — `infra/llm/pricing.py` is now the
 # single source of truth (Story 4.4 T3.5, so `features/*` can read pricing
@@ -86,8 +93,50 @@ def _to_lc_messages(messages: Sequence[ChatMessage]) -> tuple[list[BaseMessage],
             converted.append(HumanMessage(content=m.content))
         elif m.role == "assistant":
             converted.append(AIMessage(content=m.content))
+        elif m.role == "tool":
+            # Story 5.0 — the RESULT of a tool the model asked for.
+            # `tool_call_id` is guaranteed present by `ChatMessage`'s own
+            # validator, so the model can match answer to question.
+            converted.append(ToolMessage(content=m.content, tool_call_id=m.tool_call_id or ""))
+        else:  # pragma: no cover — `ChatRole` is a closed Literal
+            # Loud, not silent. This chain used to end at `assistant` with no
+            # `else`, so an unknown role was DROPPED without a trace: a whole
+            # message vanishing from a prompt, and the model answering a
+            # question it never saw. Adding `"tool"` to `ChatRole` is exactly
+            # the change that would have hit that hole.
+            raise ValueError(f"unsupported ChatMessage role: {m.role!r}")
     system_prompt = "\n\n".join(system_chunks) if system_chunks else None
     return converted, system_prompt
+
+
+def _to_tool_calls(response: BaseMessage) -> tuple[ToolCall, ...]:
+    """Normalize what the model asked to invoke (Story 5.0 AC1).
+
+    LangChain already reconciles Anthropic's ``tool_use`` content blocks and
+    OpenAI's ``tool_calls`` into one ``AIMessage.tool_calls`` shape
+    (``{"id", "name", "args"}``), which is why this adapter does not carry a
+    provider dialect of its own. Verified against the pinned versions.
+
+    Defensive per entry rather than per response: a malformed entry is
+    DROPPED with the rest kept, because losing one requested call degrades
+    the turn while raising would kill a run that is otherwise fine — the same
+    posture the repo takes on every other provider-shaped payload.
+    """
+    raw = getattr(response, "tool_calls", None) or []
+    calls: list[ToolCall] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        call_id, name = entry.get("id"), entry.get("name")
+        if not call_id or not name:
+            continue
+        args = entry.get("args")
+        calls.append(
+            ToolCall(
+                id=str(call_id), name=str(name), arguments=args if isinstance(args, dict) else {}
+            )
+        )
+    return tuple(calls)
 
 
 def _merge_system(system_kwarg: str | None, extracted: str | None) -> str | None:
@@ -194,6 +243,7 @@ class OpenAIProvider:
         system: str | None = None,
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         lc_messages, extracted_system = _to_lc_messages(messages)
         # P5 — combine explicit system kwarg with inline system messages
@@ -225,9 +275,30 @@ class OpenAIProvider:
 
         chat = ChatOpenAI(**chat_kwargs)
 
+        # Story 5.0 AC1 — offer the model its assigned tools. `bind_tools`
+        # is LangChain's provider-agnostic entry point: it emits Anthropic's
+        # `tools` blocks or OpenAI's function schemas from the SAME input, so
+        # no dialect lives in this repo. Not called with an empty sequence:
+        # binding zero tools is not the same as binding none, and some
+        # providers reject it.
+        # `bind_tools` rend un `Runnable`, pas le `ChatX` d'origine : le type
+        # annoté est donc leur borne commune, et non la classe concrète.
+        invoked: Runnable[Any, BaseMessage] = chat
+        if tools:
+            invoked = chat.bind_tools(
+                [
+                    {
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    }
+                    for t in tools
+                ]
+            )
+
         start = time.perf_counter()
         try:
-            response = await chat.ainvoke(lc_messages)
+            response = await invoked.ainvoke(lc_messages)
         except Exception as exc:
             translated = _classify_openai_exception(exc)
             if translated is None:
@@ -317,4 +388,5 @@ class OpenAIProvider:
             latency_ms=latency_ms,
             provider_request_id=str(provider_request_id) if provider_request_id else None,
             cost_estimate_usd=cost,
+            tool_calls=_to_tool_calls(response),
         )

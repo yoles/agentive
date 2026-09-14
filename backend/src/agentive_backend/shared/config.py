@@ -230,6 +230,102 @@ class Settings(BaseSettings):
         alias="AGENTIVE_MISE_EN_PLACE_CHECK_TIMEOUT_S",
     )
 
+    # ─── Boucle d'outils — plafonds (Story 5.0, AC4) ───
+    # Une boucle d'outils est non bornée PAR NATURE : elle s'arrête quand le
+    # modèle décide de ne plus appeler d'outil, ce qui n'est pas une garantie
+    # mais un pari. Chaque tour est un appel LLM facturé et au moins un appel
+    # d'outil. Ces plafonds — trois compteurs ici, plus le plafond d'horloge
+    # murale plus bas — sont l'unique chose qui borne le coût
+    # d'un nœud, et ils sont déployables : un opérateur qui voit une facture
+    # dériver doit pouvoir les baisser sans livrer de code.
+    #
+    # Les bornes `le` sont chargées, comme sur les timeouts de Mise en Place
+    # (revue P6) : sans elles, un `...MAX_ITERATIONS=1000` mal tapé rend le
+    # plafond inopérant tout en donnant l'illusion qu'il existe.
+    tool_loop_max_iterations: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        alias="AGENTIVE_TOOL_LOOP_MAX_ITERATIONS",
+    )
+    # Second plafond, et pas un doublon du premier : un seul tour peut porter
+    # plusieurs `tool_calls` (les deux providers le permettent). Borner les
+    # tours sans borner les appels laisserait 8 tours x N outils en parallèle.
+    tool_loop_max_tool_calls: int = Field(
+        default=24,
+        ge=1,
+        le=200,
+        alias="AGENTIVE_TOOL_LOOP_MAX_TOOL_CALLS",
+    )
+    # Timeout d'UN appel d'outil. Distinct de `NODE_TIMEOUT_S` (qui borne un
+    # appel LLM) et du timeout de découverte MCP (10s, à l'enregistrement) :
+    # un outil qui travaille — un `grep` sur un monorepo — a légitimement
+    # besoin de plus qu'un ping et de moins qu'un nœud entier.
+    # ⚠️ Ce plafond est PAR APPEL, et il ne borne donc RIEN tout seul : le
+    # produit `max_tool_calls x tool_call_timeout_s` vaut 12 min aux valeurs
+    # par défaut. Ce qui borne réellement un nœud est
+    # `tool_loop_max_wall_clock_s` ci-dessous (180 s), qui expire bien avant
+    # ce produit — cet arrêt-là est donc le cas NORMAL dès qu'un outil est
+    # lent, pas une exception. Un `tool_call_timeout_s` proche du plafond
+    # d'horloge murale signifie qu'un seul appel lent consomme tout le nœud.
+    tool_call_timeout_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_TOOL_CALL_TIMEOUT_S",
+    )
+
+    # Plafond d'horloge murale pour UNE exécution de nœud avec outils, et le
+    # seul des quatre qui soit une borne PLATE plutôt qu'un facteur.
+    #
+    # Pourquoi il existe. Les trois plafonds ci-dessus bornent un PRODUIT :
+    # `max_iterations x NODE_TIMEOUT_S x chaîne` d'appels LLM, plus
+    # `max_tool_calls x tool_call_timeout_s` d'appels d'outils. Aux valeurs
+    # par défaut ce produit vaut ~20 min par tentative, soit ~4,8 h une fois
+    # passé dans `recovery.derive_stale_threshold_s` — et ce module dit
+    # explicitement qu'un seuil « de plus d'une heure défait le worker de
+    # recovery » (cf `MAX_RUNTIME_RETRIES`, Story 4.6 T8.5). Sans cette
+    # borne plate, la Story 5.0 rendrait donc la détection de run planté
+    # inutilisable, silencieusement : la dérivation continuerait de calculer
+    # un nombre juste pour une formule devenue fausse.
+    #
+    # Pourquoi 180 s, et pourquoi ce nombre n'est pas libre. Ce plafond est un
+    # CADRAN sur la latence de détection de panne, et le taux de change est
+    # connu : `derive_stale_threshold_s` le multiplie par `(1 + retries)` puis
+    # par la marge x2,5, donc **une seconde de budget d'outils en plus coûte
+    # dix secondes de fenêtre de détection**. Deux bornes le coincent :
+    #   - PLANCHER 120 s = `NODE_TIMEOUT_S` x la chaîne de providers, ce qu'un
+    #     nœud SANS aucun outil peut légitimement prendre aujourd'hui en
+    #     basculant d'Anthropic vers OpenAI. En dessous, on tuerait des nœuds
+    #     sains : `derive_stale_threshold_s` REFUSE la valeur plutôt que de la
+    #     subir. À 120 s pile, la fenêtre vaut 1392,5 s : PLUS COURTE qu'avant
+    #     cette story (1617,5 s), parce que cette même story a cessé de facturer
+    #     huit escalades de routage là où il n'en a jamais lieu qu'une. Le
+    #     budget d'outils y est nul.
+    #   - PLAFOND 200 s, et `le=200.0` le fait respecter. Ce n'est pas une
+    #     précaution : c'est le calcul. À la pire combinaison LÉGALE des
+    #     autres réglages (`retry_base=60`, `retry_max=300`, `escalation=60`,
+    #     `handoff=45`), la fenêtre vaut `(W x 4 + 60x2 + 420 + 45x2) x 2,5`,
+    #     qui franchit l'heure dès `W > 202,5`. Un `le` plus large rendrait
+    #     donc la borne « moins d'une heure » fausse par un seul réglage mal
+    #     tapé — exactement ce que `le=60.0` empêche sur l'escalade, et ce que
+    #     `le=30.0` empêche sur le ping de Mise en Place.
+    #     La contrepartie est assumée : la plage utile est 120-200 s. Qui veut
+    #     plus de budget d'outils doit d'abord baisser autre chose.
+    # À 180 s : 60 s de budget d'outils par tentative, et une fenêtre de
+    # `(180 x 4 + 15x2 + 7 + 40) x 2,5 = 1992,5 s` (~33 min) contre ~27 min
+    # avant cette story. C'est le prix payé, il est explicite, et il se règle.
+    # 60 s suffisent largement aux outils en LECTURE SEULE qui sont les seuls
+    # assignables en Sprint 2 (cf `docs/runbooks/rejeu-et-outils.md`).
+    tool_loop_max_wall_clock_s: float = Field(
+        default=180.0,
+        gt=0.0,
+        le=200.0,
+        allow_inf_nan=False,
+        alias="AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S",
+    )
+
     # ─── Workflow Engine — node retry backoff (Story 4.6, défer D13) ───
     # Feed `domain/error_policy.backoff_delay_s`, which spaces successive
     # re-runs of a node's FULL provider chain (`error_policy.on_timeout =

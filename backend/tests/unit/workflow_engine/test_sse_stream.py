@@ -462,7 +462,20 @@ def test_max_stream_duration_stays_above_the_stale_threshold_at_every_legal_sett
     ceilings, `derive_stale_threshold_s` used to exceed the hardcoded
     3600 s ceiling this function replaces — a client could receive
     `stream_timeout` on a run the recovery worker did not even consider
-    orphaned yet."""
+    orphaned yet.
+
+    Story 5.0 adds a FIFTH setting to the derivation
+    (`tool_loop_max_wall_clock_s`), and it is the dominant term of the worst
+    case — so this test pushes it to its `le` like the other four. That
+    ceiling is 200.0 precisely because past ~202.5 the worst case crosses an
+    hour, which is why the premise below is now an inequality against the
+    floor rather than against 3600: at the worst legal combination the
+    threshold is ~3575 s, just under the 3600 s floor `_max_stream_duration_s`
+    guarantees. The inversion is therefore no longer REACHABLE through
+    configuration — a stronger position than the one this test was written
+    to defend, and the assertion that matters (the SSE ceiling stays above
+    the sweep's window) is unchanged and still load-bearing.
+    """
     from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
 
     worst_case_stale_threshold_s = derive_stale_threshold_s(
@@ -470,16 +483,21 @@ def test_max_stream_duration_stays_above_the_stale_threshold_at_every_legal_sett
         max_delay_s=300.0,
         escalation_timeout_s=60.0,
         handoff_summary_timeout_s=45.0,
+        tool_loop_max_wall_clock_s=200.0,
     )
-    # The premise: this is the inversion that motivated T6.6 in the first
-    # place. If this stops being true (settings' `le` ceilings moved down),
-    # the assertion below is still correct, just no longer load-bearing.
-    assert worst_case_stale_threshold_s > 3600.0
+    # The premise, restated: the worst legal window is close enough to the
+    # 3600 s floor that the reconciliation is still doing work. If this gap
+    # ever widens to nothing, the `le` ceilings have moved and the assertion
+    # below needs re-deriving rather than re-running.
+    assert 3000.0 < worst_case_stale_threshold_s < 3600.0
 
     monkeypatch.setattr(router_module.settings, "workflow_retry_base_delay_s", 60.0)
     monkeypatch.setattr(router_module.settings, "workflow_retry_max_delay_s", 300.0)
     monkeypatch.setattr(router_module.settings, "routing_escalation_timeout_s", 60.0)
     monkeypatch.setattr(router_module.settings, "workflow_handoff_summary_timeout_s", 45.0)
+    monkeypatch.setattr(router_module.settings, "tool_loop_max_wall_clock_s", 200.0)
+
+    assert router_module._max_stream_duration_s() > worst_case_stale_threshold_s
 
     assert router_module._max_stream_duration_s() > worst_case_stale_threshold_s
 

@@ -28,6 +28,9 @@ def test_complete_method_is_async_with_canonical_signature() -> None:
         "system",
         "stop",
         "timeout_s",
+        # Story 5.0 AC1 — `tools` fait partie de la signature canonique :
+        # c'est par lui que le modèle apprend qu'il a des outils.
+        "tools",
     ]
 
     # Default values for the optional kwargs.

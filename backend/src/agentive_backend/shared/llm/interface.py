@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
-from agentive_backend.shared.llm.types import ChatMessage, Completion
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 
 
 @runtime_checkable
@@ -56,8 +56,16 @@ class Completer(Protocol):
         system: str | None = None,
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         """Return a normalized :class:`Completion` — same shape across providers.
+
+        ``tools`` (Story 5.0 AC1) offers the model a set of invocable tools.
+        Provider-agnostic by construction: an implementer translates
+        :class:`ToolDefinition` into its own dialect and normalizes what the
+        model asks for back into :attr:`Completion.tool_calls`. ``None`` (the
+        default) means "no tools", which is NOT the same as an empty
+        sequence — some providers reject an empty tool list.
 
         Caller responsibility for NFR9 (no API keys in logs/traces)
         ----------------------------------------------------------

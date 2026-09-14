@@ -22,6 +22,7 @@ from agentive_backend.features.workflow_engine.recovery import (
     _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
     _MAX_PROVIDER_CHAIN_LEN,
     _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
+    _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
     DEFAULT_STALE_THRESHOLD_S,
     MAX_RECOVERY_ATTEMPTS,
     WorkflowRecoveryWorker,
@@ -240,20 +241,29 @@ def test_stale_threshold_exceeds_the_worst_case_single_node_duration() -> None:
 def test_stale_threshold_covers_a_decision_point_node_with_its_escalation() -> None:
     """Story 4.3 point 9 — the regression this story called its least visible.
 
-    A routing decision point pays its own `NODE_TIMEOUT_S` AND an escalation
-    call, each per provider on a 2-provider chain. The previous assertion
+    A routing decision point pays an escalation call on top of the node's own
+    work, per provider on a 2-provider chain. The previous assertion
     (`> NODE_TIMEOUT_S * 2`, i.e. `> 120`) held just as well at 300.0 as at
     375.0, so nothing in the suite would have noticed the escalation term
     being dropped — while the symptom (healthy runs reclaimed in a loop by
     the recovery worker until `MAX_RECOVERY_ATTEMPTS`, then abandoned
     `failed`) looks like engine instability, not like a constant.
+
+    Story 5.0 changed two things in this expression, and both are deliberate:
+    the node's own `NODE_TIMEOUT_S` term became the tool loop's flat
+    wall-clock ceiling (which CONTAINS every LLM call of the loop, provider
+    fallback included), and the escalation stopped being charged once per
+    retry. It happens once per node execution, in `graph_builder`'s routing
+    callable, AFTER `execute_agent_node` has returned with its retries
+    already spent. It is still multiplied by the chain length: that call goes
+    through `LLMRouter.complete` with no `provider_chain=`, so it does pay the
+    per-provider timeout.
     """
     assert (
         pytest.approx(
             (
-                (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT)
-                * 2
-                * (1 + MAX_RUNTIME_RETRIES)
+                _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT * (1 + MAX_RUNTIME_RETRIES)
+                + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT * _MAX_PROVIDER_CHAIN_LEN
                 + _DEFAULT_BACKOFF_S
                 + _DEFAULT_HANDOFF_S
             )
@@ -279,9 +289,11 @@ def test_stale_threshold_covers_a_node_that_exhausts_its_retry_budget() -> None:
     formula above, so that changing the margin cannot quietly drop the
     retry term.
     """
-    worst_case_node_s = (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * 2 * (
-        1 + MAX_RUNTIME_RETRIES
-    ) + _DEFAULT_BACKOFF_S
+    worst_case_node_s = (
+        _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT * (1 + MAX_RUNTIME_RETRIES)
+        + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT * _MAX_PROVIDER_CHAIN_LEN
+        + _DEFAULT_BACKOFF_S
+    )
     assert worst_case_node_s < DEFAULT_STALE_THRESHOLD_S
 
 
@@ -299,9 +311,22 @@ def test_runtime_retry_cap_stays_below_the_schema_ceiling() -> None:
     )
 
     assert MAX_RUNTIME_RETRIES < MAX_ERROR_POLICY_RETRIES
-    # 30 minutes is the comfort bound this story committed to; "several
+    # 30 minutes WAS the comfort bound Story 4.6 committed to; "several
     # hours" was the stated line for capping retries instead.
-    assert DEFAULT_STALE_THRESHOLD_S < 30 * 60
+    # Story 5.0 — la borne a changé, DÉLIBÉRÉMENT, et voici le calcul.
+    # La boucle d'outils remplace `NODE_TIMEOUT_S` (60 s, un appel LLM) par
+    # `tool_loop_max_wall_clock_s` (180 s, TOUTE l'exécution du nœud) : la
+    # fenêtre passe de 1617,5 s (~27 min) à 1992,5 s (~33 min).
+    #
+    # Les 30 minutes n'étaient pas une propriété de la formule, c'était le
+    # confort offert par les DÉFAUTS d'alors. La propriété réelle — celle que
+    # `MAX_RUNTIME_RETRIES` nomme — est « pas plus d'une heure, sinon le
+    # worker de recovery ne sert plus à rien », et c'est elle qu'on garde.
+    # Le prix est explicite et il se règle : chaque seconde de budget d'outils
+    # coûte dix secondes de fenêtre, et à 120 s (le plancher) on retrouve
+    # exactement 1617,5 s avec un budget d'outils nul.
+    assert DEFAULT_STALE_THRESHOLD_S < 60 * 60
+    assert pytest.approx(1992.5) == DEFAULT_STALE_THRESHOLD_S
 
 
 def test_recovery_escalation_default_matches_the_settings_default() -> None:
@@ -342,13 +367,17 @@ def test_the_module_default_is_the_derivation_at_the_default_settings() -> None:
     the same formula, so a change inside `_worst_case_backoff_s` or to the
     margin moved both sides together and nothing in the suite moved.
 
-    A literal breaks that symmetry: ((60 + 15) x 2 x 4 + (1 + 2 + 4) + 20 x 2) x 2,5.
+    A literal breaks that symmetry: (180 x 4 + 15 x 2 + (1 + 2 + 4) + 20 x 2) x 2,5.
+    Story 5.0 a remplacé `NODE_TIMEOUT_S x 2` (un appel LLM sur la chaîne)
+    par le plafond d'horloge murale de la boucle d'outils, qui contient TOUS
+    les appels LLM du nœud ET ses appels d'outils, et l'escalade de routage y
+    est comptée une fois par nœud au lieu de huit : 1617,5 s → 1992,5 s.
     Touch the formula, the margin, the chain length, the retry cap or the
     handoff-summary timeout (Story 4.7 T5.6), and a human has to come here
     and re-justify the number — which is the point, because this number is
     how long a genuinely crashed run stays unexamined.
     """
-    assert DEFAULT_STALE_THRESHOLD_S == 1617.5
+    assert DEFAULT_STALE_THRESHOLD_S == 1992.5
 
 
 def test_the_threshold_grows_with_the_configured_retry_delay() -> None:
@@ -374,14 +403,17 @@ def test_the_threshold_grows_with_the_configured_retry_delay() -> None:
         max_delay_s=300.0,
         escalation_timeout_s=15.0,
         handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+        tool_loop_max_wall_clock_s=_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
     )
     worst_case_node_s = (
-        (NODE_TIMEOUT_S + 15.0) * 2 * (1 + MAX_RUNTIME_RETRIES)
+        _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT * (1 + MAX_RUNTIME_RETRIES)
+        + 15.0 * _MAX_PROVIDER_CHAIN_LEN
         + (60.0 + 120.0 + 240.0)
         + _DEFAULT_HANDOFF_S
     )
     default_worst_case_node_s = (
-        (NODE_TIMEOUT_S + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT) * 2 * (1 + MAX_RUNTIME_RETRIES)
+        _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT * (1 + MAX_RUNTIME_RETRIES)
+        + _ROUTING_ESCALATION_TIMEOUT_S_DEFAULT * _MAX_PROVIDER_CHAIN_LEN
         + _DEFAULT_BACKOFF_S
         + _DEFAULT_HANDOFF_S
     )
@@ -390,31 +422,53 @@ def test_the_threshold_grows_with_the_configured_retry_delay() -> None:
     assert raised / worst_case_node_s == pytest.approx(
         DEFAULT_STALE_THRESHOLD_S / default_worst_case_node_s
     )
-    assert DEFAULT_STALE_THRESHOLD_S / worst_case_node_s < 1.6
+    # Story 5.0 : 1,647 contre 1,53 avant elle. La marge résiduelle a
+    # AUGMENTÉ, parce que le terme dominant (le plafond d'horloge murale,
+    # multiplié par les tentatives) grandit plus vite que le backoff fixe
+    # que ce test pousse à ses plafonds.
+    assert DEFAULT_STALE_THRESHOLD_S / worst_case_node_s < 1.7
 
 
 def test_the_threshold_grows_with_the_configured_escalation_timeout() -> None:
-    """Review lot 7 (P-P), the half that DID break, and the only term with
-    no ceiling at all.
+    """Review lot 7 (P-P), the half that DID break.
 
     The derivation read a hardcoded 15.0 whatever
     `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S` was set to, so raising it moved
-    the node's real worst case and not the window watching it. Past ~130 s
-    the window stopped covering the node: at 150 s a healthy node was
-    classified orphaned, claimed by the sweep, and executed a SECOND time in
-    parallel on the same `thread_id`.
+    the node's real worst case and not the window watching it: a healthy node
+    was classified orphaned, claimed by the sweep, and executed a SECOND time
+    in parallel on the same `thread_id`.
+
+    Story 5.0 moved the crossover far out — the escalation is charged once
+    per node instead of once per retry, and the dominant term is now the tool
+    loop's wall clock — so this test no longer pins a specific breaking
+    value. What it pins is the property that survived the move: the window
+    grows with the configured timeout, and it covers the node at every value,
+    including one deliberately past the setting's own `le=60` ceiling.
     """
-    worst_case_at_150 = (NODE_TIMEOUT_S + 150.0) * 2 * (
-        1 + MAX_RUNTIME_RETRIES
-    ) + _DEFAULT_BACKOFF_S
-    assert worst_case_at_150 > DEFAULT_STALE_THRESHOLD_S  # the old, fixed window: not covering
-    derived = derive_stale_threshold_s(
-        base_delay_s=1.0,
-        max_delay_s=30.0,
-        escalation_timeout_s=150.0,
-        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
-    )
-    assert derived > worst_case_at_150  # the derived one: covering
+
+    def worst_case_at(escalation: float) -> float:
+        return (
+            _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT * (1 + MAX_RUNTIME_RETRIES)
+            + escalation * _MAX_PROVIDER_CHAIN_LEN
+            + _DEFAULT_BACKOFF_S
+            + _DEFAULT_HANDOFF_S
+        )
+
+    def derived_at(escalation: float) -> float:
+        return derive_stale_threshold_s(
+            base_delay_s=1.0,
+            max_delay_s=30.0,
+            escalation_timeout_s=escalation,
+            handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+            tool_loop_max_wall_clock_s=_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
+        )
+
+    # 700 s is well past the setting's ceiling on purpose: it is the domain of
+    # the FUNCTION that is under test here, not the domain of `Settings`.
+    assert worst_case_at(700.0) > DEFAULT_STALE_THRESHOLD_S  # a fixed window: not covering
+    assert derived_at(700.0) > worst_case_at(700.0)  # the derived one: covering
+    assert derived_at(60.0) > derived_at(15.0)  # and it grows monotonically
+    assert derived_at(60.0) > worst_case_at(60.0)
 
 
 def test_the_escalation_timeout_is_bounded_by_config() -> None:
@@ -426,19 +480,39 @@ def test_the_escalation_timeout_is_bounded_by_config() -> None:
 
     with pytest.raises(pydantic.ValidationError):
         Settings(AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S=600.0)  # type: ignore[call-arg]
-    # At the WORST legal combination of all three the window is ~57 min, not
-    # the 30 the default commits to — and that is forced, not chosen: those
-    # settings let a healthy node run ~23 min without checkpointing, so no
-    # honest detector can be faster. The 30-minute promise is a property of
-    # the DEFAULTS (asserted above on `DEFAULT_STALE_THRESHOLD_S`); what the
-    # ceilings owe is that the worst case stays bounded and knowable.
+    # At the WORST legal combination of ALL FIVE the window is ~60 min, not
+    # the 33 the default commits to — and that is forced, not chosen: those
+    # settings let a healthy node run ~24 min without checkpointing, so no
+    # honest detector can be faster. The default-configuration promise is a
+    # property of the DEFAULTS (asserted above on `DEFAULT_STALE_THRESHOLD_S`);
+    # what the ceilings owe is that the worst case stays bounded and knowable.
+    #
+    # Story 5.0 — deux choses ici sont des conséquences directes de cette
+    # assertion, pas des choix de confort :
+    #   * l'escalade est passée de x8 à x2 dans la dérivation. À x8, le
+    #     plafond d'horloge murale poussait ce pire cas à 69 min, au-delà de
+    #     l'heure que `MAX_RUNTIME_RETRIES` qualifie de « défait le worker de
+    #     recovery » ;
+    #   * `tool_loop_max_wall_clock_s` porte `le=200.0`, et ce test le pousse
+    #     à ce plafond comme il pousse les quatre autres aux leurs. C'est le
+    #     terme DOMINANT du pire cas : le laisser à son défaut ici ferait de
+    #     ce test une vérification de la configuration par défaut déguisée en
+    #     vérification du pire cas — et un `le` à 1800,0 aurait alors donné
+    #     5,4 h sans que rien ne bronche.
     at_ceilings = derive_stale_threshold_s(
         base_delay_s=60.0,
         max_delay_s=300.0,
         escalation_timeout_s=60.0,
-        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+        handoff_summary_timeout_s=45.0,
+        tool_loop_max_wall_clock_s=200.0,
     )
     assert at_ceilings < 60 * 60
+    # Et les cinq plafonds sont bien ceux de `Settings` — sans quoi ce test
+    # garderait un pire cas qui n'est plus celui que la config autorise.
+    with pytest.raises(pydantic.ValidationError):
+        Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=200.1)  # type: ignore[call-arg]
+    with pytest.raises(pydantic.ValidationError):
+        Settings(AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_TIMEOUT_S=45.1)  # type: ignore[call-arg]
 
 
 def test_worst_case_backoff_honours_the_max_delay_clamp() -> None:
@@ -754,6 +828,7 @@ def test_a_value_outside_the_sane_domain_is_refused(kwargs: dict[str, float]) ->
         "max_delay_s": 30.0,
         "escalation_timeout_s": 15.0,
         "handoff_summary_timeout_s": _HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+        "tool_loop_max_wall_clock_s": _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
     }
     base.update(kwargs)
     with pytest.raises(ValueError, match="finite and >= 0"):
@@ -879,3 +954,48 @@ async def test_load_templates_not_found_matches_the_canonical_lookup_or_404_shap
     assert actual.value.detail == canonical.value.detail
     assert actual.value.context == canonical.value.context
     assert actual.value.status == canonical.value.status
+
+
+def test_a_wall_clock_below_what_a_toolless_node_needs_is_refused() -> None:
+    """Story 5.0 — le plancher, et pourquoi il est ici et pas dans `Settings`.
+
+    `Settings` ne peut pas le poser : il vaut `NODE_TIMEOUT_S x
+    _MAX_PROVIDER_CHAIN_LEN`, deux constantes de ce module-ci. Un plafond
+    d'horloge murale en dessous ne rendrait pas seulement ce seuil faux — il
+    tuerait des nœuds parfaitement sains, ceux qui basculent d'Anthropic vers
+    OpenAI SANS avoir le moindre outil assigné. Refusé au démarrage plutôt
+    que subi en production.
+    """
+    floor = NODE_TIMEOUT_S * _MAX_PROVIDER_CHAIN_LEN
+    with pytest.raises(ValueError, match="a node with no tools at all"):
+        derive_stale_threshold_s(
+            base_delay_s=1.0,
+            max_delay_s=30.0,
+            escalation_timeout_s=15.0,
+            handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+            tool_loop_max_wall_clock_s=floor - 0.5,
+        )
+    # Et la borne est inclusive : à 120,0 pile le budget d'outils est nul.
+    # La fenêtre y vaut 1392,5 s et NON les 1617,5 s d'avant cette story —
+    # l'écart n'est pas le plafond d'horloge murale (qui, au plancher, coûte
+    # exactement ce que coûtait `NODE_TIMEOUT_S x chaîne`) mais l'escalade,
+    # désormais comptée une fois par nœud au lieu de huit : 90 s de moins,
+    # x2,5 de marge, soit les 225 s d'écart. Une fenêtre plus courte qu'avant
+    # est ici une CORRECTION, pas une érosion : elle cesse de facturer sept
+    # escalades qui n'ont jamais eu lieu.
+    at_floor = derive_stale_threshold_s(
+        base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S,
+        max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
+        escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
+        handoff_summary_timeout_s=_HANDOFF_SUMMARY_TIMEOUT_S_DEFAULT,
+        tool_loop_max_wall_clock_s=floor,
+    )
+    assert at_floor == pytest.approx(1392.5)
+
+
+def test_the_wall_clock_default_matches_the_settings_default() -> None:
+    """Même exigence de parité que les trois mirrors ci-dessus : ce module
+    reflète le défaut de `Settings` pour dimensionner son fallback statique,
+    et un écart ferait décrire à ce fallback un déploiement que personne ne
+    fait tourner."""
+    assert Settings().tool_loop_max_wall_clock_s == _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT

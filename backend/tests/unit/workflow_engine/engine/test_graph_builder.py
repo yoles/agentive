@@ -440,6 +440,11 @@ async def test_failed_escalation_preserves_the_node_update_on_the_exception() ->
             # is what this test wants: it patches `execute_agent_node` away
             # entirely, so no retry loop ever runs.
             retry_settings=None,
+            # Story 5.0 T6 — paramètre REQUIS, pas optionnel : `build_state_graph`
+            # est le seul appelant en production et il connaît la table
+            # `node_id → outils`. Un défaut à `None` ferait d'un câblage
+            # oublié un node silencieusement sans outils plutôt qu'une erreur.
+            resolved_tools=None,
         )
 
         with pytest.raises(RoutingDecisionFailedError) as exc_info:

@@ -141,27 +141,110 @@ def test_the_handoff_summary_kill_switch_defaults_to_on() -> None:
     )  # type: ignore[call-arg]
 
 
-def test_the_handoff_ceiling_preserves_the_thirty_minute_promise() -> None:
+def test_the_handoff_ceiling_keeps_the_detection_window_under_an_hour() -> None:
     """I-02 — the property the ceiling is DERIVED from, not decoration.
 
-    `derive_stale_threshold_s` adds this term as `h * 2 * 2.5` = `5h` on top
-    of 1517.5 s at otherwise-default settings, and `DEFAULT_STALE_THRESHOLD_S`
-    commits in writing to staying under 30 min. `1517.5 + 5h < 1800` gives
-    `h < 56.5` — which is why the ceiling is 45.0 and not
-    `routing_escalation_timeout_s`'s 60.0: at 60.0 the window reaches 30.3
-    min and breaks that promise through a knob nobody would think to check.
+    `derive_stale_threshold_s` adds this term as `h x 2 x 2.5` = `5h` on top
+    of the rest of the window, so the ceiling on `h` is what stops a knob
+    nobody would think to check from pushing the window past the point where
+    the recovery worker stops being useful.
 
-    (The 30-minute promise is a property of the DEFAULTS of the OTHER knobs —
-    `test_the_escalation_timeout_is_bounded_by_config` already documents that
-    the worst legal combination of all four is ~57 min, and why that is
-    forced rather than chosen.)
+    **The bound this test asserts changed in Story 5.0, and the ceiling did
+    not.** It used to be "under 30 min", because at the then-current terms
+    `1517.5 + 5h < 1800` gave `h < 56.5` and 45.0 sat under it. The tool loop
+    replaced `NODE_TIMEOUT_S` with a wall-clock ceiling that contains a whole
+    node, so the window at otherwise-default settings is now ~33 min before
+    this term is added at all — the 30-minute figure is simply gone, for
+    every value of `h` including 0.
+
+    What survives is the bound `recovery.MAX_RUNTIME_RETRIES` actually names:
+    past an hour, a crashed run sits unexamined long enough that the recovery
+    worker stops being worth having. At `h = 45.0` the window is ~35 min, and
+    the ceiling still has room; at `h = 60.0` (`routing_escalation_timeout_s`'s
+    ceiling, the value this one is deliberately NOT) it would be ~38 min,
+    which also fits — so this particular ceiling is no longer the binding
+    constraint it was. It is kept at 45.0 rather than relaxed: nothing here
+    argues for MORE handoff-summary time, and a ceiling that has slack is not
+    a reason to spend it.
+
+    (The worst legal combination of all five knobs is ~54 min —
+    `test_the_escalation_timeout_is_bounded_by_config` documents that, and
+    why it is forced rather than chosen.)
     """
-    from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
+    from agentive_backend.features.workflow_engine.recovery import (
+        _TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
+        derive_stale_threshold_s,
+    )
 
     at_ceiling = derive_stale_threshold_s(
         base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S,
         max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
         escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
         handoff_summary_timeout_s=45.0,
+        tool_loop_max_wall_clock_s=_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
     )
-    assert at_ceiling < 30 * 60
+    assert at_ceiling < 60 * 60
+    # And the ceiling is what makes that true of the knob: the term it bounds
+    # is the one this test exists for, so assert its contribution explicitly
+    # rather than only the total.
+    without_handoff = derive_stale_threshold_s(
+        base_delay_s=_DEFAULT_RETRY_BASE_DELAY_S,
+        max_delay_s=_DEFAULT_RETRY_MAX_DELAY_S,
+        escalation_timeout_s=_ROUTING_ESCALATION_TIMEOUT_S_DEFAULT,
+        handoff_summary_timeout_s=0.0,
+        tool_loop_max_wall_clock_s=_TOOL_LOOP_MAX_WALL_CLOCK_S_DEFAULT,
+    )
+    assert at_ceiling - without_handoff == pytest.approx(45.0 * 2 * 2.5)
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("AGENTIVE_TOOL_LOOP_MAX_ITERATIONS", 8),
+        ("AGENTIVE_TOOL_LOOP_MAX_TOOL_CALLS", 24),
+        ("AGENTIVE_TOOL_CALL_TIMEOUT_S", 30.0),
+        ("AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S", 180.0),
+    ],
+)
+def test_the_tool_loop_ceilings_carry_the_defaults_env_example_advertises(
+    alias: str, expected: float
+) -> None:
+    """Les quatre plafonds de la boucle d'outils, épinglés par leur alias
+    d'environnement — la forme sous laquelle un opérateur les rencontre.
+
+    ⚠️ Ce test NE LIT PAS `.env.example`, et la valeur attendue y est donc
+    recopiée. Ce n'est pas un oubli : le harnais unitaire monte `backend/`
+    seul, et `.env.example` vit à la racine du dépôt, hors du contexte de
+    build. Le seul précédent de fichier racine lu par les tests
+    (`.import-linter`) passe par un montage dédié ajouté à la fois au
+    `Makefile` et au job CI - la parité `.env.example` / `Settings` mériterait
+    le même traitement, et ne l'a pas aujourd'hui. Ce qui est vérifié ici est
+    donc plus faible que le titre ne le laisserait croire : que le défaut du
+    champ est bien celui qu'on croit, et qu'il est atteignable par son alias.
+    """
+    name = next(n for n, f in Settings.model_fields.items() if f.alias == alias)
+    assert Settings.model_fields[name].default == expected
+
+
+def test_the_wall_clock_ceiling_is_what_keeps_the_window_under_an_hour() -> None:
+    """`le=200.0` n'est pas un chiffre rond : au-delà de ~202,5 s la fenêtre
+    de détection dépasse l'heure à la pire combinaison légale des autres
+    réglages. Un `le` plus large rendrait fausse, par un seul réglage mal
+    tapé, la borne que `recovery.MAX_RUNTIME_RETRIES` défend."""
+    from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
+
+    with pytest.raises(ValidationError):
+        Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=200.1)  # type: ignore[call-arg]
+
+    def window(wall_clock: float) -> float:
+        return derive_stale_threshold_s(
+            base_delay_s=60.0,
+            max_delay_s=300.0,
+            escalation_timeout_s=60.0,
+            handoff_summary_timeout_s=45.0,
+            tool_loop_max_wall_clock_s=wall_clock,
+        )
+
+    assert window(200.0) < 60 * 60
+    # Et la borne mord : juste au-dessus, elle ne tiendrait plus.
+    assert window(210.0) > 60 * 60

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.engine.handoff import HandoffSettings
     from agentive_backend.features.workflow_engine.engine.hybrid_router import RoutingSettings
     from agentive_backend.infra.db.models import AgentTemplate
+    from agentive_backend.infra.mcp.tool_executor import ResolvedTool
     from agentive_backend.shared.llm.router import LLMRouter
 
 
@@ -156,6 +157,7 @@ def _make_node_callable(
     node_id: str,
     template: AgentTemplate,
     llm_router: LLMRouter,
+    resolved_tools: Mapping[str, ResolvedTool] | None,
     conditional_edges: list[tuple[str, ParsedCondition]],
     unconditional_targets: list[str],
     rules: Sequence[RoutingRule],
@@ -191,6 +193,7 @@ def _make_node_callable(
             template=template,
             llm_router=llm_router,
             node_id=node_id,
+            resolved_tools=resolved_tools,
             retry_settings=retry_settings,
             has_downstream=has_downstream,
             handoff_settings=handoff_settings,
@@ -266,6 +269,7 @@ def build_state_graph(
     routing_settings: RoutingSettings | None = None,
     retry_settings: RetrySettings | None = None,
     handoff_settings: HandoffSettings | None = None,
+    node_tools: Mapping[str, Mapping[str, ResolvedTool]] | None = None,
 ) -> StateGraph[WorkflowState, None, WorkflowState, WorkflowState]:
     """Build (uncompiled) the ``StateGraph`` for ``dag`` — caller ``.compile()``s
     it with a checkpointer (T5.3).
@@ -363,6 +367,7 @@ def build_state_graph(
                 node_id=node.node_id,
                 template=templates[node.node_id],
                 llm_router=llm_router,
+                resolved_tools=(node_tools or {}).get(node.node_id),
                 conditional_edges=conditional_edges,
                 unconditional_targets=unconditional_by_source.get(node.node_id, []),
                 rules=rules,
@@ -377,6 +382,12 @@ def build_state_graph(
                 template=templates[node.node_id],
                 llm_router=llm_router,
                 node_id=node.node_id,
+                # Story 5.0 AC2 — keyed by node_id like `templates`, because a
+                # node's toolset follows its template. Absent key means "this
+                # node has no tools", which the loop degenerates to a single
+                # call for, so a DAG built before this story behaves
+                # identically.
+                resolved_tools=(node_tools or {}).get(node.node_id),
                 retry_settings=retry_settings,
                 has_downstream=has_downstream,
                 handoff_settings=handoff_settings,

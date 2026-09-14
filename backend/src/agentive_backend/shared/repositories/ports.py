@@ -146,6 +146,14 @@ class AgentTemplateToolRepository(Protocol):
         self, session: AsyncSession, template_id: UUID
     ) -> list[tuple[Tool, datetime]]: ...
 
+    async def list_resolved_for_template_in_session(
+        self, session: AsyncSession, template_id: UUID
+    ) -> list[tuple[Tool, ToolServer]]:
+        """Story 5.0 AC2 — les outils assignes JOINTS au serveur qui sait les
+        executer. Offrir un outil ne demande que la ligne `Tool` ; l'appeler
+        demande le `transport` et la `connection_config` du serveur."""
+        ...
+
     async def replace_in_session(
         self,
         session: AsyncSession,

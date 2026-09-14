@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from agentive_backend.shared.llm.embedder import EmbeddingPurpose
-from agentive_backend.shared.llm.types import ChatMessage, Completion
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 
 
 class MockProvider:
@@ -60,6 +60,7 @@ class MockProvider:
         system: str | None = None,
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         self._calls.append(
             {
@@ -71,6 +72,12 @@ class MockProvider:
                 "system": system,
                 "stop": list(stop) if stop is not None else None,
                 "timeout_s": timeout_s,
+                # Story 5.0 — enregistré comme tous les autres arguments, et
+                # pour la même raison : un test doit pouvoir asserter que les
+                # outils ont bien été proposés au modèle. Jeter ce paramètre
+                # rendrait le câblage invérifiable, ce que la revue 4.14 a
+                # déjà reproché au mock de `with_tenant`.
+                "tools": list(tools) if tools is not None else None,
             }
         )
         return self._consume()
