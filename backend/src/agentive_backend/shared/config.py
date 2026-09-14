@@ -359,9 +359,16 @@ class Settings(BaseSettings):
     # batch SELECT, pure-CPU validation, one INSERT — Story 4.8 Dev Notes),
     # so ordinary contention never trips it, while still turning an
     # indefinite wait into a typed, bounded failure.
+    # Floor is 1ms, not "anything above zero": the value is converted with
+    # `int(s * 1000)` at the call site, so `gt=0.0` used to admit e.g. 0.0004,
+    # which truncates to `0` — and Postgres reads `lock_timeout = 0` as
+    # DISABLED. A setting that reads as "time out almost instantly" silently
+    # restored the unbounded wait this whole mechanism exists to remove
+    # (review 4.14, finding 4). `ge=0.001` makes the smallest admissible
+    # value the smallest one Postgres can actually express.
     workflow_create_lock_timeout_s: float = Field(
         default=5.0,
-        gt=0.0,
+        ge=0.001,
         le=30.0,
         allow_inf_nan=False,
         alias="AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S",

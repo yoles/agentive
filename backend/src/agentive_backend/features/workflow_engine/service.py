@@ -397,7 +397,9 @@ class WorkflowService:
           waits on ``uq_workflow_request_fingerprint`` until the winner's
           transaction ends, holding its template locks for that whole wait.
           Bounded by a peer transaction that does no I/O of its own, so it is
-          short — but it is a wait, and no ``lock_timeout`` caps it.
+          short — and since Story 4.14 AC2 a ``lock_timeout`` caps it
+          (``settings.workflow_create_lock_timeout_s``, 5s by default),
+          turning what used to be an indefinite wait into a typed 503.
 
         Story 4.8 AC1 — a replayed request (same body, first response lost)
         collides on ``uq_workflow_request_fingerprint``, which aborts the
@@ -408,11 +410,25 @@ class WorkflowService:
 
         What this method guarantees about templates ends at the commit. A
         template rewritten one second later leaves the stored DAG stale, and
-        no lock can prevent that; three mechanisms already cover that
-        horizon — ``start_run`` re-evaluates diversity at run start,
-        :func:`_template_fingerprints` records what each node actually ran so
-        a resume can detect drift, and :func:`_load_templates` raises if a
-        template vanished outright.
+        no lock can prevent that. Story 4.8 claimed three mechanisms already
+        covered that horizon; **Story 4.14 T4.3 checked them and they do
+        not** — each covers strictly less than the claim:
+
+        - ``start_run`` re-evaluates diversity, but from the same in-memory
+          ``templates`` dict it just read, so it cannot see an edit made
+          after that read;
+        - :func:`_template_fingerprints` records what each node ran, but the
+          comparison (:meth:`_report_config_drift`) is reached only from
+          ``_resume_run`` — a crash-resume or a manual resume, never a run
+          that completes normally;
+        - :func:`_load_templates` raises only if a template **vanished**,
+          never if it was modified.
+
+        A run that starts, has a template rewritten under it, and finishes
+        without pausing or crashing therefore sees the drift reported
+        nowhere. Real, open, and out of Story 4.14's scope — the full
+        accounting is in ``docs/runbooks/repositories-usage.md``
+        § *Batch reads, and when to lock them*.
 
         Raises:
             ValidationError: any of steps 1-3, 5 or 6 fails (422 RFC 7807).
@@ -499,7 +515,11 @@ class WorkflowService:
             # this, a stalled winner parked the loser indefinitely and
             # queued any concurrent `PUT /agents/templates/{id}` behind it
             # for just as long.
-            lock_timeout_ms = int(settings.workflow_create_lock_timeout_s * 1000)
+            # `round`, not `int`: `int` truncates toward zero, and Postgres
+            # reads `lock_timeout = 0` as DISABLED. `max(1, ...)` is the
+            # belt to `ge=0.001`'s braces — neither alone should be relied
+            # on, since the setting and this conversion can drift apart.
+            lock_timeout_ms = max(1, round(settings.workflow_create_lock_timeout_s * 1000))
             async with self._workflow_repo.with_tenant(
                 tenant_id, lock_timeout_ms=lock_timeout_ms
             ) as session:

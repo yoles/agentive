@@ -20,7 +20,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from agentive_backend.infra.db.models import Workflow, WorkflowRun
 from agentive_backend.shared.exceptions import ConflictError, DependencyError
-from agentive_backend.shared.repositories.base import BaseRepo
+from agentive_backend.shared.repositories.base import BaseRepo, is_lock_timeout
 
 # Key inside the applicative ``checkpoint`` JSONB counting how many times the
 # recovery worker has claimed a run (Story 4.2 AC3). Deliberately stored in
@@ -68,31 +68,10 @@ def _is_request_fingerprint_violation(exc: IntegrityError) -> bool:
     return getattr(diag, "constraint_name", None) == REQUEST_FINGERPRINT_INDEX
 
 
-# Postgres ``lock_not_available`` — raised when a statement's wait for a row
-# lock exceeds ``lock_timeout`` (Story 4.14 AC2). Distinct from
-# ``57014 query_canceled`` (``statement_timeout``, not set here) and from
-# ``40001 serialization_failure`` (not applicable — this repo never uses
-# ``SERIALIZABLE``): only the exact GUC ``create_workflow`` sets is
-# translated, so a different Postgres timeout elsewhere is never mistaken
-# for this one.
-_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
-
 # Upper bound of the `INTEGER` the metrics aggregates cast into. Clamped
 # BEFORE the narrowing cast, which would otherwise raise `22003` and abort
 # the whole aggregate. See `WorkflowRunRepo._non_negative_metrics_count`.
 _METRICS_COUNT_CEILING = 2_147_483_647
-
-
-def _is_lock_timeout(exc: OperationalError) -> bool:
-    """True only for a ``lock_timeout`` expiry, never any other
-    ``OperationalError`` (connection loss, admin shutdown, ...).
-
-    Mirrors :func:`_is_request_fingerprint_violation`'s discipline for the
-    same reason: the caller turns this into a specific, typed 503, so a
-    blanket ``except OperationalError`` would misreport a connection drop
-    as "the lock timed out, retry me" instead of surfacing the real fault.
-    """
-    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
 
 
 class WorkflowRepo(BaseRepo):
@@ -283,7 +262,12 @@ class WorkflowRepo(BaseRepo):
                 context={"name": name, "request_fingerprint": request_fingerprint},
             ) from exc
         except OperationalError as exc:
-            if not _is_lock_timeout(exc):
+            # Narrows the boundary translation in `BaseRepo.with_tenant` to a
+            # message that names the workflow. Not the only guard: the
+            # transaction-scoped `lock_timeout` arms EVERY statement of the
+            # body, so `with_tenant` catches whatever expires outside this
+            # flush (the `SELECT ... FOR SHARE` above it, notably).
+            if not is_lock_timeout(exc):
                 raise
             raise DependencyError(
                 detail=f"Timed out waiting for a lock while creating workflow '{name}'",
@@ -856,20 +840,37 @@ class WorkflowRunRepo(BaseRepo):
         ``jsonb_set``'s first argument a scalar — an error, for the WHOLE
         UPDATE, not just this row.
 
-        That shape is not exotic: every :class:`WorkflowRun` is created
-        with ``checkpoint=None`` before its first superstep
-        (``create_in_session``'s default, used by every real
-        ``start_run``). ``WorkflowRun.checkpoint`` is
+        How a row acquires that shape: ``WorkflowRun.checkpoint`` is
         ``postgresql.JSONB`` with the SQLAlchemy default
-        ``none_as_null=False``, so binding that Python ``None`` serializes
-        to ``'null'::jsonb`` — NOT SQL ``NULL`` — the moment the ORM
-        attribute is explicitly set (verified against a live Postgres: for
-        such a row, ``checkpoint IS NULL`` is false and
-        ``jsonb_typeof(checkpoint)`` is ``'null'``). A run that crashes
-        before its first ``_sync_checkpoint_safely`` call — the exact
-        scenario the recovery sweep exists to catch — keeps that shape
-        forever, and the next sweep that reaches it fails to claim ANY of
-        up to 50 batched orphans, not just the poisoned one.
+        ``none_as_null=False``, so binding a Python ``None`` serializes to
+        ``'null'::jsonb`` — NOT SQL ``NULL`` — the moment the ORM attribute
+        is explicitly set (verified against a live Postgres: for such a row,
+        ``checkpoint IS NULL`` is false and ``jsonb_typeof(checkpoint)`` is
+        ``'null'``). One poisoned row fails the claim for ALL of up to 50
+        batched orphans, not just itself — which is what made the failure
+        intermittent and suite-wide.
+
+        **Correction (review 4.14, B-01).** Story 4.14 justified this guard
+        by claiming "every ``WorkflowRun`` is created with
+        ``checkpoint=None`` before its first superstep, used by every real
+        ``start_run``". That is **false**, and the same claim was repeated in
+        the story's Completion Notes and in commit ``5506fb8``'s message.
+        :meth:`WorkflowExecutionService.start_run` always passes a populated
+        ``checkpoint={"task_input": ..., TEMPLATE_FINGERPRINTS_KEY: ...}``
+        (it has to — a run that dies before LangGraph's first checkpoint is
+        restarted from ``START`` using exactly that stored input), so no row
+        it creates has this shape. The only path reaching
+        ``create_in_session``'s ``checkpoint=None`` default is the thin
+        :meth:`WorkflowRunRepo.create` wrapper, whose callers in this repo
+        are all **test harnesses**. The bug that was fixed was therefore a
+        test-harness artefact, not a class of poisoned production rows.
+
+        The guard is kept regardless, and deliberately: it is two SQL
+        operators wide, it makes the batch resilient to any non-object shape
+        from any future writer, and "no current caller produces this" is a
+        property of today's call sites rather than of the column, whose type
+        admits every JSON shape. What is corrected here is the *claim*, not
+        the code.
 
         ``jsonb_typeof(...) = 'object'`` is the same defense
         :meth:`_recovery_attempts_expr` already applies one level down

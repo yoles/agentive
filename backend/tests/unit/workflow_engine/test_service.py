@@ -103,16 +103,20 @@ def _make_service(
     # against two separate transactions. Identity only proves anything if
     # distinct transactions have distinct identities.
     opened_sessions: list[AsyncMock] = []
+    # Story 4.14 T2 — the kwarg `create_workflow` passes, RECORDED rather than
+    # discarded. The mock originally did `del lock_timeout_ms`, which made the
+    # wiring untestable: deleting `lock_timeout_ms=` from the service left the
+    # whole suite green while production reverted to an unbounded wait (review
+    # 4.14, finding 2). The e2e test cannot cover this either — it drives the
+    # repo directly with its own literal, bypassing the service and the
+    # setting.
+    lock_timeouts: list[int | None] = []
 
     @asynccontextmanager
     async def _with_tenant(
         _tenant_id: Any, *, lock_timeout_ms: int | None = None
     ) -> AsyncIterator[AsyncMock]:
-        # Story 4.14 T2 — `create_workflow` now calls `with_tenant(tenant_id,
-        # lock_timeout_ms=...)`; the mock must accept the kwarg to keep
-        # being source-compatible, the same reason `_tenant_id` itself is
-        # accepted without being asserted on here.
-        del lock_timeout_ms
+        lock_timeouts.append(lock_timeout_ms)
         session_mock = AsyncMock()
         session_mock.flush = AsyncMock()
         session_mock.refresh = AsyncMock()
@@ -125,6 +129,7 @@ def _make_service(
     # Exposed so tests can assert on the NUMBER of transactions opened, which
     # is the other half of the same property.
     workflow_repo.opened_sessions = opened_sessions
+    workflow_repo.lock_timeouts = lock_timeouts
 
     async def _mock_create(
         _session: object,
@@ -785,6 +790,49 @@ async def test_create_workflow_resolves_templates_inside_the_insert_transaction(
     # ...and it is locked, so a concurrent `PUT /agents/templates/{id}` waits
     # for the commit instead of slipping between validation and INSERT.
     assert trepo.list_by_ids_in_session.await_args.kwargs["lock"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_bounds_its_transaction_with_the_configured_lock_timeout(
+    event_publish_mock: AsyncMock,
+) -> None:
+    """Story 4.14 AC2 — the WIRING, which nothing pinned before (review 4.14,
+    finding 2).
+
+    The e2e companion drives `repo.with_tenant(None, lock_timeout_ms=200)`
+    directly with its own literal, so it proves the repo mechanism and says
+    nothing about whether the service ever asks for it. Deleting
+    `lock_timeout_ms=lock_timeout_ms` from `create_workflow`, or getting the
+    unit wrong (passing seconds where milliseconds are expected), left the
+    whole suite green.
+
+    Asserting the exact derived value rather than "not None" is deliberate:
+    a seconds/milliseconds mix-up yields `5` instead of `5000` — a bound
+    1000x tighter that aborts every contended create instantly — and "not
+    None" cannot tell the two apart.
+    """
+    from agentive_backend.shared.config import settings
+
+    tpl = _template()
+    service, wrepo, _trepo = _make_service({tpl.id: tpl})
+
+    await service.create_workflow(
+        name="bounded-window",
+        nodes=[WorkflowNodeRequest(node_id="a", agent_template_id=tpl.id)],
+        edges=[],
+    )
+
+    expected_ms = max(1, round(settings.workflow_create_lock_timeout_s * 1000))
+    assert wrepo.lock_timeouts == [expected_ms], (
+        "create_workflow must bound its transaction with "
+        f"{expected_ms}ms (derived from "
+        "settings.workflow_create_lock_timeout_s); got "
+        f"{wrepo.lock_timeouts}"
+    )
+    # And the derived value must be one Postgres reads as a bound at all:
+    # `lock_timeout = 0` means DISABLED, so a floor of 1ms is part of the
+    # contract, not an implementation detail (review 4.14, finding 4).
+    assert expected_ms >= 1
 
 
 @pytest.mark.asyncio

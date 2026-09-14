@@ -180,7 +180,24 @@ Three rules when you reach for it:
        `lock_not_available`) into a domain `DependencyError` (503,
        retriable) — never let a raw driver exception reach feature code, the
        same discipline `_is_request_fingerprint_violation` already applies
-       to the unique-violation path next to it. Pass `lock_timeout_ms` only
+       to the unique-violation path next to it.
+       **The translation lives at the `with_tenant` boundary, not only at
+       that one method.** `SET LOCAL` is transaction-scoped, so the bound
+       arms *every* statement in the body — including the
+       `SELECT ... FOR SHARE` that resolves the templates, which is the
+       first statement and the one a concurrent template writer actually
+       contends with. A per-method handler covered the INSERT its author had
+       in mind and let the SELECT escape as a raw `sqlalchemy`
+       `OperationalError`, i.e. a bare 500 (review 4.14, finding 1).
+       `with_tenant` now translates any `55P03` raised under a bound it was
+       asked for; `create_in_session` keeps its own handler only to name the
+       workflow in the message.
+       **Known deployment constraint:** a `statement_timeout` set role-wide
+       or by a pooler *below* this value pre-empts it — Postgres raises
+       `57014 query_canceled` instead, which is deliberately NOT translated
+       (it also fires for slow queries that never waited on a lock), so the
+       caller sees the untyped error. This repo sets no `statement_timeout`
+       anywhere. Pass `lock_timeout_ms` only
        from the call site that needs the bound: it is opt-in on
        `with_tenant`, not a default on the method, because a role-wide or
        method-wide timeout would change every query's behaviour and is not
@@ -226,10 +243,12 @@ line — weaker than the shorthand above suggests:**
   it does not re-READ. It cannot see an edit that lands after that dict
   was built.
 - `_template_fingerprints` drift detection (`_resume_run`'s
-  `_warn_on_template_drift`) compares the fingerprint STAMPED into the
+  `_report_config_drift`) compares the fingerprint STAMPED into the
   checkpoint at creation time — itself computed from that same
   already-read `templates` dict — against a fresh read taken at RESUME
-  time. It only ever runs on a crash-and-resume. A run that starts, races
+  time. It only ever runs on a resume — a crash-resume swept up by the
+  recovery worker, or an operator's manual `POST .../resume`; never on a
+  run that simply completes. A run that starts, races
   a concurrent `PUT /agents/templates/{id}` in the window between
   `_load_templates` and the `workflow_runs` INSERT, and then completes
   normally WITHOUT ever crashing, has that edit surfaced NOWHERE — not

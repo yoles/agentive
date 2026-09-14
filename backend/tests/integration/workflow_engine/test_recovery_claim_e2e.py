@@ -221,8 +221,9 @@ async def test_claim_tolerates_a_run_never_checkpointed_via_the_orm(
     psycopg as a genuine SQL ``NULL`` parameter — so every OTHER test in this
     file that passes ``checkpoint=None`` has never exercised the real bug.
 
-    ``WorkflowRunRepo.create`` (the path every real run and
-    ``_crash_run_subprocess.py`` actually use) is different: its
+    ``WorkflowRunRepo.create`` (the thin wrapper that omits ``checkpoint``,
+    used by ``_crash_run_subprocess.py`` and the other test harnesses) is
+    different: its
     ``checkpoint`` column is ``postgresql.JSONB`` with the SQLAlchemy default
     ``none_as_null=False``, so binding the ORM attribute ``checkpoint=None``
     serializes to the JSON literal ``'null'::jsonb`` — NOT SQL ``NULL``.
@@ -237,10 +238,20 @@ async def test_claim_tolerates_a_run_never_checkpointed_via_the_orm(
     ``test_claim_tolerates_a_non_numeric_stored_counter`` above already
     guards against).
 
-    In production this is not a test-only curiosity: any run that crashes
-    (OOM, SIGKILL, hardware loss) before its FIRST ``_sync_checkpoint_safely``
-    call lands has exactly this shape, and the next recovery sweep that
-    reaches it fails to claim ANY of up to 50 batched orphans.
+    **Reachability, corrected (review 4.14, B-01).** Story 4.14 claimed here
+    that "any run that crashes (OOM, SIGKILL, hardware loss) before its FIRST
+    ``_sync_checkpoint_safely`` call lands has exactly this shape". It does
+    not: ``start_run`` always writes a populated
+    ``checkpoint={"task_input": ..., TEMPLATE_FINGERPRINTS_KEY: ...}`` at row
+    creation, precisely so such a crash can be restarted from ``START``. No
+    production path produces a ``'null'::jsonb`` checkpoint today — the bug
+    reproduced below was a **test-harness artefact**.
+
+    What remains true, and is what this test pins: ONE row of any non-object
+    shape fails the claim for ALL of up to 50 batched orphans. The guard is
+    kept because that blast radius is disproportionate to its cost, and
+    because "no current writer produces this" is a property of today's call
+    sites, not of a column typed to accept any JSON shape.
     """
     repo = WorkflowRunRepo(session_factory=app_session_factory)
     workflow_id = uuid4()

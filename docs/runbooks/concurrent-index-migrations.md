@@ -29,11 +29,18 @@ def downgrade() -> None:
     op.drop_column("ma_table", "ma_colonne")
 ```
 
-Trois points qui piègent facilement :
+Quatre points qui piègent facilement :
 
 1. **`autocommit_block()` committe la transaction ambiante en entrant.** Tout ce qui précède le bloc dans la même migration est donc déjà committé et visible quand le bloc s'exécute — irréversible si le reste de la migration échoue après coup. Placer le bloc `CONCURRENTLY` en DERNIER dans `upgrade()` (et en PREMIER, symétriquement, dans `downgrade()`) minimise la fenêtre où un échec laisse la migration à moitié appliquée.
+
+   **Et cette fenêtre n'est pas seulement « à moitié appliquée » : elle est non rejouable telle quelle.** Alembic ne stampe `alembic_version` qu'après le retour de `upgrade()`. Si le `CONCURRENTLY` échoue, le DDL qui le précédait est committé mais la révision reste enregistrée comme non appliquée : un `alembic upgrade head` rejoue `upgrade()` depuis le début et meurt sur `DuplicateColumn` (ou équivalent), et `downgrade()` est inatteignable puisqu'on n'est pas à cette révision. La migration est alors bloquée dans les deux sens, et il faut réparer à la main.
+
+   Deux façons de ne pas s'y exposer, par ordre de préférence :
+   - **une révision qui ne contient QUE le bloc `CONCURRENTLY`**, et le DDL transactionnel dans la révision précédente. Rien à rejouer partiellement, rien à rendre idempotent ;
+   - à défaut, **rendre idempotent tout DDL placé avant le bloc** (`IF NOT EXISTS`, `IF EXISTS`) — c'est ce que font déjà `20260913_000001` et `20260913_000002` de ce dépôt, dont les blocs ouvrent par un `DROP INDEX CONCURRENTLY IF EXISTS` avant de reconstruire, précisément pour être rejouables après un échec.
 2. **Pas d'index unique `NULLS NOT DISTINCT` sans le déclarer aussi dans les modèles** (cf `docs/decisions/workflow-creation-idempotency.md` § index partiel) — la remarque de la Story 4.8 P4 s'applique identiquement ici : sinon le prochain `alembic revision --autogenerate` propose un `DROP INDEX`.
 3. **`DROP INDEX CONCURRENTLY` existe aussi** et doit être utilisé dans `downgrade()` par symétrie, pour la même raison que la construction : un `DROP INDEX` ordinaire prend lui aussi `ACCESS EXCLUSIVE`.
+4. **Le coût d'un `ACCESS EXCLUSIVE`, ce n'est pas seulement sa détention — c'est aussi son acquisition**, et cette moitié-là n'est bornée par aucune mesure de durée de construction. Un `CREATE INDEX` ordinaire doit attendre la fin de toute transaction conflictuelle sur la table, et **pendant qu'il fait la queue, il bloque tout lecteur et tout écrivain qui arrive derrière lui**. Une migration dont la construction dure 46 ms peut donc immobiliser la table plusieurs minutes si une transaction longue (ou un `idle in transaction`) la précède. C'est indépendant de `CONCURRENTLY` : cela vaut pour tout DDL transactionnel. Poser un `SET LOCAL lock_timeout` sur la session de migration et réessayer est la parade — la Story 4.11 T7.1 l'a fait pour le DDL de `workflow_runs`, avec un test (`backend/tests/unit/workflow_engine/test_control_signal_migration.py`) ; suivre ce précédent plutôt que de le redécouvrir.
 
 ## Rollback
 
@@ -42,8 +49,9 @@ Trois points qui piègent facilement :
 ## Vérifications
 
 - `pg_index.indisvalid` doit valoir `true` pour l'index construit — un `CREATE INDEX CONCURRENTLY` qui échoue à mi-chemin (ex. contrainte violée par une ligne existante) laisse un index **invalide** qui occupe de l'espace et doit être `DROP`é manuellement avant de rejouer la migration ; Postgres ne le refait jamais tout seul.
+- **`alembic_version` doit être cohérent avec ce qui a réellement été appliqué.** Après un échec dans le bloc, vérifier la révision courante (`alembic current`) ET l'état du DDL committé avant le bloc (colonne créée ? contrainte posée ?). Si la révision n'a pas été stampée alors que le DDL pré-bloc existe, la migration n'est pas rejouable en l'état — cf le point 1 des pièges pour les deux façons de l'éviter.
 - `EXPLAIN` une requête qui devrait utiliser le nouvel index, pour confirmer que le planificateur le voit et l'emploie.
 
 ## Référence
 
-- Mesure réelle sur ce dépôt (Story 4.14 T3.2), pour dimensionner quand `CONCURRENTLY` est nécessaire plutôt qu'une précaution : un `CREATE UNIQUE INDEX` ordinaire (non-`CONCURRENTLY`) sur `workflows (request_fingerprint, tenant_id)`, prédicat partiel ne matchant aucune row, a pris **13,6 ms sur 100 000 lignes** et **46,7 ms sur 1 000 000 lignes** — négligeable, parce que le prédicat partiel réduit le travail à un balayage de table plutôt qu'à une écriture d'index par ligne. Ce n'est PAS un plancher universel : un index **non partiel**, ou dont le prédicat matche une fraction significative des lignes, paie le coût d'écriture complet et doit être mesuré au cas par cas avant de décider si `CONCURRENTLY` est nécessaire.
+- Mesure réelle sur ce dépôt (Story 4.14 T3.2), pour dimensionner quand `CONCURRENTLY` est nécessaire plutôt qu'une précaution : un `CREATE UNIQUE INDEX` ordinaire (non-`CONCURRENTLY`) sur `workflows (request_fingerprint, tenant_id)`, prédicat partiel ne matchant aucune row, a pris **13,6 ms sur 100 000 lignes** et **46,7 ms sur 1 000 000 lignes** — négligeable, parce que le prédicat partiel réduit le travail à un balayage de table plutôt qu'à une écriture d'index par ligne. ⚠️ **Ces chiffres mesurent la détention du verrou, jamais son acquisition** (cf piège 4 ci-dessus) : ils ne disent rien du temps passé à l'obtenir derrière une transaction longue, pendant lequel la table est de fait indisponible. Ce n'est PAS un plancher universel : un index **non partiel**, ou dont le prédicat matche une fraction significative des lignes, paie le coût d'écriture complet et doit être mesuré au cas par cas avant de décider si `CONCURRENTLY` est nécessaire.

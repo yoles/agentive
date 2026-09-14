@@ -93,7 +93,11 @@ pour toute sa durée. Acceptable ici parce que le prédicat partiel ne matche
 **aucune** row au moment de la construction (colonne tout juste ajoutée,
 entièrement `NULL`) : le coût est celui d'un balayage de table, pas d'une
 écriture d'index par ligne. Mesuré en conditions réelles sur ce dépôt :
-13,6 ms sur 100 000 lignes, 46,7 ms sur 1 000 000 — négligeable. Ce n'est
+13,6 ms sur 100 000 lignes, 46,7 ms sur 1 000 000 — négligeable. ⚠️ Ces
+chiffres bornent la **détention** du verrou, pas son **acquisition** : le DDL
+attend d'abord la fin de toute transaction conflictuelle sur `workflows`, en
+bloquant tout ce qui arrive derrière lui — durée bornée par le bloqueur, pas
+par ces 46,7 ms (revue 4.14, finding 10). Ce n'est
 pas une propriété générale de toute migration d'index : un prédicat qui
 matche une fraction significative des lignes existantes n'a pas cette
 propriété et doit passer par `CREATE INDEX CONCURRENTLY`, confirmé

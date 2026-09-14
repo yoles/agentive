@@ -9,6 +9,7 @@ here, not the archetype-registry skeleton.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -449,9 +450,16 @@ async def test_create_workflow_losing_writer_fails_fast_on_a_stalled_winner(
     dag_payload = {"nodes": [], "edges": []}
 
     # Session A — the stalled "winner": inserts the colliding fingerprint
-    # and holds its transaction open across the whole test body, exactly
-    # mirroring a winning `create_workflow` transaction that has not yet
-    # committed.
+    # and holds its transaction open across the whole test body, standing in
+    # for a winning `create_workflow` transaction that has not yet committed.
+    #
+    # It is opened from the raw factory rather than through `with_tenant`, so
+    # it carries neither `SET LOCAL app.tenant_id` nor a `lock_timeout` of its
+    # own. That is deliberate and sufficient: all this session has to do is
+    # HOLD the row lock. Giving it a bound of its own would only introduce a
+    # second timer racing the one under test. (The docstring here used to
+    # claim it "exactly mirrors" a real transaction, which the next three
+    # lines contradicted — review 4.14, finding 12.)
     async with app_session_factory() as winner_session:
         await repo.create_in_session(
             winner_session,
@@ -464,6 +472,7 @@ async def test_create_workflow_losing_writer_fails_fast_on_a_stalled_winner(
 
         # Session B — the loser: same fingerprint, same tenant (`None`),
         # bounded to a short wait.
+        started = time.monotonic()
         with pytest.raises(DependencyError) as exc_info:
             async with asyncio.timeout(5.0):  # outer safety net, not the mechanism under test
                 async with repo.with_tenant(None, lock_timeout_ms=200) as loser_session:
@@ -473,9 +482,22 @@ async def test_create_workflow_losing_writer_fails_fast_on_a_stalled_winner(
                         dag=dag_payload,
                         request_fingerprint=fingerprint,
                     )
+        elapsed = time.monotonic() - started
 
         assert exc_info.value.status == 503
         assert exc_info.value.context["name"] == "lock-timeout-loser"
+        # The BOUND is the property, not merely the eventual failure (review
+        # 4.14, finding 12). Without this, a `lock_timeout` that resolved to
+        # 4.9s instead of the requested 200ms passed identically — so the
+        # unit-conversion class of bug (seconds forwarded where milliseconds
+        # are expected, or a value truncated to `0` and thus DISABLED) was
+        # invisible here. Generous ceiling: it must discriminate 200ms from
+        # the 5s safety net and from an unbounded wait, not benchmark the
+        # machine.
+        assert elapsed < 2.0, (
+            f"the loser waited {elapsed:.2f}s for a 200ms lock_timeout — "
+            "the bound was not applied as requested"
+        )
 
         await winner_session.rollback()
 
@@ -486,3 +508,80 @@ async def test_create_workflow_losing_writer_fails_fast_on_a_stalled_winner(
         name="lock-timeout-followup", dag=dag_payload, request_fingerprint=fingerprint
     )
     assert created.request_fingerprint == fingerprint
+
+
+@pytest.mark.asyncio
+async def test_lock_timeout_on_the_template_select_is_translated_not_leaked(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Review 4.14, finding 1 — the bound arms EVERY statement, so every
+    statement must come back typed.
+
+    ``SET LOCAL lock_timeout`` is transaction-scoped, so it applies to the
+    ``SELECT ... FOR SHARE`` that resolves the templates just as much as to
+    the INSERT that follows it. The original fix translated ``55P03`` inside
+    ``WorkflowRepo.create_in_session`` only, which covered the INSERT and let
+    the SELECT escape as a raw ``sqlalchemy.exc.OperationalError`` — a bare
+    500 with no RFC 7807 body, in the very contention the feature exists to
+    bound (a template writer queued behind a stalled creator).
+
+    This test takes the SELECT path specifically: an exclusive lock on the
+    template row means the ``FOR SHARE`` can never be granted, so the timeout
+    fires there and the INSERT is never reached. The sibling test above
+    covers the INSERT path; together they cover both statements the bound
+    arms.
+
+    Three layers of the 4.14 review converged on this defect, and it had no
+    test at all — the same gap as finding 2, one level down.
+    """
+    template = await _create_template(app_session_factory)
+    repo = WorkflowRepo(session_factory=app_session_factory)
+
+    # Hold the template row exclusively, so any `FOR SHARE` on it blocks.
+    async with app_session_factory() as blocker:
+        await blocker.execute(
+            text("SELECT id FROM agent_templates WHERE id = :id FOR UPDATE"),
+            {"id": str(template.id)},
+        )
+
+        started = time.monotonic()
+        with pytest.raises(DependencyError) as exc_info:
+            async with asyncio.timeout(5.0):  # safety net, not the mechanism under test
+                async with repo.with_tenant(None, lock_timeout_ms=200) as session:
+                    await AgentTemplateRepo(
+                        session_factory=app_session_factory
+                    ).list_by_ids_in_session(session, [template.id], lock=True)
+        elapsed = time.monotonic() - started
+
+        # Typed 503 from the `with_tenant` BOUNDARY — `create_in_session` was
+        # never reached, so its own handler cannot be what produced this.
+        assert exc_info.value.status == 503
+        assert exc_info.value.context["lock_timeout_ms"] == 200
+        assert elapsed < 2.0, (
+            f"the SELECT waited {elapsed:.2f}s for a 200ms lock_timeout — "
+            "the bound was not applied to this statement"
+        )
+
+        await blocker.rollback()
+
+
+@pytest.mark.asyncio
+async def test_with_tenant_refuses_a_non_positive_lock_timeout(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Review 4.14, finding 4 — ``lock_timeout = 0`` means DISABLED in
+    Postgres, so forwarding a zero would silently restore the unbounded wait
+    the parameter exists to remove. Raised before the session is even opened,
+    because a bound that does not bound is worse than no bound at all: the
+    caller believes it is protected.
+
+    ``-1`` is refused by the same guard rather than reaching Postgres, where
+    it raises SQLSTATE ``22023`` from inside the transaction — an error no
+    caller of this API would think to expect.
+    """
+    repo = WorkflowRepo(session_factory=app_session_factory)
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="strictly positive"):
+            async with repo.with_tenant(None, lock_timeout_ms=bad):
+                pass  # pragma: no cover — the guard raises before the body

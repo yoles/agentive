@@ -347,31 +347,6 @@ async def test_resume_when_run_was_paused_should_complete_without_replaying_a_no
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason=(
-        "Story 4.14 AC1/T1.3/T1.5 — intermittent in full-suite runs only "
-        "(~1 in 10; never reproduced isolated). Distinct root cause from the "
-        "`test_resume_after_sigkill_does_not_replay_node_a` flakiness fixed "
-        "in this same story (that one was `claim_stale_running` crashing on "
-        "a checkpoint stored as JSON `null`; this test never calls "
-        "`claim_stale_running`). Captured failure: `status`/`ended_at`/"
-        "`control_signal`/`calls == 2` all pass — node `a`'s call AND its "
-        "handoff summary call both genuinely fired — but "
-        "`metrics['total_tokens']` comes back `{'input': 0, 'output': 0}` "
-        "instead of `{'input': 20, 'output': 10}`. That is exactly the "
-        "failure mode the comment a few lines below already names and "
-        "guards against ('passing an empty mapping recorded the "
-        "cancellation ... as free') — the guard did not hold on this one "
-        "run. Points at a race between LangGraph's superstep boundary and "
-        "`_observe_control`'s `pre_state` read in `_execute`, not at "
-        "anything this story's scope (idempotency/lock timeouts) touches. "
-        "Closer to Story 4.11 (robustesse opérationnelle du contrôle de "
-        "run) — flagged there rather than investigated further here per "
-        "T1.5's bound on how far AC1 should dig."
-    ),
-    strict=False,
-    raises=AssertionError,
-)
 async def test_cancel_when_run_is_live_should_stop_it_and_keep_partial_metrics(
     app_session_factory: async_sessionmaker[AsyncSession],
     seed_session_factory: async_sessionmaker[AsyncSession],
@@ -403,6 +378,49 @@ async def test_cancel_when_run_is_live_should_stop_it_and_keep_partial_metrics(
     # Story 4.7 — `a`'s own completion + its handoff summary, both consumed
     # before the cancel settles at the boundary.
     assert calls == 2
+    # Asserted BEFORE the metrics block below, which may end the test early
+    # via `pytest.xfail()`. Ordering is load-bearing: this is the only e2e
+    # guard that a live cancel reaches the outbox at all, and it must not sit
+    # behind a tolerated flake.
+    assert (
+        await _count_outbox(
+            seed_session_factory, "workflow_engine.workflow_run.cancelled", run_id=run_id
+        )
+        == 1
+    )
+
+    # ── the one intermittent fact, isolated ──────────────────────────────
+    #
+    # Review 4.14 (finding 3): this test used to carry a module-level
+    # `@pytest.mark.xfail(strict=False, raises=AssertionError)`. That marker
+    # matched EVERY assertion in the body — the terminal status, `ended_at`,
+    # the cleared control signal, the call count, the outbox event — so a
+    # regression that stopped cancelled runs from ever reaching a terminal
+    # state, or dropped the outbox event entirely, would have reported as
+    # `xfailed` and kept the suite green. The flake is one fact wide; the
+    # mute was ten assertions wide.
+    #
+    # Scoped to the metrics comparison alone, and reported as xfail only when
+    # it fails in the exact shape that was measured (`{0, 0}`, i.e. the spend
+    # was recorded as free). Any OTHER wrong value still fails loudly, since
+    # that would be a different defect.
+    #
+    # Mechanism, per Story 4.11's investigation (which corrected the
+    # hypothesis this marker used to state): the race is at the SECOND
+    # `_observe_control` — `snapshot = await graph.aget_state(config)` taken
+    # right after `astream`'s update — and NOT at the `pre_state` read the
+    # original reason named. `update[node_id]` already carries `node_metrics`
+    # in memory, which suggests `aget_state()` can read back a checkpoint
+    # written before this superstep landed.
+    #
+    # Ownership: **Story 9.8** (`9-8-fiabilite-comptabilite-run-annule`),
+    # filed 2026-09-14 by this review's IG-01. Story 4.11 investigated, chose
+    # not to fix a heavily-reviewed path on a ~1-in-10 reproduction, and
+    # closed as `done` leaving it orphaned — which is exactly why 9.8's last
+    # AC requires this mask to be settled (removed, or accepted in writing)
+    # before that story can close. A mask that names no owner is how this one
+    # survived four stories.
+    #
     # Node `a` was billed — its spend must survive the cancellation (mirror
     # `_mark_failed`, never `_mark_completed`).
     #
@@ -413,15 +431,20 @@ async def test_cancel_when_run_is_live_should_stop_it_and_keep_partial_metrics(
     # zeroed and the 10/5 it had actually billed appeared NOWHERE — a hole
     # described as a design choice. Both calls are billed and both are now
     # counted (P-2): 10/5 for `a` itself, 10/5 for its summary.
+    if row["metrics"]["total_tokens"] == {"input": 0, "output": 0}:
+        pytest.xfail(
+            "Known intermittent (~1 run in 10, full suite only, never isolated): "
+            "the cancellation was recorded as free. `calls == 2` above proves both "
+            "LLM calls fired, so the spend existed and was lost on the way to "
+            "`metrics`. Race at the second `_observe_control` "
+            "(`graph.aget_state(config)` after `astream`'s update) reading back a "
+            "checkpoint older than this superstep — see Story 4.11's investigation. "
+            "Scoped to this one comparison so the rest of the test stays live. "
+            "Owner: Story 9.8 (9-8-fiabilite-comptabilite-run-annule)."
+        )
     assert row["metrics"]["total_tokens"] == {"input": 20, "output": 10}
     assert row["metrics"]["handoffs"]["tokens"] == {"input": 10, "output": 5}
     assert row["metrics"]["handoffs"]["cost_usd"] == "0.0001"
-    assert (
-        await _count_outbox(
-            seed_session_factory, "workflow_engine.workflow_run.cancelled", run_id=run_id
-        )
-        == 1
-    )
 
 
 @pytest.mark.asyncio
