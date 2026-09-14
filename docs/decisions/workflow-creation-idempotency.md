@@ -78,9 +78,14 @@ WHERE request_fingerprint IS NOT NULL
 L'index est également **déclaré** dans `Workflow.__table_args__`, en plus
 d'être créé en SQL brut par la migration. Ce n'est pas une redondance
 décorative : `alembic/env.py` pointe `target_metadata` sur `Base.metadata`,
-donc un index présent en base et absent des modèles est émis en `DROP INDEX`
-par le prochain `alembic revision --autogenerate` — ce qui désactiverait
-l'idempotence sans le moindre signal. Une revue de code a par ailleurs
+et `Base.metadata` doit décrire le schéma que l'application attend.
+**⚠ Correction (Story 4.15 AC4)** : la justification d'origine — « sinon le
+prochain `--autogenerate` émet un `DROP INDEX` » — est **retirée**. Alembic ne
+compare pas de façon fiable les prédicats `postgresql_where`, et cet index est
+partiel : la déclaration ne supprime donc pas le diff parasite. Le risque
+énoncé (désactiver l'idempotence sans signal) est **réel**, mais la parade est
+procédurale — relire à la main toute migration autogénérée qui touche cet
+index, cf `docs/runbooks/concurrent-index-migrations.md` point 2. Une revue de code a par ailleurs
 établi que l'argument initial (« SQLAlchemy ne sait pas exprimer
 `NULLS NOT DISTINCT` ») était faux pour la version épinglée : 2.0.49 compile
 `Index(..., postgresql_nulls_not_distinct=True, postgresql_where=...)` vers

@@ -34,9 +34,19 @@ tourne une fois par jour (`AGENTIVE_WORKFLOW_CHECKPOINT_RETENTION_INTERVAL_S`,
 défaut 86400s) et purge, via `AsyncPostgresSaver.adelete_thread(str(run.id))`
 (le `thread_id` LangGraph EST l'UUID du run — `service.py`'s
 `config["configurable"]["thread_id"] = str(run_id)`), tout run terminal
-(`completed`/`error`/`cancelled`) dont `ended_at` dépasse
+(`completed`/`error`/`cancelled`) dont la date de fin dépasse
 `AGENTIVE_WORKFLOW_CHECKPOINT_RETENTION_DAYS` (défaut **90 jours**, même
 précédent que `audit_events`).
+
+« Date de fin » = `COALESCE(ended_at, last_checkpoint_at, started_at)` depuis
+la **Story 4.15 AC3**, et non `ended_at` seul. Un run terminal dont `ended_at`
+n'a jamais été estampillé était auparavant invisible pour la purge **à
+jamais**, sans que rien ne le signale. Aucun site d'écriture applicatif ne
+produit ce cas (vérifié) : c'est un trou défensif, désormais fermé. Quand le
+repli est effectivement exercé, la passe émet
+`workflow_engine.retention_terminal_run_without_ended_at` avec le `run_id` —
+si vous le voyez, quelque chose a écrit un statut terminal en dehors des
+chemins applicatifs.
 
 `workflow_runs.checkpoint_purged_at` marque le travail fait — sans lui,
 chaque passe re-sélectionnerait pour toujours tout run déjà purgé (une
@@ -53,10 +63,17 @@ un second mécanisme d'ordonnancement pour un seul job.
 ```bash
 # Combien de runs restent à purger, et depuis quand le plus vieux attend :
 docker compose exec db psql -U agentive_owner -d agentive -c "
-SELECT count(*), min(ended_at) FROM workflow_runs
+SELECT count(*), min(COALESCE(ended_at, last_checkpoint_at, started_at))
+FROM workflow_runs
 WHERE status IN ('completed','error','cancelled')
-  AND ended_at < now() - interval '90 days'
+  AND COALESCE(ended_at, last_checkpoint_at, started_at) < now() - interval '90 days'
   AND checkpoint_purged_at IS NULL;"
+
+# Threads orphelins en attente (Story 4.15 AC2) — ceux dont la ligne de run
+# a disparu par CASCADE, qu'aucun autre chemin ne peut plus atteindre :
+docker compose exec db psql -U agentive_owner -d agentive -c "
+SELECT count(DISTINCT c.thread_id) FROM checkpoints c
+WHERE NOT EXISTS (SELECT 1 FROM workflow_runs wr WHERE wr.id::text = c.thread_id);"
 
 # Suivre les passes de purge en prod :
 docker compose logs backend | grep workflow_engine.retention_run_completed
@@ -192,8 +209,14 @@ table non triviale.
 [`concurrent-index-migrations.md`](./concurrent-index-migrations.md)) est
 PARTIEL (`WHERE status = 'running'`) et D'EXPRESSION (sur le `COALESCE`
 exact que la requête trie) — déclaré aussi dans
-`infra/db/models.py::WorkflowRun.__table_args__` pour ne jamais être
-`DROP`é par un futur `alembic revision --autogenerate`.
+`infra/db/models.py::WorkflowRun.__table_args__`, pour que `Base.metadata`
+décrive le schéma attendu.
+⚠️ Cette déclaration ne protège **pas** d'un `DROP INDEX` émis par un futur
+`alembic revision --autogenerate` — revendication retirée par la Story 4.15
+AC4 : Alembic ne compare de façon fiable ni les index d'expression ni les
+prédicats partiels, et c'est précisément ce qu'est cet index. La protection
+est **procédurale** : relire à la main toute migration autogénérée qui le
+touche (cf `concurrent-index-migrations.md`, point 2).
 
 ```sql
 -- Confirmer que le planificateur choisit bien l'index (pas seulement qu'il existe) :
@@ -236,3 +259,49 @@ FROM workflow_runs;
 # Les deux passes du worker dans les logs, chaque jour :
 docker compose logs backend | grep workflow_engine.retention_run_completed
 ```
+
+---
+
+## Troisième passe — threads orphelins (Story 4.15 AC2)
+
+`list_purgeable` joint sur `workflow_runs`, et `workflow_runs` cascade depuis
+`workflows` (`ON DELETE CASCADE`). **Supprimer un workflow emporte donc ses
+runs, et laisse leurs blobs LangGraph inatteignables par tout chemin de
+découverte** — exactement la croissance non bornée que la passe AC1 existe
+pour fermer, atteinte par une porte que sa conception ne regarde pas.
+
+Une troisième passe balaie ces threads, **sous le même bail consultatif** que
+la purge nominale (elle supprime aussi, donc N réplicas se contendraient sur
+`checkpoint_writes`/`checkpoint_blobs`).
+
+Trois propriétés qu'un opérateur doit connaître **avant** de supprimer une
+ligne `workflows` à la main :
+
+1. **Aucune fenêtre de rétention ne s'applique à cette passe.** Un thread
+   orphelin n'a plus de run contre lequel lire sa trace : il est mort dès que
+   sa ligne disparaît, et il est purgé au prochain passage — pas 90 jours
+   après. Si vous voulez garder la trace d'un run, ne supprimez pas son
+   workflow.
+2. **La découverte couvre les trois tables** (`checkpoints`, `checkpoint_blobs`,
+   `checkpoint_writes`), pas seulement la première : une purge interrompue en
+   cours de route laisserait sinon des résidus qu'aucune requête ne verrait
+   plus.
+3. **Un plafond de rayon de souffle refuse la passe entière** au-delà de 500
+   candidats, avec un ERROR. Cette passe agit sur un prédicat **négatif** —
+   « aucune ligne de run visible pour ce thread » — et supprime : si le
+   prédicat perd sa référence (RLS masquant des lignes au passage
+   multi-tenant, snapshot de réplica en retard), *tout* paraît orphelin. Le
+   plafond transforme ce cas en refus et en ligne de log.
+
+```bash
+# Les cinq events de cette passe :
+docker compose logs backend | grep -E "retention_orphan_(threads_purged|no_progress|saturated|failure_cap_reached|refused_blast_radius)"
+```
+
+> ⚠️ **Prérequis multi-tenant.** Tant que toutes les lignes portent
+> `tenant_id IS NULL`, le prédicat est exact. Dès qu'un `tenant_id` non nul
+> existe, la politique RLS `tenant_isolation` rend la ligne invisible à la
+> session `with_tenant(None)` de cette passe, et le thread d'un run **vivant**
+> paraît orphelin. Le plafond borne les dégâts ; il ne rend pas la passe
+> correcte. Fermer ce point est un prérequis de la **Story 4.9 AC1**, où il
+> est enregistré à côté de l'inventaire des sites.

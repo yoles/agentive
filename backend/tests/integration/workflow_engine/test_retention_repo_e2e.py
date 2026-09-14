@@ -81,6 +81,16 @@ async def seed_run(
     yield _seed
 
     async with app_session_factory() as session:
+        # Les `checkpoints` semes par un test partent AVANT les lignes de run,
+        # et depuis le finalizer et non la fin du corps : une assertion qui
+        # casse laissait sinon des checkpoints committes derriere des runs
+        # supprimes, fabriquant un orphelin PERMANENT qui fait echouer tous
+        # les tests d'orphelins du reste de la session et masque la vraie
+        # cause (revue 4.15, finding 7). `migrated_db` est session-scoped.
+        await session.execute(
+            text("DELETE FROM checkpoints WHERE thread_id = ANY(:tids)"),
+            {"tids": [str(rid) for rid in run_ids]},
+        )
         await session.execute(
             text("DELETE FROM workflow_runs WHERE id = ANY(CAST(:ids AS uuid[]))"),
             {"ids": [str(rid) for rid in run_ids]},
@@ -484,3 +494,210 @@ async def test_the_windowed_metrics_aggregate_uses_the_composite_index(
 
     assert "ix_workflow_runs_workflow_started" in plan, plan
     assert "Seq Scan" not in plan, plan
+
+
+# ─── Story 4.15 AC2 — threads orphelins ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_orphan_checkpoint_threads_finds_only_runs_that_no_longer_exist(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_run: SeedRun,
+) -> None:
+    """AC2 — `ON DELETE CASCADE` efface les runs d'un workflow supprimé, et
+    `list_purgeable` joint sur `workflow_runs` : les blobs LangGraph du run
+    deviennent alors inatteignables par tout chemin de découverte.
+
+    Le test sème un `checkpoints` pour DEUX runs, supprime le workflow de
+    l'un (donc son run, par cascade) et vérifie les deux moitiés de la
+    propriété : le thread devenu orphelin est trouvé, **et celui du run
+    vivant ne l'est jamais**. La seconde moitié est la plus importante — ce
+    balayage supprime des données.
+    """
+    repo = WorkflowRunRepo(session_factory=app_session_factory)
+
+    doomed_run = await seed_run(status="completed", ended_at=datetime.now(UTC))
+    alive_run = await seed_run(status="completed", ended_at=datetime.now(UTC))
+
+    # `thread_id` vaut TOUJOURS `str(run_id)` — site unique, `service.py`.
+    async with app_session_factory() as session:
+        for run_id in (doomed_run, alive_run):
+            await session.execute(
+                text(
+                    "INSERT INTO checkpoints "
+                    "(thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata) "
+                    "VALUES (:t, '', gen_random_uuid()::text, 'x', '{}'::jsonb, '{}'::jsonb)"
+                ),
+                {"t": str(run_id)},
+            )
+        await session.commit()
+
+    assert await repo.list_orphan_checkpoint_threads() == []
+
+    # Supprimer le WORKFLOW, pas le run : c'est la cascade qui cree l'orphelin.
+    async with app_session_factory() as session:
+        await session.execute(
+            text(
+                "DELETE FROM workflows WHERE id = (SELECT workflow_id FROM workflow_runs WHERE id = :id)"
+            ),
+            {"id": str(doomed_run)},
+        )
+        await session.commit()
+
+    orphans = await repo.list_orphan_checkpoint_threads()
+
+    seeded = {str(doomed_run), str(alive_run)}
+    assert set(orphans) & seeded == {str(doomed_run)}, (
+        "seul le thread dont la ligne workflow_runs a disparu doit etre "
+        f"orphelin ; obtenu {orphans}"
+    )
+    assert str(alive_run) not in orphans
+
+    async with app_session_factory() as session:
+        await session.execute(
+            text("DELETE FROM checkpoints WHERE thread_id = ANY(:ids)"),
+            {"ids": [str(doomed_run), str(alive_run)]},
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_the_worker_actually_purges_an_orphan_thread_through_the_real_saver(
+    migrated_db: str,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_run: SeedRun,
+) -> None:
+    """T1.4, seconde moitié — « devient orphelin **puis est purgé** ».
+
+    Le test de découverte ci-dessus s'arrête à la requête. Seul un passage du
+    worker contre le **vrai** `AsyncPostgresSaver` prouve qu'`adelete_thread`
+    vide effectivement les trois tables pour un thread dont la ligne de run
+    n'existe plus — les doubles unitaires sont des `AsyncMock`, qui ne peuvent
+    rien montrer de tel (revue 4.15, finding 4). Mirror de
+    `test_the_worker_purges_through_a_real_checkpointer`, sur le chemin
+    orphelin plutôt que sur le chemin nominal.
+    """
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from agentive_backend.features.workflow_engine.retention import CheckpointRetentionWorker
+
+    now = datetime.now(UTC)
+    run_id = await seed_run(status="completed", ended_at=now)
+    repo = WorkflowRunRepo(session_factory=app_session_factory)
+    dsn = migrated_db.replace("postgresql+psycopg://", "postgresql://", 1)
+
+    async with AsyncPostgresSaver.from_conn_string(dsn) as checkpointer:
+        config = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
+        await checkpointer.aput(
+            config,
+            {"v": 1, "id": str(uuid4()), "ts": now.isoformat(), "channel_values": {"x": 1}},
+            {"source": "input", "step": 0, "parents": {}},
+            {},
+        )
+        assert await checkpointer.aget(config) is not None, "précondition : un checkpoint existe"
+        assert str(run_id) not in await repo.list_orphan_checkpoint_threads(), (
+            "précondition : tant que la ligne de run vit, le thread n'est pas orphelin"
+        )
+
+        # La cascade, et rien d'autre, fabrique l'orphelin.
+        async with app_session_factory() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM workflows WHERE id = "
+                    "(SELECT workflow_id FROM workflow_runs WHERE id = :id)"
+                ),
+                {"id": str(run_id)},
+            )
+            await session.commit()
+
+        assert str(run_id) in await repo.list_orphan_checkpoint_threads()
+
+        worker = CheckpointRetentionWorker(
+            checkpointer=checkpointer,
+            session_factory=app_session_factory,
+            interval_s=86_400.0,
+            retention_days=90,
+            paused_alert_after_days=7,
+        )
+        summary = await worker.run_once()
+
+        assert summary.orphan_purged_count >= 1
+        assert summary.orphan_failed_count == 0, "un vrai adelete_thread ne doit pas échouer"
+        assert await checkpointer.aget(config) is None, "le blob doit avoir réellement disparu"
+        assert str(run_id) not in await repo.list_orphan_checkpoint_threads(), (
+            "et le thread ne doit plus être découvert — preuve que la purge a mordu "
+            "sur les trois tables, pas seulement sur `checkpoints`"
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_orphan_checkpoint_threads_tolerates_a_non_uuid_thread_id(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`checkpoints.thread_id` est une colonne TEXTE d'une table LangGraph :
+    rien ne garantit qu'elle porte un UUID. La comparaison se fait donc en
+    texte (`wr.id::text = c.thread_id`) et jamais par un cast de `thread_id`
+    vers `uuid`, qui ferait lever la requête ENTIÈRE au lieu de simplement
+    ne pas matcher.
+    """
+    repo = WorkflowRunRepo(session_factory=app_session_factory)
+
+    async with app_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO checkpoints "
+                "(thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata) "
+                "VALUES ('pas-un-uuid', '', gen_random_uuid()::text, 'x', '{}'::jsonb, '{}'::jsonb)"
+            ),
+        )
+        await session.commit()
+
+    orphans = await repo.list_orphan_checkpoint_threads()
+    assert "pas-un-uuid" in orphans
+
+    async with app_session_factory() as session:
+        await session.execute(text("DELETE FROM checkpoints WHERE thread_id = 'pas-un-uuid'"))
+        await session.commit()
+
+
+# ─── Story 4.15 AC3 — terminal sans `ended_at` ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_covers_a_terminal_run_whose_ended_at_is_null(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seed_run: SeedRun,
+) -> None:
+    """AC3 — `ended_at IS NOT NULL` rendait un run terminal sans `ended_at`
+    invisible pour la purge, à jamais, sans que rien ne le signale.
+
+    Le cas n'est pas démontré atteignable (tous les sites d'écriture
+    terminale passent `ended_at`, vérifié) : c'est un trou défensif. Il est
+    fermé plutôt que seulement signalé — un run terminal est fini par
+    définition, donc ses blobs sont du poids mort quelle que soit la colonne
+    qui date sa fin. Le repli `COALESCE(ended_at, last_checkpoint_at,
+    started_at)` donne toujours une date à comparer.
+    """
+    now = datetime.now(UTC)
+    repo = WorkflowRunRepo(session_factory=app_session_factory)
+
+    orphan_date = await seed_run(
+        status="completed", ended_at=None, last_checkpoint_at=now - timedelta(days=100)
+    )
+    # Le repli ne doit pas rendre purgeable ce qui ne l'est pas :
+    recent = await seed_run(
+        status="completed", ended_at=None, last_checkpoint_at=now - timedelta(days=1)
+    )
+    still_running = await seed_run(status="running", ended_at=None)
+
+    ids = {
+        run.id
+        for run in await repo.list_purgeable(
+            terminal_statuses=("completed", "error", "cancelled"),
+            older_than=now - timedelta(days=90),
+        )
+    }
+
+    assert orphan_date in ids, "un terminal ancien sans ended_at doit devenir purgeable"
+    assert recent not in ids, "le repli ne doit pas ignorer la fenetre de retention"
+    assert still_running not in ids, "un run non terminal n'est jamais purgeable"

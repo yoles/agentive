@@ -4,17 +4,43 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 
-from agentive_backend.features.workflow_engine.retention import CheckpointRetentionWorker
+from agentive_backend.features.workflow_engine.retention import (
+    _MAX_ORPHANS_PER_PASS,
+    CheckpointRetentionWorker,
+)
+
+#: Distingue « pas d'argument » de `ended_at=None`, qui est le cas sous test.
+_SENTINEL = object()
 
 
-def _run(*, run_id: object | None = None, workflow_id: object | None = None) -> SimpleNamespace:
-    return SimpleNamespace(id=run_id or uuid4(), workflow_id=workflow_id or uuid4())
+def _run(
+    *,
+    run_id: object | None = None,
+    workflow_id: object | None = None,
+    ended_at: object | None = _SENTINEL,
+    status: str = "completed",
+) -> SimpleNamespace:
+    """A ``WorkflowRun`` double carrying the fields the purge actually reads.
+
+    `ended_at`/`status` are part of the shape since Story 4.15 AC3: the purge
+    reports a terminal run reaching it through the `COALESCE` fallback, so a
+    double without them raises `AttributeError` instead of modelling the row.
+    Default is a real timestamp — the nominal case — so only a test that means
+    to exercise the fallback passes `ended_at=None`.
+    """
+    return SimpleNamespace(
+        id=run_id or uuid4(),
+        workflow_id=workflow_id or uuid4(),
+        ended_at=datetime.now(UTC) if ended_at is _SENTINEL else ended_at,
+        status=status,
+    )
 
 
 def _draining(*batches: list[SimpleNamespace]) -> AsyncMock:
@@ -60,6 +86,11 @@ def _make_worker() -> tuple[CheckpointRetentionWorker, AsyncMock, AsyncMock]:
     # vanished under us"; be explicit rather than relying on a MagicMock
     # comparing unequal to 0 by accident.
     workflow_run_repo.mark_checkpoint_purged = AsyncMock(return_value=1)
+    # Story 4.15 — sans ca, `list_orphan_checkpoint_threads` rend un MagicMock
+    # (verite-vraie mais iterable vide) et la passe orpheline part droit dans
+    # sa branche `no_progress` dans TOUS les tests preexistants.
+    workflow_run_repo.list_orphan_checkpoint_threads = AsyncMock(return_value=[])
+    workflow_run_repo.count_visible_runs = AsyncMock(return_value=42)
     worker._workflow_run_repo = workflow_run_repo
     return worker, workflow_run_repo, checkpointer
 
@@ -321,3 +352,179 @@ async def test_stop_is_idempotent() -> None:
     await worker.start()
     await worker.stop()
     await worker.stop()  # must not raise
+
+
+# ─── Story 4.15 AC2 — balayage des threads orphelins ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_once_purges_threads_whose_run_row_no_longer_exists() -> None:
+    """AC2 — `ON DELETE CASCADE` efface les runs d'un workflow supprime, et
+    `list_purgeable` joint sur `workflow_runs` : les blobs LangGraph
+    correspondants deviennent alors introuvables par la purge, DEFINITIVEMENT.
+
+    C'est la condition de croissance non bornee que l'AC1 de la Story 4.10
+    existe pour fermer, atteinte par une porte que sa conception ne couvre
+    pas. La decouverte doit donc etre independante de `workflow_runs`."""
+    worker, repo, checkpointer = _make_worker()
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    orphans = ["thread-a", "thread-b"]
+    repo.list_orphan_checkpoint_threads = AsyncMock(side_effect=[orphans, []])
+
+    summary = await worker.run_once()
+
+    assert checkpointer.adelete_thread.await_count == 2
+    assert {c.args[0] for c in checkpointer.adelete_thread.await_args_list} == set(orphans)
+    assert summary.orphan_purged_count == 2
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_is_skipped_by_a_replica_without_the_lease() -> None:
+    """Le balayage SUPPRIME des donnees : comme la passe AC1, il doit vivre
+    sous le bail consultatif, sinon N repliques emettent les memes DELETE et
+    se contendent sur `checkpoint_writes`/`checkpoint_blobs`."""
+    worker, repo, checkpointer = _make_worker()
+    repo.purge_lease = _lease(False)
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    repo.list_orphan_checkpoint_threads = AsyncMock(return_value=["thread-a"])
+
+    summary = await worker.run_once()
+
+    repo.list_orphan_checkpoint_threads.assert_not_awaited()
+    checkpointer.adelete_thread.assert_not_awaited()
+    assert summary.orphan_purged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_one_failing_orphan_does_not_block_its_siblings() -> None:
+    """Meme resilience par item que toutes les autres passes du depot."""
+    worker, repo, checkpointer = _make_worker()
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    repo.list_orphan_checkpoint_threads = AsyncMock(side_effect=[["bad", "good"], []])
+    checkpointer.adelete_thread = AsyncMock(
+        side_effect=[RuntimeError("boom"), None],
+    )
+
+    summary = await worker.run_once()
+
+    assert summary.orphan_purged_count == 1
+    assert summary.orphan_failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_stops_when_a_claim_makes_no_progress() -> None:
+    """Le balayage ne peut pas s'appuyer sur un marqueur pour drainer (la
+    ligne du run n'existe plus, il n'y a rien a estampiller) : la seule
+    preuve de progression est que la reclamation suivante rende autre chose.
+    Sans cette garde, un thread que `adelete_thread` echoue a vider serait
+    reclame `_MAX_BATCHES_PER_PASS` fois."""
+    worker, repo, checkpointer = _make_worker()
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    repo.list_orphan_checkpoint_threads = AsyncMock(return_value=["stuck"])
+
+    summary = await worker.run_once()
+
+    assert repo.list_orphan_checkpoint_threads.await_count == 2
+    assert checkpointer.adelete_thread.await_count == 1
+    assert summary.orphan_purged_count == 1
+
+
+@pytest.mark.asyncio
+async def test_purging_a_terminal_run_without_ended_at_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3 — fermer le trou ne doit pas rendre l'anomalie invisible. Aucun
+    site d'ecriture applicatif ne produit un statut terminal sans
+    `ended_at` : si la purge en rencontre un, c'est qu'autre chose a ecrit
+    ce statut, et cela doit se voir."""
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.retention._log.warning",
+        lambda event, **kw: events.append((event, kw)),
+    )
+    run = _run(ended_at=None, status="completed")
+    worker, repo, _checkpointer = _make_worker()
+    repo.list_purgeable = _draining([run])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+
+    summary = await worker.run_once()
+
+    assert summary.purged_count == 1, "le trou est FERME : le run doit bien etre purge"
+    reported = [
+        kw
+        for event, kw in events
+        if event == "workflow_engine.retention_terminal_run_without_ended_at"
+    ]
+    assert reported, "...et l'anomalie doit rester visible, pas absorbee en silence"
+    assert reported[0]["run_id"] == str(run.id)
+
+
+@pytest.mark.asyncio
+async def test_a_normal_terminal_run_is_purged_without_any_anomaly_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le pendant du test precedent : le warning doit mordre sur le cas
+    anormal SEULEMENT. Sans lui, une implementation qui loggue a chaque purge
+    passerait le test ci-dessus tout en noyant le signal."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.retention._log.warning",
+        lambda event, **kw: events.append(event),
+    )
+    worker, repo, _checkpointer = _make_worker()
+    repo.list_purgeable = _draining([_run()])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+
+    summary = await worker.run_once()
+
+    assert summary.purged_count == 1
+    assert "workflow_engine.retention_terminal_run_without_ended_at" not in events
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_refuses_a_batch_beyond_the_blast_radius_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second garde, pour toute cause de predicat faux que le premier ne
+    couvre pas (RLS partielle, replica en retard, politique future). Un lot
+    au-dela du plafond est traite comme un predicat faux, pas comme un
+    arriere : refus complet, ERROR, zero suppression."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        "agentive_backend.features.workflow_engine.retention._log.error",
+        lambda event, **kw: events.append(event),
+    )
+    worker, repo, checkpointer = _make_worker()
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    repo.list_orphan_checkpoint_threads = AsyncMock(
+        return_value=[f"t-{i}" for i in range(_MAX_ORPHANS_PER_PASS + 1)]
+    )
+
+    summary = await worker.run_once()
+
+    checkpointer.adelete_thread.assert_not_awaited()
+    assert summary.orphan_purged_count == 0
+    assert "workflow_engine.retention_orphan_refused_blast_radius" in events
+
+
+@pytest.mark.asyncio
+async def test_a_failing_orphan_is_excluded_from_the_next_claim() -> None:
+    """Sans exclusion, un thread dont la suppression echoue toujours et qui
+    trie en tete est re-reclame a chaque lot : la garde d'egalite d'ensemble
+    ne mord pas (le reste du lot differe), et il est reessaye jusqu'a 1000
+    fois par passe, chaque echec ecrivant une trace complete."""
+    worker, repo, checkpointer = _make_worker()
+    repo.list_purgeable = _draining([])
+    repo.count_stale_paused = AsyncMock(return_value=(0, None, None))
+    repo.list_orphan_checkpoint_threads = AsyncMock(side_effect=[["bad"], []])
+    checkpointer.adelete_thread = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await worker.run_once()
+
+    second_claim = repo.list_orphan_checkpoint_threads.await_args_list[1]
+    assert list(second_claim.kwargs["exclude_threads"]) == ["bad"]

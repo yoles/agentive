@@ -74,6 +74,31 @@ def _is_request_fingerprint_violation(exc: IntegrityError) -> bool:
 _METRICS_COUNT_CEILING = 2_147_483_647
 
 
+def _terminal_at() -> ColumnElement[datetime]:
+    """When a terminal run ended, with a fallback (Story 4.15 AC3).
+
+    ``list_purgeable`` used ``ended_at IS NOT NULL`` as a hard filter, which
+    made a terminal run whose ``ended_at`` was never stamped invisible to the
+    purge **forever**, with nothing reporting it. The case is not demonstrated
+    reachable — every terminal write site in the application passes
+    ``ended_at``, verified — so this is a defensive hole rather than an
+    observed bug.
+
+    It is CLOSED rather than merely signalled: a terminal run is finished by
+    definition, so its blobs are dead weight whatever column dates its end.
+    ``COALESCE`` always yields something to compare against the retention
+    window, and ``started_at`` is ``NOT NULL``, so the expression can never be
+    NULL and silently drop a row again.
+
+    A ``CHECK`` constraint was rejected as the alternative: it would cost a
+    migration on a potentially large table for a case never observed, and it
+    would make a write FAIL rather than repair the omission.
+    """
+    return func.coalesce(
+        WorkflowRun.ended_at, WorkflowRun.last_checkpoint_at, WorkflowRun.started_at
+    )
+
+
 class WorkflowRepo(BaseRepo):
     """Public API surface for Workflow. ALL DB access must go through this class."""
 
@@ -1082,17 +1107,122 @@ class WorkflowRunRepo(BaseRepo):
                 select(WorkflowRun)
                 .where(
                     WorkflowRun.status.in_(terminal_statuses),
-                    WorkflowRun.ended_at.is_not(None),
-                    WorkflowRun.ended_at < older_than,
+                    _terminal_at() < older_than,
                     WorkflowRun.checkpoint_purged_at.is_(None),
                 )
-                .order_by(WorkflowRun.ended_at)
+                .order_by(_terminal_at())
                 .limit(limit)
             )
             if exclude_run_ids:
                 stmt = stmt.where(WorkflowRun.id.not_in(exclude_run_ids))
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    async def count_visible_runs(self) -> int:
+        """How many ``workflow_runs`` rows THIS session can see.
+
+        Exists for one caller — the orphan sweep's safety gate. See
+        :meth:`list_orphan_checkpoint_threads` for why a count is the thing
+        that makes a destructive negative predicate safe to act on.
+        """
+        async with self.with_tenant(None) as session:
+            result = await session.execute(text("SELECT count(*) FROM workflow_runs"))
+            return int(result.scalar_one())
+
+    async def list_orphan_checkpoint_threads(
+        self, *, limit: int = 1000, exclude_threads: Sequence[str] = ()
+    ) -> list[str]:
+        """LangGraph ``thread_id``s whose ``workflow_runs`` row no longer
+        exists (Story 4.15 AC2).
+
+        :meth:`list_purgeable` is the only other discovery path for checkpoint
+        blobs, and it JOINS on ``workflow_runs``. ``workflow_runs`` cascades
+        from ``workflows`` (``ondelete="CASCADE"``), so deleting a workflow
+        takes its runs with it and leaves their
+        ``checkpoints``/``checkpoint_writes``/``checkpoint_blobs`` rows
+        unreachable by anything — permanently. That is exactly the unbounded
+        growth Story 4.10 AC1 exists to close, reached through a door its
+        design does not look at.
+
+        **⚠️ This predicate is NEGATIVE and its caller DELETES. Read this
+        before changing it.** Every other purge path in this repo fails safe:
+        ``list_purgeable`` reads under the same RLS restriction, where being
+        unable to see a row means *skip*. This one inverts the sign — not
+        seeing a row means *delete*. The two blind spots that follow are
+        therefore the difference between a no-op and data loss, and neither is
+        closed by this query alone.
+
+        **Blind spot 1 — Row-Level Security (review 4.15, three layers
+        converged).** ``workflow_runs`` carries ``ENABLE`` *and* ``FORCE ROW
+        LEVEL SECURITY`` with ``USING (tenant_id IS NULL OR tenant_id =
+        current_setting('app.tenant_id', true)::uuid)``; ``checkpoints`` is a
+        LangGraph table and carries none. ``with_tenant(None)`` never sets the
+        GUC, so the policy collapses to ``tenant_id IS NULL``: the moment any
+        run row carries a non-NULL ``tenant_id`` it becomes INVISIBLE here,
+        its live thread reads as an orphan, and its checkpoints are deleted
+        out from under a running graph. Inert today — every write passes
+        ``tenant_id=None`` — but it arms itself with the first tenant-scoped
+        write, silently, in a daily background job. Registered as a blocker on
+        Story 4.9 AC1 (multi-tenant propagation) beside the site inventory.
+
+        **Blind spot 2 — anything else that could hide rows** (a future
+        policy, a replica reading a lagging snapshot, a role change). The
+        class is open, so the guard must be too.
+
+        Neither is closed here, because a session cannot prove from the inside
+        what RLS is hiding from it: ``SELECT count(*) WHERE tenant_id IS NOT
+        NULL`` returns 0 whether or not such rows exist. The caller therefore
+        gates on :meth:`count_visible_runs` and on a blast-radius ceiling —
+        cause-agnostic checks that turn "the predicate went wrong, for any
+        reason" into a refusal and an ERROR line instead of a mass delete.
+
+        **Discovery spans all three checkpoint tables**, not just
+        ``checkpoints``. ``adelete_thread`` issues separate DELETEs, so an
+        interrupted purge (pod eviction, pool close during the 2s stop window)
+        can remove the ``checkpoints`` rows and leave
+        ``checkpoint_blobs``/``checkpoint_writes`` behind. Keying discovery on
+        ``checkpoints`` alone would make those residues invisible to this
+        sweep too — the very unbounded growth it exists to close, one table
+        down.
+
+        **Why the join is on ``uuid`` and not on ``text``.** ``thread_id`` is
+        free-form text, so ``wr.id::text = c.thread_id`` would put the cast on
+        the INDEXED side and defeat the primary key, full-scanning
+        ``workflow_runs`` — the largest table in the schema, and the one this
+        story exists because it grows. Instead each candidate is shape-checked
+        and cast ONCE in a ``MATERIALIZED`` CTE (materialized so Postgres
+        cannot push the cast into a context where a non-UUID value would make
+        the whole statement raise), and the anti-join runs against the PK. A
+        ``thread_id`` that is not a UUID can belong to no run and is reported
+        as an orphan by construction.
+        """
+        async with self.with_tenant(None) as session:
+            result = await session.execute(
+                text(
+                    "WITH candidate AS MATERIALIZED ("
+                    "  SELECT thread_id FROM checkpoints"
+                    "  UNION SELECT thread_id FROM checkpoint_blobs"
+                    "  UNION SELECT thread_id FROM checkpoint_writes"
+                    "), typed AS MATERIALIZED ("
+                    "  SELECT thread_id,"
+                    "         CASE WHEN thread_id ~* "
+                    "              '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                    "[0-9a-f]{4}-[0-9a-f]{12}$'"
+                    "              THEN thread_id::uuid END AS run_id"
+                    "  FROM candidate"
+                    ") "
+                    "SELECT t.thread_id FROM typed t "
+                    "WHERE NOT (t.thread_id = ANY(:excluded)) "
+                    "  AND ("
+                    "    t.run_id IS NULL"
+                    "    OR NOT EXISTS (SELECT 1 FROM workflow_runs wr WHERE wr.id = t.run_id)"
+                    "  ) "
+                    "ORDER BY t.thread_id "
+                    "LIMIT :limit"
+                ),
+                {"limit": limit, "excluded": list(exclude_threads)},
+            )
+            return [row[0] for row in result.all()]
 
     async def mark_checkpoint_purged(self, run_id: UUID) -> int:
         """Stamp ``checkpoint_purged_at = now()`` (Story 4.10 AC1) — called
