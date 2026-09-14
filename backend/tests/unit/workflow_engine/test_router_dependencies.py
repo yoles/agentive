@@ -302,6 +302,7 @@ def test_execution_service_comes_from_app_state() -> None:
         workflow_repo=SimpleNamespace(),  # type: ignore[arg-type]
         workflow_run_repo=SimpleNamespace(),  # type: ignore[arg-type]
         template_repo=SimpleNamespace(),  # type: ignore[arg-type]
+        tool_hub_repo=SimpleNamespace(),  # type: ignore[arg-type]
         llm_router=SimpleNamespace(),  # type: ignore[arg-type]
         checkpointer=SimpleNamespace(),  # type: ignore[arg-type]
         routing_rules=(),

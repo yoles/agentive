@@ -27,6 +27,7 @@ the *consumer's* view.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
@@ -152,6 +153,17 @@ class AgentTemplateToolRepository(Protocol):
         """Story 5.0 AC2 — les outils assignes JOINTS au serveur qui sait les
         executer. Offrir un outil ne demande que la ligne `Tool` ; l'appeler
         demande le `transport` et la `connection_config` du serveur."""
+        ...
+
+    async def list_resolved_for_templates(
+        self, template_ids: Sequence[UUID], *, tenant_id: UUID | None = ...
+    ) -> dict[UUID, list[tuple[Tool, ToolServer]]]:
+        """Revue P2 — meme jointure, pour PLUSIEURS templates a la fois.
+
+        Le moteur de workflow resout les outils de tout un DAG en une passe ;
+        appeler la methode mono-template en boucle rendrait le N+1 que cette
+        derniere dit exister pour eviter. Un template sans outil assigne est
+        ABSENT du dict, pas mappe sur une liste vide."""
         ...
 
     async def replace_in_session(

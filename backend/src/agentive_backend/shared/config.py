@@ -318,13 +318,49 @@ class Settings(BaseSettings):
     # avant cette story. C'est le prix payé, il est explicite, et il se règle.
     # 60 s suffisent largement aux outils en LECTURE SEULE qui sont les seuls
     # assignables en Sprint 2 (cf `docs/runbooks/rejeu-et-outils.md`).
+    # Revue P14 — `ge=120.0` POSÉ ICI. Trois endroits (ce commentaire,
+    # `recovery.py` et le runbook) affirmaient que la valeur était « REFUSÉE
+    # au démarrage » ; le champ ne portait que `gt=0.0`, et le plancher
+    # n'existait que dans `derive_stale_threshold_s`. Un
+    # `AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=60` passait donc la validation,
+    # le process démarrait, répondait aux health checks — puis chaque run et
+    # chaque flux SSE levaient un `ValueError` nu depuis une fonction de
+    # DÉRIVATION, très loin de la faute. Le refus au démarrage est désormais
+    # réel : pydantic rend une erreur de configuration nommée.
+    #
+    # Le garde de `derive_stale_threshold_s` reste, et c'est voulu : il est
+    # l'autorité (il connaît `NODE_TIMEOUT_S` et la longueur de chaîne, que
+    # `shared/config.py` ne peut pas importer sans inverser les couches), et
+    # cette borne-ci en est le miroir avancé. Si les deux divergent un jour,
+    # c'est la dérivation qui a raison.
     tool_loop_max_wall_clock_s: float = Field(
         default=180.0,
-        gt=0.0,
+        ge=120.0,
         le=200.0,
         allow_inf_nan=False,
         alias="AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S",
     )
+
+    @model_validator(mode="after")
+    def _a_single_tool_call_cannot_outlive_the_whole_node(self) -> Settings:
+        """Revue P22 — `tool_call_timeout_s` (`le=300`) pouvait légalement
+        dépasser `tool_loop_max_wall_clock_s` (`le=200`).
+
+        La conséquence était déjà écrite en prose au-dessus du champ — « un
+        seul appel lent consomme tout le nœud » — et gardée nulle part : la
+        boucle mourait alors systématiquement sur son plafond d'horloge, en
+        ayant exécuté un seul outil, et le réglage `tool_call_timeout_s`
+        n'avait plus aucun effet observable. Une combinaison qui ne peut rien
+        vouloir dire est refusée, pas subie.
+        """
+        if self.tool_call_timeout_s > self.tool_loop_max_wall_clock_s:
+            raise ValueError(
+                f"AGENTIVE_TOOL_CALL_TIMEOUT_S ({self.tool_call_timeout_s}s) exceeds "
+                f"AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S ({self.tool_loop_max_wall_clock_s}s): "
+                "a single tool call would always consume the entire node and the loop "
+                "would always die on its wall-clock ceiling"
+            )
+        return self
 
     # ─── Workflow Engine — node retry backoff (Story 4.6, défer D13) ───
     # Feed `domain/error_policy.backoff_delay_s`, which spaces successive

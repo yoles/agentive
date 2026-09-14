@@ -23,7 +23,7 @@ import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from agentive_backend.infra.mcp.client import (
@@ -63,8 +63,11 @@ class ToolInvocation:
     """What one execution did — the raw material for the Playground's
     ``tool_invocations`` (AC6) and for per-node metrics."""
 
-    tool_id: UUID
-    server_id: UUID
+    #: ``None`` UNIQUEMENT quand le modèle a réclamé un outil qui ne lui a
+    #: pas été offert : il n'existe alors aucune ligne `tools` ni aucun
+    #: serveur à nommer (revue P11). Tout appel résolu les porte.
+    tool_id: UUID | None
+    server_id: UUID | None
     tool_name: str
     arguments: dict[str, Any]
     result_summary: str
@@ -72,17 +75,67 @@ class ToolInvocation:
     status: Literal["success", "error", "timeout"]
 
 
+#: Le schéma minimal qu'un provider accepte pour un outil sans argument.
+#: Anthropic REFUSE un `input_schema` vide (`input_schema.type: Field
+#: required`, 400) et OpenAI attend également un objet typé.
+_EMPTY_OBJECT_SCHEMA: Final[dict[str, Any]] = {"type": "object", "properties": {}}
+
+#: Miroirs des bornes de `ToolDefinition`. Dupliqués ici À DESSEIN :
+#: `shared/llm/types.py` les fait respecter en LEVANT, ce qui est juste
+#: pour un contrat, et cette projection doit au contraire ABSORBER ce
+#: qu'un serveur MCP annonce sans faire tomber le run (revue P5).
+_MAX_TOOL_NAME_CHARS: Final = 128
+_MAX_TOOL_DESCRIPTION_CHARS: Final = 2_048
+
+
 def to_tool_definitions(resolved: Mapping[str, ResolvedTool]) -> list[ToolDefinition]:
     """Project resolved tools into the provider-agnostic contract the loop
-    offers to the model."""
-    return [
-        ToolDefinition(
-            name=t.name,
-            description=t.description,
-            input_schema=t.input_schema,
+    offers to the model.
+
+    ``input_schema`` vide est NORMALISÉ plutôt que transmis tel quel (revue
+    P6). Ce n'est pas un cas de bord : `tools.input_schema` porte
+    ``server_default='{}'::jsonb``, donc ``{}`` est la valeur PERSISTÉE PAR
+    DÉFAUT pour tout outil dont le serveur MCP n'annonce pas de schéma. Le
+    transmettre faisait échouer le run entier par un 400 provider — fatal,
+    sans repli — pour un outil parfaitement légitime qui ne prend simplement
+    aucun argument.
+    """
+    definitions: list[ToolDefinition] = []
+    for t in resolved.values():
+        if len(t.name) > _MAX_TOOL_NAME_CHARS:
+            # Revue P5 — un nom ne se tronque PAS : c'est l'identifiant que le
+            # modèle renverra, et le raccourcir ferait échouer la résolution
+            # sur un nom qui n'existe pas. L'outil est donc écarté, bruyamment
+            # — offrir un outil inappelable est pire que ne pas l'offrir.
+            _log.warning(
+                "mcp.tool_name_too_long",
+                tool=t.name[:64],
+                length=len(t.name),
+                ceiling=_MAX_TOOL_NAME_CHARS,
+            )
+            continue
+        description = t.description
+        if len(description) > _MAX_TOOL_DESCRIPTION_CHARS:
+            # Une description, SI : elle est indicative, et beaucoup de
+            # serveurs MCP réels y inlinent des exemples d'usage. La tronquer
+            # dégrade la qualité de l'appel ; laisser la `ValidationError`
+            # remonter tuait le run entier (500 non audité) pour un outil
+            # parfaitement fonctionnel.
+            _log.warning(
+                "mcp.tool_description_truncated",
+                tool=t.name,
+                length=len(description),
+                ceiling=_MAX_TOOL_DESCRIPTION_CHARS,
+            )
+            description = description[: _MAX_TOOL_DESCRIPTION_CHARS - 1] + "…"
+        definitions.append(
+            ToolDefinition(
+                name=t.name,
+                description=description,
+                input_schema=t.input_schema or dict(_EMPTY_OBJECT_SCHEMA),
+            )
         )
-        for t in resolved.values()
-    ]
+    return definitions
 
 
 @dataclass
@@ -113,6 +166,26 @@ class McpToolExecutor:
                 "mcp.tool_executor_unknown_tool",
                 requested=call.name,
                 offered=sorted(self.resolved),
+            )
+            # Revue P11 — enregistré comme n'importe quel autre échec. Ce
+            # retour anticipé n'alimentait rien, alors que `run_tool_loop`
+            # incrémente `tool_calls_made` inconditionnellement : un modèle
+            # qui hallucine huit fois le même nom produisait
+            # `tool_calls: 8, tool_names: [], tool_failures: 0` — trois
+            # champs qui se contredisent, et un node « réussi » dont
+            # personne ne pouvait expliquer le prix. C'est exactement l'angle
+            # mort que le commentaire de `tool_names` dit exister pour
+            # éclairer.
+            self.invocations.append(
+                ToolInvocation(
+                    tool_id=None,
+                    server_id=None,
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    result_summary="ERROR: unknown tool",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    status="error",
+                )
             )
             return self._wrap(f"ERROR: no tool named {call.name!r} is available to you.")
 
@@ -183,7 +256,35 @@ class McpToolExecutor:
             return str(raw)
 
     @staticmethod
-    def _wrap(text: str) -> str:
+    def _escaped_len(text: str) -> int:
+        """Length ``text`` will have once ``wrap_external_input`` escapes it.
+
+        ``html.escape(quote=False)`` maps ``&`` to ``&amp;`` (5 chars) and
+        ``<``/``>`` to ``&lt;``/``&gt;`` (4 chars). Everything else is
+        length-preserving, so the cost is a per-character sum.
+        """
+        return sum(5 if ch == "&" else 4 if ch in "<>" else 1 for ch in text)
+
+    @classmethod
+    def _truncate_to_escaped_budget(cls, text: str, budget: int) -> tuple[str, bool]:
+        """Largest prefix of ``text`` whose ESCAPED form fits in ``budget``.
+
+        Cuts on the RAW string — never on the escaped one — so the result can
+        still be handed to ``wrap_external_input`` for a single, correct
+        escape pass. Slicing escaped text would risk severing an entity
+        (``&am``) and would double-escape if re-wrapped.
+        """
+        if cls._escaped_len(text) <= budget:
+            return text, False
+        cost = 0
+        for i, ch in enumerate(text):
+            cost += 5 if ch == "&" else 4 if ch in "<>" else 1
+            if cost > budget:
+                return text[:i], True
+        return text, False
+
+    @classmethod
+    def _wrap(cls, text: str) -> str:
         """Truncate, then wrap — and this is the ONLY exit of this class.
 
         ``wrap_external_input`` is applied HERE, one layer below the loop, so
@@ -193,11 +294,17 @@ class McpToolExecutor:
         it (Story 9.7). Placing the guard at the only exit makes a fifth
         omission structurally impossible rather than merely discouraged.
 
-        Truncation happens BEFORE wrapping so the cap applies to what the
-        model actually reads — wrapping first would let escaping push the
-        result past the ceiling it is supposed to respect (review 4.15,
-        finding P-01, same ordering mistake).
+        The cap is applied to the ESCAPED length, not the raw one (review
+        P9). Truncating the raw string first and escaping afterwards left the
+        ceiling unenforced in exactly the cases it exists for: escaping
+        expands ``&`` five-fold and ``<``/``>`` four-fold, so 8 000 raw chars
+        of HTML, XML or a diff — a ``grep`` over a monorepo, this module's own
+        stated use case — reached the prompt as up to 40 000. The previous
+        docstring claimed this ordering made "the cap apply to what the model
+        actually reads"; it did the opposite, and the test only probed ``"A"``,
+        a character escaping leaves alone.
         """
-        if len(text) > MAX_TOOL_RESULT_CHARS:
-            text = text[:MAX_TOOL_RESULT_CHARS] + "\n[… tronqué]"
+        text, truncated = cls._truncate_to_escaped_budget(text, MAX_TOOL_RESULT_CHARS)
+        if truncated:
+            text += "\n[… tronqué]"
         return wrap_external_input(text, "tool_output")

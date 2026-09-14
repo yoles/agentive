@@ -195,6 +195,7 @@ def _wire_execution_service_with_real_mise_en_place(
         workflow_repo=WorkflowRepo(session_factory=session_factory),
         workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
         template_repo=AgentTemplateRepo(session_factory=session_factory),
+        tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
         llm_router=app.state.llm_router,
         checkpointer=app.state.workflow_checkpointer,
         routing_rules=app.state.routing_rules,

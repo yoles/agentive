@@ -1155,6 +1155,9 @@ def _make_execution_service() -> tuple[WorkflowExecutionService, AsyncMock, Asyn
         workflow_repo=workflow_repo,
         workflow_run_repo=workflow_run_repo,
         template_repo=template_repo,
+        # Revue P2 — le DAG de ces tests n'assigne aucun outil ; la requete
+        # batchee rend un dict vide et chaque noeud repart sans outils.
+        tool_hub_repo=AsyncMock(**{"list_resolved_for_templates.return_value": {}}),
         llm_router=AsyncMock(),
         checkpointer=AsyncMock(),
         # Explicitly empty: these tests inject `routing_decisions` straight
@@ -1282,7 +1285,7 @@ async def test_start_run_resolves_every_template_in_one_batch_query(
     )
     run = _workflow_run(workflow_id=workflow_id)
     workflow_run_repo.create_in_session.return_value = run
-    template_repo.get_by_id.return_value = SimpleNamespace(config={})
+    template_repo.get_by_id.return_value = SimpleNamespace(config={}, id=uuid4())
     service._drive_run = AsyncMock()  # type: ignore[method-assign]
 
     await service.start_run(workflow_id=workflow_id, run_input={"seed": 1})
@@ -1621,7 +1624,7 @@ async def test_drive_run_syncs_checkpoint_and_publishes_step_completed(
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     run_id = uuid4()
-    templates = {"a": SimpleNamespace(config={})}
+    templates = {"a": SimpleNamespace(config={}, id=uuid4())}
     await service._drive_run(run_id, workflow, templates, {"foo": "bar"}, correlation_id=uuid4())
 
     workflow_run_repo.update_checkpoint.assert_awaited_once()
@@ -2020,7 +2023,10 @@ async def test_fanout_superstep_syncs_the_checkpoint_once(
     )
     _patch_build_state_graph(monkeypatch, compiled)
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
-    templates = {"b": SimpleNamespace(config={}), "c": SimpleNamespace(config={})}
+    templates = {
+        "b": SimpleNamespace(config={}, id=uuid4()),
+        "c": SimpleNamespace(config={}, id=uuid4()),
+    }
 
     await service._drive_run(uuid4(), workflow, templates, {}, correlation_id=uuid4())
 
@@ -2047,7 +2053,7 @@ async def test_fanout_last_node_id_is_deterministic(
     )
     _patch_build_state_graph(monkeypatch, compiled)
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
-    templates = {name: SimpleNamespace(config={}) for name in ("a", "b", "c")}
+    templates = {name: SimpleNamespace(config={}, id=uuid4()) for name in ("a", "b", "c")}
 
     await service._drive_run(uuid4(), workflow, templates, {}, correlation_id=uuid4())
 
@@ -2071,7 +2077,7 @@ async def test_langgraph_bookkeeping_keys_are_not_treated_as_nodes(
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     step_nodes = [
@@ -2244,7 +2250,10 @@ async def test_each_superstep_checkpoints_the_state_known_at_that_point(
     )
     _patch_build_state_graph(monkeypatch, compiled)
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
-    templates = {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})}
+    templates = {
+        "a": SimpleNamespace(config={}, id=uuid4()),
+        "b": SimpleNamespace(config={}, id=uuid4()),
+    }
 
     await service._drive_run(uuid4(), workflow, templates, {}, correlation_id=uuid4())
 
@@ -2356,7 +2365,7 @@ async def test_completed_run_marks_nodes_that_never_executed_as_skipped(
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     # Still `completed` — the reachable graph genuinely finished.
@@ -2404,7 +2413,7 @@ async def test_completed_run_with_skipped_nodes_still_reflects_handoffs_in_check
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     final_checkpoint = workflow_run_repo.update_checkpoint.await_args.kwargs["checkpoint"]
@@ -2428,7 +2437,7 @@ async def test_fully_executed_run_records_no_skipped_nodes(
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     for call in workflow_run_repo.update_checkpoint.await_args_list:
@@ -2789,7 +2798,7 @@ async def test_completed_run_persists_routing_counts_in_metrics(
     service, _wrepo, workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     metrics = workflow_run_repo.update_status.await_args.kwargs["metrics"]
@@ -2840,7 +2849,7 @@ async def test_failed_run_still_aggregates_partial_routing_counts(
     await service._drive_run(
         uuid4(),
         workflow,
-        {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})},
+        {"a": SimpleNamespace(config={}, id=uuid4()), "b": SimpleNamespace(config={}, id=uuid4())},
         {},
         correlation_id=uuid4(),
     )
@@ -2897,7 +2906,7 @@ async def test_escalated_decision_publishes_routing_escalated_event(
     await service._drive_run(
         uuid4(),
         workflow,
-        {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})},
+        {"a": SimpleNamespace(config={}, id=uuid4()), "b": SimpleNamespace(config={}, id=uuid4())},
         {},
         correlation_id=uuid4(),
     )
@@ -2963,7 +2972,7 @@ async def test_escalated_decision_published_only_once_per_node(
     service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     published_types = [
@@ -3017,7 +3026,7 @@ async def test_routing_metrics_recorded_once_per_node_like_the_event(
     monkeypatch.setattr(service, "_record_routing_metrics_safely", record_mock)
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     assert record_mock.call_count == 1
@@ -3069,7 +3078,7 @@ async def test_resume_does_not_republish_decisions_from_the_restored_checkpoint(
     run.checkpoint = {"routing_decisions": {"a": decision}}
     workflow_run_repo.get_by_id.return_value = run
 
-    await service._resume_run(run.id, workflow, {"a": SimpleNamespace(config={})})
+    await service._resume_run(run.id, workflow, {"a": SimpleNamespace(config={}, id=uuid4())})
 
     republished = [
         call.args[0]
@@ -3115,7 +3124,7 @@ async def test_routing_settings_and_rules_are_forwarded_to_build_state_graph(
     service._routing_rules = (rule,)  # type: ignore[attr-defined]
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     assert captured["rules"] == (rule,)
@@ -3123,6 +3132,124 @@ async def test_routing_settings_and_rules_are_forwarded_to_build_state_graph(
     assert captured["routing_settings"].threshold == pytest.approx(
         settings.routing_confidence_threshold
     )
+
+
+@pytest.mark.asyncio
+async def test_node_tools_are_resolved_and_forwarded_to_build_state_graph(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """Revue P2 — le câblage manquant, et le test qui le tenait.
+
+    `node_tools` avait été filé jusque dans la signature de
+    `build_state_graph` sans qu'aucun appelant de production ne le passe :
+    chaque nœud tournait sans outils alors que la moitié moteur de l'AC1/AC2
+    était annoncée livrée. Les tests du moteur passaient `resolved_tools=`
+    directement à `execute_agent_node`, donc court-circuitaient exactement le
+    maillon absent.
+
+    Ce test part du SERVICE et regarde ce que `build_state_graph` reçoit —
+    c'est la seule altitude à laquelle l'oubli était visible.
+    """
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    template_id = uuid4()
+    workflow = _workflow(
+        dag={"nodes": [{"node_id": "a", "agent_template_id": str(template_id)}], "edges": []}
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {}}},
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_build(*args: Any, **kwargs: Any) -> _FakeGraphBuilder:
+        captured["node_tools"] = kwargs.get("node_tools")
+        return _FakeGraphBuilder(compiled)
+
+    monkeypatch.setattr(svc_module, "build_state_graph", _fake_build)
+
+    tool_row = SimpleNamespace(
+        id=uuid4(),
+        name="search_files",
+        description="Search the repo.",
+        input_schema={"type": "object", "properties": {}},
+    )
+    server_row = SimpleNamespace(
+        id=uuid4(),
+        transport="stdio",
+        connection_config={"command": "srv"},
+    )
+
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+    service._tool_hub_repo.list_resolved_for_templates.return_value = {  # type: ignore[attr-defined]
+        template_id: [(tool_row, server_row)]
+    }
+
+    await service._drive_run(
+        uuid4(),
+        workflow,
+        {"a": SimpleNamespace(config={}, id=template_id)},
+        {},
+        correlation_id=uuid4(),
+    )
+
+    node_tools = captured["node_tools"]
+    assert node_tools is not None, "build_state_graph n'a reçu aucun node_tools"
+    assert set(node_tools) == {"a"}
+    resolved = node_tools["a"]["search_files"]
+    # La projection complète : offrir un outil ne demande que la ligne `Tool`,
+    # l'APPELER demande le transport et la config du serveur. Un `ResolvedTool`
+    # amputé de ces deux champs compilerait et échouerait à l'exécution.
+    assert resolved.tool_id == tool_row.id
+    assert resolved.server_id == server_row.id
+    assert resolved.transport == "stdio"
+    assert resolved.connection_config == {"command": "srv"}
+
+
+@pytest.mark.asyncio
+async def test_a_dag_whose_templates_have_no_tools_costs_one_query_and_yields_nothing(
+    monkeypatch: pytest.MonkeyPatch, event_publish_mock: AsyncMock
+) -> None:
+    """Le chemin d'avant la story, inchangé — et une seule requête pour tout
+    le DAG, pas une par nœud (le N+1 que `_load_templates` a déjà eu à
+    refermer)."""
+    import agentive_backend.features.workflow_engine.service as svc_module
+
+    template_id = uuid4()
+    workflow = _workflow(
+        dag={
+            "nodes": [
+                {"node_id": "a", "agent_template_id": str(template_id)},
+                {"node_id": "b", "agent_template_id": str(template_id)},
+            ],
+            "edges": [],
+        }
+    )
+    compiled = _FakeCompiledGraph(
+        updates=[{"a": {"node_outputs": {"a": {}}, "node_metrics": {"a": {}}}}],
+        final_state={"node_outputs": {"a": {}}, "node_metrics": {"a": {}}},
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_build(*args: Any, **kwargs: Any) -> _FakeGraphBuilder:
+        captured["node_tools"] = kwargs.get("node_tools")
+        return _FakeGraphBuilder(compiled)
+
+    monkeypatch.setattr(svc_module, "build_state_graph", _fake_build)
+
+    service, _wrepo, _workflow_run_repo, _trepo = _make_execution_service()
+    repo = service._tool_hub_repo  # type: ignore[attr-defined]
+    repo.list_resolved_for_templates.return_value = {}
+
+    template = SimpleNamespace(config={}, id=template_id)
+    await service._drive_run(
+        uuid4(), workflow, {"a": template, "b": template}, {}, correlation_id=uuid4()
+    )
+
+    assert captured["node_tools"] == {}
+    # Deux nœuds, un seul template, UNE requête — et des ids dédupliqués.
+    assert repo.list_resolved_for_templates.await_count == 1
+    assert repo.list_resolved_for_templates.await_args.args[0] == [template_id]
 
 
 # ─── IG3 — the node's paid work survives a failed routing decision ────────
@@ -3174,7 +3301,7 @@ async def test_failed_routing_decision_persists_the_node_work_it_carried(
 
     run_id = uuid4()
     await service._drive_run(
-        run_id, workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        run_id, workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     status_call = workflow_run_repo.update_status.await_args
@@ -3953,7 +4080,7 @@ async def test_observe_control_when_the_run_was_already_paused_should_accumulate
     )
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     metrics = run_repo.update_status.await_args.kwargs["metrics"]
@@ -4193,7 +4320,10 @@ async def test_execute_when_pause_signal_is_observed_should_pause_and_never_comp
     run_repo.get_control_signal = AsyncMock(side_effect=[None, "pause"])
 
     run_id = uuid4()
-    templates = {"a": SimpleNamespace(config={}), "b": SimpleNamespace(config={})}
+    templates = {
+        "a": SimpleNamespace(config={}, id=uuid4()),
+        "b": SimpleNamespace(config={}, id=uuid4()),
+    }
     await service._drive_run(run_id, workflow, templates, {}, correlation_id=uuid4())
 
     statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
@@ -4237,7 +4367,7 @@ async def test_execute_when_cancel_signal_is_observed_should_mark_cancelled_with
     run_repo.get_control_signal = AsyncMock(side_effect=[None, "cancel"])
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     cancelled_call = next(
@@ -4271,7 +4401,7 @@ async def test_execute_when_signal_predates_the_loop_should_execute_zero_nodes(
     run_repo.get_control_signal = AsyncMock(return_value="pause")
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     # No superstep was ever consumed — no `step_completed`, no completion.
@@ -4304,7 +4434,7 @@ async def test_execute_when_run_reaches_a_terminal_status_should_consume_any_pen
     service, run_repo, _wrepo = _control_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     terminal_call = run_repo.update_status.await_args
@@ -4336,7 +4466,7 @@ async def test_execute_when_control_settles_should_close_the_astream_generator(
     run_repo.get_control_signal = AsyncMock(side_effect=[None, "pause"])
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     assert compiled.stream_closed is True
@@ -4365,7 +4495,7 @@ async def test_execute_when_cancel_predates_the_loop_should_still_account_the_wo
     run_repo.get_control_signal = AsyncMock(return_value="cancel")
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     status_call = run_repo.update_status.await_args
@@ -4397,7 +4527,7 @@ async def test_execute_when_cancel_metrics_are_corrupt_should_still_cancel_not_f
     run_repo.get_control_signal = AsyncMock(return_value="cancel")
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     assert run_repo.update_status.await_args.kwargs["status"] == "cancelled"
@@ -4424,7 +4554,7 @@ async def test_execute_when_control_read_fails_should_let_the_run_finish(
     run_repo.get_control_signal = AsyncMock(side_effect=RuntimeError("db down"))
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
@@ -4463,7 +4593,7 @@ async def test_execute_when_settle_cas_loses_should_keep_running_without_event(
     run_repo.update_status = AsyncMock(return_value=0)
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     published = [c.args[0] for c in event_publish_mock.await_args_list]
@@ -4504,7 +4634,7 @@ async def test_execute_settle_write_is_guarded_on_the_signal_it_read(
     run_repo.get_control_signal = AsyncMock(side_effect=[None, signal])
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     settle = next(
@@ -4554,7 +4684,7 @@ async def test_execute_when_a_cancel_escalates_over_the_pause_being_settled(
     run_repo.update_status = AsyncMock(side_effect=_update_status)
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     published = [c.args[0] for c in event_publish_mock.await_args_list]
@@ -4592,7 +4722,7 @@ async def test_execute_when_control_signal_is_unrecognised_should_keep_running(
     run_repo.get_control_signal = AsyncMock(return_value="pausing")
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
@@ -4623,7 +4753,7 @@ async def test_execute_when_control_repo_is_an_unconfigured_mock_should_still_co
     service, _wrepo, run_repo, _trepo = _make_execution_service()
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     statuses = [c.kwargs["status"] for c in run_repo.update_status.await_args_list]
@@ -4756,7 +4886,7 @@ async def test_terminal_write_carries_the_duration_billed_before_the_pause(
     )
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     terminal = next(
@@ -4788,7 +4918,7 @@ async def test_terminal_write_is_unchanged_for_a_run_that_never_paused(
     run_repo.get_by_id.return_value = _workflow_run(status="running", metrics={})
 
     await service._drive_run(
-        uuid4(), workflow, {"a": SimpleNamespace(config={})}, {}, correlation_id=uuid4()
+        uuid4(), workflow, {"a": SimpleNamespace(config={}, id=uuid4())}, {}, correlation_id=uuid4()
     )
 
     terminal = next(

@@ -82,7 +82,7 @@ async def test_mono_node_dag_runs_and_terminates() -> None:
         providers={"mock": MockProvider("mock", [_completion('{"x": 1}')])},
         default_chain=["mock"],
     )
-    graph = build_state_graph(dag, templates, router).compile()
+    graph = build_state_graph(dag, templates, router, node_tools={}).compile()
 
     result = await graph.ainvoke(_initial_state())
 
@@ -109,7 +109,7 @@ async def test_linear_dag_runs_nodes_in_order() -> None:
         },
         default_chain=["mock"],
     )
-    graph = build_state_graph(dag, templates, router).compile()
+    graph = build_state_graph(dag, templates, router, node_tools={}).compile()
 
     result = await graph.ainvoke(_initial_state())
 
@@ -142,7 +142,7 @@ async def test_conditional_branch_only_true_target_runs() -> None:
         default_chain=["mock"],
     )
     graph = build_state_graph(
-        dag, templates, router, rules=(), routing_settings=_routing_settings()
+        dag, templates, router, rules=(), routing_settings=_routing_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -176,7 +176,7 @@ async def test_conditional_and_unconditional_edge_same_node_both_taken() -> None
         default_chain=["mock"],
     )
     graph = build_state_graph(
-        dag, templates, router, rules=(), routing_settings=_routing_settings()
+        dag, templates, router, rules=(), routing_settings=_routing_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -195,7 +195,7 @@ async def test_multi_root_fan_out_both_roots_execute() -> None:
         },
         default_chain=["mock"],
     )
-    graph = build_state_graph(dag, templates, router).compile()
+    graph = build_state_graph(dag, templates, router, node_tools={}).compile()
 
     result = await graph.ainvoke(_initial_state())
 
@@ -223,7 +223,7 @@ async def test_multiple_sink_nodes_merge_via_reducer() -> None:
         },
         default_chain=["mock"],
     )
-    graph = build_state_graph(dag, templates, router).compile()
+    graph = build_state_graph(dag, templates, router, node_tools={}).compile()
 
     result = await graph.ainvoke(_initial_state())
 
@@ -247,7 +247,7 @@ async def test_decision_point_node_records_routing_decision_in_state() -> None:
         default_chain=["mock"],
     )
     graph = build_state_graph(
-        dag, templates, router, rules=(), routing_settings=_routing_settings()
+        dag, templates, router, rules=(), routing_settings=_routing_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -269,7 +269,7 @@ async def test_non_decision_point_node_never_writes_routing_decisions() -> None:
         },
         default_chain=["mock"],
     )
-    graph = build_state_graph(dag, templates, router).compile()
+    graph = build_state_graph(dag, templates, router, node_tools={}).compile()
 
     result = await graph.ainvoke(_initial_state())
 
@@ -298,7 +298,7 @@ async def test_two_decision_point_nodes_each_execute_with_their_own_template() -
     provider = MockProvider("mock", [], infinite_default=_completion('{"status": "ok"}'))
     router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     graph = build_state_graph(
-        dag, templates, router, rules=(), routing_settings=_routing_settings()
+        dag, templates, router, rules=(), routing_settings=_routing_settings(), node_tools={}
     ).compile()
 
     await graph.ainvoke(_initial_state())
@@ -380,7 +380,7 @@ def test_build_state_graph_raises_if_decision_point_has_no_routing_settings() ->
         default_chain=["mock"],
     )
     with pytest.raises(ValueError, match="routing_settings"):
-        build_state_graph(dag, templates, router)
+        build_state_graph(dag, templates, router, node_tools={})
 
 
 # ─── IG3 — a failed escalation must not discard the node's paid work ──────
@@ -483,7 +483,7 @@ async def test_sink_node_is_never_summarized_even_with_handoff_settings_provided
     provider = MockProvider("mock", [_completion('{"x": 1}')])
     router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     graph = build_state_graph(
-        dag, templates, router, handoff_settings=_handoff_settings()
+        dag, templates, router, handoff_settings=_handoff_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -509,7 +509,7 @@ async def test_non_terminal_unconditional_node_is_summarized_when_settings_provi
     )
     router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     graph = build_state_graph(
-        dag, templates, router, handoff_settings=_handoff_settings()
+        dag, templates, router, handoff_settings=_handoff_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -560,6 +560,7 @@ async def test_decision_point_node_is_also_summarized_via_make_node_callable_bra
         router,
         routing_settings=_routing_settings(),
         handoff_settings=_handoff_settings(),
+        node_tools={},
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -589,7 +590,7 @@ async def test_node_is_not_summarized_when_every_successor_opted_out() -> None:
     provider = MockProvider("mock", [_completion('{"step": "a"}'), _completion('{"step": "b"}')])
     router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     graph = build_state_graph(
-        dag, templates, router, handoff_settings=_handoff_settings()
+        dag, templates, router, handoff_settings=_handoff_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())
@@ -620,7 +621,7 @@ async def test_node_is_still_summarized_when_only_some_successors_opted_out() ->
     )
     router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
     graph = build_state_graph(
-        dag, templates, router, handoff_settings=_handoff_settings()
+        dag, templates, router, handoff_settings=_handoff_settings(), node_tools={}
     ).compile()
 
     result = await graph.ainvoke(_initial_state())

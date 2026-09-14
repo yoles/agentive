@@ -77,7 +77,29 @@ def _to_lc_messages(
         elif m.role == "user":
             converted.append(HumanMessage(content=m.content))
         elif m.role == "assistant":
-            converted.append(AIMessage(content=m.content))
+            # Story 5.0 (revue P1) — les invocations que CE tour a demandées
+            # repartent avec lui. Sans elles, le `ToolMessage` qui suit porte un
+            # `tool_call_id` qui ne référence rien dans le transcript, et les
+            # deux providers refusent l'échange par un 400 — fatal, sans repli
+            # possible côté `LLMRouter`.
+            #
+            # `content` vide est ici NORMAL, pas dégradé : sur un tour purement
+            # `tool_use`, ce sont les blocs d'outils qui portent le tour, et
+            # c'est `AIMessage` qui les rend à partir de `tool_calls`.
+            converted.append(
+                AIMessage(
+                    content=m.content,
+                    tool_calls=[
+                        {
+                            "id": c.id,
+                            "name": c.name,
+                            "args": dict(c.arguments),
+                            "type": "tool_call",
+                        }
+                        for c in m.tool_calls
+                    ],
+                )
+            )
         elif m.role == "tool":
             # Story 5.0 — the RESULT of a tool the model asked for.
             # `tool_call_id` is guaranteed present by `ChatMessage`'s own
@@ -116,11 +138,16 @@ def _to_tool_calls(response: BaseMessage) -> tuple[ToolCall, ...]:
         if not call_id or not name:
             continue
         args = entry.get("args")
-        calls.append(
-            ToolCall(
-                id=str(call_id), name=str(name), arguments=args if isinstance(args, dict) else {}
-            )
-        )
+        if not isinstance(args, dict):
+            # Revue P13 — traité comme n'importe quelle autre entrée
+            # malformée, donc ABANDONNÉ, plutôt que coercé en `{}`. Coercer
+            # exécutait l'outil sans arguments : il échouait alors sur la
+            # validation de schéma du serveur MCP, et le modèle recevait une
+            # erreur qui ne ressemblait en rien à sa vraie cause. Une entrée
+            # abandonnée est visible — si toutes le sont, `run_tool_loop`
+            # lève `ToolLoopProtocolError` au lieu de rendre une réponse vide.
+            continue
+        calls.append(ToolCall(id=str(call_id), name=str(name), arguments=args))
     return tuple(calls)
 
 

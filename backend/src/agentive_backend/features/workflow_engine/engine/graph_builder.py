@@ -269,7 +269,7 @@ def build_state_graph(
     routing_settings: RoutingSettings | None = None,
     retry_settings: RetrySettings | None = None,
     handoff_settings: HandoffSettings | None = None,
-    node_tools: Mapping[str, Mapping[str, ResolvedTool]] | None = None,
+    node_tools: Mapping[str, Mapping[str, ResolvedTool]],
 ) -> StateGraph[WorkflowState, None, WorkflowState, WorkflowState]:
     """Build (uncompiled) the ``StateGraph`` for ``dag`` — caller ``.compile()``s
     it with a checkpointer (T5.3).
@@ -301,6 +301,22 @@ def build_state_graph(
     suite predating this story) keep compiling — but any node that IS a
     decision point requires a real ``routing_settings`` (``None`` there is a
     caller bug, not a degrade-quietly case).
+
+    ``node_tools`` (Story 5.0, made REQUIRED by review P2) maps ``node_id`` to
+    that node's assigned tools. It follows ``rules``' posture, not
+    ``retry_settings``': there is NO default, because a default is precisely
+    how this argument was lost. It shipped as ``None``-defaulted and no
+    production caller ever passed it, so every workflow node ran tool-less
+    while the whole engine-side of the story's AC1/AC2 appeared delivered and
+    its unit tests — which pass ``resolved_tools=`` directly to
+    ``execute_agent_node`` — stayed green. This function's own sibling
+    :func:`_make_node_callable` already refuses a defaulted value for exactly
+    that reason; the reasoning applies here and was not applied.
+
+    An EMPTY mapping remains a perfectly legitimate explicit choice ("this
+    graph has no tools"), mirroring the ``routing_rules`` precedent in
+    ``WorkflowExecutionService.__init__``: only *forgetting* the argument is
+    now impossible.
 
     ``retry_settings`` (Story 4.6 T11.3) threads the node-level retry knobs
     down from the assembly layer, mirror ``routing_settings``. ``None`` is
@@ -367,7 +383,7 @@ def build_state_graph(
                 node_id=node.node_id,
                 template=templates[node.node_id],
                 llm_router=llm_router,
-                resolved_tools=(node_tools or {}).get(node.node_id),
+                resolved_tools=node_tools.get(node.node_id),
                 conditional_edges=conditional_edges,
                 unconditional_targets=unconditional_by_source.get(node.node_id, []),
                 rules=rules,
@@ -387,7 +403,7 @@ def build_state_graph(
                 # node has no tools", which the loop degenerates to a single
                 # call for, so a DAG built before this story behaves
                 # identically.
-                resolved_tools=(node_tools or {}).get(node.node_id),
+                resolved_tools=node_tools.get(node.node_id),
                 retry_settings=retry_settings,
                 has_downstream=has_downstream,
                 handoff_settings=handoff_settings,

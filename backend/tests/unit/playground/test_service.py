@@ -1568,3 +1568,185 @@ async def test_a_run_without_tools_still_costs_exactly_one_llm_call() -> None:
     # Et aucun outil n'est offert : `None`, pas une liste vide — certains
     # providers refusent une liste d'outils vide.
     assert llm_router.complete.await_args.kwargs["tools"] is None
+
+
+# ─── Revue de code — lot 3 ────────────────────────────────────────────────
+
+
+def test_tool_arguments_are_redacted_before_leaving_over_http() -> None:
+    """Revue P10 — le champ s'appelle `arguments_redacted` et ne rédigeait
+    rien : le dict du modèle repartait VERBATIM sur HTTP.
+
+    Un modèle peut recopier dans un argument une clé lue dans son propre
+    prompt système — risque que le protocole `Completer` documente déjà. Et
+    `agent_node` exclut délibérément ces mêmes arguments de `node_metrics`
+    au titre de NFR9 : le Playground faisait l'inverse, sur une surface plus
+    exposée.
+    """
+    from agentive_backend.features.playground.service import _redact_arguments
+
+    out = _redact_arguments({"q": "token sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "n": 3})
+
+    assert "sk-ant" not in out["q"]
+    assert "[REDACTED]" in out["q"]
+    assert out["n"] == 3, "une valeur non-texte traverse inchangée"
+
+
+def test_oversized_tool_arguments_are_replaced_by_a_marker() -> None:
+    """La seconde moitié de P10 : le champ n'était pas borné non plus, alors
+    que la docstring de `ToolInvocationLog` affirmait qu'il l'était et que
+    TOUS les autres champs de ce payload le sont.
+
+    Un marqueur plutôt qu'une troncature : un JSON coupé au milieu n'est ni
+    lisible ni analysable, et prétendre montrer les arguments en les mutilant
+    serait le même mensonge que celui qu'on corrige.
+    """
+    from agentive_backend.features.playground.service import (
+        _MAX_LOGGED_ARGUMENTS_JSON_BYTES,
+        _redact_arguments,
+    )
+
+    out = _redact_arguments({"blob": "A" * (_MAX_LOGGED_ARGUMENTS_JSON_BYTES * 2)})
+
+    assert set(out) == {"_truncated"}
+    assert str(_MAX_LOGGED_ARGUMENTS_JSON_BYTES) in out["_truncated"]
+
+
+def test_arguments_within_the_cap_are_reported_in_full() -> None:
+    """La borne ne doit pas manger le cas courant — un argument d'outil
+    normal fait quelques dizaines d'octets."""
+    from agentive_backend.features.playground.service import _redact_arguments
+
+    assert _redact_arguments({"path": "src/main.py", "depth": 2}) == {
+        "path": "src/main.py",
+        "depth": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_two_tools_sharing_a_name_do_not_silently_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue P7 — `tools` est `UNIQUE(server_id, name)` : le même nom sur deux
+    serveurs est explicitement LÉGAL, et les deux peuvent être assignés au
+    même template.
+
+    La compréhension de dict qui résolvait les outils était clée sur le NOM :
+    le second écrasait le premier sans un mot. Le modèle se voyait offrir UN
+    outil, `tools_activated_count` en annonçait DEUX (il compte des ids), et
+    l'appel partait vers le serveur survivant — lequel, personne ne pouvait
+    le dire.
+    """
+    shared_name = "read_file"
+    first, second = MagicMock(), MagicMock()
+    for tool in (first, second):
+        tool.id, tool.name = uuid4(), shared_name
+        tool.description, tool.input_schema = "lit", {"type": "object"}
+    server_a, server_b = MagicMock(), MagicMock()
+    for server in (server_a, server_b):
+        server.id, server.transport = uuid4(), "stdio"
+        server.connection_config = {"command": "x"}
+
+    template = MagicMock()
+    template.config = {"system_prompt": "p", "llm_model": "claude-sonnet-4-6"}
+    service, llm_router = _make_service(
+        template=template,
+        assigned_tools=[(first, MagicMock()), (second, MagicMock())],
+        resolved_tools=[(first, server_a), (second, server_b)],
+        completion=_completion("ok"),
+    )
+
+    await service.run(
+        template_id=uuid4(), arguments={}, enabled_tool_ids=None, timeout_seconds=30.0
+    )
+
+    offered = llm_router.complete.await_args.kwargs["tools"]
+    # Un seul outil reste offert — l'ambiguïté ne se résout pas — mais la
+    # collision est désormais tracée, et le premier (ordre `name, id`) gagne
+    # de façon déterministe.
+    assert [d.name for d in offered] == [shared_name]
+
+
+@pytest.mark.asyncio
+async def test_the_request_timeout_bounds_the_whole_run_not_just_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue P8 — `timeout_seconds` (`le=120`, documenté « longer runs belong
+    in workflow engine ») n'était transmis qu'en timeout PAR APPEL LLM.
+
+    Le plafond d'horloge de la boucle venait d'une constante de module
+    (180 s) : une requête à 5 s pouvait donc légitimement occuper un worker
+    180 s, et une requête à 120 s était silencieusement relevée à 180 s. Le
+    paramètre ne décrivait plus la requête.
+    """
+    import agentive_backend.features.playground.service as svc_module
+
+    captured: dict[str, object] = {}
+
+    async def _spy(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise AssertionError("stop")
+
+    monkeypatch.setattr(svc_module, "run_tool_loop", _spy)
+
+    template = MagicMock()
+    template.config = {"system_prompt": "p", "llm_model": "claude-sonnet-4-6"}
+    service, _router = _make_service(template=template, completion=_completion("ok"))
+
+    # Le spy interrompt la boucle ; `_complete` enveloppe toute exception en
+    # `DependencyError` (H-02) pour garantir l'audit unique, donc c'est cette
+    # forme-là qui remonte. Ce qu'on mesure est l'argument, pas l'issue.
+    with pytest.raises(DependencyError):
+        await service.run(
+            template_id=uuid4(), arguments={}, enabled_tool_ids=None, timeout_seconds=7.5
+        )
+
+    assert captured["max_wall_clock_s"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_a_secret_in_a_tool_argument_does_not_reach_the_http_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le CÂBLAGE de P10, pas seulement son helper.
+
+    Écrit après coup : la première version de ces tests n'éprouvait que
+    `_redact_arguments` isolément, et une mutation remettant
+    `arguments_redacted=inv.arguments` au site d'appel les laissait TOUS
+    verts. Un helper testé dont l'usage ne l'est pas est précisément le
+    défaut que la revue a relevé sur `node_tools` (P2) — filé jusque dans une
+    signature, appelé par personne.
+    """
+    tool = MagicMock()
+    tool.id, tool.name = uuid4(), "grep"
+    tool.description, tool.input_schema = "cherche", {"type": "object"}
+    server = MagicMock()
+    server.id, server.transport = uuid4(), "stdio"
+    server.connection_config = {"command": "x"}
+
+    secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA"
+    call = ToolCall(id="t1", name="grep", arguments={"q": f"cherche {secret} dans le code"})
+
+    template = MagicMock()
+    template.config = {"system_prompt": "p", "llm_model": "claude-sonnet-4-6"}
+    service, llm_router = _make_service(
+        template=template,
+        assigned_tools=[(tool, MagicMock())],
+        resolved_tools=[(tool, server)],
+        completion=_completion("fini"),
+    )
+    llm_router.complete = AsyncMock(
+        side_effect=[_completion("je cherche", tool_calls=(call,)), _completion("fini")]
+    )
+    monkeypatch.setattr(
+        "agentive_backend.infra.mcp.tool_executor.call_tool",
+        AsyncMock(return_value={"content": [{"type": "text", "text": "rien"}], "isError": False}),
+    )
+
+    response = await service.run(
+        template_id=uuid4(), arguments={}, enabled_tool_ids=None, timeout_seconds=30.0
+    )
+
+    [invocation] = response.tool_invocations
+    assert secret not in str(invocation.arguments_redacted)
+    assert "[REDACTED]" in invocation.arguments_redacted["q"]

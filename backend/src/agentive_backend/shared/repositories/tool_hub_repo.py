@@ -9,6 +9,7 @@ forbids ``sqlalchemy`` imports from ``agentive_backend.features``).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -254,6 +255,49 @@ class AgentTemplateToolRepo(BaseRepo):
         )
         result = await session.execute(stmt)
         return [(tool, server) for tool, server in result.all()]
+
+    async def list_resolved_for_templates(
+        self,
+        template_ids: Sequence[UUID],
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[UUID, list[tuple[Tool, ToolServer]]]:
+        """Same join as :meth:`list_resolved_for_template_in_session`, for
+        MANY templates at once (review P2).
+
+        The workflow engine needs this shape: a DAG resolves its tools once
+        per run, for every node, and calling the single-template method in a
+        loop would reintroduce exactly the N+1 that method's own docstring
+        says it exists to avoid — one query per node, on the hot path of
+        every run and every resume.
+
+        Opens its own transaction rather than taking a session, because the
+        engine's caller has none to lend: ``_load_templates`` is the
+        precedent, and it batches for the same reason.
+
+        Returns a dict keyed by ``agent_template_id``. A template with no
+        assigned tool is ABSENT rather than mapped to an empty list — the
+        caller distinguishes "no tools" from "unknown template" by asking the
+        template map, not this one. Empty ``template_ids`` short-circuits
+        without a round trip: a DAG of nodes that all lack tools must not pay
+        for a query returning nothing.
+        """
+        if not template_ids:
+            return {}
+        stmt = (
+            select(AgentTemplateTool.agent_template_id, Tool, ToolServer)
+            .join(Tool, Tool.id == AgentTemplateTool.tool_id)
+            .join(ToolServer, ToolServer.id == Tool.server_id)
+            .where(AgentTemplateTool.agent_template_id.in_(list(template_ids)))
+            .order_by(asc(Tool.name), asc(Tool.id))
+        )
+        async with self.with_tenant(tenant_id) as session:
+            result = await session.execute(stmt)
+            rows = result.all()
+        grouped: dict[UUID, list[tuple[Tool, ToolServer]]] = {}
+        for template_id, tool, server in rows:
+            grouped.setdefault(template_id, []).append((tool, server))
+        return grouped
 
     async def replace_in_session(
         self,

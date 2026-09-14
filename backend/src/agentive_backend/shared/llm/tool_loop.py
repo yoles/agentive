@@ -57,12 +57,80 @@ DEFAULT_MAX_TOOL_CALLS: Final = settings.tool_loop_max_tool_calls
 DEFAULT_MAX_WALL_CLOCK_S: Final = settings.tool_loop_max_wall_clock_s
 
 
+@dataclass(frozen=True)
+class ToolLoopUsage:
+    """What a loop had already SPENT when it was refused.
+
+    Exists because a ceiling used to throw all of it away (review P4): the
+    error carried a message and nothing else, so the Playground audited a run
+    that had burned up to 8 billed LLM calls and 24 tool executions as
+    ``input_tokens=0, output_tokens=0`` — a fabricated zero, in a codebase
+    that elsewhere insists on ``None`` for "unknown" precisely so the two
+    cannot be confused.
+
+    This is the same family as IG1 of the 4.3 review and P-2 of the 4.7:
+    spend that appeared nowhere. AC4 mandates the typed refusal AND that
+    every iteration's cost reaches the run totals; it never said what happens
+    to that cost on the refusal path, and the answer is not "it vanishes".
+    """
+
+    iterations: int
+    tool_calls_made: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_cost_usd: Decimal | None
+
+
 class ToolLoopLimitError(LLMError):
     """A ceiling was reached before the model stopped asking for tools.
 
-    Subclasses :class:`LLMError` so the existing error classification and the
-    workflow engine's ``error_policy`` dispatcher route it like any other LLM
-    fault, rather than it being a new exception family nobody handles.
+    Subclasses :class:`LLMError` so it lands in the same family as every
+    other LLM fault for logging and RFC 7807 rendering.
+
+    It is deliberately NOT retried, and the caller does not consult
+    ``error_policy`` for it — a ceiling is a deterministic verdict about a
+    model that will not stop, so retrying only re-buys the same refusal, and
+    a replayed loop re-executes tools that are not necessarily idempotent
+    (cf ``docs/runbooks/rejeu-et-outils.md``). An earlier version of this
+    docstring claimed the dispatcher routed it "like any other LLM fault";
+    it never did — ``_complete_with_retry`` catches only
+    ``LLMAllProvidersFailedError`` — and describing a mechanism that does not
+    exist is worse than describing none (review P21).
+
+    ``usage`` carries what the refused loop already spent, so the caller can
+    record it instead of reporting zero.
+    """
+
+    def __init__(self, detail: str, *, usage: ToolLoopUsage) -> None:
+        super().__init__(
+            detail,
+            context={
+                "iterations": usage.iterations,
+                "tool_calls_made": usage.tool_calls_made,
+                "input_tokens": usage.total_input_tokens,
+                "output_tokens": usage.total_output_tokens,
+                "cost_usd": (
+                    str(usage.total_cost_usd) if usage.total_cost_usd is not None else None
+                ),
+            },
+        )
+        self.usage = usage
+
+
+class ToolLoopProtocolError(LLMError):
+    """The provider said "I am calling a tool" and named none.
+
+    ``finish_reason == "tool_use"`` with an EMPTY ``tool_calls`` cannot happen
+    on a healthy exchange: either every entry was malformed and the adapter
+    dropped them all, or a LangChain/provider payload changed shape under us.
+
+    Raised rather than returned (review P12). The loop used to take the "the
+    model answered" branch here and hand back a completion whose text is
+    typically ``""``: ``execute_agent_node`` then best-effort-parsed an empty
+    output and recorded the node as SUCCESSFUL. A silent wrong answer is the
+    one outcome this module's ceilings exist to prevent — ``types.py`` already
+    asserts this combination "stays detectable as the anomaly it would be",
+    and nothing was detecting it.
     """
 
 
@@ -82,7 +150,13 @@ class ToolLoopResult:
     completion: Completion
     """The final completion — the one that asked for no further tool."""
     messages: tuple[ChatMessage, ...]
-    """The full transcript, tool results included, ready to be persisted."""
+    """The full transcript, ready to be persisted: the starting messages, every
+    tool request with its result, AND the turn that finally answered.
+
+    That last turn was missing (review P16) — the snapshot was taken before it
+    was appended, so a consumer persisting this as the conversation stored a
+    history that stopped mid-exchange, with the answer reachable only through
+    ``completion``."""
     iterations: int
     """LLM calls made, always >= 1."""
     tool_calls_made: int
@@ -93,6 +167,43 @@ class ToolLoopResult:
     mirroring :class:`LLMUsage`'s own convention — never ``0`` for "unknown",
     which would be a fabricated figure indistinguishable from a real free
     call."""
+
+
+def _validate_ceilings(
+    *,
+    has_tools: bool,
+    max_iterations: int,
+    max_tool_calls: int,
+    max_wall_clock_s: float,
+) -> None:
+    """Refuse a ceiling that cannot mean anything, before any call is billed.
+
+    Extracted from :func:`run_tool_loop` to keep it under the repo's mccabe
+    gate: these guards are a flat list with no interaction between them, so
+    they read better on their own than inlined ahead of the loop.
+    """
+    if max_iterations < 1:
+        raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
+    if has_tools and max_iterations < 2:
+        # Conséquence de P15, refusée au lieu d'être subie. Le dernier tour
+        # autorisé part sans outils ; quand il n'y en a QU'UN, ce tour est
+        # aussi le premier, et un nœud portant des outils tournerait sans
+        # aucun — silencieusement, ce que l'AC4 interdit explicitement.
+        #
+        # Gardé ICI plutôt que par un `ge=2` sur le réglage : cette fonction
+        # a d'autres appelants que `settings`, et une borne posée sur le
+        # champ ne protège que le chemin qui passe par lui. Deux itérations
+        # est le minimum qui a un sens — une pour demander, une pour
+        # conclure.
+        raise ValueError(
+            f"max_iterations must be >= 2 when tools are offered, got {max_iterations}: "
+            "the last allowed turn is not offered tools, so a single-iteration loop "
+            "would silently run tool-less"
+        )
+    if max_tool_calls < 0:
+        raise ValueError(f"max_tool_calls must be >= 0, got {max_tool_calls}")
+    if not math.isfinite(max_wall_clock_s) or max_wall_clock_s <= 0:
+        raise ValueError(f"max_wall_clock_s must be finite and > 0, got {max_wall_clock_s!r}")
 
 
 async def run_tool_loop(
@@ -140,20 +251,22 @@ async def run_tool_loop(
             returning the partial answer would hide a model stuck in a loop
             behind a plausible-looking result.
 
-            On the wall-clock path the tokens already billed are LOST from the
-            result, because there is no result. That is true of the other two
-            ceilings as well, and it is the caller's failure path that records
-            the node as failed; no ceiling here fabricates a partial success.
+            No ceiling fabricates a partial success. But the spend is NOT
+            lost with the result: every ``ToolLoopLimitError`` carries a
+            :class:`ToolLoopUsage` (review P4) so the caller's failure path
+            can record what was actually billed instead of reporting zero.
+        ToolLoopProtocolError: the provider reported ``finish_reason ==
+            "tool_use"`` and named no usable call (review P12).
         ValueError: a ceiling is not strictly positive. A ``max_iterations``
             of 0 would make the function return without ever calling the
             model, which no caller can mean.
     """
-    if max_iterations < 1:
-        raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
-    if max_tool_calls < 0:
-        raise ValueError(f"max_tool_calls must be >= 0, got {max_tool_calls}")
-    if not math.isfinite(max_wall_clock_s) or max_wall_clock_s <= 0:
-        raise ValueError(f"max_wall_clock_s must be finite and > 0, got {max_wall_clock_s!r}")
+    _validate_ceilings(
+        has_tools=bool(tools),
+        max_iterations=max_iterations,
+        max_tool_calls=max_tool_calls,
+        max_wall_clock_s=max_wall_clock_s,
+    )
 
     transcript: list[ChatMessage] = list(messages)
     iterations = 0
@@ -161,6 +274,16 @@ async def run_tool_loop(
     total_input = 0
     total_output = 0
     total_cost: Decimal | None = None
+
+    def _usage() -> ToolLoopUsage:
+        """Snapshot de la dépense engagée, pour un refus (revue P4)."""
+        return ToolLoopUsage(
+            iterations=iterations,
+            tool_calls_made=tool_calls_made,
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            total_cost_usd=total_cost,
+        )
 
     # `asyncio.timeout` rather than a deadline checked between iterations: a
     # check between turns bounds nothing when a single turn is what hangs, and
@@ -170,7 +293,22 @@ async def run_tool_loop(
     try:
         async with deadline:
             while True:
-                completion = await complete(transcript, tools)
+                # Revue P15 — le dernier tour AUTORISÉ part sans outils.
+                # `.env.example` documentait déjà ce comportement (« il ne
+                # peut plus demander d'outil ») alors que le code offrait
+                # `tools` à chaque tour puis refusait au modèle ce qu'il
+                # venait de l'inviter à faire : 8 appels facturés et jusqu'à
+                # 24 exécutions MCP jetés, là où ne pas tendre la perche rend
+                # une réponse exploitable. On ne peut pas reprocher à un
+                # modèle d'utiliser un outil qu'on lui présente.
+                is_final_turn = iterations + 1 >= max_iterations
+                # `tuple(...)` et non la liste vive : le transcript est muté
+                # après cet appel (le tour demandé, ses résultats, puis la
+                # réponse finale), et passer la liste elle-même donnait à
+                # l'appelé une vue qui CHANGE sous lui. Un adaptateur qui la
+                # stocke, un mock qui l'enregistre ou un log différé voyaient
+                # un état postérieur à leur propre appel.
+                completion = await complete(tuple(transcript), None if is_final_turn else tools)
                 iterations += 1
                 total_input += completion.input_tokens
                 total_output += completion.output_tokens
@@ -178,7 +316,21 @@ async def run_tool_loop(
                     total_cost = (total_cost or Decimal(0)) + completion.cost_estimate_usd
 
                 if not completion.tool_calls:
+                    if completion.finish_reason == "tool_use":
+                        # Revue P12 — anomalie, pas une réponse.
+                        raise ToolLoopProtocolError(
+                            "provider reported finish_reason='tool_use' with no usable "
+                            f"tool call after {iterations} iteration(s) — every entry was "
+                            "dropped as malformed, or the payload shape changed"
+                        )
                     # The model answered. This is the ONLY exit that returns a result.
+                    #
+                    # Revue P16 — le tour qui RÉPOND entre lui aussi dans le
+                    # transcript. Le snapshot était pris avant, donc
+                    # `messages` — documenté « the full transcript, ready to
+                    # be persisted » — s'arrêtait systématiquement sur un
+                    # `role="tool"` et ne contenait jamais la réponse.
+                    transcript.append(ChatMessage(role="assistant", content=completion.text))
                     return ToolLoopResult(
                         completion=completion,
                         messages=tuple(transcript),
@@ -192,21 +344,41 @@ async def run_tool_loop(
                 if tool_calls_made + len(completion.tool_calls) > max_tool_calls:
                     raise ToolLoopLimitError(
                         f"tool call ceiling reached: {tool_calls_made} made, "
-                        f"{len(completion.tool_calls)} more requested, ceiling {max_tool_calls}"
+                        f"{len(completion.tool_calls)} more requested, ceiling {max_tool_calls}",
+                        usage=_usage(),
                     )
                 if iterations >= max_iterations:
                     # Checked AFTER the tool-call ceiling and only when the model is
                     # still asking: a model that answers on its last allowed turn has
                     # not exceeded anything, and failing it would be wrong.
+                    #
+                    # Depuis P15 ce tour-là n'a plus reçu d'outils, donc ce
+                    # refus ne se déclenche plus que si le modèle en réclame
+                    # SANS qu'on lui en ait proposé — défensif, pas nominal.
                     raise ToolLoopLimitError(
                         f"iteration ceiling reached: {iterations} LLM calls, ceiling "
-                        f"{max_iterations}, and the model is still requesting tools"
+                        f"{max_iterations}, and the model is still requesting tools",
+                        usage=_usage(),
                     )
 
                 # The assistant turn that REQUESTED the tools must stay in the
-                # transcript: without it the provider sees results answering nothing,
-                # and Anthropic rejects the exchange outright.
-                transcript.append(ChatMessage(role="assistant", content=completion.text))
+                # transcript, WITH its requests: without the text the provider
+                # loses the model's reasoning, and without `tool_calls` it sees
+                # results answering nothing and rejects the exchange outright
+                # (review P1 — the text was kept, the correlation was not, so
+                # every second iteration died on a fatal 400).
+                #
+                # `completion.text` is routinely EMPTY on a turn that only asked
+                # for tools. That is not a degenerate case to guard against: the
+                # tool-use blocks are what carries the turn, and the adapters
+                # render them from `tool_calls`.
+                transcript.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=completion.text,
+                        tool_calls=completion.tool_calls,
+                    )
+                )
                 for call in completion.tool_calls:
                     result = await execute(call)
                     tool_calls_made += 1
@@ -223,5 +395,6 @@ async def run_tool_loop(
             raise
         raise ToolLoopLimitError(
             f"wall-clock ceiling reached after {max_wall_clock_s}s: "
-            f"{iterations} LLM call(s), {tool_calls_made} tool call(s) made"
+            f"{iterations} LLM call(s), {tool_calls_made} tool call(s) made",
+            usage=_usage(),
         ) from None

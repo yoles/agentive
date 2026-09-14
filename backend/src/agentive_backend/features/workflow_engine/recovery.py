@@ -188,17 +188,32 @@ def derive_stale_threshold_s(
 
     ::
 
-        (node call + its routing escalation)   -> NODE_TIMEOUT_S + escalation
-        x every provider in the chain          -> _MAX_PROVIDER_CHAIN_LEN
+        the node's whole tool loop, flat       -> tool_loop_max_wall_clock_s
         x every attempt (first + retries)      -> 1 + MAX_RUNTIME_RETRIES
-        + the backoff waits between them       -> _worst_case_backoff_s(...)
+        + its routing escalation, ONCE per
+          node, across the provider chain      -> escalation_timeout_s
+                                                   x _MAX_PROVIDER_CHAIN_LEN
+        + the backoff waits between attempts   -> _worst_case_backoff_s(...)
         + its handoff summary, once, across
           every provider in the chain          -> handoff_summary_timeout_s
                                                    x _MAX_PROVIDER_CHAIN_LEN
         x margin for checkpoint-write latency
           and event-loop scheduling            -> _SAFETY_MARGIN
 
-    ``handoff_summary_timeout_s`` is REQUIRED, like its three siblings.
+    Story 5.0 changed the first two lines and the review (P19) caught that
+    this block had not followed. What changed, and why:
+
+    * ``NODE_TIMEOUT_S`` no longer leads the formula. A node is no longer ONE
+      LLM call but N LLM calls and M tool calls, all enclosed in the flat
+      wall-clock ceiling — which already contains the provider chain, so the
+      ``x _MAX_PROVIDER_CHAIN_LEN`` factor left that first term with it.
+    * The routing escalation is counted ONCE per node, not once per attempt.
+      It lives in ``graph_builder``'s routing callable, which runs AFTER
+      ``execute_agent_node`` has returned with its retries already spent.
+      Billing it eight times was a writing convenience that stayed harmless
+      only while the rest was small.
+
+    ``handoff_summary_timeout_s`` is REQUIRED, like its siblings.
     Review of 2026-09-12 (P-15): it shipped with a default, and a default on
     an argument of this function is precisely the failure it exists to
     prevent — a future caller who forgets to wire it silently derives a
@@ -209,9 +224,12 @@ def derive_stale_threshold_s(
     change that introduced the default.
 
     **A function, not a constant, because the inputs are deployment-tunable
-    and the invariant is not** (Story 4.6, review lot 7 / P-P). The three
-    arguments are `AGENTIVE_WORKFLOW_RETRY_BASE_DELAY_S`,
-    `...MAX_DELAY_S` and `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`; the
+    and the invariant is not** (Story 4.6, review lot 7 / P-P). The arguments
+    are `AGENTIVE_WORKFLOW_RETRY_BASE_DELAY_S`, `...MAX_DELAY_S`,
+    `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`,
+    `AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_TIMEOUT_S` and, since Story 5.0,
+    `AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S` — five, not the three this
+    paragraph used to claim (review P19). The
     previous version hardcoded all three at their defaults and told the
     operator, in a comment, that "a deployment that raises those delays must
     raise ``stale_threshold_s=`` with them".
@@ -243,7 +261,8 @@ def derive_stale_threshold_s(
     """
     # P-15 — the invariant this function exists to make true by construction
     # is only true over a sane domain. `Settings` carries `gt=0`/
-    # `allow_inf_nan=False` on all four inputs, but this is a PUBLIC function
+    # `allow_inf_nan=False` on all five inputs (review P19 — they were four
+    # before Story 5.0), but this is a PUBLIC function
     # called directly (including from tests), and a negative value here yields
     # a NEGATIVE threshold: every `running` run is instantly classified
     # orphaned and re-claimed, i.e. generalised double execution — silently.
@@ -302,11 +321,23 @@ def derive_stale_threshold_s(
         #
         # Pourquoi le corriger MAINTENANT plutôt que de le laisser tranquille.
         # Sur-facturer ce terme était gratuit tant que le reste était petit ;
-        # ça ne l'est plus. À x8, la pire combinaison LÉGALE de tous les
-        # réglages donne une fenêtre de 69 min — au-delà de l'heure que ce
-        # module qualifie lui-même de « défait le worker de recovery ». À x2
-        # elle vaut 54 min, et le défaut passe de 37 à 33 min. La marge x2,5
-        # ci-dessous couvre toujours l'ensemble.
+        # ça ne l'est plus. Chiffres RECALCULÉS à la revue (P18) : les deux
+        # que portait ce commentaire — « 69 min » et « 54 min » — étaient
+        # faux, et faux dans le sens dangereux, puisqu'ils faisaient croire à
+        # une marge sous l'heure qui n'existe pas.
+        #
+        # À la pire combinaison LÉGALE (`W=200`, `escalation=60`,
+        # `retry_base=60`, `retry_max=300`, `handoff=45`) :
+        #   - à x8 : `(800 + 480 + 420 + 90) x 2,5 = 4475 s`, soit 74,6 min
+        #     — bien au-delà de l'heure que ce module qualifie lui-même de
+        #     « défait le worker de recovery ».
+        #   - à x2 : `(800 + 120 + 420 + 90) x 2,5 = 3575 s`, soit 59,6 min.
+        #     La bascule se fait à `W = 202,5` exactement, ce que `le=200.0`
+        #     interdit — la marge réelle est donc de 2,5 s de budget, pas des
+        #     six minutes que « 54 min » laissait supposer.
+        # Aux valeurs par DÉFAUT, le passage de x8 à x2 fait tomber la fenêtre
+        # de 37 à 33 min (2217,5 s -> 1992,5 s) ; ces deux chiffres-là étaient
+        # justes. La marge x2,5 ci-dessous couvre toujours l'ensemble.
         + escalation_timeout_s * _MAX_PROVIDER_CHAIN_LEN
         + _worst_case_backoff_s(base_delay_s=base_delay_s, max_delay_s=max_delay_s)
         + handoff_summary_timeout_s * _MAX_PROVIDER_CHAIN_LEN

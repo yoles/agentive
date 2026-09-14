@@ -37,7 +37,12 @@ from agentive_backend.shared.config import settings
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.testing import MockProvider
 from agentive_backend.shared.llm.types import ChatMessage, Completion
-from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
+from agentive_backend.shared.repositories import (
+    AgentTemplateRepo,
+    AgentTemplateToolRepo,
+    WorkflowRepo,
+    WorkflowRunRepo,
+)
 
 _COMMIT_POLL_TIMEOUT_S = 10.0
 _COMMIT_POLL_INTERVAL_S = 0.05
@@ -167,6 +172,7 @@ async def main() -> None:
             workflow_repo=workflow_repo,
             workflow_run_repo=workflow_run_repo,
             template_repo=template_repo,
+            tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
             llm_router=llm_router,
             checkpointer=checkpointer,
             routing_rules=load_routing_rules(),

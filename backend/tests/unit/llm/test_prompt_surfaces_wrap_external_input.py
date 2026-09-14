@@ -44,19 +44,37 @@ KNOWN_UNWRAPPED = {
     "features/playground/service.py": "Story 9.7",
 }
 
-#: Modules qui touchent `.complete(` sans composer de prompt : la plomberie
-#: du routeur et les politiques d'erreur, qui ne voient jamais de contenu.
+#: Modules qui atteignent le LLM sans composer de prompt : la plomberie du
+#: routeur, les politiques d'erreur, et la boucle d'outils elle-même — qui
+#: transporte des messages composés ailleurs et n'en fabrique aucun.
 NOT_PROMPT_BUILDERS = {
     "shared/llm/router.py",
+    "shared/llm/tool_loop.py",
     "features/workflow_engine/domain/error_policy.py",
     "features/workflow_engine/domain/provider_chain.py",
 }
+
+#: Les façons d'atteindre un LLM dans ce dépôt. Le détecteur ne cherchait que
+#: `.complete(` — ce qui était exact tant qu'il n'existait qu'une seule voie.
+#:
+#: La Story 5.0 en a ouvert une seconde et ne l'a pas déclarée (revue P20) :
+#: `run_tool_loop(complete=...)` reçoit son appelant par INJECTION, donc un
+#: module qui compose un prompt et le confie à la boucle ne contient aucun
+#: `.complete(` et restait totalement invisible. La cinquième surface pouvait
+#: donc apparaître sans faire échouer la moitié « non classée » — précisément
+#: ce que ce fichier dit exister pour empêcher, écrit par la story qui a
+#: introduit l'indirection.
+LLM_ENTRY_POINTS = (
+    ".complete(",
+    "run_tool_loop(",
+)
 
 
 def _modules_issuing_completions() -> set[str]:
     found = set()
     for path in SRC.rglob("*.py"):
-        if ".complete(" in path.read_text(encoding="utf-8"):
+        source = path.read_text(encoding="utf-8")
+        if any(entry in source for entry in LLM_ENTRY_POINTS):
             found.add(str(path.relative_to(SRC)))
     return found
 
@@ -91,6 +109,27 @@ def test_a_declared_wrapping_surface_really_wraps(relative: str) -> None:
         f"{relative} est déclaré comme enveloppant ses entrées externes mais "
         "n'appelle jamais wrap_external_input."
     )
+
+
+def test_the_detector_sees_every_way_this_repo_reaches_a_model() -> None:
+    """Le détecteur lui-même est testé (revue P20).
+
+    Sa faiblesse n'était pas une surface oubliée mais une VOIE oubliée : il
+    cherchait un littéral, et la Story 5.0 a ajouté une indirection que ce
+    littéral ne rencontre jamais. Ce test épingle l'ensemble des voies
+    connues, pour qu'en ajouter une troisième sans l'inscrire se voie.
+    """
+    # `shared/llm/tool_loop.py` est la preuve vivante du trou : il compose et
+    # transporte tout prompt multi-tours du dépôt, et ne contient pas
+    # `.complete(`. Il DOIT être découvert — puis classé.
+    discovered = _modules_issuing_completions()
+
+    assert "shared/llm/tool_loop.py" in discovered, (
+        "le détecteur ne voit pas la boucle d'outils : la voie "
+        "`run_tool_loop(` a disparu de LLM_ENTRY_POINTS."
+    )
+    assert "features/playground/service.py" in discovered
+    assert "features/workflow_engine/engine/agent_node.py" in discovered
 
 
 @pytest.mark.parametrize(("relative", "story"), sorted(KNOWN_UNWRAPPED.items()))

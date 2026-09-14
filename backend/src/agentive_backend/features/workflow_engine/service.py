@@ -20,7 +20,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID
 
 from agentive_backend.features.workflow_engine.domain import (
@@ -66,6 +66,7 @@ from agentive_backend.features.workflow_engine.schemas import (
     WorkflowEdgeRequest,
     WorkflowNodeRequest,
 )
+from agentive_backend.infra.mcp.tool_executor import ResolvedTool
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.diversity import LLMSelection, check_llm_diversity
 from agentive_backend.shared.contracts.events import (
@@ -110,6 +111,7 @@ if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.mise_en_place import MiseEnPlaceService
     from agentive_backend.infra.db.models import AgentTemplate, Workflow, WorkflowRun
     from agentive_backend.shared.llm.router import LLMRouter
+    from agentive_backend.shared.repositories.ports import AgentTemplateToolRepository
 
 _log = get_logger(__name__)
 
@@ -911,6 +913,89 @@ async def _load_templates(
     return templates
 
 
+async def _load_node_tools(
+    tool_hub_repo: AgentTemplateToolRepository,
+    templates: Mapping[str, AgentTemplate],
+    *,
+    tenant_id: UUID | None,
+) -> dict[str, dict[str, ResolvedTool]]:
+    """Resolve every node's assigned tools — ONE batch query for the whole DAG
+    (review P2, closing the engine half of Story 5.0 AC1/AC2).
+
+    Mirrors :func:`_load_templates` deliberately, down to the batching: both
+    run on the hot path of every run AND every resume, and a per-node query
+    here would be the same N+1 that story had to close.
+
+    ``ResolvedTool`` is the projection ``infra/mcp`` needs to CALL a tool
+    (transport + connection config), which is why the repo hands back ORM rows
+    and this layer does the last step — ``shared`` cannot import ``infra``
+    (Contract 2), so the projection cannot live in the repo.
+
+    A node whose template has no assigned tool is absent from the result, and
+    ``build_state_graph`` then passes ``None`` down to ``execute_agent_node``
+    — the pre-Story-5.0 path, byte for byte, for a workflow that uses no
+    tools.
+
+    Two nodes MAY share a template; the grouped rows are keyed by template id
+    and fanned back out per node, so that costs one query, not two.
+    """
+    template_ids = {template.id for template in templates.values()}
+    grouped = await tool_hub_repo.list_resolved_for_templates(
+        sorted(template_ids), tenant_id=tenant_id
+    )
+    if not grouped:
+        return {}
+    node_tools: dict[str, dict[str, ResolvedTool]] = {}
+    for node_id, template in templates.items():
+        rows = grouped.get(template.id)
+        if not rows:
+            continue
+        resolved: dict[str, ResolvedTool] = {}
+        for tool, server in rows:
+            transport = server.transport
+            if transport not in ("stdio", "sse"):
+                # Garanti par le CHECK `ck_tool_server_transport`, donc
+                # inatteignable sauf dérive du schéma. Ignoré bruyamment
+                # plutôt que transmis : `ResolvedTool` promet un transport
+                # que `call_tool` sait router, et mentir ici déplacerait
+                # l'échec loin de sa cause.
+                _log.warning(
+                    "workflow_engine.tool_unknown_transport",
+                    node_id=node_id,
+                    tool=tool.name,
+                    transport=transport,
+                )
+                continue
+            if tool.name in resolved:
+                # Revue P7 — `tools` est UNIQUE(server_id, name) : le même nom
+                # sur deux serveurs est explicitement légal, et les deux
+                # peuvent être assignés au même template. Le dict est clé sur
+                # le NOM, donc le second écrasait le premier en silence et le
+                # modèle se voyait offrir un outil dont il ne pouvait pas
+                # savoir lequel il appelait. Déterministe (la requête ordonne
+                # par `name, id`), mais arbitraire — donc signalé.
+                _log.warning(
+                    "workflow_engine.tool_name_collision",
+                    node_id=node_id,
+                    tool=tool.name,
+                    kept_server_id=str(resolved[tool.name].server_id),
+                    dropped_server_id=str(server.id),
+                )
+                continue
+            resolved[tool.name] = ResolvedTool(
+                tool_id=tool.id,
+                server_id=server.id,
+                name=tool.name,
+                description=tool.description,
+                input_schema=dict(tool.input_schema or {}),
+                transport=cast("Literal['stdio', 'sse']", transport),
+                connection_config=dict(server.connection_config or {}),
+            )
+        if resolved:
+            node_tools[node_id] = resolved
+    return node_tools
+
+
 #: Per-field cap on the free-text a check contributes to an outbox row,
 #: mirroring the ``summary[:4000]`` the refusal event already applies. A run
 #: can be resumed arbitrarily many times and each resume writes one of these,
@@ -1255,6 +1340,7 @@ class WorkflowExecutionService:
         workflow_repo: WorkflowRepo,
         workflow_run_repo: WorkflowRunRepo,
         template_repo: AgentTemplateRepo,
+        tool_hub_repo: AgentTemplateToolRepository,
         llm_router: LLMRouter,
         checkpointer: AsyncPostgresSaver,
         routing_rules: Sequence[RoutingRule],
@@ -1263,6 +1349,10 @@ class WorkflowExecutionService:
         self._workflow_repo = workflow_repo
         self._workflow_run_repo = workflow_run_repo
         self._template_repo = template_repo
+        # Story 5.0 (revue P2) — REQUIS, comme `routing_rules` plus bas et
+        # pour la meme raison : sans lui, chaque noeud tournait sans outils
+        # en silence alors que la story annoncait le contraire.
+        self._tool_hub_repo = tool_hub_repo
         self._llm_router = llm_router
         self._checkpointer = checkpointer
         # Story 4.5 T3.8 — the pre-workflow hook `start_run` calls between
@@ -2421,6 +2511,15 @@ class WorkflowExecutionService:
 
         try:
             dag = _dag_from_stored(workflow.dag)
+            # Story 5.0 (revue P2) — resolu ICI, dans la couche d'assemblage,
+            # comme `templates` : `engine/` ne lit jamais la base lui-meme.
+            # Une passe par execution, donc aussi a chaque reprise — un
+            # template dont les outils ont change entre le crash et la reprise
+            # repart avec les outils COURANTS, exactement comme il repart avec
+            # le `config` courant (cf `_report_config_drift`).
+            node_tools = await _load_node_tools(
+                self._tool_hub_repo, templates, tenant_id=workflow.tenant_id
+            )
             graph = build_state_graph(
                 dag,
                 templates,
@@ -2429,6 +2528,7 @@ class WorkflowExecutionService:
                 routing_settings=routing_settings,
                 retry_settings=retry_settings,
                 handoff_settings=handoff_settings,
+                node_tools=node_tools,
             ).compile(checkpointer=self._checkpointer)
         except Exception as exc:
             # A stored DAG that no longer parses, or a `node_id` LangGraph

@@ -715,6 +715,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workflow_repo=WorkflowRepo(session_factory=session_factory),
         workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
         template_repo=AgentTemplateRepo(session_factory=session_factory),
+        # Story 5.0 (revue P2) — sans ce repo, `_load_node_tools` n'a rien a
+        # interroger et chaque noeud de workflow tourne sans outils.
+        tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
         llm_router=llm_router,
         checkpointer=workflow_checkpointer,
         routing_rules=app.state.routing_rules,

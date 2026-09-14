@@ -75,6 +75,21 @@ class ChatMessage(BaseModel):
     #: unchanged; a ``"tool"`` message without it is refused below, because a
     #: result the model cannot correlate is worse than no result.
     tool_call_id: str | None = None
+    #: Set ONLY on ``role="assistant"`` — the tool invocations THIS turn asked
+    #: for, carried back into the transcript verbatim (review P1).
+    #:
+    #: Without this field the loop could re-inject a tool RESULT but not the
+    #: REQUEST it answers: the adapters rebuilt the assistant turn from
+    #: ``content`` alone, so the ``tool_call_id`` on the following ``"tool"``
+    #: message pointed at nothing. Both providers reject that outright —
+    #: Anthropic ``tool_result without a corresponding tool_use``, OpenAI
+    #: ``role 'tool' must be a response to a preceding message with
+    #: tool_calls`` — and a 400 is fatal in ``LLMRouter``, with no fallback.
+    #: Every second iteration of every loop died there.
+    #:
+    #: Defaults to empty, so an assistant turn that asked for nothing (every
+    #: caller predating the tool loop) is constructed exactly as before.
+    tool_calls: tuple[ToolCall, ...] = ()
 
     @model_validator(mode="after")
     def _tool_messages_carry_their_correlation_id(self) -> ChatMessage:
@@ -82,6 +97,13 @@ class ChatMessage(BaseModel):
             raise ValueError("a ChatMessage(role='tool') must carry tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is only meaningful on role='tool'")
+        # Mirror of the rule above, for the symmetric field: a request only
+        # makes sense on the turn that issued it. Loud rather than ignored —
+        # `tool_calls` on a "user" or "tool" message means the caller has
+        # confused the two halves of the exchange, and silently dropping them
+        # is how the correlation was lost in the first place.
+        if self.role != "assistant" and self.tool_calls:
+            raise ValueError("tool_calls is only meaningful on role='assistant'")
         return self
 
 

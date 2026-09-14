@@ -471,10 +471,18 @@ def test_max_stream_duration_stays_above_the_stale_threshold_at_every_legal_sett
     hour, which is why the premise below is now an inequality against the
     floor rather than against 3600: at the worst legal combination the
     threshold is ~3575 s, just under the 3600 s floor `_max_stream_duration_s`
-    guarantees. The inversion is therefore no longer REACHABLE through
-    configuration — a stronger position than the one this test was written
-    to defend, and the assertion that matters (the SSE ceiling stays above
-    the sweep's window) is unchanged and still load-bearing.
+    guarantees.
+
+    Revue P17 — l'assertion « inchangée et toujours porteuse » ne l'était
+    plus. `_max_stream_duration_s()` rend `max(3600, seuil + 120)` : avec un
+    pire cas à 3575 s, `> 3575` était satisfait par le PLANCHER CONSTANT
+    seul, donc supprimer entièrement l'appel à `derive_stale_threshold_s`
+    laissait ce test vert. Elle était aussi écrite DEUX FOIS à l'identique.
+
+    Ce qui la rend porteuse : la marge de 120 s fait que le terme dérivé
+    domine bel et bien le plancher au pire cas (3575 + 120 = 3695 > 3600).
+    On assert donc la VALEUR, pas seulement l'inégalité — c'est la seule
+    forme qui tombe si la dérivation disparaît.
     """
     from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
 
@@ -497,9 +505,18 @@ def test_max_stream_duration_stays_above_the_stale_threshold_at_every_legal_sett
     monkeypatch.setattr(router_module.settings, "workflow_handoff_summary_timeout_s", 45.0)
     monkeypatch.setattr(router_module.settings, "tool_loop_max_wall_clock_s", 200.0)
 
-    assert router_module._max_stream_duration_s() > worst_case_stale_threshold_s
+    duration = router_module._max_stream_duration_s()
 
-    assert router_module._max_stream_duration_s() > worst_case_stale_threshold_s
+    # L'invariant que ce test défend : le plafond SSE reste au-dessus de la
+    # fenêtre du balayage, sans quoi un flux se ferme avant que le run soit
+    # déclaré planté.
+    assert duration > worst_case_stale_threshold_s
+    # Et il le reste PARCE QUE la dérivation est lue, pas parce qu'un
+    # plancher constant l'absorbe : au pire cas le terme dérivé domine.
+    assert duration == pytest.approx(
+        worst_case_stale_threshold_s + router_module._STREAM_DURATION_HEADROOM_S
+    )
+    assert duration > router_module._MAX_STREAM_DURATION_FLOOR_S
 
 
 def test_max_stream_duration_keeps_the_one_hour_floor_at_default_settings() -> None:

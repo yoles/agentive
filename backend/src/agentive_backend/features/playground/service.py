@@ -58,7 +58,8 @@ from agentive_backend.shared.exceptions import (
     DependencyError,
     ValidationError,
 )
-from agentive_backend.shared.llm.tool_loop import run_tool_loop
+from agentive_backend.shared.llm.redaction import redact_secrets
+from agentive_backend.shared.llm.tool_loop import ToolLoopLimitError, run_tool_loop
 from agentive_backend.shared.llm.types import ChatMessage, Completion
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.memory.push_memory import DEFAULT_SIMILARITY_THRESHOLD
@@ -268,6 +269,53 @@ class _LLMOutcome:
     tool_invocations: list[ToolInvocation] = dc_field(default_factory=list)
 
 
+#: Plafond sur les arguments d'outil REMONTES dans la reponse HTTP. Sans
+#: rapport avec `_MAX_ARGUMENTS_JSON_BYTES` (schemas.py), qui borne ce que
+#: l'APPELANT envoie : celui-ci borne ce que le MODELE a produit, et un
+#: modele peut emettre un argument de plusieurs centaines de kio.
+_MAX_LOGGED_ARGUMENTS_JSON_BYTES: Final = 4_096
+
+
+def _redact_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Rend `arguments_redacted` conforme a son nom (revue P10).
+
+    Le champ passait le dict du modele VERBATIM : ni redige, ni borne, alors
+    que la docstring de `ToolInvocationLog` affirmait le contraire et que
+    `agent_node` exclut deliberement ces memes arguments de `node_metrics`
+    au titre de NFR9. Un argument d'outil est une entree externe non
+    maitrisee qui repart ici sur HTTP.
+
+    Deux gardes, dans cet ordre :
+
+    1. **Redaction** — un modele peut recopier dans un argument une cle d'API
+       lue dans son propre prompt systeme, risque que le protocole `Completer`
+       documente deja.
+    2. **Borne** — la reponse est rendue a un navigateur ; tous les autres
+       champs de ce payload sont plafonnes, celui-ci ne l'etait pas.
+
+    Le depassement rend un marqueur plutot qu'une troncature : un JSON coupe
+    au milieu n'est ni lisible ni analysable, et pretendre montrer les
+    arguments tout en les mutilant serait le meme mensonge que celui qu'on
+    corrige.
+    """
+    redacted: dict[str, Any] = {
+        key: redact_secrets(value) if isinstance(value, str) else value
+        for key, value in arguments.items()
+    }
+    try:
+        size = len(json.dumps(redacted, ensure_ascii=False, default=str).encode("utf-8"))
+    except TypeError, ValueError:  # pragma: no cover — defensive
+        return {"_unserializable": f"{len(redacted)} argument(s)"}
+    if size > _MAX_LOGGED_ARGUMENTS_JSON_BYTES:
+        return {
+            "_truncated": (
+                f"{len(redacted)} argument(s), {size} bytes — above the "
+                f"{_MAX_LOGGED_ARGUMENTS_JSON_BYTES}-byte response cap"
+            )
+        }
+    return redacted
+
+
 class PlaygroundService:
     """Run an agent-template in isolation — Story 2.7 FR48."""
 
@@ -372,8 +420,31 @@ class PlaygroundService:
         # meme semantique que `_count_activated_tools`, qui a deja valide la
         # liste et leve un 422 sur un outil non assigne.
         enabled = set(enabled_tool_ids) if enabled_tool_ids is not None else None
-        resolved_tools = {
-            tool.name: ResolvedTool(
+        resolved_tools: dict[str, ResolvedTool] = {}
+        for tool, server in resolved_rows:
+            if enabled is not None and tool.id not in enabled:
+                continue
+            if tool.name in resolved_tools:
+                # Revue P7 — `tools` est UNIQUE(server_id, name) : le meme nom
+                # sur deux serveurs est explicitement legal, et les deux
+                # peuvent etre assignes au meme template. La comprehension de
+                # dict qui etait ici, clee sur le NOM, laissait le second
+                # ecraser le premier en silence : le modele se voyait offrir
+                # UN outil, `tools_activated_count` en annoncait DEUX (il
+                # compte des ids), et l'appel partait vers le serveur
+                # survivant sans que personne ne puisse le savoir.
+                #
+                # Deterministe — la requete ordonne par `(name, id)` — mais
+                # arbitraire, donc signale plutot que subi.
+                _log.warning(
+                    "playground.tool_name_collision",
+                    template_id=str(template_id),
+                    tool=tool.name,
+                    kept_server_id=str(resolved_tools[tool.name].server_id),
+                    dropped_server_id=str(server.id),
+                )
+                continue
+            resolved_tools[tool.name] = ResolvedTool(
                 tool_id=tool.id,
                 server_id=server.id,
                 name=tool.name,
@@ -382,9 +453,6 @@ class PlaygroundService:
                 transport=server.transport,
                 connection_config=dict(server.connection_config or {}),
             )
-            for tool, server in resolved_rows
-            if enabled is None or tool.id in enabled
-        }
         outcome = await self._complete(
             config_snapshot=config_snapshot,
             prompt_resolved=prompt_resolved,
@@ -478,7 +546,7 @@ class PlaygroundService:
                     tool_id=inv.tool_id,
                     tool_name=inv.tool_name,
                     server_id=inv.server_id,
-                    arguments_redacted=inv.arguments,
+                    arguments_redacted=_redact_arguments(inv.arguments),
                     result_summary=inv.result_summary,
                     duration_ms=inv.duration_ms,
                     status=inv.status,
@@ -830,7 +898,6 @@ class PlaygroundService:
         # outil ne paie rien pour cette machinerie et son comportement est
         # inchange.
         executor = McpToolExecutor(resolved=resolved_tools or {})
-        tool_definitions = to_tool_definitions(resolved_tools or {})
 
         async def _call(msgs: Sequence[ChatMessage], tools: Any) -> Completion:
             return await self._llm_router.complete(
@@ -844,11 +911,33 @@ class PlaygroundService:
             )
 
         try:
+            # Revue P5 — la projection vit DANS le `try`. Elle construit des
+            # `ToolDefinition`, dont `name`/`description` sont bornes ; une
+            # description MCP hors bornes levait donc une `ValidationError`
+            # AVANT que le `try` ne soit entre, elle echappait a `_complete`
+            # ET a `run()`, et le run ne publiait aucun evenement d'audit
+            # (AC5 rompu) pour un 500 opaque au lieu du 503 documente.
+            # C'est exactement le defaut H-02 que le commentaire ci-dessous
+            # dit avoir referme.
+            tool_definitions = to_tool_definitions(resolved_tools or {})
             loop_result = await run_tool_loop(
                 complete=_call,
                 messages=messages,
                 tools=tool_definitions or None,
                 execute=executor,
+                # Revue P8 — `timeout_seconds` est le contrat passe par
+                # l'appelant (`le=120`, documente « longer runs belong in
+                # workflow engine »). Il n'etait transmis qu'en timeout PAR
+                # APPEL LLM : une requete a 5 s pouvait legitimement occuper
+                # un worker 180 s (le plafond plat du module), et une requete
+                # a 120 s etait silencieusement ramenee a 180 s sans que
+                # personne ne le dise. Le parametre ne decrivait plus la
+                # requete.
+                #
+                # Consequence assumee : un run de Playground riche en outils
+                # doit desormais demander un `timeout_seconds` a sa mesure.
+                # C'est le sens du parametre.
+                max_wall_clock_s=timeout_seconds,
             )
             completion = loop_result.completion
         except asyncio.CancelledError as exc:
@@ -879,6 +968,36 @@ class PlaygroundService:
                 model_used=model,
                 provider_used="",
                 error=exc,
+            )
+        except ToolLoopLimitError as exc:
+            # Revue P4 — un plafond atteint n'est PAS une dépense nulle.
+            # Ce run a pu brûler jusqu'à 8 appels LLM facturés et 24
+            # exécutions MCP ; il était audité `input_tokens=0,
+            # output_tokens=0, tool_invocations=[]`. Le zéro était fabriqué,
+            # et `tool_invocations=[]` rendait littéralement le symptôme de
+            # D80 que cette story ferme.
+            #
+            # Le refus reste un refus : le statut est bien `llm_error` et
+            # l'appelant reçoit son 503. Seule la comptabilité est réparée.
+            error = DependencyError(
+                detail=f"tool loop ceiling reached: {exc.detail}",
+                context={
+                    "template_id": str(template_id),
+                    "error_type": type(exc).__name__,
+                    **exc.context,
+                },
+            )
+            error.__cause__ = exc
+            return _LLMOutcome(
+                status="llm_error",
+                raw_output="",
+                input_tokens=exc.usage.total_input_tokens,
+                output_tokens=exc.usage.total_output_tokens,
+                cost_estimate_usd=exc.usage.total_cost_usd,
+                model_used=model,
+                provider_used="",
+                error=error,
+                tool_invocations=list(executor.invocations),
             )
         except Exception as exc:
             # H-02 (fix-batch 2026-09-02): was ``except LLMError``. But
@@ -911,6 +1030,9 @@ class PlaygroundService:
                 model_used=model,
                 provider_used="",
                 error=error,
+                # Revue P4 — meme raison : un echec provider au 6e tour ne
+                # doit pas effacer les 5 tours d'outils deja executes.
+                tool_invocations=list(executor.invocations),
             )
         return _LLMOutcome(
             status="success",

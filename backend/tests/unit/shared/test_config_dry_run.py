@@ -248,3 +248,60 @@ def test_the_wall_clock_ceiling_is_what_keeps_the_window_under_an_hour() -> None
     assert window(200.0) < 60 * 60
     # Et la borne mord : juste au-dessus, elle ne tiendrait plus.
     assert window(210.0) > 60 * 60
+
+
+# ─── Revue de code — lot 3 : bornes des plafonds de boucle d'outils ───────
+
+
+def test_the_wall_clock_floor_is_refused_at_startup_for_real() -> None:
+    """Revue P14 — trois endroits (le commentaire de `config.py`, celui de
+    `recovery.py` et le runbook) affirmaient qu'une valeur sous 120 s était
+    « REFUSÉE au démarrage ».
+
+    Le champ ne portait que `gt=0.0` : le plancher n'existait que dans
+    `derive_stale_threshold_s`. Un `=60` passait donc la validation, le
+    process démarrait, passait ses health checks — puis chaque run ET chaque
+    flux SSE levaient un `ValueError` nu depuis une fonction de DÉRIVATION,
+    très loin de la faute. Une erreur de configuration prenait la feature
+    en panne à chaud au lieu d'être refusée à froid.
+    """
+    with pytest.raises(ValidationError):
+        Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=60.0)  # type: ignore[call-arg]
+
+
+def test_the_documented_useful_range_is_exactly_what_the_field_accepts() -> None:
+    """Les deux bornes de la plage 120-200 s sont calculées, pas choisies :
+    sous 120 s on tuerait un nœud sain sans aucun outil qui bascule d'un
+    provider à l'autre ; au-delà de 202,5 s la pire combinaison légale
+    dépasse l'heure que ce module qualifie de « défait le worker »."""
+    assert Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=120.0).tool_loop_max_wall_clock_s == 120.0  # type: ignore[call-arg]
+    assert Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=200.0).tool_loop_max_wall_clock_s == 200.0  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        Settings(AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=201.0)  # type: ignore[call-arg]
+
+
+def test_a_tool_call_cannot_be_allowed_to_outlive_the_whole_node() -> None:
+    """Revue P22 — `tool_call_timeout_s` (`le=300`) pouvait légalement
+    dépasser `tool_loop_max_wall_clock_s` (`le=200`), sans aucun garde.
+
+    La conséquence était déjà écrite en prose au-dessus du champ — « un seul
+    appel lent consomme tout le nœud » — et n'était vérifiée nulle part : la
+    boucle mourait alors systématiquement sur son plafond d'horloge après un
+    unique outil, et `tool_call_timeout_s` n'avait plus d'effet observable.
+    """
+    with pytest.raises(ValidationError, match="exceeds"):
+        Settings(  # type: ignore[call-arg]
+            AGENTIVE_TOOL_CALL_TIMEOUT_S=300.0,
+            AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=200.0,
+        )
+
+
+def test_a_tool_call_timeout_equal_to_the_wall_clock_stays_legal() -> None:
+    """La borne est un `>`, pas un `>=` : consommer exactement tout le budget
+    en un appel est un choix défendable (un seul outil très lent), tant que
+    la boucle n'est pas condamnée à mourir AVANT de l'avoir fini."""
+    settings = Settings(  # type: ignore[call-arg]
+        AGENTIVE_TOOL_CALL_TIMEOUT_S=180.0,
+        AGENTIVE_TOOL_LOOP_MAX_WALL_CLOCK_S=180.0,
+    )
+    assert settings.tool_call_timeout_s == settings.tool_loop_max_wall_clock_s

@@ -40,7 +40,12 @@ from agentive_backend.features.workflow_engine.service import WorkflowExecutionS
 from agentive_backend.shared.llm.router import LLMRouter
 from agentive_backend.shared.llm.testing import MockProvider
 from agentive_backend.shared.llm.types import Completion
-from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
+from agentive_backend.shared.repositories import (
+    AgentTemplateRepo,
+    AgentTemplateToolRepo,
+    WorkflowRepo,
+    WorkflowRunRepo,
+)
 
 from .conftest import _workflow_checkpoint_dsn, always_pass_mise_en_place_service
 
@@ -135,6 +140,7 @@ async def test_resume_after_sigkill_does_not_replay_node_a(
             workflow_repo=workflow_repo,
             workflow_run_repo=workflow_run_repo,
             template_repo=template_repo,
+            tool_hub_repo=AgentTemplateToolRepo(session_factory=app_session_factory),
             llm_router=llm_router,
             checkpointer=checkpointer,
             routing_rules=load_routing_rules(),

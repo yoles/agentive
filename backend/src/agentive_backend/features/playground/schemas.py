@@ -73,16 +73,21 @@ class ToolInvocationLog(BaseModel):
     so ``finish_reason == "tool_use"`` — mapped by both adapters since Story
     1.6 — could not physically occur.
 
-    ``arguments_redacted`` and ``result_summary`` are bounded on purpose:
-    this payload is returned over HTTP and a tool result is an unbounded
-    source of text.
+    ``result_summary`` is bounded on purpose: this payload is returned over
+    HTTP and a tool result is an unbounded source of text.
+
+    ``tool_id`` / ``server_id`` are ``None`` in exactly one case: the model
+    asked for a tool it was never offered (review P11). There is then no
+    ``tools`` row and no server to name, but the attempt is still reported —
+    it consumed a turn of the loop's budget, and hiding it was how a run
+    could cost eight iterations while every metric claimed nothing happened.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    tool_id: UUID
+    tool_id: UUID | None
     tool_name: str
-    server_id: UUID
+    server_id: UUID | None
     arguments_redacted: dict[str, Any] = Field(default_factory=dict)
     result_summary: str = ""
     duration_ms: int = Field(ge=0)
