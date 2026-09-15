@@ -42,14 +42,21 @@ from agentive_backend.infra.mcp.client import (
     call_tool,
     discover_tools,
 )
+from agentive_backend.infra.mcp.policy import apply_sandbox_policy
 from agentive_backend.infra.mcp.sandbox import SandboxBackend, detect_sandbox_backend
+from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.events import (
     ToolDiscoveredEvent,
     ToolInvokedEvent,
     ToolServerConnectedEvent,
 )
 from agentive_backend.shared.event_bus import notify_best_effort, publish
-from agentive_backend.shared.exceptions import ConflictError, DependencyError, NotFoundError
+from agentive_backend.shared.exceptions import (
+    ConflictError,
+    DependencyError,
+    ForbiddenError,
+    NotFoundError,
+)
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.security import REDACTED, is_secret_key, redact_recursive
 
@@ -160,11 +167,33 @@ class ToolHubService:
 
         Raises
         ------
+        ForbiddenError
+            ``AGENTIVE_ALLOW_MCP_REGISTRATION`` is false.
         ConflictError
             ``(name, tenant_id)`` already exists.
         DependencyError
             MCP discovery timed out (default 10s).
         """
+        # Story 5.2, revue de code — LA GARDE EST ICI, plus seulement dans le
+        # routeur. Le constat d'origine était juste (« le drapeau garde le
+        # routeur, pas le service ») et la Story 5.2 l'avait corrigé dans son
+        # APPELANT, ce qui laissait le trou ouvert pour le suivant. Le
+        # contrôle appartient à l'acte qu'il garde : enregistrer un serveur MCP
+        # spawne un sous-processus arbitraire.
+        #
+        # Placé ici, il ne se déclenche QUE lorsqu'un enregistrement a
+        # réellement lieu : un provisioning qui se contente de vérifier
+        # l'existant n'a plus besoin du drapeau, ce qui rend son activation
+        # signifiante au lieu d'être une case à cocher permanente.
+        if not settings.mcp_allow_registration:
+            raise ForbiddenError(
+                detail=(
+                    "MCP server registration is disabled. Set "
+                    "AGENTIVE_ALLOW_MCP_REGISTRATION=true to enable."
+                ),
+                context={"flag": "AGENTIVE_ALLOW_MCP_REGISTRATION", "name": name},
+            )
+
         # Step 1 (out of transaction) — duplicate check via a fresh session.
         # We do this BEFORE the discovery so we don't waste 10s of subprocess
         # spawn / SSE handshake for a name that's already taken.
@@ -184,11 +213,22 @@ class ToolHubService:
         # Step 2 (out of transaction) — MCP discovery. Network/subprocess
         # I/O outside the DB transaction so we don't hold a connection
         # open for 10s.
+        # Story 5.2 T2.2 — le profil sandbox du serveur, appliqué à la
+        # DÉCOUVERTE aussi. Le passer à `call_tool` seul livrerait un serveur
+        # qui s'exécute mais ne s'enregistre pas : sous bwrap, un serveur de
+        # lecture de code dont les racines ne sont pas ro-bindées ne voit même
+        # pas son propre interpréteur, et `list_tools` échoue avant tout le
+        # reste.
+        profile, effective_config = apply_sandbox_policy(
+            transport=transport,  # type: ignore[arg-type]  # Literal narrowed upstream
+            connection_config=connection_config,
+        )
         try:
             discovered = await discover_tools(
                 transport=transport,  # type: ignore[arg-type]  # Literal narrowed upstream
-                connection_config=connection_config,
+                connection_config=effective_config,
                 timeout=DEFAULT_DISCOVERY_TIMEOUT_S,
+                profile=profile,
             )
         except MCPDiscoveryTimeoutError as exc:
             raise DependencyError(
@@ -522,13 +562,21 @@ class ToolHubService:
         capturing ``(status, result, duration_ms, error)`` instead of raising
         inline — so the caller can audit once before re-raising."""
         start = time.monotonic()
+        # Même politique que sur le chemin `workflow_engine` (Story 5.2 T2.2) :
+        # le Playground et le moteur appellent le MÊME serveur, il serait
+        # confiné dans l'un et pas dans l'autre sans cette ligne.
+        profile, effective_config = apply_sandbox_policy(
+            transport=transport,  # type: ignore[arg-type]  # Literal narrowed by DB CHECK
+            connection_config=connection_config,
+        )
         try:
             result = await call_tool(
                 transport=transport,  # type: ignore[arg-type]  # Literal narrowed by DB CHECK
-                connection_config=connection_config,
+                connection_config=effective_config,
                 tool_name=tool_name,
                 arguments=arguments,
                 timeout=timeout,
+                profile=profile,
                 backend=backend,
             )
         except MCPExecutionTimeoutError as exc:

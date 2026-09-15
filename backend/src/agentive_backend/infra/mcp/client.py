@@ -26,6 +26,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from agentive_backend.infra.mcp.policy import apply_sandbox_policy
 from agentive_backend.infra.mcp.sandbox import (
     MCPExecutionError,
     MCPExecutionTimeoutError,
@@ -156,6 +157,24 @@ async def _discover_inner(
     """Inner discovery loop without the timeout wrapper. Kept separate so
     the wait_for stack-trace points to a clean signature."""
     if transport == "stdio":
+        # Story 5.2, revue de code — LE BACKSTOP EST ICI, et AVANT l'extraction
+        # de `command`/`args`/`env`.
+        #
+        # La politique de sandbox par serveur était appliquée par chacun des
+        # trois appelants (`ToolHubService.connect_server`, `invoke_tool`,
+        # `mise_en_place._check_tools`), et le commentaire de ce dernier le
+        # disait sans le voir : « TROISIÈME appelant, et le plus facile à
+        # oublier ». Une garantie qui repose sur le fait qu'aucun quatrième
+        # appelant n'oublie n'est pas une garantie — et `mcp-servers.yaml`
+        # affirme qu'« un `UPDATE` sur `connection_config` ne peut pas élargir
+        # l'allowlist », ce qui ne tient que si la politique précède CHAQUE
+        # spawn. Elle le précède donc ici, au point de passage obligé.
+        #
+        # Idempotente : réappliquée sur une configuration déjà réécrite, elle
+        # rend la même chose — les appelants explicites restent corrects.
+        policy_profile, connection_config = apply_sandbox_policy(
+            transport="stdio", connection_config=connection_config
+        )
         command = connection_config.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("stdio connection_config requires non-empty 'command'")
@@ -181,7 +200,7 @@ async def _discover_inner(
         # spawn through bwrap (or the setrlimit bootstrap fallback) by
         # asking the SDK to launch the sandbox with the real command as its
         # tail args.
-        effective_profile = profile or SandboxProfile()
+        effective_profile = profile or policy_profile or SandboxProfile()
         effective_env: dict[str, str] | None
         if env is not None:
             effective_env = {k: v for k, v in env.items() if k in effective_profile.env_passthrough}
@@ -345,6 +364,24 @@ async def _call_tool_inner(
     ``sse_client``).
     """
     if transport == "stdio":
+        # Story 5.2, revue de code — LE BACKSTOP EST ICI, et AVANT l'extraction
+        # de `command`/`args`/`env`.
+        #
+        # La politique de sandbox par serveur était appliquée par chacun des
+        # trois appelants (`ToolHubService.connect_server`, `invoke_tool`,
+        # `mise_en_place._check_tools`), et le commentaire de ce dernier le
+        # disait sans le voir : « TROISIÈME appelant, et le plus facile à
+        # oublier ». Une garantie qui repose sur le fait qu'aucun quatrième
+        # appelant n'oublie n'est pas une garantie — et `mcp-servers.yaml`
+        # affirme qu'« un `UPDATE` sur `connection_config` ne peut pas élargir
+        # l'allowlist », ce qui ne tient que si la politique précède CHAQUE
+        # spawn. Elle le précède donc ici, au point de passage obligé.
+        #
+        # Idempotente : réappliquée sur une configuration déjà réécrite, elle
+        # rend la même chose — les appelants explicites restent corrects.
+        policy_profile, connection_config = apply_sandbox_policy(
+            transport="stdio", connection_config=connection_config
+        )
         command = connection_config.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("stdio connection_config requires non-empty 'command'")
@@ -368,7 +405,7 @@ async def _call_tool_inner(
         # which inherits this env wholesale ; without filtering, secret-
         # bearing keys from ``connection_config["env"]`` would leak into
         # the subprocess.
-        effective_profile = profile or SandboxProfile()
+        effective_profile = profile or policy_profile or SandboxProfile()
         effective_env: dict[str, str] | None
         if env is not None:
             effective_env = {k: v for k, v in env.items() if k in effective_profile.env_passthrough}

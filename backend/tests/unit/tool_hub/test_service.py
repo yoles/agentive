@@ -39,8 +39,43 @@ from agentive_backend.infra.mcp.sandbox import (
 from agentive_backend.shared.exceptions import (
     ConflictError,
     DependencyError,
+    ForbiddenError,
     NotFoundError,
 )
+
+
+@pytest.fixture(autouse=True)
+def _registration_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """La garde du drapeau vit désormais DANS le service (revue Story 5.2).
+
+    Elle gardait le routeur seul, et la Story 5.2 l'avait re-implémentée dans
+    son appelant — ce qui laissait `connect_server` ouvert pour le prochain
+    script in-process. Ces tests-ci exercent ce qui vient APRÈS la porte ; le
+    refus lui-même a son propre test juste en dessous.
+    """
+    monkeypatch.setattr(svc_module.settings, "mcp_allow_registration", True)
+
+
+@pytest.mark.asyncio
+async def test_connect_server_is_refused_when_registration_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le drapeau garde l'ACTE d'enregistrer, pas seulement la route HTTP.
+
+    Enregistrer un serveur MCP spawne un sous-processus arbitraire : le
+    contrôle appartient au service, pas à chacun de ses appelants.
+    """
+    monkeypatch.setattr(svc_module.settings, "mcp_allow_registration", False)
+    service = _make_service()
+
+    with pytest.raises(ForbiddenError) as excinfo:
+        await service.connect_server(
+            name="whatever",
+            transport="stdio",
+            connection_config={"command": "/bin/true", "args": []},
+        )
+
+    assert "AGENTIVE_ALLOW_MCP_REGISTRATION" in str(excinfo.value.detail)
 
 
 def _make_service(

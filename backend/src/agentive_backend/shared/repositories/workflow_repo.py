@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, Numeric, case, cast, func, literal, or_, select, text, update
+from sqlalchemy import Integer, Numeric, asc, case, cast, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -158,6 +158,39 @@ class WorkflowRepo(BaseRepo):
             )
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
+
+    async def list_by_name(
+        self, name: str, *, tenant_id: UUID | None = None, limit: int = 100
+    ) -> list[Workflow]:
+        """Tous les workflows portant ce nom (Story 5.2 T5.2).
+
+        Rend une LISTE, et c'est le fait que cette méthode existe pour
+        rendre visible : ``workflows.name`` n'est **pas** unique
+        (``infra/db/models.py``), et l'empreinte d'idempotence de
+        ``create_workflow`` couvre le DAG. Changer le DAG d'un workflow de
+        provisioning crée donc une SECONDE ligne homonyme, et le
+        ``workflow_id`` que l'opérateur avait noté continue de pointer sur
+        l'ancienne. Un appelant qui veut « le » workflow d'un nom doit
+        d'abord constater combien il y en a.
+
+        Ordonné par ``created_at, id`` : le provisioning doit pouvoir dire
+        « la plus ancienne » sans dépendre de l'ordre de retour de Postgres.
+
+        ``limit`` par défaut à 100, comme :meth:`list_active` juste en dessous
+        (revue 5.2). La méthode était sans borne, alors que sa raison d'être
+        est précisément d'observer une croissance non bornée : dans le scénario
+        qui la motive, elle chargeait tous les ``Workflow`` homonymes — leur
+        ``dag`` JSONB compris — pour n'en afficher que les ``id``.
+        """
+        async with self.with_tenant(tenant_id) as session:
+            stmt = (
+                select(Workflow)
+                .where(Workflow.name == name, Workflow.tenant_id == tenant_id)
+                .order_by(asc(Workflow.created_at), asc(Workflow.id))
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
 
     async def list_active(
         self, *, tenant_id: UUID | None = None, limit: int = 100

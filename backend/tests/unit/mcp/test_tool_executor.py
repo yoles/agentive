@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from agentive_backend.infra.mcp.client import MCPExecutionTimeoutError
+from agentive_backend.infra.mcp.client import MCPExecutionTimeoutError, MCPToolError
 from agentive_backend.infra.mcp.tool_executor import (
     MAX_TOOL_RESULT_CHARS,
     McpToolExecutor,
@@ -116,6 +116,58 @@ async def test_a_timeout_is_reported_to_the_model_not_raised(
 
     assert "timed out" in out
     assert executor.invocations[0].status == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_refusal_reaches_the_model_with_its_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 5.2 T1.4 — un refus doit être EXPLOITABLE, pas seulement signalé.
+
+    Ajouté par la revue : la branche `except MCPToolError` était livrée sans
+    aucun test (`grep "refused the call"` ne rendait rien). Or c'est la moitié
+    de T1.4 : « ERROR: tool 'read_file' failed: MCPToolError » ne dit pas à
+    l'agent de corriger son chemin, et c'était tout ce que le `except
+    Exception` rendait.
+    """
+    tool = _tool(name="read_file")
+    detail = "chemin hors des racines autorisées : '/etc/passwd' résout vers /etc/passwd"
+    monkeypatch.setattr(
+        _MODULE, AsyncMock(side_effect=MCPToolError(tool_name="read_file", detail=detail))
+    )
+    executor = McpToolExecutor(resolved={tool.name: tool})
+
+    out = await executor(ToolCall(id="t1", name="read_file"))
+
+    assert "racines autorisées" in out, "le modèle doit pouvoir corriger son chemin"
+    assert "refused the call" in out
+    assert executor.invocations[0].status == "error"
+    # Et le détail reste enveloppé comme n'importe quelle sortie d'outil.
+    assert "<tool_output>" in out
+
+
+@pytest.mark.asyncio
+async def test_a_policy_failure_is_reported_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue 5.2 — `apply_sandbox_policy` était appelé HORS du `try`.
+
+    Une exception de la politique (réglage incohérent, interpréteur
+    introuvable) échappait alors à `__call__` et tuait la boucle d'outils,
+    alors que la docstring de la classe garantit que seule une erreur de
+    programmation s'en échappe.
+    """
+    tool = _tool()
+    monkeypatch.setattr(
+        "agentive_backend.infra.mcp.tool_executor.apply_sandbox_policy",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("`sys.executable` est vide")),
+    )
+    executor = McpToolExecutor(resolved={tool.name: tool})
+
+    out = await executor(ToolCall(id="t1", name="grep"))
+
+    assert "RuntimeError" in out
+    assert executor.invocations[0].status == "error"
 
 
 @pytest.mark.asyncio

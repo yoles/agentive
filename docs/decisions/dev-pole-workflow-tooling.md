@@ -50,9 +50,21 @@ le lit. Cette boucle ne nécessite aucun outil — le run s'arrête sur le node
 Dev Lead et son plan est lu par John en `curl`.
 
 Les Stories 5.2 (filesystem + ripgrep) et 5.5 (GitHub) ne sont **pas
-bloquées** : leurs serveurs MCP sont **tiers**, ils s'enregistrent
-normalement, et elles exerceront le mécanisme livré ici avec une liste non
-vide.
+bloquées** : elles exerceront le mécanisme livré ici avec une liste non vide.
+
+> ⚠️ **AMENDÉ PAR LA STORY 5.2 (2026-09-15).** Ce paragraphe affirmait que
+> leurs serveurs MCP « sont **tiers**, ils s'enregistrent normalement ».
+> C'était une hypothèse, pas un état relevé : l'image backend est
+> `python:3.14-slim` + `bubblewrap` + `curl` — **ni Node, ni `npx`, ni
+> `ripgrep`** — donc aucun serveur tiers n'était enregistrable en l'état. La
+> Story 5.2 a écrit un serveur stdio **interne** en Python
+> (`infra/mcp/servers/code_search.py`) et documenté l'arbitrage dans
+> [`dev-pole-code-search-server.md`](./dev-pole-code-search-server.md). La
+> Story 5.5 (GitHub) hérite du même constat et devra le trancher pour
+> elle-même — elle a besoin du **réseau**, que `unshare_net=True` ferme.
+> Corrigé ici plutôt que laissé : un ADR qui reste faux fait prendre des
+> décisions sur un état qui n'existe pas, ce qui est exactement ce qui s'est
+> produit.
 
 ## Conséquences
 
@@ -63,3 +75,7 @@ vide.
 - Quand le besoin d'outiller le moteur deviendra réel — c'est-à-dire quand un
   agent devra *lancer* ou *piloter* un run, pas en décrire un —, il prendra sa
   propre story, avec l'arbitrage sandbox comme objet principal.
+- **Le `tools: []` du Dev Lead reste la décision de cet ADR**, et la Story 5.2
+  ne le change pas : c'est le *Code Researcher* qui porte la première liste non
+  vide du dépôt. Ce que la 5.2 invalide est le paragraphe « serveurs tiers »
+  ci-dessus, pas la décision elle-même.

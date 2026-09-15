@@ -346,6 +346,38 @@ def _diversity_warnings(
     return warnings
 
 
+#: Plafond de longueur d'un nom d'outil projeté dans `workflow_runs.metrics`.
+#: Le commentaire d'origine excluait les ARGUMENTS au nom de NFR9 (« entrée
+#: externe non maîtrisée, et ce JSONB est relu par l'UI ») — mais un nom
+#: HALLUCINÉ vient de la même source : `McpToolExecutor` enregistre
+#: `tool_name=call.name` tel quel sur le chemin « outil inconnu ». Le nombre
+#: d'entrées était borné (`tool_loop_max_tool_calls`), leur longueur non.
+_MAX_TOOL_NAME_CHARS: Final = 100
+
+
+def _coerce_counter(value: object) -> int:
+    """Un compteur JSONB, sans jamais lever (revue 5.2)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    try:
+        return int(value)
+    except TypeError, ValueError:
+        return 0
+
+
+def _coerce_tool_names(value: object) -> list[str]:
+    """Les noms d'outils, typés et bornés.
+
+    `[str(name) for name in (value or [])]` explosait une CHAÎNE caractère par
+    caractère (`"read_file"` devenait neuf faux outils, silencieusement) et
+    levait un `TypeError` sur un entier. La garde `isinstance(..., list)` était
+    déjà appliquée huit lignes plus bas à `contract_problems`.
+    """
+    if not isinstance(value, list):
+        return []
+    return [str(name)[:_MAX_TOOL_NAME_CHARS] for name in value]
+
+
 class WorkflowService:
     """Workflow creation — DAG validation + versioned persistence (Story 4.1)."""
 
@@ -1265,6 +1297,39 @@ def _aggregate_metrics(
             # with only its `duration_ms` hinting at the difference.
             # Defaults to 1 for rows written before this story.
             "llm_attempts": metric.get("llm_attempts", 1),
+            # Story 5.2 AC2 — les quatre compteurs d'outils, PROJETÉS ici.
+            #
+            # `agent_node` les écrivait déjà dans `node_metrics` depuis la
+            # Story 5.0, et cette projection les jetait : `workflow_runs.metrics`
+            # est la seule surface qu'un opérateur puisse interroger, donc un
+            # node ayant coûté huit appels d'outils y était indiscernable d'un
+            # node qui n'en a fait aucun. Personne ne l'avait vu parce
+            # qu'AUCUN template du dépôt ne portait un outil — le compteur
+            # valait toujours zéro. C'est la même classe de défaut que la
+            # revue 5.0 a nommée sur `node_tools` (« câblé par aucun appelant
+            # de production ») et que 4.6 avait déjà réglée pour
+            # `llm_attempts`, exactement ici.
+            #
+            # Toujours présents, avec un défaut nul — contrairement à
+            # `contract_problems` ou `handoff_summary_tokens` juste en
+            # dessous, dont l'ABSENCE est le signal. Ici zéro n'est pas une
+            # valeur fabriquée : un run antérieur à la Story 5.0 n'a
+            # effectivement appelé aucun outil, et un compteur toujours
+            # présent est ce qui rend les runs comparables entre eux.
+            # `_coerce_counter` et non `int(... or 0)` : revue 5.2. `or 0`
+            # couvre `None` et `0`, pas `"abc"` ni `{}` — qui levaient
+            # `ValueError`/`TypeError` et faisaient tomber l'agrégation de TOUT
+            # le run, sur les deux chemins (complété ET en échec). Une row
+            # `node_metrics` malformée doit dégrader un compteur, pas effacer
+            # les métriques d'un run qui vient déjà d'échouer.
+            "tool_calls": _coerce_counter(metric.get("tool_calls")),
+            "tool_loop_iterations": _coerce_counter(metric.get("tool_loop_iterations")),
+            "tool_failures": _coerce_counter(metric.get("tool_failures")),
+            # Les NOMS, dans l'ordre d'appel — un compteur seul ne dit pas
+            # QUEL outil a coûté le node. Les ARGUMENTS restent délibérément
+            # dehors : ils sont une entrée externe non maîtrisée (NFR9), et
+            # ce JSONB est relu par l'UI.
+            "tool_names": _coerce_tool_names(metric.get("tool_names")),
         }
         # Story 4.7 — the cost of producing THIS node's own handoff summary
         # (a separate LLM call, T3.2), same rationale as `llm_attempts`: the

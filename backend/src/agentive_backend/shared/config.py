@@ -6,8 +6,10 @@ All other modules must import `settings` from here.
 
 from __future__ import annotations
 
+import posixpath
 from decimal import Decimal
 from functools import lru_cache
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import quote_plus
 
@@ -31,6 +33,16 @@ _DEV_DEFAULT_SENTINELS: tuple[str, ...] = (
     "change_me_owner_dev",
     "change_me_audit_dev",
 )
+
+
+def _normalise_root(root: str) -> str:
+    """Le chemin tel qu'il sera réellement appliqué.
+
+    `posixpath.normpath` retire les `//`, les `.`, les `/` finaux et résout les
+    `..` **textuellement** (sans toucher au disque, donc sans suivre de
+    symlink : c'est le serveur qui refuse une racine non canonique).
+    """
+    return posixpath.normpath(root)
 
 
 class Settings(BaseSettings):
@@ -402,6 +414,135 @@ class Settings(BaseSettings):
                 "would always die on its wall-clock ceiling"
             )
         return self
+
+    # ─── Pôle Dev — serveur MCP de lecture de code (Story 5.2, défer D62) ───
+    #
+    # **C'est une règle de sécurité, et c'est pour ça qu'elle est ici.** D62
+    # (ouvert par la Story 2.6) décrit littéralement une colonne
+    # `tools.sandbox_profile JSONB`. Une allowlist de chemins qui décide de ce
+    # qu'un agent LLM peut lire doit être lisible dans un diff git et revue
+    # comme du code, pas modifiable par un `UPDATE`. La divergence assumée
+    # vis-à-vis de la forme littérale de D62 est écrite dans
+    # `docs/decisions/dev-pole-code-search-server.md`.
+    #
+    # Ces racines gouvernent DEUX choses, et les deux sont nécessaires :
+    #   - les `--root` passés au serveur `code_search` (sa propre allowlist,
+    #     seule frontière qui existe sous le repli `setrlimit`, lequel n'isole
+    #     PAS le filesystem) ;
+    #   - les `--ro-bind` du `SandboxProfile` dérivé sous bwrap.
+    # Liste séparée par des virgules — lisible dans un `.env`, contrairement
+    # au JSON qu'un `list[str]` exigerait de pydantic-settings.
+    dev_code_roots_raw: str = Field(
+        default="/app",
+        alias="AGENTIVE_DEV_CODE_ROOTS",
+    )
+    # Les trois bornes de sortie du serveur, appliquées À LA SOURCE et non
+    # après coup : `MAX_TOOL_RESULT_CHARS` (infra/mcp/tool_executor.py) tronque
+    # déjà ce qui part dans le prompt, mais après avoir tout lu — un
+    # `search_content` sur un monorepo paierait la lecture entière pour rendre
+    # 8 000 caractères.
+    #
+    # Taille lue par appel de `read_file`. Le DÉFAUT est volontairement sous le
+    # plafond de 8 000 caractères de l'enveloppe d'outil (`MAX_TOOL_RESULT_CHARS`,
+    # infra/mcp/tool_executor.py) : `read_file` rend `next_offset` pour lire la
+    # suite, donc pagineer coûte moins cher que tronquer deux fois.
+    #
+    # ⚠️ Le PLAFOND, lui, laisse monter bien au-delà, et la revue 5.2 a corrigé
+    # le commentaire qui prétendait l'inverse. Au-delà d'environ 7 000 octets de
+    # contenu, la réponse JSON dépasse l'enveloppe et `MAX_TOOL_RESULT_CHARS` la
+    # coupe **au milieu du document** : le modèle reçoit alors du JSON non
+    # parsable, pas un contenu tronqué proprement. C'est le prix d'un réglage
+    # élevé, et il est ici écrit plutôt que découvert.
+    dev_code_max_read_bytes: int = Field(
+        default=6_000,
+        ge=256,
+        le=200_000,
+        alias="AGENTIVE_DEV_CODE_MAX_READ_BYTES",
+    )
+    # Nombre de résultats rendus par `list_directory`, `find_files` et
+    # `search_content`. Borné à 1 000 : au-delà, la borne n'en est plus une et
+    # la troncature aval reprendrait la main sans rien économiser en lecture.
+    dev_code_max_results: int = Field(
+        default=100,
+        ge=1,
+        le=1_000,
+        alias="AGENTIVE_DEV_CODE_MAX_RESULTS",
+    )
+    # Profondeur de parcours sous le répertoire de départ. Ce qu'elle borne
+    # n'est pas la sortie mais le COÛT : un lien ou une arborescence générée
+    # peuvent faire tourner un parcours bien plus longtemps que ce que la
+    # réponse laisse voir.
+    dev_code_max_depth: int = Field(
+        default=12,
+        ge=1,
+        le=40,
+        alias="AGENTIVE_DEV_CODE_MAX_DEPTH",
+    )
+
+    @property
+    def dev_code_roots(self) -> tuple[str, ...]:
+        """Les racines autorisées, normalisées et dédupliquées.
+
+        Rendue en propriété plutôt qu'en champ `list[str]` : pydantic-settings
+        décode un champ complexe en JSON AVANT toute validation, donc un
+        `AGENTIVE_DEV_CODE_ROOTS=/app,/srv` aurait fait échouer le démarrage
+        sur une `SettingsError` de parsing au lieu d'être lu.
+
+        « Normalisées » est devenu vrai avec la revue de la Story 5.2 : la
+        version d'origine faisait un `strip()` et dédoublonnait sur la CHAÎNE
+        EXACTE. `/app,/app/` produisait donc deux entrées, et
+        `code_search_profile` en dérivait `--ro-bind /app /app --ro-bind
+        /app/ /app/` — un ro-bind en double, que bwrap refuse. Le test qui
+        gardait cette propriété n'exerçait que le doublon exact, seul cas que
+        la déduplication attrapait.
+        """
+        seen: dict[str, None] = {}
+        for chunk in self.dev_code_roots_raw.split(","):
+            root = chunk.strip()
+            if root:
+                seen.setdefault(_normalise_root(root), None)
+        return tuple(seen)
+
+    @field_validator("dev_code_roots_raw")
+    @classmethod
+    def _dev_code_roots_are_an_allowlist(cls, value: str) -> str:
+        """Refuse au DÉMARRAGE ce qui ne serait pas une allowlist.
+
+        Une racine vide, relative, ou égale à `/` annule le contrôle tout en
+        ayant l'air d'en être un. Le serveur refuse déjà ces trois cas, mais il
+        le fait au spawn — c'est-à-dire à la première Mise en Place, très loin
+        du réglage fautif. Ici l'erreur nomme le réglage.
+        """
+        roots = [chunk.strip() for chunk in value.split(",") if chunk.strip()]
+        if not roots:
+            raise ValueError(
+                "AGENTIVE_DEV_CODE_ROOTS est vide — le serveur de lecture de code "
+                "n'aurait aucune racine autorisée et ne pourrait pas démarrer."
+            )
+        for root in roots:
+            if not root.startswith("/"):
+                raise ValueError(
+                    f"AGENTIVE_DEV_CODE_ROOTS contient une racine relative ({root!r}) : "
+                    "le répertoire courant du sous-processus sandboxé n'est pas une "
+                    "notion contrôlée. Utiliser un chemin absolu."
+                )
+            # Revue 5.2 — `..` passait ce validateur : `'/app/..'.rstrip('/')`
+            # vaut `'/app/..'`, donc ni vide ni `/`. Or il RÉSOUT vers `/`, et
+            # `code_search_profile` ro-bindait la chaîne brute : le sandbox
+            # montait tout le filesystem. Refusé à la source, parce que la
+            # valeur lue dans un diff git doit être celle qui s'applique.
+            if ".." in PurePosixPath(root).parts:
+                raise ValueError(
+                    f"AGENTIVE_DEV_CODE_ROOTS contient un `..` ({root!r}) : la racine "
+                    "réellement appliquée ne serait pas celle qu'on lit ici "
+                    f"({_normalise_root(root)!r}). Écrire le chemin résolu."
+                )
+            if _normalise_root(root) == "/":
+                raise ValueError(
+                    "AGENTIVE_DEV_CODE_ROOTS contient `/` : une allowlist qui contient "
+                    "la racine du filesystem n'est pas une allowlist."
+                )
+        return value
 
     # ─── Workflow Engine — node retry backoff (Story 4.6, défer D13) ───
     # Feed `domain/error_policy.backoff_delay_s`, which spaces successive

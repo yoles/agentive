@@ -31,6 +31,7 @@ from agentive_backend.features.workflow_engine.domain.mise_en_place import (
 from agentive_backend.features.workflow_engine.domain.provider_chain import resolve_provider_chain
 from agentive_backend.infra.llm.pricing import KNOWN_PROVIDERS, provider_for_model
 from agentive_backend.infra.mcp.client import discover_tools
+from agentive_backend.infra.mcp.policy import apply_sandbox_policy
 from agentive_backend.shared.exceptions import (
     AuthError,
     BusinessRuleError,
@@ -350,9 +351,20 @@ class MiseEnPlaceService:
         failures (review BS3): a server that answers discovery but has
         dropped the tool a template depends on breaks the same promise as a
         server that is down, and the check's own name claims to cover it.
-        Note that workflow runs do not invoke tools yet
-        (``engine/agent_node`` anti-scope), so both halves of this check are
-        anticipatory by AC1's deliberate design.
+        **Cette note disait le contraire du vrai depuis la Story 5.0**, qui a
+        livré la boucle ``tool_use`` : « workflow runs do not invoke tools yet
+        (``engine/agent_node`` anti-scope) » décrivait l'état d'avant. Depuis
+        la Story 5.2, des nodes appellent réellement leurs outils pendant un run —
+        ce check n'est plus anticipatif, il garde le lancement d'un workflow
+        dont les outils comptent. Ni le template ni le nombre d'outils ne sont
+        nommés ici, volontairement : la revue 5.2 a relevé que la version
+        d'origine (« le Code Researcher appelle quatre outils ») réémettait,
+        dans le paragraphe qui la condamne, la dette qu'elle corrige — un
+        service générique documentant un template précis redevient faux au
+        premier outil retiré d'un YAML, sans que rien ne casse. Même famille de
+        correction que la docstring de ``ToolInvocationLog`` que la Story 5.0
+        a dû reprendre : une affirmation périmée dans un docstring est plus
+        coûteuse qu'une absence, parce qu'on s'y fie.
 
         Opens its OWN session (T3.3) rather than sharing one across the
         four checks — ``run_checks`` awaits all four concurrently via
@@ -393,10 +405,21 @@ class MiseEnPlaceService:
 
         async def _probe(server: ToolServer) -> list[Any]:
             async with semaphore:
-                return await discover_tools(
+                # Story 5.2 T2.2 — TROISIÈME appelant, et le plus facile à
+                # oublier : c'est celui qui décide si un run démarre. Un
+                # serveur sandboxé à l'exécution mais pingé sans profil
+                # rapporterait « injoignable » à chaque lancement, ou
+                # l'inverse — un ping qui passe pour une exécution qui ne
+                # passe pas est pire, il déplace l'échec loin de sa cause.
+                profile, effective_config = apply_sandbox_policy(
                     transport=server.transport,  # type: ignore[arg-type]  # Literal narrowed at registration
                     connection_config=server.connection_config,
+                )
+                return await discover_tools(
+                    transport=server.transport,  # type: ignore[arg-type]  # Literal narrowed at registration
+                    connection_config=effective_config,
                     timeout=self._settings.tool_ping_timeout_s,
+                    profile=profile,
                 )
 
         raw_results = await asyncio.gather(

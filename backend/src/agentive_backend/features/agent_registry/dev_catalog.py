@@ -27,7 +27,7 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Annotated, Any, Final, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -45,6 +45,13 @@ from agentive_backend.shared.contracts.dev_roles import DEV_ROLE_DESCRIPTIONS, D
 from agentive_backend.shared.repositories.namespace_repo import NamespaceType
 
 DEFAULT_CATALOG_DIR: Final[Path] = Path(__file__).parent / "templates" / "dev"
+
+#: Les serveurs MCP du pôle, déclarés à part des agents (Story 5.2 T3.1).
+#: Un seul fichier, au même endroit, chargé par le même loader — mais un
+#: document de forme différente, donc exclu du glob des agents. Sans cette
+#: exclusion, ``load_dev_catalog`` le validerait comme un agent et échouerait
+#: sur ``extra="forbid"``.
+DEV_SERVERS_FILENAME: Final = "mcp-servers.yaml"
 
 #: Le jeton rendu par :func:`render_dev_roles`. ``${...}`` et non ``{...}`` :
 #: les prompts du pôle contiennent des accolades JSON.
@@ -250,6 +257,12 @@ def load_dev_catalog(catalog_dir: Path | None = None) -> Mapping[str, DevAgentDe
 
     catalog: dict[str, DevAgentDefinition] = {}
     for path in sorted(directory.glob("*.yaml")):
+        if path.name == DEV_SERVERS_FILENAME:
+            # Les serveurs MCP vivent ici aussi, mais ce ne sont pas des
+            # agents : `load_dev_servers` les lit. Sauté NOMMÉMENT plutôt que
+            # par un motif de nom (« tout ce qui commence par `_` »), pour que
+            # le jour où un agent s'appelle mal, le catalogue le dise.
+            continue
         try:
             raw_text = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -316,6 +329,123 @@ def load_dev_catalog(catalog_dir: Path | None = None) -> Mapping[str, DevAgentDe
     return MappingProxyType(catalog)
 
 
+class DevMcpServerDefinition(BaseModel):
+    """Un serveur MCP que le pôle a besoin de voir enregistré (Story 5.2 T3.1).
+
+    **``launcher`` est un jeu FERMÉ, pas un nom de module.** Un champ libre
+    ferait de ce YAML une surface d'exécution arbitraire : éditer une ligne
+    suffirait à lancer n'importe quel module Python dans le sous-processus
+    sandboxé. La commande et l'``argv`` réels sont construits par
+    :mod:`agentive_backend.infra.mcp.policy`, qui est du code revu en diff, et
+    les racines autorisées viennent de ``Settings`` — jamais d'ici.
+
+    ``tools`` n'est pas décoratif : c'est ce que la seconde exécution du
+    provisioning VÉRIFIE (T3.3). ``connect_server`` n'a aucun chemin de
+    re-découverte — un nom déjà pris lève ``ConflictError`` avant même de
+    spawner le serveur — donc « il existe » et « il expose toujours ce que le
+    catalogue demande » sont deux affirmations différentes, et c'est la
+    seconde qui conditionne le démarrage des runs (``mise_en_place``
+    ``_check_tools`` refuse un lancement dont un outil assigné a disparu).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=50, pattern=r"^[a-z][a-z0-9_]*$")
+    name: str = Field(min_length=1, max_length=255)
+    transport: Literal["stdio"] = "stdio"
+    launcher: Literal["code_search"]
+    #: DOCUMENTAIRE — pour le lecteur du YAML, et rien d'autre.
+    #: `ToolHubService.connect_server` ne prend que `name`, `transport`,
+    #: `connection_config` et `tenant_id`, et `tool_servers` n'a pas de colonne
+    #: de description : cette valeur est validée puis jetée. La revue 5.2 l'a
+    #: relevé comme « un champ en trop qui a l'apparence d'un champ utile » ;
+    #: le champ reste (il documente le catalogue), le fait qu'il ne soit pas
+    #: persisté est désormais écrit.
+    description: str = Field(default="", max_length=1_000)
+    #: Revue 5.2 — `min_length=1` portait sur la LISTE, pas sur ses éléments
+    #: (contrairement à `key`, qui porte un `pattern`). `tools: ["  ", ""]`
+    #: était accepté, et le refus n'arrivait qu'au provisioning, avec un
+    #: message où le nom manquant est invisible : « n'expose plus :   , ».
+    tools: list[Annotated[str, Field(min_length=1, pattern=r"^\S(?:.*\S)?$")]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _tools_are_declared_once(self) -> DevMcpServerDefinition:
+        duplicates = sorted({name for name in self.tools if self.tools.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                f"le serveur '{self.key}' déclare deux fois les mêmes outils : "
+                f"{', '.join(duplicates)}."
+            )
+        return self
+
+
+class _DevServersDocument(BaseModel):
+    """Le document ``mcp-servers.yaml`` dans son ensemble."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    servers: list[DevMcpServerDefinition] = Field(min_length=1)
+
+
+def load_dev_servers(catalog_dir: Path | None = None) -> tuple[DevMcpServerDefinition, ...]:
+    """Charge et valide la déclaration des serveurs MCP du pôle.
+
+    Le fichier est OPTIONNEL : un pôle sans serveur MCP est un état légitime
+    (c'était celui de la Story 5.1), et l'absence rend un tuple vide plutôt
+    qu'une erreur. Ce qui n'est pas légitime, c'est un fichier présent et
+    illisible — celui-là lève, comme pour les agents.
+
+    Raises:
+        RuntimeError: YAML illisible ou malformé, clé en double, deux serveurs
+            de même ``key`` ou de même ``name``.
+    """
+    directory = catalog_dir or DEFAULT_CATALOG_DIR
+    if not directory.is_dir():
+        raise RuntimeError(f"dev catalog init failed: {directory} is not a directory")
+    path = directory / DEV_SERVERS_FILENAME
+    if not path.is_file():
+        return ()
+
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"dev catalog init failed: cannot read {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"dev catalog init failed: {path} is not valid UTF-8 ({exc}).") from exc
+
+    try:
+        raw_data = yaml.load(raw_text, Loader=_StrictLoader)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"dev catalog init failed: YAML parse error in {path}: {exc}") from exc
+
+    if not isinstance(raw_data, dict):
+        raise RuntimeError(
+            f"dev catalog init failed: expected mapping at top level of {path}, "
+            f"got {type(raw_data).__name__}"
+        )
+
+    try:
+        document = _DevServersDocument.model_validate(raw_data)
+    except PydanticValidationError as exc:
+        raise RuntimeError(
+            f"dev catalog init failed: schema validation error in {path}: {exc}"
+        ) from exc
+
+    seen_keys: set[str] = set()
+    seen_names: set[str] = set()
+    for server in document.servers:
+        if server.key in seen_keys:
+            raise RuntimeError(f"dev catalog init failed: duplicate server key '{server.key}'")
+        # `tool_servers` porte UNIQUE(name, tenant_id) : deux homonymes ne
+        # sont pas un doublon inoffensif, le second ferait lever
+        # `ConflictError` au provisioning sans que rien ne dise pourquoi.
+        if server.name in seen_names:
+            raise RuntimeError(f"dev catalog init failed: duplicate server name '{server.name}'")
+        seen_keys.add(server.key)
+        seen_names.add(server.name)
+    return tuple(document.servers)
+
+
 def catalog_namespaces(
     catalog: Mapping[str, DevAgentDefinition],
 ) -> list[DevNamespaceRequirement]:
@@ -344,9 +474,12 @@ def catalog_namespaces(
 __all__ = [
     "DEFAULT_CATALOG_DIR",
     "DEV_ROLES_TOKEN",
+    "DEV_SERVERS_FILENAME",
     "DevAgentDefinition",
+    "DevMcpServerDefinition",
     "DevNamespaceRequirement",
     "catalog_namespaces",
     "load_dev_catalog",
+    "load_dev_servers",
     "render_dev_roles",
 ]

@@ -38,7 +38,26 @@ Concrètement, avant d'assigner un outil à un template d'agent :
 2. Refuser l'assignation si l'outil peut : écrire un fichier, créer/modifier une ressource distante, envoyer un message, déclencher un job, consommer un quota facturé à l'appel, ou muter quoi que ce soit d'observable hors du processus.
 3. En cas de doute, refuser. Le Playground reste disponible pour l'usage manuel : l'opérateur y voit chaque appel et ne subit ni retry automatique ni resume.
 
-Cette contrainte n'est **pas** appliquée par le code aujourd'hui — il n'existe aucun champ « read-only » sur `Tool`, et l'inventer sans que les serveurs MCP le déclarent produirait une garantie fausse. Elle est procédurale, et c'est ici qu'elle est écrite. Le rendre applicable est le travail d'une story ultérieure (allowlist par template, ou déclaration d'idempotence côté serveur).
+Cette contrainte n'est **pas** appliquée par le code de façon générale — il n'existe aucun champ « read-only » sur `Tool`, et l'inventer sans que les serveurs MCP le déclarent produirait une garantie fausse. Elle reste procédurale pour un serveur tiers, et c'est ici qu'elle est écrite. Le rendre applicable en général est le travail d'une story ultérieure (allowlist par template, ou déclaration d'idempotence côté serveur).
+
+> **Story 5.2 — elle cesse d'être procédurale pour le seul serveur du dépôt.** `dev-code-search`
+> (`infra/mcp/servers/code_search.py`) est le premier serveur MCP de production, et il est en
+> lecture seule **par construction** : aucun mode d'ouverture en écriture, aucun `subprocess`,
+> aucune exécution, aucun outil générique — propriété gardée par un test structurel qui analyse
+> l'AST du module. ⚠️ Cette garde est une **heuristique syntaxique**, pas une preuve : elle
+> couvre les modes d'ouverture et une liste d'appels interdits, pas tout ce qu'un import
+> pourrait faire. Elle vaut mieux qu'une relecture, elle ne la remplace pas entièrement.
+>
+> Les quatre outils du Code Researcher peuvent donc être rejoués **sans effet de bord sur le
+> disque**. « Sans conséquence » serait trop dire, et la revue de la Story 5.2 l'a relevé : un
+> rejeu re-spawne un sous-processus, relit des fichiers, et **ce qu'il lit repart dans un
+> prompt facturé**. C'est la lecture seule qui est acquise, pas la gratuité.
+>
+> ⚠️ Ce qui n'est **pas** vérifié : que le rejeu d'un nœud ré-appelle bien ses outils (5.0 AC5).
+> Aucun test d'intégration ne couvre ce chemin aujourd'hui. La propriété est plausible — elle
+> découle de la façon dont `agent_node` reconstruit son état — mais elle est supposée, et la
+> revue a corrigé la phrase qui prétendait le contraire.
+> Cf [`dev-pole-code-search-server.md`](../decisions/dev-pole-code-search-server.md).
 
 ## Procédure — constater ce qui a été rejoué
 

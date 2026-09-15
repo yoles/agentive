@@ -6,6 +6,10 @@ Couvre les trois AC :
 * **AC1** — le provisioning (`scripts.seed_dev`) crée le namespace, le
   template `Dev Lead` depuis l'archétype Orchestrateur, et le workflow
   d'entrée ; une seconde exécution ne crée rien.
+
+Depuis la Story 5.2 le DAG d'entrée porte DEUX nodes
+(`dev_lead → code_researcher`), donc chaque run de ce module consomme deux
+réponses du `MockProvider` et l'accusé nomme deux agents.
 * **AC2** — `POST /workflows/{id}/runs` rend un `run_id` immédiatement, et la
   PREMIÈRE frame SSE porte l'accusé de réception, en moins de 2 s, y compris
   pour un client qui s'attache après le premier checkpoint.
@@ -23,19 +27,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from scripts.seed_dev import (
+    CODE_RESEARCHER_NODE_ID,
+    DEV_ENTRY_WORKFLOW_NAME,
     DEV_LEAD_NODE_ID,
-    DEV_LEAD_WORKFLOW_NAME,
     DevDepartmentSeeder,
     SeedReport,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.dev_roles import validate_delegation_plan
 from agentive_backend.shared.correlation import new_correlation_id, set_correlation_id
 from agentive_backend.shared.llm.router import LLMRouter
@@ -57,8 +65,49 @@ _FIRST_FRAME_BUDGET_S = 2.0
 #: plafond large sert de garde-fou de régression : il ne valide pas une
 #: promesse, il empêche une dérive silencieuse sur le chemin que John voit.
 _POST_BUDGET_S = 5.0
-_POLL_TIMEOUT_S = 20.0
+#: ⚠️ Doit rester AU-DESSUS du budget d'un appel d'outil
+#: (`AGENTIVE_TOOL_CALL_TIMEOUT_S`, 30 s par défaut). Depuis cette story, un
+#: run du DAG d'entrée spawne un vrai sous-processus MCP par appel — il n'y a
+#: pas de pool (défer D61). À 20 s, `_wait_for_terminal` rendait un statut non
+#: terminal et le test échouait sur « != completed » AVANT même que le timeout
+#: d'outil ne se déclenche : un échec qui accuse le moteur là où la cause est
+#: le budget du test (revue 5.2).
+_POLL_TIMEOUT_S = 45.0
 _POLL_INTERVAL_S = 0.1
+
+#: Le corpus que le serveur de lecture de code peut réellement lire — la
+#: PREMIÈRE racine autorisée, jamais `/app` en dur.
+#:
+#: ⚠️ Revue 5.2 : ce module codait `/app` en dur, sans repli ni `skipif`, alors
+#: que le module de dogfooding avait explicitement prévu le cas — deux
+#: politiques opposées sur la même contrainte, dans le même changeset. Hors
+#: container, l'échec était `tool_failures > 0` avec le message « l'appel
+#: d'outil a échoué — voir les logs du serveur », qui ne nomme pas la cause.
+_CORPUS_FEATURES = Path(settings.dev_code_roots[0]) / "src" / "agentive_backend" / "features"
+_CORPUS_AVAILABLE = _CORPUS_FEATURES.is_dir()
+
+
+@pytest.fixture(autouse=True)
+def _mcp_registration_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Le provisioning REFUSE d'enregistrer un serveur MCP sans ce drapeau.
+
+    Ce n'est pas une gêne de test à contourner, c'est le comportement que la
+    Story 5.2 T3.4 exige. Depuis la revue de cette story, la garde vit dans
+    `ToolHubService.connect_server` — au point où le sous-processus est spawné,
+    et non plus dans chacun de ses appelants. Ici on se place du côté de
+    l'opérateur qui a dit oui.
+
+    Le refus lui-même est asserté ailleurs, et le renvoi d'origine pointait un
+    fichier INEXISTANT (`tests/unit/agent_registry/test_seed_dev_servers.py`,
+    troisième référence morte relevée par la revue). Les bons chemins :
+    `tests/unit/tool_hub/test_service.py::test_connect_server_is_refused_when_registration_is_disabled`
+    pour la porte elle-même, et
+    `tests/scripts/test_seed_dev.py::test_the_registration_refusal_names_the_setting`
+    pour sa traduction en message d'opérateur.
+    """
+    from agentive_backend.shared.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "mcp_allow_registration", True)
 
 
 def _plan(*, summary: str, subtasks: list[tuple[str, str, str]]) -> str:
@@ -125,6 +174,44 @@ _CASES: dict[str, tuple[str, str]] = {
 }
 
 
+#: Une sortie de Code Researcher bien formée. Les chemins sont RÉELS et
+#: existent dans le container (`/app` est le volume `./backend`), mais ce
+#: module ne s'appuie pas dessus : la vérification « ces chemins existent
+#: vraiment et viennent d'un outil » est l'objet de
+#: `tests/integration/mcp/test_code_search_dogfooding.py`, sur le serveur réel.
+#: Ici la sortie est pré-écrite, donc elle prouve que le contrat traverse le
+#: moteur — pas que le modèle sait explorer.
+_RESEARCHER_ANSWER = json.dumps(
+    {
+        "status": "done",
+        "summary": "Relevé des patterns des modules existants",
+        "relevant_files": [
+            {
+                "path": "/app/src/agentive_backend/features/tool_hub/router.py",
+                "role": "routeur HTTP du module",
+                "why": "montre la forme d'un routeur de feature",
+            }
+        ],
+        "dependencies_graph": {"features/tool_hub": ["shared/repositories", "infra/mcp"]},
+        "existing_patterns": [
+            {
+                "name": "router/service/schemas",
+                "description": "chaque feature porte ces trois fichiers",
+                "examples": ["/app/src/agentive_backend/features/tool_hub/service.py"],
+            }
+        ],
+        "risk_areas": [
+            {
+                "area": "import-linter",
+                "risk": "un module qui en importe un autre casse la CI",
+                "evidence": "/app/.import-linter",
+            }
+        ],
+    },
+    ensure_ascii=False,
+)
+
+
 def _completion(text_: str) -> Completion:
     return Completion(
         text=text_,
@@ -144,6 +231,43 @@ async def _seed(session_factory: async_sessionmaker[AsyncSession]) -> SeedReport
     ligne de commande)."""
     set_correlation_id(new_correlation_id())
     return await DevDepartmentSeeder(session_factory=session_factory).run()
+
+
+#: Le résumé de passage que le moteur demande ENTRE les deux nodes.
+#:
+#: Ce n'est pas un détail de fixture : dès qu'un DAG a une arête, `agent_node`
+#: appelle le modèle une fois de plus pour condenser la sortie de l'émetteur
+#: (Story 4.7), et c'est CE résumé — et non la sortie brute du Dev Lead — que
+#: le Code Researcher lit dans `upstream_outputs`. Un run du DAG d'entrée coûte
+#: donc TROIS appels LLM, pas deux. La forme est imposée par
+#: `DEFAULT_HANDOFF_SUMMARY_SYSTEM_PROMPT`.
+_HANDOFF_SUMMARY = json.dumps(
+    {
+        "decisions": [
+            "Déléguer l'exploration du codebase à code_researcher : "
+            "relever les patterns des modules existants"
+        ],
+        "artifacts_refs": [],
+        "blockers": [],
+        "next_questions": ["Quels modules servent de baseline ?"],
+    },
+    ensure_ascii=False,
+)
+
+
+def _dag_completions(plan_json: str) -> list[Completion]:
+    """Les TROIS réponses qu'un run du DAG d'entrée consomme, dans l'ordre.
+
+    `MockProvider` est FIFO, et l'ordre est : le node `dev_lead`, le résumé de
+    passage de l'arête, puis le node `code_researcher`. Une liste plus courte
+    fait échouer le dernier node sur une file vide — le run finit `error` et
+    le test échoue très loin de son sujet.
+    """
+    return [
+        _completion(plan_json),
+        _completion(_HANDOFF_SUMMARY),
+        _completion(_RESEARCHER_ANSWER),
+    ]
 
 
 def _build_app(
@@ -261,6 +385,38 @@ async def test_seeding_provisions_the_namespace_the_template_and_the_entry_workf
         assert tools_body["template_id"] == str(template_id)
         assert tools_body["assigned_tools"] == []
 
+    # Story 5.2 AC1 — LA PREMIÈRE LISTE NON VIDE DU DÉPÔT, vue depuis l'API et
+    # non depuis le composant. La 5.0 a livré la boucle d'outils, la 5.1 le
+    # mécanisme d'assignation — et sa revue a trouvé que `tools: []` faisait
+    # sortir `_assign_tools` avant toute résolution, donc qu'aucun test
+    # n'atteignait le mécanisme. C'est ici qu'il est enfin traversé.
+    researcher_id = report.template_ids["code_researcher"]
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        researcher_detail = await client.get(
+            f"/api/v1/agents/templates/{researcher_id}", headers=_auth_headers()
+        )
+        assert researcher_detail.status_code == 200, researcher_detail.text
+        assert researcher_detail.json()["archetype"] == "chercheur"
+        assert researcher_detail.json()["name"] == "Code Researcher"
+        assert set(researcher_detail.json()["config"]["output_contract"]["core"]) == {
+            "relevant_files",
+            "dependencies_graph",
+            "existing_patterns",
+            "risk_areas",
+        }
+
+        researcher_tools = await client.get(
+            f"/api/v1/agents/templates/{researcher_id}/tools", headers=_auth_headers()
+        )
+        assert researcher_tools.status_code == 200, researcher_tools.text
+        assigned = researcher_tools.json()["assigned_tools"]
+        assert {tool["name"] for tool in assigned} == {
+            "list_directory",
+            "read_file",
+            "find_files",
+            "search_content",
+        }, f"liste d'outils assignés inattendue : {assigned}"
+
     assert body["archetype"] == "orchestrateur"
     assert body["name"] == "Dev Lead"
     # AC1 — « son system prompt est spécialisé orchestration Dev ».
@@ -289,8 +445,11 @@ async def test_seeding_twice_creates_nothing_new(
     assert second.created == []
     assert second.updated == []
     assert second.template_ids == first.template_ids
+    assert second.server_ids == first.server_ids
     assert second.workflow_id == first.workflow_id
     assert "agent-template Dev Lead" in second.unchanged
+    assert "agent-template Code Researcher" in second.unchanged
+    assert "serveur MCP dev-code-search" in second.unchanged
 
     # Les assertions ci-dessus portent sur ce que le seeder dit de LUI-MÊME.
     # « Zéro doublon » est une propriété de la BASE, et c'est la seule chose
@@ -307,9 +466,30 @@ async def test_seeding_twice_creates_nothing_new(
         assert templates.scalar_one() == 1
         workflows = await session.execute(
             text("SELECT count(*) FROM workflows WHERE name = :name"),
-            {"name": DEV_LEAD_WORKFLOW_NAME},
+            {"name": DEV_ENTRY_WORKFLOW_NAME},
         )
         assert workflows.scalar_one() == 1
+        # Story 5.2 T3.3 — `connect_server` n'a AUCUN chemin de re-découverte :
+        # un nom déjà pris lève `ConflictError` avant même de spawner le
+        # serveur. La seconde exécution doit donc relire et vérifier, pas
+        # ré-enregistrer — et surtout ne pas laisser deux rows.
+        servers = await session.execute(
+            text("SELECT count(*) FROM tool_servers WHERE name = :name"),
+            {"name": "dev-code-search"},
+        )
+        # Compté PAR NOM, et non globalement : ce package n'a aucune fixture
+        # de purge (les rows survivent à toute la session), donc un compte
+        # global deviendrait cumulatif dès qu'un autre module enregistre un
+        # serveur — et l'échec accuserait l'idempotence du seeder.
+        assert servers.scalar_one() == 1
+        tools = await session.execute(
+            text(
+                "SELECT count(*) FROM tools t JOIN tool_servers s ON s.id = t.server_id "
+                "WHERE s.name = :name"
+            ),
+            {"name": "dev-code-search"},
+        )
+        assert tools.scalar_one() == 4
         namespaces = await session.execute(
             text("SELECT count(*) FROM namespaces WHERE name = :name"),
             {"name": "dev-metier"},
@@ -329,9 +509,21 @@ async def test_the_entry_workflow_mounts_the_dev_lead_template(
             text("SELECT dag FROM workflows WHERE id = :wid"), {"wid": str(report.workflow_id)}
         )
         dag = row.scalar_one()
-    nodes = dag["nodes"] if isinstance(dag, dict) else json.loads(dag)["nodes"]
-    assert [node["node_id"] for node in nodes] == [DEV_LEAD_NODE_ID]
+    payload = dag if isinstance(dag, dict) else json.loads(dag)
+    nodes = payload["nodes"]
+    assert [node["node_id"] for node in nodes] == [DEV_LEAD_NODE_ID, CODE_RESEARCHER_NODE_ID]
     assert nodes[0]["agent_template_id"] == str(report.template_ids["dev_lead"])
+    assert nodes[1]["agent_template_id"] == str(report.template_ids["code_researcher"])
+    # L'edge, sans condition : le Chercheur s'exécute quoi que le Dev Lead ait
+    # rendu — y compris un plan `failed`, cas où c'est justement le codebase
+    # qu'il faut regarder pour répondre à la `blocking_question`.
+    assert payload["edges"] == [
+        {
+            "from_node_id": DEV_LEAD_NODE_ID,
+            "to_node_id": CODE_RESEARCHER_NODE_ID,
+            "condition": None,
+        }
+    ]
 
 
 # ─── AC2 — prise de demande et accusé de réception ───────────────────
@@ -352,7 +544,7 @@ async def test_a_natural_language_request_is_acknowledged_on_the_first_sse_frame
     """
     report = await _seed(app_session_factory)
     objective, canned = _CASES["scaffolding"]
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
 
     transport = httpx.ASGITransport(app=app)
     loop = asyncio.get_running_loop()
@@ -381,10 +573,23 @@ async def test_a_natural_language_request_is_acknowledged_on_the_first_sse_frame
 
         # L'accusé est déjà sur le 201 : le dogfooding de Sprint 2 se fait en
         # client HTTP, pas dans une UI.
+        # T5.4 — le DAG a un node de plus, donc l'accusé nomme un agent de
+        # plus ET son ETA (somme des médianes PAR NODE) double. Ce test
+        # épinglait déjà la phrase exacte, et c'est ce qui rend la bascule
+        # visible plutôt que subie.
         ack = body["acknowledgement"]
-        assert ack["message"] == "Compris. Je mobilise Dev Lead. ETA ~1 min."
-        assert ack["agents"] == ["Dev Lead"]
-        assert ack["eta_minutes"] >= 1
+        assert ack["message"] == "Compris. Je mobilise Dev Lead et Code Researcher. ETA ~2 min."
+        assert ack["agents"] == ["Dev Lead", "Code Researcher"]
+        assert ack["eta_minutes"] == 2
+        # ⚠️ `eta_source` est asserté ICI parce que le package n'a AUCUNE
+        # fixture de purge : tous les tests du module partagent le même
+        # `workflow_id` et voient l'historique des runs précédents. L'ancienne
+        # assertion `>= 1` absorbait cette pollution ; `== 2` ne l'absorbe plus,
+        # et 2 est exactement la valeur du repli heuristique (60 s par node).
+        # Sans cette ligne, le test passait aussi bien avec un historique lu
+        # qu'avec un repli silencieux — et basculait sous `-k`, `--lf` ou un
+        # réordonnancement (revue 5.2).
+        assert ack["eta_source"] == "heuristic"
 
         started = loop.time()
 
@@ -422,7 +627,7 @@ async def test_the_acknowledgement_survives_the_checkpoint_rewrite(
     """
     report = await _seed(app_session_factory)
     objective, canned = _CASES["bugfix"]
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -462,7 +667,7 @@ async def test_the_acknowledgement_is_built_without_calling_the_llm(
     """
     report = await _seed(app_session_factory)
     objective, canned = _CASES["refactoring"]
-    provider = MockProvider("mock", [_completion(canned)])
+    provider = MockProvider("mock", _dag_completions(canned))
     app = _make_app(session_factory=app_session_factory)
     app.state.workflow_checkpointer = workflow_checkpointer
     app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
@@ -479,8 +684,9 @@ async def test_the_acknowledgement_is_built_without_calling_the_llm(
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
 
-    # Exactement un appel : celui du node. Aucun pour l'accusé.
-    assert len(provider.calls) == 1
+    # Exactement TROIS appels : un par node du DAG, plus le résumé de passage
+    # de l'arête. Aucun pour l'accusé — c'est ce que ce test garde.
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -509,7 +715,7 @@ async def test_the_started_event_carries_the_same_acknowledgement_as_the_201(
 
     report = await _seed(app_session_factory)
     objective, canned = _CASES["scaffolding"]
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -578,8 +784,11 @@ async def test_a_run_reads_its_eta_from_the_measured_history_of_past_runs(
     report = await _seed(app_session_factory)
     objective, canned = _CASES["scaffolding"]
 
-    # 180 s sur LE node du DAG — une valeur qu'aucun repli ne peut produire
-    # (le défaut est de 60 s), donc l'ETA rendue prouve la LECTURE.
+    # 180 s + 120 s sur les DEUX nodes du DAG — des valeurs qu'aucun repli ne
+    # peut produire (le défaut est de 60 s par node, donc 2 min au total),
+    # donc l'ETA rendue prouve la LECTURE. Poser l'historique d'un seul node
+    # ferait retomber l'ETA en `heuristic` sur l'autre : `build_acknowledgement`
+    # exige un échantillon pour CHAQUE node avant d'annoncer `history`.
     async with app_session_factory() as session:
         await session.execute(
             text(
@@ -590,12 +799,19 @@ async def test_a_run_reads_its_eta_from_the_measured_history_of_past_runs(
             {
                 "wf": str(report.workflow_id),
                 "cid": str(new_correlation_id()),
-                "m": json.dumps({"per_node": {DEV_LEAD_NODE_ID: {"duration_ms": 180_000}}}),
+                "m": json.dumps(
+                    {
+                        "per_node": {
+                            DEV_LEAD_NODE_ID: {"duration_ms": 180_000},
+                            CODE_RESEARCHER_NODE_ID: {"duration_ms": 120_000},
+                        }
+                    }
+                ),
             },
         )
         await session.commit()
 
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         run_resp = await client.post(
@@ -610,9 +826,9 @@ async def test_a_run_reads_its_eta_from_the_measured_history_of_past_runs(
             "le node du DAG n'a pas retrouvé sa durée mesurée — les clés de "
             "`templates` et de `metrics.per_node` ont divergé"
         )
-        # 180 s ⇒ 3 min. Le repli heuristique aurait rendu 1 min.
-        assert ack["eta_minutes"] == 3
-        assert "ETA ~3 min." in ack["message"]
+        # 180 s + 120 s ⇒ 5 min. Le repli heuristique aurait rendu 2 min.
+        assert ack["eta_minutes"] == 5
+        assert "ETA ~5 min." in ack["message"]
 
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
@@ -647,7 +863,14 @@ async def test_a_workflow_whose_recent_runs_all_failed_still_finds_its_measured_
             {
                 "wf": str(report.workflow_id),
                 "cid": str(new_correlation_id()),
-                "m": json.dumps({"per_node": {DEV_LEAD_NODE_ID: {"duration_ms": 180_000}}}),
+                "m": json.dumps(
+                    {
+                        "per_node": {
+                            DEV_LEAD_NODE_ID: {"duration_ms": 180_000},
+                            CODE_RESEARCHER_NODE_ID: {"duration_ms": 120_000},
+                        }
+                    }
+                ),
             },
         )
         # Plus d'échecs récents que `AGENTIVE_ACK_HISTORY_LIMIT` (20).
@@ -666,7 +889,7 @@ async def test_a_workflow_whose_recent_runs_all_failed_still_finds_its_measured_
             )
         await session.commit()
 
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         run_resp = await client.post(
@@ -681,7 +904,7 @@ async def test_a_workflow_whose_recent_runs_all_failed_still_finds_its_measured_
             "25 échecs récents ont masqué l'historique mesuré — le filtre de statut "
             "est appliqué APRÈS la troncature"
         )
-        assert ack["eta_minutes"] == 3
+        assert ack["eta_minutes"] == 5
 
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
@@ -711,7 +934,7 @@ async def test_the_seeded_pole_starts_through_the_real_mise_en_place(
     app = _make_app(session_factory=app_session_factory)
     app.state.workflow_checkpointer = workflow_checkpointer
     app.state.llm_router = LLMRouter(
-        providers={"mock": MockProvider("mock", [_completion(canned)])},
+        providers={"mock": MockProvider("mock", _dag_completions(canned))},
         default_chain=["mock"],
     )
     wire_execution_service_with_real_mise_en_place(app)
@@ -759,7 +982,7 @@ async def test_each_reference_case_produces_a_coherent_delegation_plan(
     """
     report = await _seed(app_session_factory)
     objective, canned = _CASES[case]
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -824,7 +1047,7 @@ async def test_an_incoherent_plan_reaching_the_engine_is_reported_not_swallowed(
             ],
         }
     )
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(rogue)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(rogue))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -881,7 +1104,7 @@ async def test_a_coherent_plan_records_no_contract_problem(
 
     report = await _seed(app_session_factory)
     objective, canned = _CASES["scaffolding"]
-    app = _build_app(app_session_factory, workflow_checkpointer, [_completion(canned)])
+    app = _build_app(app_session_factory, workflow_checkpointer, _dag_completions(canned))
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -964,3 +1187,225 @@ async def test_a_missing_namespace_refuses_the_launch(
     assert absent in body
     # Le message dit quoi faire, pas seulement que ça a échoué.
     assert "Créer le namespace" in body
+
+
+# ─── AC2 — la sortie est APPUYÉE sur des appels d'outils réels ───────
+
+
+@pytest.mark.asyncio
+async def test_the_code_researcher_really_calls_its_tools_during_a_run(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """Story 5.2 AC2 / T7.5 — **la preuve que la Story 5.0 n'a jamais eue**.
+
+    Sa revue a trouvé que `node_tools` n'était câblé par aucun appelant de
+    production alors que TOUS ses tests unitaires passaient : la boucle
+    d'outils était livrée, l'exécuteur MCP était livré, et aucun template ne
+    portait un seul outil. Ce test est le premier du dépôt où un run de
+    workflow exécute réellement un outil.
+
+    Tout est réel sauf le modèle : Postgres, le checkpointing LangGraph, le
+    serveur MCP (sous-processus stdio sandboxé), la table `tools` peuplée par
+    la découverte. Le `MockProvider` ne fait que DEMANDER l'outil — ce qu'il
+    reçoit en retour vient du disque.
+
+    Trois choses distinctes sont vérifiées, et la troisième est celle qui
+    empêche ce test d'être circulaire :
+      1. les outils ont été OFFERTS au modèle (`calls[...]["tools"]`) ;
+      2. l'exécution est COMPTÉE dans `metrics.per_node` — la surface que
+         l'AC2 nomme ;
+      3. le résultat rendu au modèle porte des chemins qui EXISTENT vraiment
+         sur le disque. Une fixture ne peut pas fabriquer ça.
+    """
+    from sqlalchemy import text
+
+    from agentive_backend.shared.llm.types import ToolCall
+
+    report = await _seed(app_session_factory)
+    objective, canned = _CASES["scaffolding"]
+
+    asking_for_a_tool = Completion(
+        text="",
+        model="mock-model",
+        provider="mock",
+        input_tokens=100,
+        output_tokens=20,
+        finish_reason="tool_use",
+        latency_ms=5.0,
+        cost_estimate_usd=Decimal("0.0001"),
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="find_files",
+                arguments={
+                    "pattern": "**/router.py",
+                    "path": str(_CORPUS_FEATURES),
+                    "max_results": 5,
+                },
+            ),
+        ),
+    )
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(canned),  # node `dev_lead`
+            _completion(_HANDOFF_SUMMARY),  # résumé de passage de l'arête
+            asking_for_a_tool,  # node `code_researcher`, tour 1
+            _completion(_RESEARCHER_ANSWER),  # node `code_researcher`, tour 2
+        ],
+    )
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.workflow_checkpointer = workflow_checkpointer
+    app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    wire_execution_service(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_resp = await client.post(
+            f"/api/v1/workflows/{report.workflow_id}/runs",
+            headers=_auth_headers(),
+            json={"input": {"objective": objective}},
+        )
+        assert run_resp.status_code == 201, run_resp.text
+        run_id = run_resp.json()["run_id"]
+        assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
+
+    async with app_session_factory() as session:
+        row = await session.execute(
+            text("SELECT metrics FROM workflow_runs WHERE id = :r"), {"r": run_id}
+        )
+        metrics = row.scalar_one()
+
+    # (2) — la surface que l'AC2 nomme, mot pour mot.
+    researcher = metrics["per_node"][CODE_RESEARCHER_NODE_ID]
+    assert researcher["tool_calls"] > 0, (
+        "le node n'a appelé aucun outil : `_load_node_tools` ne l'a pas résolu, "
+        "ou la liste `tools:` du template est restée vide"
+    )
+    assert researcher["tool_names"] == ["find_files"]
+    assert researcher["tool_failures"] == 0, (
+        "l'appel d'outil a échoué. Sous le repli `setrlimit` (bwrap absent), "
+        "`RLIMIT_CPU`/`RLIMIT_AS` peuvent tuer le sous-processus à l'import — "
+        "vérifier les logs du serveur ET le backend de sandbox effectif."
+    )
+    assert researcher["tool_loop_iterations"] == 2
+
+    # Le Dev Lead n'a AUCUN outil, et sa métrique le dit : la forme ne change
+    # pas pour un node sans outils (Story 5.0 AC4).
+    assert metrics["per_node"][DEV_LEAD_NODE_ID]["tool_calls"] == 0
+    assert metrics["per_node"][DEV_LEAD_NODE_ID]["tool_names"] == []
+
+    # (1) — les outils ont bien été OFFERTS, et seulement au node qui les a.
+    calls = provider.calls
+    assert calls[0]["tools"] is None, "le Dev Lead s'est vu offrir des outils qu'il n'a pas"
+    # Revue 5.2 — `calls[1]` (résumé de passage) et `calls[3]` (tour 2) n'étaient
+    # contrôlés par rien : un bug offrant les outils de lecture à l'appel de
+    # résumé, où aucun contrat ne les attend, passait inaperçu.
+    assert calls[1]["tools"] is None, "le résumé de passage s'est vu offrir des outils"
+    offered = {tool.name for tool in calls[2]["tools"] or []}
+    assert offered == {"list_directory", "read_file", "find_files", "search_content"}
+    assert calls[2]["tools"], "les outils n'ont pas été offerts au Chercheur"
+    assert {tool.name for tool in calls[3]["tools"] or []} == offered, (
+        "le tour 2 de la boucle doit ré-offrir les mêmes outils"
+    )
+
+    # (3) — ce que le modèle a REÇU vient du disque. C'est ce qui distingue ce
+    # test d'une fixture qui se relit elle-même : les chemins ci-dessous ont
+    # été produits par un sous-processus lisant `/app`, pas écrits ici.
+    tool_messages = [message for message in calls[3]["messages"] if message.role == "tool"]
+    assert tool_messages, "le résultat de l'outil n'a pas été renvoyé au modèle"
+    body = tool_messages[0].content
+    assert "<tool_output>" in body, "le résultat d'outil n'est pas enveloppé (règle d'or #9)"
+    returned = re.findall(rf"{re.escape(str(_CORPUS_FEATURES))}/[\w/]+\.py", body)
+    assert returned, f"aucun chemin dans le résultat de l'outil : {body[:400]}"
+    for path in returned:
+        assert Path(path).is_file(), f"le serveur a rendu un chemin inexistant : {path}"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_path_inside_a_run_does_not_kill_the_run(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """Le mode de panne **(b)** du runbook, enfin prouvé (revue 5.2).
+
+    `docs/runbooks/pole-dev.md` affirme : « Un chemin est refusé au runtime →
+    le run ne meurt **PAS**. Le refus arrive au modèle comme un résultat
+    d'erreur exploitable (`isError`), et l'agent peut corriger son chemin. »
+    C'est la section la plus rassurante du runbook, et elle ne reposait sur
+    aucun test : le seul test d'outils dans un run n'exerçait que le chemin
+    heureux (`tool_failures == 0`).
+
+    Ce que ce test établit, et que les unitaires ne peuvent pas : que le refus
+    traverse le sous-processus, le transport MCP, `McpToolExecutor` et la
+    boucle d'outils pour revenir au modèle sous forme de message `tool`
+    exploitable — pendant que le run, lui, va jusqu'à `completed`.
+    """
+    from sqlalchemy import text
+
+    from agentive_backend.shared.llm.types import ToolCall
+
+    report = await _seed(app_session_factory)
+    objective, canned = _CASES["scaffolding"]
+
+    asking_for_a_forbidden_path = Completion(
+        text="",
+        model="mock",
+        provider="mock",
+        input_tokens=100,
+        output_tokens=20,
+        finish_reason="tool_use",
+        latency_ms=5.0,
+        cost_estimate_usd=Decimal("0.0001"),
+        tool_calls=(ToolCall(id="call-1", name="read_file", arguments={"path": "/etc/passwd"}),),
+    )
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(canned),
+            _completion(_HANDOFF_SUMMARY),
+            asking_for_a_forbidden_path,
+            _completion(_RESEARCHER_ANSWER),
+        ],
+    )
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.workflow_checkpointer = workflow_checkpointer
+    app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    wire_execution_service(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_resp = await client.post(
+            f"/api/v1/workflows/{report.workflow_id}/runs",
+            headers=_auth_headers(),
+            json={"input": {"objective": objective}},
+        )
+        assert run_resp.status_code == 201, run_resp.text
+        run_id = run_resp.json()["run_id"]
+        # LE point : le run termine normalement malgré le refus.
+        assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
+
+    async with app_session_factory() as session:
+        row = await session.execute(
+            text("SELECT metrics FROM workflow_runs WHERE id = :r"), {"r": run_id}
+        )
+        metrics = row.scalar_one()
+
+    researcher = metrics["per_node"][CODE_RESEARCHER_NODE_ID]
+    assert researcher["tool_calls"] > 0
+    assert researcher["tool_failures"] == 1, "le refus doit être COMPTÉ, pas avalé"
+
+    # Et il est revenu au modèle sous une forme qu'il peut exploiter.
+    tool_messages = [message for message in provider.calls[3]["messages"] if message.role == "tool"]
+    assert tool_messages, "le refus n'a pas été renvoyé au modèle"
+    body = tool_messages[0].content
+    assert "<tool_output>" in body, "le refus n'est pas enveloppé (règle d'or #9)"
+    assert "racines autorisées" in body, (
+        "le message ne dit pas au modèle POURQUOI le chemin est refusé — "
+        "T1.4 exige un résultat d'erreur exploitable, pas seulement signalé"
+    )

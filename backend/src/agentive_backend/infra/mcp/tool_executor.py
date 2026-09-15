@@ -28,8 +28,10 @@ from uuid import UUID
 
 from agentive_backend.infra.mcp.client import (
     MCPExecutionTimeoutError,
+    MCPToolError,
     call_tool,
 )
+from agentive_backend.infra.mcp.policy import apply_sandbox_policy
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.llm.security import wrap_external_input
 from agentive_backend.shared.llm.types import ToolCall, ToolDefinition
@@ -190,12 +192,29 @@ class McpToolExecutor:
             return self._wrap(f"ERROR: no tool named {call.name!r} is available to you.")
 
         status: Literal["success", "error", "timeout"]
+        # Story 5.2 T2.2 — le profil sandbox du SERVEUR, et la configuration
+        # de connexion qu'il réécrit. Avant cette story aucun appelant ne
+        # passait `profile=`, donc le défaut s'appliquait partout : il ne
+        # ro-bind que `/usr /etc /lib /lib64 /bin /sbin`, et sous bwrap un
+        # serveur de lecture de code n'aurait vu ni le code ni son propre
+        # interpréteur.
         try:
-            raw = await call_tool(
+            # Story 5.2 — DANS le `try`, et c'est une correction de la revue.
+            # L'appel précédait le `try`, donc une exception de la politique
+            # (réglage incohérent, interpréteur introuvable) échappait à
+            # `__call__` et tuait la boucle d'outils — le contre-exemple exact
+            # de la règle que ce bloc défend trente lignes plus bas : « le
+            # modèle peut corriger ; il ne peut rien faire d'un run mort ».
+            profile, connection_config = apply_sandbox_policy(
                 transport=tool.transport,
                 connection_config=tool.connection_config,
+            )
+            raw = await call_tool(
+                transport=tool.transport,
+                connection_config=connection_config,
                 tool_name=tool.name,
                 arguments=call.arguments,
+                profile=profile,
                 # AC4, troisième plafond. Passé EXPLICITEMENT plutôt que
                 # laissé au défaut de `call_tool` : le défaut de ce module-là
                 # est dimensionné pour un appel isolé (Dry Run, Playground
@@ -211,6 +230,22 @@ class McpToolExecutor:
             status = "timeout"
             text = f"ERROR: tool {tool.name!r} timed out: {exc}"
             _log.warning("mcp.tool_executor_timeout", tool=tool.name)
+        except MCPToolError as exc:
+            # Story 5.2 T1.4 — un refus d'outil est une information que le
+            # modèle peut EXPLOITER, et le `except Exception` ci-dessous la
+            # réduisait au seul nom de classe : « ERROR: tool 'read_file'
+            # failed: MCPToolError » ne dit pas au modèle de corriger son
+            # chemin. `MCPToolError.detail` est le texte que le serveur MCP a
+            # lui-même renvoyé — c'est de la sortie d'outil, exactement comme
+            # un succès, donc pas plus risquée que lui : `_wrap` l'enveloppe
+            # dans `<tool_output>` avant qu'elle n'atteigne le prompt.
+            #
+            # Distinct du `except Exception` qui suit, et cette distinction
+            # est le point : une exception PYTHON peut porter un DSN, un
+            # chemin interne ou un jeton (NFR9), et celle-là reste muette.
+            status = "error"
+            text = f"ERROR: tool {tool.name!r} refused the call: {exc.detail}"
+            _log.warning("mcp.tool_executor_tool_error", tool=tool.name)
         except Exception as exc:
             status = "error"
             text = f"ERROR: tool {tool.name!r} failed: {type(exc).__name__}"

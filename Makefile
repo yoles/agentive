@@ -192,9 +192,17 @@ migrate-init: ## Crée la migration initiale (manuel, pas autogenerate)
 	$(DC_DEV) run --rm backend uv run alembic revision -m "initial schema"
 
 .PHONY: seed-dev
-seed-dev: ## Provisionne le Pôle Dev (namespaces + agent-templates + workflow d'entrée) — Story 5.1
-	# Idempotent : une seconde exécution ne crée rien et ne duplique rien.
+seed-dev: ## Provisionne le Pôle Dev (serveurs MCP + namespaces + agent-templates + workflow) — Stories 5.1/5.2
+	# Idempotent tant que le DAG du workflow d'entrée et les UUID de templates
+	# ne changent pas : une seconde exécution ne crée rien et ne duplique rien.
 	# Suppose les migrations appliquées (`make migrate`).
+	#
+	# AGENTIVE_ALLOW_MCP_REGISTRATION : requis UNIQUEMENT quand un serveur MCP
+	# doit réellement être enregistré (première exécution, ou serveur ajouté au
+	# catalogue). Une exécution qui se contente de vérifier l'existant n'en a
+	# pas besoin — la garde vit dans `ToolHubService.connect_server`, au point
+	# où le sous-processus est spawné. Pour la première exécution :
+	#     AGENTIVE_ALLOW_MCP_REGISTRATION=true make seed-dev
 	$(DC_DEV) run --rm backend uv run python -m scripts.seed_dev
 
 .PHONY: test-backend
