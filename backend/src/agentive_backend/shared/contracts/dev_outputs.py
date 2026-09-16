@@ -68,6 +68,24 @@ def _is_filled(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _is_rendered(value: object) -> bool:
+    """``True`` si ``value`` dit quelque chose, QUEL QUE SOIT son type.
+
+    ``_is_filled`` ne juge que des chaînes et les inspecteurs de champ ne
+    jugent que la forme attendue. Entre les deux il restait un angle mort :
+    un champ rendu dans le MAUVAIS type échappait à la règle « sur un refus,
+    ne rends rien ». Une approche livrée en texte brut sur un ``status:
+    "failed"`` est exactement le refus à moitié rendu que cette règle
+    interdit — la juger sur son type reviendrait à ne l'attraper que quand le
+    modèle se trompe dans le bon type.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str | bytes | list | tuple | dict | set | frozenset):
+        return bool(value)
+    return True
+
+
 def _status_problems(status: object) -> list[str]:
     if status not in _TERMINAL_STATUSES:
         return [f"status invalide : {status!r} (attendu 'done' ou 'failed')"]
@@ -120,15 +138,27 @@ def validate_architect_approach(output: object) -> list[str]:
     test_strategy = output.get("test_strategy")
 
     if output.get("status") == "failed":
-        if (
-            (isinstance(approach, Mapping) and approach)
-            or (isinstance(tradeoffs, list) and tradeoffs)
-            or (isinstance(risks, list) and risks)
-            or (isinstance(test_strategy, Mapping) and test_strategy)
-        ):
+        # `_is_rendered` et non un test de type : un `approach` livré en
+        # CHAÎNE sur un refus échappait à cette règle, parce qu'il n'était ni
+        # un `Mapping` non vide (pas vu ici) ni soumis à `_approach_problems`
+        # (la branche `done` est court-circuitée par le `return` ci-dessous).
+        # La règle porte sur « a-t-il rendu quelque chose », pas sur « l'a-t-il
+        # rendu dans le bon type ».
+        rendered = [
+            name
+            for name, value in (
+                ("approach", approach),
+                ("tradeoffs", tradeoffs),
+                ("risks", risks),
+                ("test_strategy", test_strategy),
+            )
+            if _is_rendered(value)
+        ]
+        if rendered:
             problems.append(
                 "un status 'failed' doit rendre `approach`, `tradeoffs`, `risks` et "
-                "`test_strategy` vides — une approche à moitié rendue est pire qu'un refus"
+                "`test_strategy` vides — une approche à moitié rendue est pire qu'un "
+                f"refus (rendu : {', '.join(rendered)})"
             )
         problems.extend(_blocking_question_problems(output))
         return problems
@@ -216,6 +246,17 @@ def _risk_problems(risks: object) -> list[str]:
     entries = _entries(risks)
     if len(entries) != len(risks):
         problems.append("chaque entrée de risks doit être un objet")
+    if not risks:
+        # L'AC3 énumère ce que l'approche doit porter : « la complexité
+        # estimée, LES RISQUES et au moins une alternative écartée ». Un
+        # `risks: []` passait pourtant conforme — la boucle ci-dessous ne juge
+        # que les risques déclarés. La règle est posée des DEUX côtés (ici et
+        # dans les « RÈGLES DURES » du prompt) : un validateur plus strict que
+        # le contrat donné à l'agent serait son propre défaut.
+        problems.append(
+            "risks doit porter au moins un risque — une approche sans aucun risque "
+            "identifié est une affirmation, pas une analyse"
+        )
     for item in entries:
         if not _is_filled(item.get("risk")):
             problems.append("chaque risque doit être énoncé (`risk`)")
@@ -247,8 +288,17 @@ def _test_strategy_problems(test_strategy: object) -> list[str]:
                 f"niveaux de test inconnus : {', '.join(unknown)} "
                 f"(attendu parmi {', '.join(_TEST_LEVELS)})"
             )
-    if not isinstance(test_strategy.get("focus"), list):
+    focus = test_strategy.get("focus")
+    if not isinstance(focus, list):
         problems.append("test_strategy.focus doit lister ce que les tests doivent garder")
+    elif not focus:
+        # Seul le TYPE était testé : un `focus: []` disait « des tests, mais
+        # sans dire ce qu'ils gardent », ce qui est la forme vide de la
+        # stratégie. Symétrique de `levels`, qui exige déjà au moins une entrée.
+        problems.append(
+            "test_strategy.focus doit nommer au moins une propriété à garder — "
+            "une liste vide ne dit pas ce que les tests servent à tenir"
+        )
     return problems
 
 
@@ -295,8 +345,11 @@ def validate_producer_output(output: object) -> list[str]:
     unaddressed = output.get("unaddressed")
     problems.extend(_unaddressed_problems(unaddressed))
 
-    has_diffs = isinstance(code_diffs, list) and bool(code_diffs)
-    has_gaps = isinstance(unaddressed, list) and bool(unaddressed)
+    has_diffs = bool(_entries(code_diffs))
+    # `_entries` et non `bool(unaddressed)` : un écart déclaré ne compte que
+    # s'il est EXPLOITABLE. Compter la longueur brute laissait
+    # `unaddressed: ["rien"]` tenir lieu de travail rendu.
+    has_gaps = bool(_entries(unaddressed))
     if not has_diffs and not has_gaps:
         problems.append(
             "un status 'done' sans aucun `code_diffs` et sans aucun `unaddressed` ne décrit "
@@ -349,7 +402,15 @@ def _unaddressed_problems(unaddressed: object) -> list[str]:
     if not isinstance(unaddressed, list):
         return [f"unaddressed mal formé (reçu {type(unaddressed).__name__})"]
     problems: list[str] = []
-    for item in _entries(unaddressed):
+    # Ce contrôle de forme manquait ici alors que les quatre autres
+    # inspecteurs de tableau le portent, et c'est ce qui rendait la règle
+    # « produire, ou dire ce qui a empêché de produire » contournable : une
+    # liste de CHAÎNES suffisait à la satisfaire, parce que `_entries` les
+    # filtre en silence et que la règle ne comptait que la longueur brute.
+    entries = _entries(unaddressed)
+    if len(entries) != len(unaddressed):
+        problems.append("chaque entrée de unaddressed doit être un objet")
+    for item in entries:
         if not _is_filled(item.get("item")):
             problems.append("chaque `unaddressed` doit nommer ce qui n'a pas été traité")
         if not _is_filled(item.get("reason")):
@@ -365,10 +426,17 @@ def _unaddressed_problems(unaddressed: object) -> list[str]:
 #: un template qui en déclare un SUR-ENSEMBLE est jugé (le Dev Lead déclare
 #: ``status`` en plus de ``plan`` et ``delegations``).
 #:
-#: Ordre significatif : le PREMIER contrat couvert gagne. Aucun des trois
-#: n'est un sous-ensemble d'un autre aujourd'hui, et le test
-#: ``test_the_registry_has_no_ambiguous_contract`` garde cette propriété — sans
-#: quoi l'ordre déciderait silencieusement d'un verdict.
+#: Aucun des trois n'est un sous-ensemble d'un autre, et le test
+#: ``test_the_registry_has_no_ambiguous_contract`` garde cette propriété.
+#:
+#: ⚠️ Cette propriété est nécessaire mais PAS suffisante, et la docstring
+#: d'origine affirmait le contraire. Le dispatch ne compare pas les contrats
+#: entre eux : il les compare au ``core`` DÉCLARÉ par le template. Un template
+#: dont le ``core`` est l'union de deux contrats les couvre donc tous les deux
+#: sans qu'aucun ne soit sous-ensemble de l'autre — et ``output_contract.core``
+#: est librement écrivable par ``PUT /api/v1/agents/templates/{id}``. Ce cas
+#: n'est plus tranché par l'ordre de ce tuple : il est NOMMÉ
+#: (cf. :func:`contract_problems`).
 _VALIDATORS: Final[tuple[tuple[frozenset[str], Callable[[object], list[str]]], ...]] = (
     (frozenset({"plan", "delegations"}), validate_delegation_plan),
     (
@@ -394,14 +462,26 @@ def contract_problems(node_output: object, *, declared_core: Iterable[object]) -
     Une sortie non parsable (enveloppe ``_raw``) ne rend rien : elle est déjà
     signalée par le repli lui-même et par la règle de routage
     ``no-parsable-output`` à 0.9. Le redire ici dirait deux fois la même chose.
+
+    Un ``core`` qui couvre PLUSIEURS contrats est un défaut de déclaration,
+    pas un cas à trancher en silence : le nommer rend la main à l'auteur du
+    template au lieu de laisser l'ordre de :data:`_VALIDATORS` décider à sa
+    place.
     """
     if isinstance(node_output, Mapping) and RAW_OUTPUT_KEY in node_output:
         return []
     core = {key for key in declared_core if isinstance(key, str)}
-    for required, validator in _VALIDATORS:
-        if required <= core:
-            return validator(node_output)
-    return []
+    matched = [(required, validator) for required, validator in _VALIDATORS if required <= core]
+    if not matched:
+        return []
+    if len(matched) > 1:
+        covered = " ; ".join(", ".join(sorted(required)) for required, _ in matched)
+        return [
+            "le `output_contract.core` déclaré couvre PLUSIEURS contrats du pôle "
+            f"({covered}) — aucun verdict n'est rendu, parce que le choix "
+            "appartient à l'auteur du template et non à l'ordre du registre"
+        ]
+    return matched[0][1](node_output)
 
 
 __all__ = [

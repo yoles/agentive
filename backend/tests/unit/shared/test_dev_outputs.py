@@ -362,3 +362,179 @@ def test_the_registry_has_no_ambiguous_contract() -> None:
         for right in contracts:
             if left is not right:
                 assert not left <= right, f"{sorted(left)} est couvert par {sorted(right)}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Revue de la Story 5.3 — les trous que les échantillons nominaux ne voyaient
+# pas. Chacun de ces tests est écrit sur la PROPRIÉTÉ gardée, et ses
+# échantillons sont posés à la main : les dériver des constantes du validateur
+# reproduirait la circularité que la revue de la 5.2 a dû défaire huit fois.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_production_that_declares_no_real_work_cannot_hide_behind_unaddressed() -> None:
+    """`unaddressed` doit porter des OBJETS, sinon la règle se contourne.
+
+    La règle « produire, ou dire ce qui a empêché de produire » ne comptait
+    que la longueur brute de `unaddressed`. Une liste d'une chaîne suffisait
+    donc à la satisfaire — et c'est la sortie que produit spontanément un
+    modèle qui n'a rien à dire. Les deux constats sont exigés : la forme des
+    entrées ET l'absence de travail décrit.
+    """
+    problems = validate_producer_output(
+        {
+            "status": "done",
+            "code_diffs": [],
+            "tests": [],
+            "docs_snippets": [],
+            "unaddressed": ["l'étape a3 n'a pas été traitée"],
+        }
+    )
+    assert any("unaddressed doit être un objet" in p for p in problems), problems
+    assert any("ne décrit aucun travail" in p for p in problems), problems
+
+
+def test_a_well_formed_gap_still_stands_in_for_a_production() -> None:
+    """La contrepartie : un écart EXPLOITABLE reste une sortie conforme.
+
+    Sans ce test, le précédent pourrait être satisfait en refusant tout
+    `code_diffs` vide — ce qui forcerait un Producteur bloqué à improviser,
+    l'exact contraire de ce que le prompt lui demande.
+    """
+    assert (
+        validate_producer_output(
+            {
+                "status": "done",
+                "code_diffs": [],
+                "tests": [],
+                "docs_snippets": [],
+                "unaddressed": [{"item": "étape a3", "reason": "le fichier visé n'existe pas"}],
+            }
+        )
+        == []
+    )
+
+
+def test_a_refusal_that_still_hands_over_an_approach_is_named_whatever_its_type() -> None:
+    """Sur `failed`, la règle porte sur « a-t-il rendu », pas sur le type.
+
+    Un `approach` livré en CHAÎNE échappait à tout : ni `Mapping` non vide
+    (donc pas vu par la branche `failed`), ni soumis à `_approach_problems`
+    (la branche `done` est court-circuitée). Le refus à moitié rendu que la
+    règle interdit passait par la porte de derrière.
+    """
+    problems = validate_architect_approach(
+        {
+            "status": "failed",
+            "approach": "voici quand même l'approche complète que je propose",
+            "blocking_question": "quel module vise la tâche ?",
+        }
+    )
+    assert any("à moitié rendue" in p for p in problems), problems
+    assert any("approach" in p for p in problems), problems
+
+
+def test_a_clean_refusal_still_passes() -> None:
+    """La contrepartie du précédent : un refus qui ne rend RIEN est conforme."""
+    assert (
+        validate_architect_approach(
+            {
+                "status": "failed",
+                "approach": {},
+                "tradeoffs": [],
+                "risks": [],
+                "test_strategy": {},
+                "blocking_question": "le Chercheur n'a rendu aucun fichier exploitable",
+            }
+        )
+        == []
+    )
+
+
+def test_an_approach_without_a_single_risk_is_named() -> None:
+    """L'AC3 énumère « la complexité estimée, LES RISQUES et au moins une
+    alternative écartée ». Un `risks: []` passait pourtant conforme : la
+    boucle de validation ne juge que les risques déclarés, donc zéro risque
+    ne violait rien. La règle est posée des deux côtés — ici et dans les
+    « RÈGLES DURES » du prompt de l'Analyste.
+    """
+    problems = validate_architect_approach(
+        {
+            "status": "done",
+            "approach": {
+                "summary": "brancher le lecteur sur le port existant",
+                "complexity": "low",
+                "steps": [{"id": "a1", "title": "brancher"}],
+            },
+            "tradeoffs": [
+                {"option": "port existant", "chosen": True, "rationale": "déjà testé"},
+                {"option": "nouveau port", "chosen": False, "rationale": "coût sans gain"},
+            ],
+            "risks": [],
+            "test_strategy": {"levels": ["unit"], "focus": ["le port reste unique"]},
+        }
+    )
+    assert any("au moins un risque" in p for p in problems), problems
+
+
+def test_a_test_strategy_that_names_no_property_to_keep_is_named() -> None:
+    """`focus` n'était testé qu'en TYPE : une liste vide disait « des tests,
+    mais sans dire ce qu'ils gardent ». Symétrique de `levels`, qui exige
+    déjà au moins une entrée."""
+    problems = validate_architect_approach(
+        {
+            "status": "done",
+            "approach": {
+                "summary": "brancher le lecteur sur le port existant",
+                "complexity": "low",
+                "steps": [{"id": "a1", "title": "brancher"}],
+            },
+            "tradeoffs": [
+                {"option": "port existant", "chosen": True, "rationale": "déjà testé"},
+                {"option": "nouveau port", "chosen": False, "rationale": "coût sans gain"},
+            ],
+            "risks": [
+                {"risk": "le port change de signature", "severity": "low", "mitigation": "test"}
+            ],
+            "test_strategy": {"levels": ["unit"], "focus": []},
+        }
+    )
+    assert any("au moins une propriété à garder" in p for p in problems), problems
+
+
+def test_a_core_that_covers_two_contracts_is_named_not_silently_arbitrated() -> None:
+    """Le dispatch compare le contrat au `core` DÉCLARÉ, pas aux autres contrats.
+
+    `test_the_registry_has_no_ambiguous_contract` garde une propriété
+    nécessaire mais PAS suffisante : deux contrats dont aucun n'est
+    sous-ensemble de l'autre peuvent être couverts tous les deux par un `core`
+    qui en est l'union. `output_contract.core` étant librement écrivable par
+    `PUT /api/v1/agents/templates/{id}`, le cas est atteignable — et l'ordre
+    du registre ne doit pas le trancher à la place de l'auteur du template.
+    """
+    problems = contract_problems(
+        {"status": "done"},
+        declared_core={"plan", "delegations", "code_diffs", "tests", "docs_snippets"},
+    )
+    assert len(problems) == 1, problems
+    assert "couvre PLUSIEURS contrats" in problems[0]
+    # Et le constat NOMME les deux contrats, sinon il n'est pas actionnable.
+    assert "plan" in problems[0] and "code_diffs" in problems[0]
+
+
+def test_the_raw_envelope_key_still_matches_the_one_the_engine_writes() -> None:
+    """`RAW_OUTPUT_KEY` est dupliquée ici plutôt qu'importée (`shared/` ne peut
+    pas dépendre de `features/`, Contract 1). Ce test est le seul endroit où
+    les deux côtés peuvent être comparés — comme
+    `test_no_dev_template_declares_more_tokens_than_the_engine_allows` le fait
+    pour `MAX_TOKENS_HARD_CAP`.
+
+    Sans lui, un renommage côté moteur ferait rendre `contract_problems` une
+    avalanche de faux constats sur CHAQUE sortie non parsable, en silence.
+    """
+    from agentive_backend.features.workflow_engine.engine.agent_node import (
+        RAW_OUTPUT_KEY as ENGINE_RAW_OUTPUT_KEY,
+    )
+    from agentive_backend.shared.contracts.dev_outputs import RAW_OUTPUT_KEY
+
+    assert RAW_OUTPUT_KEY == ENGINE_RAW_OUTPUT_KEY

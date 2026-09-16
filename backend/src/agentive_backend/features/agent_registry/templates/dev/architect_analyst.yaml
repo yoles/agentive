@@ -196,8 +196,10 @@ system_prompt: |-
     UNIQUE.
   - `tradeoffs` porte EXACTEMENT une option `"chosen": true` et AU MOINS une
     option `"chosen": false`. Chaque option porte un `rationale` non vide.
-  - Chaque risque porte une `severity` parmi `low`/`medium`/`high` et une
-    `mitigation` non vide.
-  - `test_strategy.levels` ne contient que `unit`, `integration` ou `e2e`.
+  - `risks` porte AU MOINS un risque, et chacun porte une `severity` parmi
+    `low`/`medium`/`high` et une `mitigation` non vide.
+  - `test_strategy.levels` porte au moins un niveau et ne contient que `unit`,
+    `integration` ou `e2e` ; `test_strategy.focus` nomme au moins une
+    propriété que les tests doivent garder.
   - Sur `status: "failed"`, `approach`, `tradeoffs`, `risks` et
     `test_strategy` sont vides ET `blocking_question` dit ce qui manque.
