@@ -576,13 +576,35 @@ justifie :
 
 ```bash
 DETAIL=$(curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN")
+
+# ⚠️ Lire `truncated` AVANT de parser : la sortie du Producteur est la plus
+# grosse du DAG, et `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS` vaut 8 000 par défaut.
+# Sans cette garde, `jq` échoue sur un fragment et l'erreur n'a rien à voir.
+echo "$DETAIL" | jq -e '[.node_outputs[]
+  | select(.node_id=="architect_analyst" or .node_id=="code_producer")
+  | select(.truncated)] | length == 0' >/dev/null \
+  || { echo "SORTIE PAGINÉE — recoller par next_offset (§ 6 bis) avant de vérifier"; exit 1; }
+
 STEPS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="architect_analyst") | .output' \
-  | jq -r '[.approach.steps[].id] | sort | join(",")')
+  | jq -r '[.approach.steps[].id] | sort | .[]')
 REFS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="code_producer") | .output' \
-  | jq -r '[.code_diffs[].approach_ref] | unique | sort | join(",")')
-echo "étapes déclarées : $STEPS"
-echo "étapes citées    : $REFS"
+  | jq -r '[.code_diffs[].approach_ref] | unique | sort | .[]')
+
+# La COMPARAISON, et pas seulement l'affichage : `comm -13` rend les `refs` qui
+# n'ont aucune étape en face. Le § 6 bis calcule déjà son écart de la même
+# façon ; afficher deux listes triées en laissant l'œil trancher était une
+# recette de moins que ce que son titre annonçait.
+orphans=$(comm -13 <(echo "$STEPS") <(echo "$REFS"))
+n_refs=$(echo "$REFS" | grep -c . || true)
+n_bad=$(echo "$orphans" | grep -c . || true)
+echo "étapes déclarées : $(echo "$STEPS" | paste -sd, -)"
+echo "étapes citées    : $(echo "$REFS" | paste -sd, -)"
+echo "$n_refs référence(s) vérifiée(s), $n_bad orpheline(s)"
+[ "$n_bad" -eq 0 ] || echo "ORPHELINES (code que rien ne justifie) : $(echo "$orphans" | paste -sd, -)"
 ```
+
+⚠️ `n_refs` à zéro **n'est pas un succès** : il signifie que le Producteur n'a cité aucune étape,
+donc que l'AC3 n'a rien à vérifier — même posture qu'`AUCUN CHEMIN À VÉRIFIER` au § 6 bis.
 
 > ⚠️ **`unaddressed` non vide n'est PAS un échec.** Le prompt du Producteur lui impose de
 > signaler ce qu'il ne peut pas couvrir plutôt que d'improviser. Une production vide
@@ -815,8 +837,8 @@ Critères de lecture, dans cet ordre — **les deux premiers sont éliminatoires
   l'opérateur pointerait toujours sur la première — un seed qui rapporte « créé » à chaque
   exécution, et des homonymes que rien ne distingue.
 
-  **Il y a donc TROIS générations en base**, toutes lançables, chacune avec son propre
-  `workflow_id` :
+  **Le provisioning connaît TROIS générations**, et laisse en place toutes celles qu'il trouve —
+  chacune reste lançable avec son propre `workflow_id` :
 
   | Génération | Nom | DAG |
   |---|---|---|
@@ -824,8 +846,16 @@ Critères de lecture, dans cet ordre — **les deux premiers sont éliminatoires
   | v2 (Story 5.2) | `Pôle Dev — prise de demande (v2 : …)` | `dev_lead → code_researcher` |
   | v3 (Story 5.3) | `Pôle Dev — prise de demande (v3 : …)` | les quatre nodes |
 
-  Le provisioning **liste les deux générations précédentes** dans sa section « inchangés », avec
-  tous leurs homonymes — ne rapporter que la plus ancienne laisserait la v2 invisible. Les deux autres options ont été
+  ⚠️ **Trois générations connues n'est pas trois générations présentes**, et c'est une
+  distinction que ce runbook affirmait à tort. `_report_legacy_entry_workflows` émet une ligne
+  **par génération effectivement trouvée en base** : sur une base où la v1 n'a jamais été
+  provisionnée, la section « inchangés » n'en portera que deux. C'est le cas de la base de
+  référence du 2026-09-16, dont le rapport de `make seed-dev` ne liste que la v2. Lire la sortie
+  réelle du provisioning plutôt que cette table — la table dit ce que le code sait reconnaître,
+  pas ce que la base contient.
+
+  Le provisioning **liste chaque génération précédente présente** dans sa section « inchangés »,
+  avec tous ses homonymes — ne rapporter que la plus ancienne laisserait la v2 invisible. Les deux autres options ont été
   écartées : **retirer** l'ancien demanderait un chemin de suppression de workflow qui n'existe
   nulle part dans le dépôt (constat de la Story 4.15), et se contenter d'une **recherche par
   nom** laisserait deux homonymes en base. Le provisioning signale explicitement l'ancien

@@ -180,26 +180,39 @@ system_prompt: |-
   CONVENTIONS DU PROJET — elles font partie du livrable, pas de son décor
   Le namespace mémoire `dev-metier` est le dépositaire de ces conventions ;
   celles qui suivent sont celles qui s'appliquent à tout code que tu produis.
-  1. Nommage : `snake_case` en Python / SQL / JSON, `camelCase` en TypeScript,
-     `PascalCase` pour les classes, composants et types.
-  2. Communication entre features UNIQUEMENT par le bus d'événements
-     (`shared.event_bus`) ou par des contrats partagés (`shared.contracts`).
-     Jamais d'import direct d'un module `features/X` vers un `features/Y`.
-  3. Accès base de données UNIQUEMENT via `shared.repositories.*`. Jamais
-     d'`AsyncSession` ni d'`asyncpg` directs hors de `infra/db/`.
-  4. Accès LLM UNIQUEMENT via `shared.llm.LLMRouter`. Jamais d'import direct
-     de `anthropic`, `openai`, `langchain_*` depuis `features/` ou `api/`.
-  5. Configuration UNIQUEMENT via `shared.config.settings`. Jamais d'accès
-     direct à `os.environ`.
-  6. Imports par le barrel public d'une feature, jamais d'import profond.
-  7. Tout input externe (saisie utilisateur, sortie d'outil) est enveloppé
-     dans `<user_input>` ou `<tool_output>` avant tout appel LLM.
-  8. Le `correlation_id` et le `tenant_id` se propagent dans les logs, les
-     events, les requêtes et les métriques.
-  9. Backend Python 3.14, `ruff` avec `line-length = 100`, `mypy --strict`.
-     Frontend TypeScript strict.
-  10. Une feature backend suit `service.py` + `schemas.py` + `events.py` +
-      `tests/` + `__init__.py` (barrel).
+
+  ⚠️ La NUMÉROTATION est celle des « 11 règles d'or » de `CONVENTIONS.md`, et
+  elle n'est pas décorative : ce numéro est le raccourci qu'emploient la
+  spec, les ADR et les revues de ce dépôt. Une liste renumérotée à partir de
+  1 ferait citer « règle d'or #3 » pour l'accès base, que tout le reste du
+  dépôt appelle #4 — un renvoi faux propagé dans chaque `rationale` que tu
+  produis. Les numéros absents ci-dessous (#1, #7) ne s'appliquent pas à un
+  livrable textuel ; ils n'ont pas disparu, ils ne te concernent pas.
+
+  #2. Nommage : `snake_case` en Python / SQL / JSON, `camelCase` en
+      TypeScript, `PascalCase` pour les classes, composants et types.
+  #3. Communication entre features UNIQUEMENT par le bus d'événements
+      (`shared.event_bus`) ou par des contrats partagés (`shared.contracts`).
+      Jamais d'import direct d'un module `features/X` vers un `features/Y`.
+  #4. Accès base de données UNIQUEMENT via `shared.repositories.*`. Jamais
+      d'`AsyncSession` ni d'`asyncpg` directs hors de `infra/db/`.
+  #5. Accès LLM UNIQUEMENT via `shared.llm.LLMRouter`. Jamais d'import direct
+      de `anthropic`, `openai`, `langchain_*` depuis `features/` ou `api/`.
+  #6. Configuration UNIQUEMENT via `shared.config.settings`. Jamais d'accès
+      direct à `os.environ`.
+  #8. Imports par le barrel public d'une feature, jamais d'import profond.
+  #9. Tout input externe (saisie utilisateur, sortie d'outil) est enveloppé
+      dans `<user_input>` ou `<tool_output>` avant tout appel LLM.
+  #10 et #11. Le `correlation_id` et le `tenant_id` se propagent dans les
+      logs, les events, les requêtes et les métriques.
+
+  Et deux contraintes qui ne sont pas des règles d'or mais des faits de
+  configuration, lisibles dans `/app/pyproject.toml` :
+  - Backend Python 3.14, `ruff` avec `line-length = 100`, `mypy --strict`.
+    Frontend TypeScript strict.
+  - Une feature backend suit `service.py` + `schemas.py` + `events.py` +
+    `tests/` + `__init__.py` (barrel) — c'est la structure type de la règle
+    d'or #7, dont la moitié frontend ne te concerne pas ici.
   Si l'approche que tu as reçue contredit l'une de ces règles, NE LA SUIS PAS
   en silence : produis ce que tu peux, et porte la contradiction dans
   `unaddressed`.

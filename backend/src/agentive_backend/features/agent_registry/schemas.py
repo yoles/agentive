@@ -236,6 +236,24 @@ class UpdateTemplateRequest(BaseModel):
     P-03 fix — un payload entièrement vide (`{}`) ou avec UNIQUEMENT des champs
     `null` est rejeté en 422 RFC 7807 plutôt que de produire un audit event
     spurious sur un UPDATE no-op.
+
+    **Story 5.3 — ``include_raw_previous_output``.** Ce DTO est le SEUL chemin
+    déclaratif vers le régime de passage d'un template : lit-il les sorties
+    BRUTES de ses nodes amont, ou les résumés de passage de la Story 4.7
+    (défaut) ? Le moteur lit la clé depuis ``agent_templates.config`` depuis la
+    4.7, mais aucun champ ne permettait de l'écrire.
+
+    Ce que le champ COÛTE, et pas seulement ce qu'il fait : la charge amont
+    n'est plus condensée et croît à chaque étape, donc la seule borne restante
+    est ``MAX_UPSTREAM_OUTPUT_CHARS`` (50 000 caractères), dont l'éviction
+    retire **la plus grosse entrée d'abord** — souvent celle dont le node aval
+    a le plus besoin. Depuis la revue de la 5.3, cette éviction est reportée
+    dans ``metrics.per_node[<node_id>].upstream_truncation`` plutôt que dans le
+    seul log serveur. Ce qu'il REND : un contrat de sortie structuré arrive
+    intact chez son consommateur, et quand TOUS les successeurs d'un node
+    l'activent, le résumé de ce node n'est plus produit — l'appel LLM est
+    économisé. Dossier complet :
+    ``docs/decisions/dev-pole-agent-handoff-contract.md``.
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -32,8 +32,16 @@ sorties brutes. **Mais aucun champ d'API ne permettait de l'écrire.** Les huit 
 
 Tant que le pôle n'avait qu'un ou deux nodes, personne ne l'a senti. La Story 5.2 l'a nommé, l'a
 documenté dans `code_researcher.yaml`, et a confié l'arbitrage à la Story 5.3 « qui ajoute des
-nodes et sentira le sujet plus fort ». C'est le cas : sur quatre nodes, un contrat structuré
-traverse **trois** condensations avant d'atteindre le dernier agent.
+nodes et sentira le sujet plus fort ». C'est le cas : sous le régime de résumé, un DAG à quatre
+nodes paie **trois** condensations, et la sortie de l'Analyste est condensée **avant** d'atteindre
+le Producteur.
+
+> *Correction de revue.* Ce paragraphe disait « un contrat structuré traverse trois condensations
+> avant d'atteindre le dernier agent ». C'est faux : trois est le nombre de condensations du DAG,
+> pas celui qu'une sortie donnée subit — chaque sortie n'est condensée qu'une fois. L'argument qui
+> tranche l'arbitrage n'a jamais eu besoin de ce chiffre, et il est intact sans lui : **une seule**
+> condensation suffit à faire disparaître les `approach.steps[].id`. Le corriger plutôt que de le
+> laisser porter la décision est précisément la discipline que cet ADR réclame ailleurs.
 
 ### Ce que la condensation coûte réellement ici
 
@@ -184,8 +192,23 @@ Cf `sprint-status.yaml`, clé `5-8-lecture-memoire-workflow`.
   `test_the_producer_reads_the_analysts_raw_output_not_a_handoff_summary` épingle ce nombre.
 - Le Code Producer reçoit les `approach.steps[].id` de l'Analyste dans son prompt — vérifié sur
   `provider.calls`, pas sur la configuration.
-- `include_raw_previous_output` est comparé à chaque provisioning, donc une divergence entre le
-  YAML et la base est **refusée**, pas rapportée « inchangé ».
+- `include_raw_previous_output` appartient à `_OWNED_CONFIG_KEYS`, donc il est **comparé** à
+  chaque provisioning au lieu d'être posé une fois puis oublié. Les deux issues possibles, qui
+  ne sont pas la même chose :
+  - le YAML déclare une valeur différente de la base → `config_is_current` rend `False`, le
+    provisioning **met à jour** et le rapporte « mis à jour » ;
+  - la base porte la clé et le catalogue ne la déclare plus → `stale_owned_keys` la nomme et le
+    provisioning **refuse**, parce qu'`update_template` est un PATCH et ne l'effacerait pas.
+
+  *Correction de revue : ce point affirmait « une divergence est refusée » sans distinguer les
+  deux cas. Un opérateur pouvait en conclure qu'un YAML divergent arrête le provisioning, alors
+  qu'il est silencieusement écrasé en base.*
+- **Un `include_raw_previous_output: false` posé par l'API ne bloque pas le provisioning.** La
+  valeur est strictement équivalente à l'absence de clé — le moteur ne reconnaît que le littéral
+  `True` — donc `stale_owned_keys` la traite comme neutre (`_NEUTRAL_STORED_VALUES`). Sans cette
+  exception, un `false` sans effet suffisait à faire échouer tout `make seed-dev`,
+  **définitivement** : ni `merge_updates` ni `to_mapping` n'offrent de chemin pour remettre la
+  clé à `null`.
 - Les conventions que le Producteur doit suivre sont lisibles dans un diff git, comme l'allowlist
   de chemins l'est depuis la Story 5.2 — même raison : ce qui décide de ce qu'un agent produit ou
   peut lire se revoit comme du code.
