@@ -216,3 +216,70 @@ def wire_execution_service_with_real_mise_en_place(
         routing_rules=app.state.routing_rules,
         mise_en_place_service=mise_en_place_service,
     )
+
+
+#: Les tables d'ÉTAT DE RUN, purgées entre deux tests de ce package. L'ordre
+#: compte : les tables du checkpointer d'abord, `workflow_runs` ensuite.
+#:
+#: Ce qui n'est PAS purgé, et c'est délibéré : `workflows`, `agent_templates`,
+#: `tool_servers`, `tools`, `namespaces`. Le provisioning du Pôle Dev est
+#: coûteux (il spawne un serveur MCP) et les tests le partagent volontairement
+#: — c'est l'état de RUN qui fuit, pas l'état de configuration. Le seul FK
+#: vers `workflow_runs` est en `ON DELETE SET NULL`
+#: (`agent_instances.workflow_run_id`), donc la suppression ne casse rien.
+_RUN_STATE_TABLES = (
+    "checkpoint_writes",
+    "checkpoint_blobs",
+    "checkpoints",
+    "workflow_runs",
+)
+
+
+@pytest.fixture(autouse=True)
+async def purge_run_state(
+    app_session_factory: async_sessionmaker[AsyncSession],  # noqa: F811
+) -> AsyncIterator[None]:
+    """Repart d'un état de run vide avant CHAQUE test de ce package.
+
+    **Le trou que cette fixture ferme.** Ce package n'avait aucune fixture de
+    purge : les tests partagent le même `workflow_id` et voyaient l'historique
+    des runs précédents. La Story 5.3 le documente en toutes lettres
+    (piège #10), la revue de la 5.2 avait déjà dû contourner le symptôme en
+    ajoutant une assertion sur `eta_source` — le motif n'avait jamais été
+    fermé à la racine. Deux tests tombaient environ **une fois sur cinq**, et
+    seulement en suite complète :
+
+    * ``test_a_run_reads_its_eta_from_the_measured_history_of_past_runs`` —
+      l'ETA est la **médiane par node** sur TOUS les runs complétés du
+      workflow. Le test pose un historique de 180/120/90/150 s, mais un run
+      d'un autre test qui dépassait la milliseconde écrivait un
+      ``duration_ms`` réel (1 ms) au lieu du ``0`` que
+      ``node_duration_samples`` écarte. La médiane basculait, et l'ETA rendait
+      8 min au lieu de 9.
+    * ``test_resume_after_sigkill_does_not_replay_node_a`` —
+      ``WorkflowRecoveryWorker.run_once()`` balaie **tous** les runs en
+      ``running`` de la base. Un run laissé en vol par un autre test était
+      repris lui aussi, et ``resume_triggered_count`` rendait 2 au lieu de 1.
+
+    Les deux sont des assertions justes sur un périmètre non borné. Le réflexe
+    de les scoper une par une était le contournement de la 5.2 ; purger est
+    ce qui rend la propriété vraie pour tous les tests du package, y compris
+    ceux qui seront écrits ensuite sans connaître le piège.
+
+    **Purge AVANT et non après** : un test qui échoue laisse alors ses rows
+    en place pour l'autopsie, et le test suivant repart propre quand même.
+    """
+    from sqlalchemy import text
+
+    async with app_session_factory() as session:
+        for table in _RUN_STATE_TABLES:
+            # `to_regclass` plutôt qu'un `try/except` par table : les tables du
+            # checkpointer sont créées par une migration, et une absence doit
+            # rester silencieuse sans avaler une VRAIE erreur de permission.
+            exists = await session.execute(
+                text("SELECT to_regclass(:name)"), {"name": f"public.{table}"}
+            )
+            if exists.scalar_one() is not None:
+                await session.execute(text(f"DELETE FROM {table}"))
+        await session.commit()
+    yield
