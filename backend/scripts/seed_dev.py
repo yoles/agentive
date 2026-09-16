@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 import sys
 from collections.abc import Sequence
@@ -307,8 +308,36 @@ def stale_owned_keys(stored: object, desired: dict[str, Any]) -> list[str]:
     return sorted(
         key
         for key in _OWNED_CONFIG_KEYS
-        if key not in desired and stored.get(key) not in (None, {}, [])
+        if key not in desired and not _is_neutral_stored_value(key, stored.get(key))
     )
+
+
+#: Les clés possédées dont une valeur stockée, bien que PRÉSENTE, ne change
+#: rien au comportement — donc ne constitue pas une config périmée à trancher.
+#:
+#: ⚠️ Une seule aujourd'hui, et elle vient d'un trou trouvé par la revue de la
+#: Story 5.3. ``include_raw_previous_output: false`` est strictement
+#: équivalent à son absence : ``agent_node`` et ``graph_builder`` ne
+#: reconnaissent QUE le littéral ``True``. Sans cette exception, un opérateur
+#: qui poserait ce ``false`` par l'API — usage que le champ encourage
+#: explicitement — bloquait **définitivement** tout ``make seed-dev``, sur une
+#: valeur sans effet, et sans aucun moyen de revenir en arrière :
+#: ``merge_updates`` traite ``None`` comme « ne touche pas » et ``to_mapping``
+#: n'émet la clé que ``is not None``, donc l'API ne peut pas la remettre à
+#: ``null``. Le diff de la 5.3 ajoutait la clé à ``_OWNED_CONFIG_KEYS`` et son
+#: seul chemin d'écriture sans réconcilier les deux.
+_NEUTRAL_STORED_VALUES: dict[str, tuple[Any, ...]] = {
+    "include_raw_previous_output": (False,),
+}
+
+
+def _is_neutral_stored_value(key: str, value: Any) -> bool:
+    """``True`` si ``value`` équivaut à « ce champ n'est pas réglé »."""
+    if value is None or value == {} or value == []:
+        return True
+    # `is` et non `==` : `0 == False` en Python, et confondre un plafond réglé
+    # à zéro avec un booléen éteint rendrait cette exception contagieuse.
+    return any(value is neutral for neutral in _NEUTRAL_STORED_VALUES.get(key, ()))
 
 
 class DevDepartmentSeeder:
@@ -850,12 +879,17 @@ class DevDepartmentSeeder:
                 "c'est l'appel qu'il faut corriger, pas le catalogue."
             )
         expected_nodes = {node_id: report.template_ids[node_id] for node_id in _ENTRY_NODE_KEYS}
-        await self._report_legacy_entry_workflows(report)
-        await self._assert_entry_workflow_can_be_created(expected_nodes)
         # La chaîne est LINÉAIRE et dans l'ordre naturel du pôle : on explore
         # avant d'analyser, on analyse avant de produire. C'est exactement
         # l'ordre que le prompt du Dev Lead impose à ses délégations.
         ordered = list(_ENTRY_NODE_KEYS)
+        # Construit AVANT la garde et réutilisé pour la création : la
+        # topologie comparée est alors littéralement celle qui sera écrite,
+        # et non une seconde expression de la même intention qui pourrait
+        # dériver.
+        expected_edges = set(itertools.pairwise(ordered))
+        await self._report_legacy_entry_workflows(report)
+        await self._assert_entry_workflow_can_be_created(expected_nodes, expected_edges)
         result = await self._workflow_service.create_workflow(
             name=DEV_ENTRY_WORKFLOW_NAME,
             nodes=[
@@ -864,7 +898,7 @@ class DevDepartmentSeeder:
             ],
             edges=[
                 WorkflowEdgeRequest(from_node_id=source, to_node_id=target)
-                for source, target in itertools.pairwise(ordered)
+                for source, target in sorted(expected_edges, key=lambda e: ordered.index(e[0]))
             ],
             tenant_id=self._tenant_id,
         )
@@ -901,7 +935,9 @@ class DevDepartmentSeeder:
                 f"toujours lançable{plural} : {ids}"
             )
 
-    async def _assert_entry_workflow_can_be_created(self, expected_nodes: dict[str, UUID]) -> None:
+    async def _assert_entry_workflow_can_be_created(
+        self, expected_nodes: dict[str, UUID], expected_edges: set[tuple[str, str]]
+    ) -> None:
         """Refuse de créer un SECOND workflow d'entrée — AVANT de le créer.
 
         ⚠️ **Corrigé par la revue de la Story 5.2 : ce contrôle arrivait un run
@@ -915,32 +951,107 @@ class DevDepartmentSeeder:
         chemin de suppression de workflow dans le dépôt (constat 4.15).
 
         Le contrôle porte donc maintenant sur le CONTENU : un homonyme dont le
-        DAG monte les mêmes templates sur les mêmes nodes est la ligne
-        idempotente attendue (``create_workflow`` la rendra en replay) ; tout
-        autre homonyme est un doublon qu'il faut trancher à la main, et le
-        provisioning s'arrête en nommant les deux.
+        DAG monte les mêmes templates sur les mêmes nodes **et les relie par
+        les mêmes arêtes** est la ligne idempotente attendue
+        (``create_workflow`` la rendra en replay) ; tout autre homonyme est un
+        doublon qu'il faut trancher à la main, et le provisioning s'arrête en
+        nommant les deux.
+
+        ⚠️ **Les arêtes font partie du contrôle depuis la revue de la 5.3.**
+        L'empreinte d'idempotence couvre le DAG entier : comparer les seuls
+        nodes laissait un homonyme d'arêtes divergentes passer la garde, puis
+        se faire insérer en double par ``create_workflow``. Cf.
+        :func:`_dag_edges_of`.
         """
         homonyms = await self._workflow_repo.list_by_name(
             DEV_ENTRY_WORKFLOW_NAME, tenant_id=self._tenant_id
         )
         if not homonyms:
             return
-        divergent = [row for row in homonyms if _dag_nodes_of(row) != expected_nodes]
+        unreadable = [row for row in homonyms if _dag_of(row) is None]
+        if unreadable:
+            ids = ", ".join(str(row.id) for row in unreadable)
+            raise SeedError(
+                f"le DAG de {len(unreadable)} workflow(s) homonyme(s) de "
+                f"«{DEV_ENTRY_WORKFLOW_NAME}» ({ids}) est illisible : ni mapping, ni JSON "
+                "décodable. Le provisioning ne peut pas décider s'il s'agit de la ligne "
+                "idempotente attendue ou d'un doublon, et il ne devine pas. Inspecter ces "
+                "rows à la main."
+            )
+        divergent = [
+            row
+            for row in homonyms
+            if _dag_nodes_of(row) != expected_nodes or _dag_edges_of(row) != expected_edges
+        ]
         if len(homonyms) > 1 or divergent:
             ids = ", ".join(str(row.id) for row in homonyms)
             raise SeedError(
                 f"{len(homonyms)} workflow(s) portent déjà le nom «{DEV_ENTRY_WORKFLOW_NAME}» "
                 f"({ids}), dont {len(divergent)} dont le DAG ne monte pas les templates "
-                "attendus. `workflows.name` n'est pas unique et l'idempotence de "
-                "`create_workflow` porte sur l'empreinte du DAG : créer maintenant ajouterait "
-                "une ligne de plus au lieu de mettre à jour. Supprimer les rows en trop à la "
-                "main, ou repartir d'une base propre."
+                "attendus sur les mêmes arêtes. `workflows.name` n'est pas unique et "
+                "l'idempotence de `create_workflow` porte sur l'empreinte du DAG entier — "
+                "arêtes comprises : créer maintenant ajouterait une ligne de plus au lieu de "
+                "mettre à jour. Supprimer les rows en trop à la main, ou repartir d'une base "
+                "propre."
             )
+
+
+def _dag_of(row: Any) -> dict[str, Any] | None:
+    """Le DAG persisté sous forme de mapping, ou ``None`` s'il est illisible.
+
+    ``workflows.dag`` revient tantôt en ``dict`` (JSONB décodé par le driver),
+    tantôt en texte JSON — le dépôt connaît les deux formes et les tests
+    d'intégration de ce même pôle font déjà ce ``json.loads`` de repli.
+
+    ⚠️ ``None`` n'est PAS ``{}``. Confondre « DAG illisible » et « DAG vide »
+    faisait classer l'homonyme comme divergent et produisait un refus
+    définitif au message faux (« dont le DAG ne monte pas les templates
+    attendus »), sans aucun moyen de distinguer les deux causes — alors que le
+    seul chemin de sortie est un ``DELETE`` manuel.
+    """
+    dag = row.dag
+    if isinstance(dag, str):
+        try:
+            dag = json.loads(dag)
+        except TypeError, ValueError:
+            return None
+    return dag if isinstance(dag, dict) else None
+
+
+def _dag_edges_of(row: Any) -> set[tuple[str, str]] | None:
+    """Les arêtes ``{(from, to)}`` du DAG persisté, ou ``None`` s'il est illisible.
+
+    ⚠️ **Pourquoi les arêtes comptent autant que les nodes.** L'idempotence de
+    ``create_workflow`` porte sur l'empreinte SHA-256 de ``{name, dag}``, et
+    le DAG comprend ses arêtes. Une garde qui ne comparait que les nodes
+    laissait donc passer un homonyme de MÊME topologie de nodes mais d'arêtes
+    différentes : ``divergent`` était vide, la garde rendait sans lever, et
+    ``create_workflow`` — voyant une empreinte différente — insérait une
+    SECONDE ligne homonyme en rapportant « créé ». C'est le défaut que la
+    revue de la 5.2 avait fait corriger sur les nodes, revenu par les arêtes
+    dès que la Story 5.3 a rendu celles-ci variables (trois arêtes générées
+    au lieu d'une).
+    """
+    dag = _dag_of(row)
+    if dag is None:
+        return None
+    edges = dag.get("edges")
+    if not isinstance(edges, list):
+        return set()
+    out: set[tuple[str, str]] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source = edge.get("from_node_id")
+        target = edge.get("to_node_id")
+        if isinstance(source, str) and isinstance(target, str):
+            out.add((source, target))
+    return out
 
 
 def _dag_nodes_of(row: Any) -> dict[str, UUID]:
     """``{node_id: agent_template_id}`` du DAG persisté, pour comparaison."""
-    dag = row.dag if isinstance(row.dag, dict) else {}
+    dag = _dag_of(row) or {}
     nodes = dag.get("nodes")
     if not isinstance(nodes, list):
         return {}

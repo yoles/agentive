@@ -7,14 +7,20 @@ comparaison qui décide « rien n'a changé », dont dépend toute l'idempotence
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Sequence
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from scripts.seed_dev import (
     SeedError,
     SeedReport,
+    _dag_edges_of,
+    _dag_nodes_of,
+    _dag_of,
+    _is_neutral_stored_value,
     config_is_current,
     desired_config_subset,
     stale_owned_keys,
@@ -717,14 +723,23 @@ def test_every_launcher_of_the_literal_has_a_factory() -> None:
 
 
 class _FakeWorkflowRow:
-    def __init__(self, name: str, nodes: dict[str, uuid.UUID]) -> None:
+    def __init__(
+        self,
+        name: str,
+        nodes: dict[str, uuid.UUID],
+        edges: Sequence[tuple[str, str]] = (),
+    ) -> None:
         self.id = uuid.uuid4()
         self.name = name
         self.dag = {
             "nodes": [
                 {"node_id": node_id, "agent_template_id": str(template_id)}
                 for node_id, template_id in nodes.items()
-            ]
+            ],
+            # ⚠️ Revue 5.3 : les arêtes font partie de l'empreinte
+            # d'idempotence, donc du contrôle. Une fake row qui n'en portait
+            # aucune rendait la garde intestable sur ce point.
+            "edges": [{"from_node_id": src, "to_node_id": dst} for src, dst in edges],
         }
 
 
@@ -765,7 +780,8 @@ async def test_a_homonym_with_a_divergent_dag_is_refused_BEFORE_it_is_duplicated
 
     with pytest.raises(SeedError) as excinfo:
         await seeder._assert_entry_workflow_can_be_created(
-            {"dev_lead": uuid.uuid4(), "code_researcher": uuid.uuid4()}
+            {"dev_lead": uuid.uuid4(), "code_researcher": uuid.uuid4()},
+            {("dev_lead", "code_researcher")},
         )
 
     assert str(stale.id) in str(excinfo.value)
@@ -777,11 +793,12 @@ async def test_the_matching_homonym_is_left_to_the_idempotent_replay() -> None:
     from scripts.seed_dev import DEV_ENTRY_WORKFLOW_NAME
 
     nodes = {"dev_lead": uuid.uuid4(), "code_researcher": uuid.uuid4()}
+    edges = [("dev_lead", "code_researcher")]
     seeder = _workflow_seeder(
-        {DEV_ENTRY_WORKFLOW_NAME: [_FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes)]}
+        {DEV_ENTRY_WORKFLOW_NAME: [_FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes, edges)]}
     )
 
-    await seeder._assert_entry_workflow_can_be_created(dict(nodes))
+    await seeder._assert_entry_workflow_can_be_created(dict(nodes), set(edges))
 
 
 @pytest.mark.asyncio
@@ -789,14 +806,15 @@ async def test_two_homonyms_stop_the_provisioning_and_name_them_both() -> None:
     from scripts.seed_dev import DEV_ENTRY_WORKFLOW_NAME, SeedError
 
     nodes = {"dev_lead": uuid.uuid4(), "code_researcher": uuid.uuid4()}
+    edges = [("dev_lead", "code_researcher")]
     rows = [
-        _FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes),
-        _FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes),
+        _FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes, edges),
+        _FakeWorkflowRow(DEV_ENTRY_WORKFLOW_NAME, nodes, edges),
     ]
     seeder = _workflow_seeder({DEV_ENTRY_WORKFLOW_NAME: rows})
 
     with pytest.raises(SeedError) as excinfo:
-        await seeder._assert_entry_workflow_can_be_created(dict(nodes))
+        await seeder._assert_entry_workflow_can_be_created(dict(nodes), set(edges))
 
     message = str(excinfo.value)
     assert all(str(row.id) in message for row in rows)
@@ -992,3 +1010,121 @@ async def test_a_generation_with_no_row_produces_no_report_line() -> None:
     await seeder._report_legacy_entry_workflows(report)
 
     assert report.unchanged == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Revue de la Story 5.3 — le garde-fou d'unicité et la sémantique PATCH.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeDagRow:
+    """Une row de `workflows` minimale dont le `dag` est fourni TEL QUEL.
+
+    Distincte de `_FakeWorkflowRow`, qui construit toujours un mapping bien
+    formé : ici on veut pouvoir passer du texte JSON, ou un DAG illisible.
+    """
+
+    def __init__(self, row_id: UUID, dag: Any) -> None:
+        self.id = row_id
+        self.dag = dag
+
+
+def _dag_payload(nodes: dict[str, UUID], edges: list[tuple[str, str]]) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"node_id": node_id, "agent_template_id": str(template_id)}
+            for node_id, template_id in nodes.items()
+        ],
+        "edges": [{"from_node_id": source, "to_node_id": target} for source, target in edges],
+    }
+
+
+def test_two_homonyms_differing_only_by_their_edges_are_seen_as_divergent() -> None:
+    """L'empreinte d'idempotence couvre le DAG ENTIER, arêtes comprises.
+
+    Comparer les seuls nodes laissait passer un homonyme de même topologie de
+    nodes mais d'arêtes différentes : la garde rendait sans lever, puis
+    `create_workflow` — voyant une empreinte différente — insérait une SECONDE
+    ligne homonyme en rapportant « créé ». C'est le défaut que la revue de la
+    5.2 avait fait corriger sur les nodes, revenu par les arêtes dès que la
+    5.3 a rendu celles-ci variables.
+    """
+    nodes = {key: uuid4() for key in ("dev_lead", "code_researcher", "architect_analyst")}
+    chain = [("dev_lead", "code_researcher"), ("code_researcher", "architect_analyst")]
+    fan_out = [("dev_lead", "code_researcher"), ("dev_lead", "architect_analyst")]
+
+    row = _FakeDagRow(uuid4(), _dag_payload(nodes, fan_out))
+    # Les nodes sont identiques : c'est exactement ce qui rendait l'ancien
+    # contrôle aveugle.
+    assert _dag_nodes_of(row) == nodes
+    assert _dag_edges_of(row) != set(chain)
+
+
+def test_a_dag_stored_as_json_text_is_read_not_mistaken_for_an_empty_one() -> None:
+    """`workflows.dag` revient tantôt en dict, tantôt en texte JSON.
+
+    Le repli `else {}` classait la forme texte comme « DAG vide », donc
+    divergente, donc un refus DÉFINITIF au message faux (« ne monte pas les
+    templates attendus ») — alors que le seul chemin de sortie est un `DELETE`
+    manuel. Le test E2E du même pôle fait déjà ce `json.loads` de repli : la
+    forme est un état connu du dépôt.
+    """
+    nodes = {"dev_lead": uuid4(), "code_researcher": uuid4()}
+    edges = [("dev_lead", "code_researcher")]
+    row = _FakeDagRow(uuid4(), json.dumps(_dag_payload(nodes, edges)))
+
+    assert _dag_nodes_of(row) == nodes
+    assert _dag_edges_of(row) == set(edges)
+
+
+def test_a_dag_that_cannot_be_read_at_all_is_distinguished_from_an_empty_one() -> None:
+    """« Illisible » et « vide » ne sont pas le même constat.
+
+    Les confondre produisait un refus au message faux. `_dag_of` rend `None`
+    pour que la garde puisse le dire, plutôt que d'accuser le DAG de monter
+    les mauvais templates.
+    """
+    assert _dag_of(_FakeDagRow(uuid4(), "{ pas du JSON")) is None
+    assert _dag_of(_FakeDagRow(uuid4(), 42)) is None
+    assert _dag_edges_of(_FakeDagRow(uuid4(), "{ pas du JSON")) is None
+    # Un DAG lisible mais sans arêtes reste un DAG lisible : `set()`, pas `None`.
+    assert _dag_edges_of(_FakeDagRow(uuid4(), {"nodes": []})) == set()
+
+
+def test_a_handoff_opt_out_left_at_false_does_not_wedge_the_provisioning() -> None:
+    """`include_raw_previous_output: false` équivaut à son absence.
+
+    Le moteur ne reconnaît QUE le littéral `True`. Un `false` posé par l'API
+    — usage que le champ encourage — n'a donc aucun effet, mais il bloquait
+    DÉFINITIVEMENT tout `make seed-dev` via `stale_owned_keys`, sans chemin de
+    retour : `merge_updates` traite `None` comme « ne touche pas » et
+    `to_mapping` n'émet la clé que `is not None`, donc l'API ne peut pas la
+    remettre à `null`.
+    """
+    desired = {"system_prompt": "x"}
+    stored = {"system_prompt": "x", "include_raw_previous_output": False}
+    assert stale_owned_keys(stored, desired) == []
+
+
+def test_a_handoff_opt_out_left_at_true_is_still_reported_as_stale() -> None:
+    """La contrepartie, sans quoi le correctif précédent serait une cécité.
+
+    `True` change réellement le régime de passage du node : le laisser en base
+    alors que le catalogue ne le déclare plus est une config périmée, et le
+    provisioning doit toujours s'arrêter dessus.
+    """
+    desired = {"system_prompt": "x"}
+    stored = {"system_prompt": "x", "include_raw_previous_output": True}
+    assert stale_owned_keys(stored, desired) == ["include_raw_previous_output"]
+
+
+def test_the_neutral_value_exception_does_not_leak_to_other_keys() -> None:
+    """`0 == False` en Python : l'exception doit porter sur l'identité.
+
+    Sans le `is`, un plafond réglé à zéro sur une autre clé possédée serait
+    confondu avec un booléen éteint, et l'exception posée pour UNE clé
+    deviendrait contagieuse.
+    """
+    assert not _is_neutral_stored_value("llm_params", 0)
+    assert not _is_neutral_stored_value("include_raw_previous_output", 0)
+    assert _is_neutral_stored_value("include_raw_previous_output", False)
