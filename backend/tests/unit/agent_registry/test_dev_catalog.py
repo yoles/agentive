@@ -431,11 +431,20 @@ def test_the_producer_declares_the_metier_namespace_identically_to_the_dev_lead(
 #: vérifie au runtime ».
 #:
 #: `code_researcher` (Story 5.2) déclare quatre clés sans validateur. La
-#: Story 5.3 a généralisé le point d'application et branché DEUX contrats sur
-#: les trois qui restaient ; le troisième est porté par la Story 5.4, qui
-#: ajoute ses propres entrées au registre. Le retirer d'ici est ce qui
-#: fermera la dette — et le test tombera tout seul si on l'oublie dans l'autre
-#: sens (un contrat branché mais laissé dans cette liste).
+#: Story 5.3 a généralisé le point d'application et branché les DEUX contrats
+#: que T4.2 commandait ; son AC1 est amendée pour ne plus promettre au-delà.
+#:
+#: **Porteur : `5-4-code-reviewer-test-engineer`** (inscrit dans
+#: `sprint-status.yaml`, pas seulement ici — une dette qui ne vit que dans un
+#: commentaire est une dette perdue, et ce dépôt l'a déjà vérifié deux fois).
+#: La 5.4 devra ajouter SON entrée au registre *et* celle du Chercheur, donc
+#: écrire un `validate_researcher_output` et énoncer les règles dures dans le
+#: `system_prompt` du Chercheur — ce qui bumpe sa version et impose de rejouer
+#: le protocole du § 7 bis du runbook.
+#:
+#: Retirer `code_researcher` d'ici est ce qui ferme la dette — et le test
+#: tombera tout seul si on l'oublie dans l'autre sens (un contrat branché mais
+#: laissé dans cette liste).
 _CONTRACTS_NOT_YET_WIRED = frozenset({"code_researcher"})
 
 

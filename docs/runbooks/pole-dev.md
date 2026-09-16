@@ -402,6 +402,17 @@ Trois précisions sur ce choix :
   couvrait**, donc son contrat était déclaré et jamais tenu. La Story 5.3 a généralisé le point
   d'application ; les Stories 5.4 → 5.6 devront **ajouter leur entrée**, pas seulement déclarer
   leurs clés.
+
+  ⚠️ **Et le contrat du Code Researcher n'est TOUJOURS pas branché** — c'est un fait présent, pas
+  une prévision. Le registre reconnaît trois contrats (Dev Lead, Architect Analyst, Code
+  Producer) ; `{relevant_files, dependencies_graph, existing_patterns, risk_areas}` n'y est pas.
+  La Story 5.3 a branché les deux contrats que ses tasks commandaient (T4.2 : « ajouter deux
+  entrées ») et son AC1 est amendée pour ne plus promettre au-delà. **Porteur :
+  `5-4-code-reviewer-test-engineer`**, qui devra ajouter son entrée *et* celle du Chercheur —
+  donc écrire un `validate_researcher_output` et énoncer les règles dures dans le `system_prompt`
+  du Chercheur, ce qui bumpe sa version et impose de rejouer le protocole du § 7 bis.
+  La dette est nommée dans le code (`_CONTRACTS_NOT_YET_WIRED`) et gardée par deux tests ; la
+  retirer de ce `frozenset` est ce qui la ferme.
 - **Marquer, pas refuser.** T6.3 permettait les deux ; tuer un run sur une maladresse de format
   serait disproportionné, d'autant que le cas *non parsable* est déjà traité ailleurs (repli
   `raw_output` + règle `no-parsable-output` à 0.9). Ce qui est traité ici est le cas
