@@ -55,10 +55,13 @@ import json
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request, Response, status
+from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 from sse_starlette.sse import EventSourceResponse
 
 from agentive_backend.features.workflow_engine.domain.run_control import (
@@ -68,14 +71,21 @@ from agentive_backend.features.workflow_engine.domain.run_control import (
 from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
 from agentive_backend.features.workflow_engine.recovery import derive_stale_threshold_s
 from agentive_backend.features.workflow_engine.schemas import (
+    AcknowledgementOut,
     CreateWorkflowRequest,
     CreateWorkflowResponse,
     DryRunRequest,
     DryRunResponse,
     HandoffStatsResponse,
+    MiseEnPlaceReportOut,
+    NodeOutputOut,
+    NodeOutputSource,
+    NodeOutputsSource,
     ResumeRunRequest,
     RoutingStatsResponse,
     RunControlResponse,
+    RunDetailResponse,
+    RunNodeOutputResponse,
     StartRunRequest,
     StartRunResponse,
 )
@@ -85,7 +95,8 @@ from agentive_backend.features.workflow_engine.service import (
 )
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.event_bus import subscribe
-from agentive_backend.shared.exceptions import DependencyError, NotFoundError
+from agentive_backend.shared.exceptions import DependencyError, NotFoundError, ValidationError
+from agentive_backend.shared.llm.redaction import redact_secrets
 from agentive_backend.shared.logging import get_logger
 from agentive_backend.shared.repositories import AgentTemplateRepo, WorkflowRepo, WorkflowRunRepo
 
@@ -527,6 +538,618 @@ async def get_workflow_handoff_stats(workflow_id: UUID, request: Request) -> Han
         raw_tokens_replaced=raw_tokens_replaced,
         summary_tokens=summary_tokens,
         reduction_ratio_pct=reduction_ratio_pct,
+    )
+
+
+# ─── Story 5.7 — lire ce qu'un run a produit, sans ouvrir `psql` ───
+#
+# `node_outputs` est une clé d'état LangGraph, et jusqu'à cette story elle
+# n'était projetée NULLE PART en HTTP : ni dans la frame SSE (à dessein, cf
+# `_state_event`), ni ailleurs. La sortie complète est LUE À LA DEMANDE dans
+# le checkpointer plutôt que recopiée dans une colonne — arbitrage complet et
+# options rejetées dans `docs/decisions/run-node-output-exposure.md`.
+#
+# Toute la connaissance de l'API LangGraph tient dans `_read_node_outputs`
+# ci-dessous, et c'est délibéré : `langgraph` est pinné strictement
+# (`==1.1.8`), donc si cette API bouge, un seul endroit bouge.
+
+
+async def _read_node_outputs(request: Request, run_id: UUID) -> tuple[dict[str, Any] | None, bool]:
+    """``(node_outputs, checkpointer_reachable)`` — trois états, pas deux.
+
+    | Retour | Ce que ça veut dire |
+    |---|---|
+    | ``({...}, True)`` | le fil a été lu ; un dict vide est alors un FAIT (ce run n'a encore rien produit), pas une ignorance |
+    | ``(None, True)``  | le checkpointer a répondu qu'il n'a **aucun** fil pour ce run : purgé par la rétention de la Story 4.10, ou run qui n'a pas atteint son premier superstep |
+    | ``(None, False)`` | le checkpointer n'a **pas pu être consulté** : non câblé, appel en échec, ou réponse d'une forme qu'on ne sait pas lire |
+
+    **Le second membre est la correction centrale de la revue.** La première
+    version rendait un `None` unique pour les trois cas, et l'appelant
+    choisissait ensuite entre `preview` et `unavailable` d'après la PRÉSENCE
+    d'un aperçu en base — c'est-à-dire d'après une propriété de la row, pas
+    d'après la cause. Conséquence : un pool saturé sur un run qui avait un
+    aperçu se lisait « fil LangGraph purgé, rien n'est reprenable », et un
+    opérateur cessait de réessayer alors qu'une requête une seconde plus tard
+    aurait tout rendu. L'ADR décrivait déjà la bonne table ; le code ne la
+    réalisait pas.
+
+    Une forme inattendue (`channel_values` ou `node_outputs` qui ne sont pas
+    des dicts) compte comme **non consultable** et non comme « vide » : c'est
+    une ignorance, et la rendre comme une lecture réussie affirmerait qu'un
+    run n'a rien produit alors qu'on n'en sait rien.
+
+    L'exception est avalée pour la même raison que dans ``_reload_run_safely``
+    : cette lecture est un CONFORT de diagnostic, et faire tomber la réponse
+    entière — statut, métriques, Mise en Place — parce qu'un pool est saturé
+    priverait l'opérateur de tout ce qui ne dépend pas d'elle. Le drapeau
+    rendu ici est ce qui empêche cet aveuglement d'être silencieux.
+    """
+    checkpointer = getattr(request.app.state, "workflow_checkpointer", None)
+    if checkpointer is None:
+        _log.warning("workflow_engine.run_node_outputs_checkpointer_unwired", run_id=str(run_id))
+        return None, False
+    try:
+        checkpoint = await checkpointer.aget({"configurable": {"thread_id": str(run_id)}})
+    except Exception:
+        _log.warning("workflow_engine.run_node_outputs_read_failed", run_id=str(run_id))
+        return None, False
+    if checkpoint is None:
+        # Réponse NORMALE du checkpointer : il n'a pas de fil pour ce run.
+        return None, True
+    # JSONB/état libre : `isinstance` avant d'émettre, comme partout ailleurs
+    # sur ce routeur. Une forme qu'on ne sait pas lire est journalisée — sans
+    # quoi une divergence d'API rendrait `none` indéfiniment, sans signal.
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("channel_values"), dict):
+        _log.warning(
+            "workflow_engine.run_node_outputs_unexpected_shape",
+            run_id=str(run_id),
+            got=type(checkpoint).__name__,
+        )
+        return None, False
+    node_outputs = checkpoint["channel_values"].get("node_outputs")
+    if node_outputs is None:
+        return {}, True
+    if not isinstance(node_outputs, dict):
+        _log.warning(
+            "workflow_engine.run_node_outputs_unexpected_channel",
+            run_id=str(run_id),
+            got=type(node_outputs).__name__,
+        )
+        return None, False
+    return node_outputs, True
+
+
+#: Un fragment de clé d'API en FIN de chaîne, quelle que soit sa longueur.
+#:
+#: `redact_secrets` exige 30 caractères après le préfixe — un plancher assumé
+#: chez lui, pour ne pas caviarder des jetons courts au hasard. Mais l'aperçu
+#: applicatif est persisté par `_preview()` SANS caviardage puis coupé à 500
+#: caractères : une clé que la coupe traverse arrive ici amputée, sous le
+#: plancher, et ressortait donc en clair (jusqu'à 29 caractères). Ici la
+#: position est l'indice qui manquait — en fin d'un texte qu'on sait tronqué,
+#: un préfixe de clé n'est jamais un jeton complet.
+#:
+#: Le correctif de fond est de caviarder À L'ÉCRITURE, avant la coupe ;
+#: il est porté par la story `9-10-caviardage-sorties-persistees`.
+_TRUNCATED_KEY_TAIL = re.compile(r"(?:sk-ant-|sk-proj-|sk-|pa-)[A-Za-z0-9_\-]*$")
+
+
+def _json_safe(value: Any, _seen: frozenset[int] = frozenset()) -> Any:
+    """Rendre une valeur sérialisable sans jamais lever.
+
+    Chemin de SECOURS : il ne s'exécute que lorsque `json.dumps` a échoué, ce
+    qui n'arrive pas sur une sortie nominale (elle vient d'un `json.loads`,
+    donc ses clés sont des chaînes). Trois cas connus, tous constatés par la
+    revue :
+
+    * un flottant non fini — `NaN`/`Infinity` sortaient en jetons nus, que
+      `JSON.parse` refuse, alors que l'Epic 6 rendra ce champ dans une UI ;
+    * une clé de dict non sérialisable (`tuple`, `frozenset`) — `default=`
+      ne s'applique JAMAIS aux clés, donc le `TypeError` n'était pas rattrapé
+      et faisait tomber la réponse ENTIÈRE : statut, métriques, Mise en Place
+      et les sorties de tous les AUTRES nodes avec ;
+    * une référence circulaire.
+
+    `_seen` porte les `id()` des conteneurs en cours de visite, ce qui coupe
+    un cycle sans fausser un partage légitime (le même sous-objet référencé
+    deux fois côte à côte reste rendu deux fois).
+    """
+    if isinstance(value, float) and not isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        if id(value) in _seen:
+            return "<circular>"
+        nested = _seen | {id(value)}
+        return {
+            (key if isinstance(key, str) else str(key)): _json_safe(item, nested)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        if id(value) in _seen:
+            return "<circular>"
+        nested = _seen | {id(value)}
+        return [_json_safe(item, nested) for item in value]
+    return value
+
+
+def _render_node_output(value: Any) -> str:
+    """Rendu JSON d'une sortie de node, caviardé — dans CET ordre.
+
+    Caviardé AVANT toute troncature faite ICI, jamais après : `redact_secrets`
+    change la longueur, donc l'appliquer après rendrait les `next_offset` d'une
+    page à l'autre incohérents. (Une coupure faite EN AMONT par `_preview()`
+    échappe par construction à cette garantie — c'est ce que
+    `_TRUNCATED_KEY_TAIL` rattrape sur le chemin de l'aperçu.)
+
+    NFR9 : la valeur vient d'un LLM, elle n'est ni exécutée, ni interprétée,
+    ni re-parsée — seulement rendue.
+
+    `allow_nan=False` plutôt que le défaut permissif : le défaut émet `NaN` et
+    `Infinity`, qui ne sont pas du JSON et que `json.loads` de Python accepte
+    quand même — de sorte qu'un test écrit en Python ne l'aurait jamais vu.
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str, allow_nan=False)
+    except TypeError, ValueError:
+        text = json.dumps(_json_safe(value), ensure_ascii=False, default=str, allow_nan=False)
+    return redact_secrets(text)
+
+
+def _slice_node_output(
+    node_id: str,
+    text: str,
+    *,
+    source: NodeOutputSource,
+    offset: int,
+    limit: int,
+    engine_truncated: bool = False,
+) -> NodeOutputOut:
+    """Une page de sortie de node, qui DIT ce qu'elle a coupé.
+
+    Deux questions distinctes, et les confondre est le défaut que la revue a
+    trouvé ici :
+
+    * **reste-t-il quelque chose dans ce que le serveur tient ?** → ``next_offset``.
+      La réponse ne dépend PAS de la provenance : un aperçu applicatif se
+      pagine aussi bien qu'une sortie de checkpointer, puisque dans les deux
+      cas le texte entier est en main au moment du découpage.
+    * **l'original avait-il déjà été coupé avant d'arriver ici ?** →
+      ``engine_truncated``, vrai seulement pour un aperçu que ``_preview()``
+      a tronqué à 500 caractères.
+
+    La première version liait ``next_offset`` à la provenance : un aperçu de
+    501 caractères demandé avec ``?limit=64`` répondait « il manque la suite
+    et elle n'est plus lisible » alors que ``?offset=64`` la servait
+    parfaitement. La réponse mentait sur une coupure que le serveur venait de
+    faire lui-même.
+
+    Les trois lignes du contrat :
+
+    ===================  ===============  ==================================
+    ``truncated``        ``next_offset``  Ce que ça veut dire
+    ===================  ===============  ==================================
+    ``False``            ``None``          c'est tout, il ne manque rien
+    ``True``             ``N``             il reste de quoi lire, reprendre à N
+    ``True``             ``None``          tout ce que le serveur tient a été
+                                           rendu, et l'ORIGINAL avait déjà été
+                                           coupé avant d'arriver (``source``
+                                           vaut ``preview`` : le fil LangGraph
+                                           n'est plus là)
+    ===================  ===============  ==================================
+
+    ``engine_truncated`` est borné par ``offset < total`` : au-delà de la fin
+    du texte, une page vide n'a rien coupé et ne doit rien annoncer. Sans
+    cette garde, ``?offset=600`` sur un aperçu de 501 caractères rendait une
+    page vide qui se déclarait tronquée.
+    """
+    total = len(text)
+    chunk = text[offset : offset + limit]
+    consumed = offset + len(chunk)
+    more_here = consumed < total
+    return NodeOutputOut(
+        node_id=node_id,
+        output=chunk,
+        source=source,
+        total_chars=total,
+        returned_chars=len(chunk),
+        offset=offset,
+        truncated=more_here or (engine_truncated and offset < total),
+        next_offset=consumed if more_here else None,
+    )
+
+
+def _engine_cut_it(text: str) -> bool:
+    """Vrai si ``_preview()`` a tronqué ce texte avant de le persister.
+
+    Le marqueur est fiable, et c'est vérifiable plutôt que supposé : l'aperçu
+    est un rendu ``json.dumps``, qui se termine toujours par ``"``, ``}``,
+    ``]`` ou un littéral (``42``, ``null``, ``true``). Une valeur non tronquée
+    ne peut donc pas finir par ``…`` — même une chaîne qui en contient un, car
+    le rendu la referme par un guillemet. Seul ``_preview`` ajoute ce
+    caractère en dernière position (``service.py:714``).
+    """
+    return text.endswith("…")
+
+
+def _preview_of(run: WorkflowRun) -> dict[str, Any]:
+    """L'aperçu applicatif de la row, ou ``{}`` — jamais une exception.
+
+    ``checkpoint`` est un JSONB libre écrit par plusieurs versions du moteur :
+    ``isinstance`` avant de lire, comme partout ailleurs sur ce routeur.
+    """
+    checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
+    preview = checkpoint.get("node_outputs_preview")
+    return preview if isinstance(preview, dict) else {}
+
+
+def _preview_text(raw: Any) -> str:
+    """Un aperçu tel qu'il doit sortir : caviardé, et rendu s'il ne l'est pas.
+
+    ``_preview()`` produit toujours une chaîne (un rendu ``json.dumps``), mais
+    ce JSONB a été écrit par plusieurs versions du moteur — d'où le repli.
+    """
+    if not isinstance(raw, str):
+        return _render_node_output(raw)
+    return _TRUNCATED_KEY_TAIL.sub("[REDACTED]", redact_secrets(raw))
+
+
+def _node_outputs_page(
+    run: WorkflowRun,
+    node_outputs: dict[str, Any] | None,
+    *,
+    limit: int,
+) -> tuple[list[NodeOutputOut], NodeOutputsSource]:
+    """Les sorties de TOUS les nodes exécutés, plus d'où elles viennent.
+
+    Ordre d'insertion préservé : ``node_outputs`` est un canal d'état que
+    LangGraph alimente dans l'ordre d'achèvement (la même propriété dont
+    ``_latest_node_id`` dépend déjà dans ``service.py``).
+
+    **Les deux sources sont FUSIONNÉES par node, pas choisies globalement.**
+    Un node dont la décision de routage a échoué a bien produit une sortie —
+    ``RoutingDecisionFailedError`` la reporte dans l'aperçu applicatif
+    (``service.py``, IG3) — mais LangGraph jette l'update d'un node qui lève,
+    donc elle n'est PAS dans le canal d'état. La version précédente n'itérait
+    que le canal : la route de détail taisait cette sortie alors que
+    ``node_statuses``, dans la même réponse, annonçait le node, et que la
+    route par node la servait. Chaque entrée porte sa propre ``source``, ce
+    qui rend la fusion lisible plutôt que silencieuse.
+    """
+    preview = _preview_of(run)
+    pages: list[NodeOutputOut] = []
+    seen: set[str] = set()
+    for node_id, output in (node_outputs or {}).items():
+        key = str(node_id)
+        seen.add(key)
+        pages.append(
+            _slice_node_output(
+                key,
+                _render_node_output(output),
+                source="checkpointer",
+                offset=0,
+                limit=limit,
+            )
+        )
+    for node_id, raw in preview.items():
+        key = str(node_id)
+        if key in seen:
+            continue
+        text = _preview_text(raw)
+        pages.append(
+            _slice_node_output(
+                key,
+                text,
+                source="preview",
+                offset=0,
+                limit=limit,
+                engine_truncated=_engine_cut_it(text),
+            )
+        )
+    if node_outputs is not None:
+        return pages, "checkpointer" if node_outputs else ("preview" if pages else "none")
+    if preview:
+        return pages, "preview"
+    return [], "none"
+
+
+def _resolved_output_limit(limit: int | None) -> int:
+    """Le plafond effectif d'une réponse, ou un ``422`` qui NOMME le réglage.
+
+    Rogner en silence un `limit` trop grand rendrait une page plus courte que
+    demandée sans le dire — la troncature silencieuse, encore, déguisée en
+    politesse. Le refus nomme la variable d'environnement, comme le fait la
+    garde `AGENTIVE_ALLOW_MCP_REGISTRATION` du provisioning.
+    """
+    ceiling = settings.run_node_output_max_chars
+    if limit is None:
+        return ceiling
+    if limit > ceiling:
+        raise ValidationError(
+            detail=(
+                f"limit ({limit}) exceeds this deployment's per-page ceiling "
+                f"({ceiling}); raise AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS or "
+                f"paginate with next_offset"
+            ),
+            context={"limit": limit, "ceiling": ceiling},
+        )
+    return limit
+
+
+def _redacted_jsonb(value: dict[str, Any]) -> dict[str, Any]:
+    """Un JSONB libre, caviardé avant de sortir (NFR9).
+
+    `metrics` porte `tool_names`, `model_used` et `contract_problems`, tous
+    d'origine LLM ou fournisseur : le diff proclamait NFR9 sur les sorties de
+    node et l'abandonnait sur ce champ de la MÊME réponse. (`last_error`, lui,
+    est bien caviardé à la source par `_mark_failed`, `service.py` — il n'a
+    pas besoin d'un second passage.)
+
+    Aller-retour par le rendu JSON plutôt qu'un parcours maison : c'est
+    `redact_secrets`, déjà éprouvé, qui fait le travail, et le coût est
+    négligeable sur un objet de cette taille. Un échec rend `{}` et le dit :
+    perdre des métriques de diagnostic est préférable à laisser passer un
+    secret, et le cas est de toute façon inatteignable sur un `metrics`
+    produit par `_aggregate_metrics`.
+    """
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str, allow_nan=False)
+        coerced = json.loads(redact_secrets(rendered))
+    except TypeError, ValueError:
+        _log.warning("workflow_engine.run_detail_metrics_unrenderable")
+        return {}
+    return coerced if isinstance(coerced, dict) else {}
+
+
+def _coerce_or_none[ModelT: BaseModel](model: type[ModelT], payload: Any) -> ModelT | None:
+    """Valider un JSONB persisté contre son schéma, ou rendre ``None``.
+
+    Les colonnes `mise_en_place` et `acknowledgement` sont `NULL` pour tout run
+    antérieur aux Stories 4.5 et 5.1, et rien n'empêche une row écrite par une
+    version plus ancienne du moteur de ne plus valider. Faire tomber la
+    réponse ENTIÈRE — statut, métriques, sorties de nodes — pour un rapport
+    annexe illisible serait exactement le défaut que la revue de la 5.2 a
+    nommé sur `_aggregate_metrics`. La clé reste présente à `null`, jamais
+    omise (leçon de l'accusé de réception, Story 5.1).
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return model.model_validate(payload)
+    except PydanticValidationError:
+        _log.warning("workflow_engine.run_detail_payload_unreadable", schema=model.__name__)
+        return None
+
+
+async def _require_run(request: Request, run_id: UUID) -> WorkflowRun:
+    """Le run du tenant appelant, ou un ``404`` — jamais un ``403``.
+
+    Un ``403`` confirmerait l'existence de la row à quelqu'un qui n'a pas le
+    droit de la voir : run inconnu et run d'un autre tenant sont
+    INDISTINCTS ici, et la RLS fait le filtrage (``with_tenant``), pas une
+    comparaison en Python qui aurait pu être oubliée.
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise DependencyError(
+            detail="Workflow engine not initialised — check lifespan startup logs.",
+            context={"missing": ["session_factory"]},
+        )
+    workflow_run_repo = WorkflowRunRepo(session_factory=session_factory)
+    run = await workflow_run_repo.get_by_id(run_id)
+    if run is None:
+        raise NotFoundError(
+            detail=f"Workflow run '{run_id}' not found", context={"run_id": str(run_id)}
+        )
+    return run
+
+
+@router.get(
+    "/workflows/runs/{run_id}",
+    response_model=RunDetailResponse,
+    summary="Read a run's state, metrics and node outputs (Story 5.7 AC1/AC2)",
+)
+async def get_workflow_run(
+    run_id: UUID,
+    request: Request,
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Characters of EACH node's output to return. Defaults to this "
+            "deployment's AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS. A value above "
+            "that ceiling is a 422 naming the setting and its value, never "
+            "silently clamped — paginate on the per-node route instead."
+        ),
+    ),
+) -> RunDetailResponse:
+    """Ce qu'un run a fait, et ce que chaque agent a réellement produit.
+
+    **Ce qu'elle rend** : l'état du run (`status`, `started_at`, `ended_at`,
+    `correlation_id`), le bloc `metrics` — dont `per_node`, qui porte les
+    quatre compteurs d'outils de l'AC2 de la Story 5.2 (`tool_calls`,
+    `tool_loop_iterations`, `tool_failures`, `tool_names`) —, le rapport de
+    Mise en Place, l'accusé de réception, la progression applicative
+    (`last_node_id`, `node_statuses`, `control_signal`, `last_error`), et un
+    extrait de la sortie de chaque node exécuté.
+
+    **Ce qu'elle NE rend PAS** : le checkpoint technique LangGraph, les blocs
+    `routing_decisions`/`handoffs` de `workflow_runs.checkpoint`
+    (`/routing-stats` et `/handoff-stats` les agrègent), et la sortie
+    complète d'un node — celle-là se lit page par page sur
+    `GET /workflows/runs/{run_id}/nodes/{node_id}/output`.
+
+    **Cette route ne change pas le flux SSE.** `node_outputs_preview` reste
+    hors de la frame `state` (cf `_state_event`) : c'est ce qui garde vraie la
+    promesse « première frame en moins de 2 s » de l'AC2 de la Story 4.2. Le
+    détail vit ici, dans une route dédiée qu'on appelle quand on le veut.
+
+    Errors:
+    * 404 — `run_id` inconnu OU appartenant à un autre tenant, indistinctement.
+    * 422 — `limit` au-delà du plafond du déploiement.
+    * 503 — état de lifespan manquant (session factory).
+    """
+    effective_limit = _resolved_output_limit(limit)
+    # ⚠️ ORDRE VOLONTAIRE : le checkpointer est lu AVANT la row.
+    #
+    # Les deux lectures sont deux transactions, donc deux instants. Dans
+    # l'ordre inverse, un run qui achève un superstep entre les deux rendait
+    # une réponse où `node_outputs` portait un node absent de `node_statuses`
+    # — une incohérence visible, dans le même corps. Lire la row en second
+    # garantit qu'elle est au moins aussi fraîche que les sorties : la
+    # progression applicative peut être EN AVANCE sur elles, jamais en
+    # retard. Le coût est une lecture de checkpointer sur le chemin d'un
+    # `run_id` inconnu, ce que le `404` d'après rattrape sans rien divulguer.
+    node_outputs, checkpointer_reachable = await _read_node_outputs(request, run_id)
+    run = await _require_run(request, run_id)
+    outputs, source = _node_outputs_page(run, node_outputs, limit=effective_limit)
+
+    # JSONB libres, écrits par plusieurs versions du moteur : `isinstance`
+    # avant d'émettre. La revue de la Story 5.2 a trouvé `_aggregate_metrics`
+    # qui faisait tomber l'agrégation d'un run ENTIER sur une valeur
+    # malformée ; une projection HTTP qui ferait tomber la réponse entière
+    # pour la même raison serait la même faute, une couche plus haut.
+    checkpoint = run.checkpoint if isinstance(run.checkpoint, dict) else {}
+    metrics = run.metrics if isinstance(run.metrics, dict) else {}
+    last_node_id = checkpoint.get("last_node_id")
+    node_statuses = checkpoint.get("node_statuses")
+    last_error = checkpoint.get("last_error")
+    control_signal = getattr(run, "control_signal", None)
+    mise_en_place = run.mise_en_place if isinstance(run.mise_en_place, dict) else None
+    acknowledgement = getattr(run, "acknowledgement", None)
+
+    return RunDetailResponse(
+        run_id=run.id,
+        workflow_id=run.workflow_id,
+        status=run.status,
+        started_at=run.started_at,
+        ended_at=run.ended_at,
+        correlation_id=run.correlation_id,
+        metrics=_redacted_jsonb(metrics),
+        # `model_validate` et non une construction champ par champ : le
+        # rapport persisté a la forme du schéma, et une row antérieure à la
+        # Story 4.5 (ou malformée) doit rendre `null` plutôt que faire tomber
+        # une réponse dont tout le reste est bon.
+        mise_en_place=_coerce_or_none(MiseEnPlaceReportOut, mise_en_place),
+        acknowledgement=_coerce_or_none(AcknowledgementOut, acknowledgement),
+        last_node_id=last_node_id if isinstance(last_node_id, str) else None,
+        # `isinstance` avant d'émettre, pas `str()` : stringifier faisait
+        # sortir un `repr` Python (`"{'retries': 2}"`, `"None"`) dans un champ
+        # typé `dict[str, str]` — une conversion silencieuse là où le
+        # commentaire d'à côté revendique un filtre. Une valeur non scalaire
+        # est omise, ce qui est le comportement que `_state_event` a déjà.
+        node_statuses=(
+            {str(nid): value for nid, value in node_statuses.items() if isinstance(value, str)}
+            if isinstance(node_statuses, dict)
+            else {}
+        ),
+        control_signal=control_signal if isinstance(control_signal, str) else None,
+        last_error=last_error if isinstance(last_error, str) else None,
+        node_outputs=outputs,
+        node_outputs_source=source,
+        checkpointer_reachable=checkpointer_reachable,
+        checkpoint_purged_at=getattr(run, "checkpoint_purged_at", None),
+    )
+
+
+@router.get(
+    "/workflows/runs/{run_id}/nodes/{node_id}/output",
+    response_model=RunNodeOutputResponse,
+    summary="Read ONE node's output, page by page (Story 5.7 AC2)",
+)
+async def get_workflow_run_node_output(
+    run_id: UUID,
+    node_id: str,
+    request: Request,
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Character offset to start at — feed back the previous page's next_offset.",
+    ),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Characters to return. Defaults to this deployment's "
+            "AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS; above that ceiling is a 422 "
+            "naming the setting and its value. The response echoes the bound "
+            "it actually applied in `limit`."
+        ),
+    ),
+) -> RunNodeOutputResponse:
+    """La route qui rend vraie « la sortie complète est atteignable » : page
+    après page, `next_offset` après `next_offset`, sans plafond sur le total
+    lu — seulement sur ce qu'une réponse porte.
+
+    `truncated: true` avec `next_offset: null` n'est pas une contradiction :
+    c'est le cas où tout ce que le serveur tient a été rendu ET où l'original
+    avait déjà été coupé avant d'arriver — `output.source` vaut alors
+    `preview`, le fil LangGraph n'étant plus là pour servir la suite.
+
+    Sert aussi les nodes que le canal d'état LangGraph n'a pas : un node dont
+    la décision de routage a échoué a produit une sortie que seul l'aperçu
+    applicatif porte. Ce repli n'implique donc PAS que le checkpointer soit
+    injoignable — `checkpointer_reachable` est le champ qui le dit.
+
+    Errors:
+    * 404 — `run_id` inconnu/d'un autre tenant, ou `node_id` sans sortie dans
+      ce run. Quand le checkpointer n'a pas pu être consulté, le message le
+      DIT au lieu d'affirmer une absence qu'on n'est pas en position de
+      constater.
+    * 422 — `limit` au-delà du plafond du déploiement.
+    * 503 — état de lifespan manquant.
+    """
+    effective_limit = _resolved_output_limit(limit)
+    # Même ordre que la route de détail, pour la même raison — cf son corps.
+    node_outputs, checkpointer_reachable = await _read_node_outputs(request, run_id)
+    run = await _require_run(request, run_id)
+
+    source: NodeOutputSource = "checkpointer"
+    engine_truncated = False
+    if node_outputs is not None and node_id in node_outputs:
+        text = _render_node_output(node_outputs[node_id])
+    else:
+        preview = _preview_of(run)
+        if node_id not in preview:
+            raise NotFoundError(
+                detail=(
+                    f"Node '{node_id}' has no recorded output in run '{run_id}'"
+                    if checkpointer_reachable
+                    else (
+                        f"Node '{node_id}' cannot be read: the workflow checkpointer "
+                        f"could not be consulted, and run '{run_id}' carries no "
+                        f"applicative preview for it — this is an outage, not an "
+                        f"empty node."
+                    )
+                ),
+                context={
+                    "run_id": str(run_id),
+                    "node_id": node_id,
+                    "checkpointer_reachable": checkpointer_reachable,
+                },
+            )
+        text = _preview_text(preview[node_id])
+        source = "preview"
+        engine_truncated = _engine_cut_it(text)
+
+    return RunNodeOutputResponse(
+        run_id=run.id,
+        node_id=node_id,
+        limit=effective_limit,
+        output=_slice_node_output(
+            node_id,
+            text,
+            source=source,
+            offset=offset,
+            limit=effective_limit,
+            engine_truncated=engine_truncated,
+        ),
+        checkpointer_reachable=checkpointer_reachable,
+        # Rendu INCONDITIONNELLEMENT, comme sur la route de détail : c'est un
+        # fait sur le RUN, pas sur cette réponse. La version précédente le
+        # conditionnait à `source == "preview"`, ce qui donnait deux
+        # sémantiques à la même colonne sur deux routes de la même story —
+        # exactement le motif que T2.2 invoquait pour l'éviter.
+        checkpoint_purged_at=getattr(run, "checkpoint_purged_at", None),
     )
 
 

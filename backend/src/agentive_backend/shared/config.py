@@ -767,6 +767,54 @@ class Settings(BaseSettings):
         alias="AGENTIVE_WORKFLOW_ROUTING_STATS_WINDOW_DAYS",
     )
 
+    # ─── Story 5.7 AC2 — combien de la sortie d'un node sort par HTTP ───
+    # `GET /workflows/runs/{run_id}` et
+    # `GET /workflows/runs/{run_id}/nodes/{node_id}/output` rendent la sortie
+    # d'un node lue dans le checkpointer LangGraph (cf
+    # `docs/decisions/run-node-output-exposure.md`). Ce plafond dit combien de
+    # caractères partent PAR NODE et PAR PAGE.
+    #
+    # Ce n'est PAS `_CHECKPOINT_PREVIEW_MAX_CHARS` (500, `service.py`), et les
+    # deux ne doivent pas être confondus : celui-là borne un aperçu de
+    # diagnostic REÉCRIT DANS LA ROW à chaque superstep, donc relu par chaque
+    # reconnexion SSE ; celui-ci borne une réponse qu'un opérateur a
+    # explicitement demandée. 8 000, c'est l'ordre de grandeur d'une sortie de
+    # Code Researcher complète (quatre tableaux de chemins) — le cas nominal
+    # tient en une page, et le reste se lit `next_offset` après `next_offset`.
+    #
+    # ⚠️ CE QUE CE PLAFOND BORNE, ET CE QU'IL NE BORNE PAS — la revue a trouvé
+    # les deux affirmations fausses ici.
+    #
+    # Il compte des CARACTÈRES (points de code), pas des octets. Le rendu part
+    # en `ensure_ascii=False`, donc un point de code accentué, CJK ou emoji
+    # pèse jusqu'à 4 octets sur le fil. Le pire cas de la route de détail est
+    # `plafond x nombre de nodes x 4 octets`, le nombre de nodes étant borné à
+    # 100 par `_MAX_NODES` (`workflow_engine/schemas.py`) :
+    #   - au défaut de 8 000 : 800 K caractères, soit jusqu'à ~3,2 Mo ;
+    #   - au plafond légal de 200 000 : 20 M caractères, soit jusqu'à ~80 Mo.
+    # Le commentaire d'origine annonçait « ~800 Ko au pire » sans distinguer
+    # les deux unités ni tenir compte du `le` — le dépôt avait pourtant déjà
+    # fait exactement ce raisonnement, en sens inverse, pour
+    # `_reject_oversized_input` (« measures the JSON as it actually TRAVELS »).
+    # Sur le DAG d'entrée du Pôle Dev (2 nodes) : ~16 K caractères.
+    #
+    # Il ne borne PAS le travail du serveur. La sortie entière de chaque node
+    # est rendue puis caviardée AVANT d'être découpée, donc `limit=1` coûte
+    # autant que `limit=8000`, et paginer un gros node relit tout à chaque
+    # page. Ce plafond protège le CLIENT et le réseau, pas la mémoire ni le
+    # CPU du backend ; ce qui borne ces derniers est la taille des sorties
+    # elles-mêmes, que rien ne plafonne aujourd'hui côté état LangGraph.
+    #
+    # Une coupure n'est jamais silencieuse : la réponse porte `truncated`,
+    # `total_chars`, `returned_chars` et `next_offset`. Un `limit` demandé
+    # au-delà de ce plafond est refusé en le nommant (422), jamais rogné.
+    run_node_output_max_chars: int = Field(
+        default=8_000,
+        ge=500,
+        le=200_000,
+        alias="AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS",
+    )
+
     # ─── CORS ───
     # JSON-parsed from env (e.g. `AGENTIVE_CORS_ALLOW_ORIGINS='["https://app.example.com"]'`).
     cors_allow_origins: list[str] = Field(

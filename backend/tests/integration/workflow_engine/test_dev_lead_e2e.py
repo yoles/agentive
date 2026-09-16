@@ -1409,3 +1409,245 @@ async def test_a_refused_path_inside_a_run_does_not_kill_the_run(
         "le message ne dit pas au modèle POURQUOI le chemin est refusé — "
         "T1.4 exige un résultat d'erreur exploitable, pas seulement signalé"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_operator_can_read_the_researchers_output_over_http(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """Story 5.7 T6.3 — **le test qui compte**.
+
+    Même gabarit que
+    `test_the_code_researcher_really_calls_its_tools_during_a_run` juste
+    au-dessus, à une différence près, et c'est toute la story : ce test-là lit
+    la row `workflow_runs` en SQL, celui-ci lit l'endpoint. Jusqu'à la Story
+    5.7, la seconde moitié n'existait pas — l'anti-scope de la 5.2 affirmait
+    que la sortie du Chercheur « est lue par un humain » alors que cette
+    lecture n'avait aucune surface.
+
+    Quatre choses distinctes :
+      1. les compteurs d'outils de l'AC2 de la 5.2 sortent par HTTP ;
+      2. la sortie du Chercheur sort en ENTIER, et la réponse dit d'où elle
+         vient (`checkpointer`) et qu'elle n'a pas été coupée ;
+      3. la Mise en Place et l'accusé de réception que l'AC1 énumère sortent
+         PEUPLÉS — ils n'avaient jusqu'ici que des assertions `is None` ;
+      4. les chemins que la sortie cite sont ceux que le SOUS-PROCESSUS a
+         rendus depuis le disque.
+
+    ⚠️ **Le point 4 est celui que la revue a trouvé circulaire, et voici ce
+    qu'il établit exactement.** La réponse finale du node est une constante de
+    ce fichier (`_RESEARCHER_ANSWER`, servie par le `MockProvider`), donc
+    vérifier que ses chemins existent ne prouverait que le soin de l'auteur du
+    test. Le chaînon non circulaire est ailleurs : on extrait les chemins du
+    MESSAGE D'OUTIL — produit par un sous-processus MCP qui a lu `/app` — et
+    on exige que ce que l'endpoint rend soit couvert par eux. Une fixture ne
+    peut pas fabriquer ce message.
+    """
+    from sqlalchemy import text
+
+    from agentive_backend.features.workflow_engine.service import _CHECKPOINT_PREVIEW_MAX_CHARS
+    from agentive_backend.shared.llm.types import ToolCall
+
+    report = await _seed(app_session_factory)
+    objective, canned = _CASES["scaffolding"]
+
+    asking_for_a_tool = Completion(
+        text="",
+        model="mock-model",
+        provider="mock",
+        input_tokens=100,
+        output_tokens=20,
+        finish_reason="tool_use",
+        latency_ms=5.0,
+        cost_estimate_usd=Decimal("0.0001"),
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="find_files",
+                arguments={
+                    "pattern": "**/router.py",
+                    "path": str(_CORPUS_FEATURES),
+                    "max_results": 5,
+                },
+            ),
+        ),
+    )
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(canned),  # node `dev_lead`
+            _completion(_HANDOFF_SUMMARY),  # résumé de passage de l'arête
+            asking_for_a_tool,  # node `code_researcher`, tour 1
+            _completion(_RESEARCHER_ANSWER),  # node `code_researcher`, tour 2
+        ],
+    )
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.workflow_checkpointer = workflow_checkpointer
+    app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    wire_execution_service(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_resp = await client.post(
+            f"/api/v1/workflows/{report.workflow_id}/runs",
+            headers=_auth_headers(),
+            json={"input": {"objective": objective}},
+        )
+        assert run_resp.status_code == 201, run_resp.text
+        run_id = run_resp.json()["run_id"]
+        assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
+
+        detail = await client.get(f"/api/v1/workflows/runs/{run_id}", headers=_auth_headers())
+
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["checkpointer_reachable"] is True
+
+    # (1) — les quatre compteurs de l'AC2 de la 5.2, enfin interrogeables
+    # autrement qu'en SQL. C'est le critère 1 du protocole du § 7 bis, déclaré
+    # éliminatoire et jusqu'ici inexécutable en suivant le runbook.
+    researcher_metrics = body["metrics"]["per_node"][CODE_RESEARCHER_NODE_ID]
+    assert researcher_metrics["tool_calls"] > 0
+    assert researcher_metrics["tool_names"] == ["find_files"]
+    assert researcher_metrics["tool_failures"] == 0
+    assert researcher_metrics["tool_loop_iterations"] == 2
+
+    # (2) — la sortie, en entier, avec sa provenance dite.
+    assert body["node_outputs_source"] == "checkpointer"
+    outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
+    assert set(outputs) == {DEV_LEAD_NODE_ID, CODE_RESEARCHER_NODE_ID}
+    researcher = outputs[CODE_RESEARCHER_NODE_ID]
+    assert researcher["source"] == "checkpointer"
+    assert researcher["truncated"] is False
+    assert researcher["next_offset"] is None
+    assert researcher["returned_chars"] == researcher["total_chars"]
+
+    # L'aperçu applicatif N'AURAIT PAS SUFFI — établi contre ce que le MOTEUR
+    # a réellement persisté, pas contre une constante de ce fichier : la row
+    # porte un aperçu que `_preview()` a coupé (marqueur `…` en fin), là où
+    # l'endpoint rend la sortie complète. C'est le constat qui a fait rejeter
+    # l'option (a) de T1.2.
+    async with app_session_factory() as session:
+        row = await session.execute(
+            text("SELECT checkpoint FROM workflow_runs WHERE id = :r"), {"r": run_id}
+        )
+        stored_preview = row.scalar_one()["node_outputs_preview"][CODE_RESEARCHER_NODE_ID]
+    assert stored_preview.endswith("…"), "l'aperçu persisté n'a pas été coupé : rien à démontrer"
+    assert len(stored_preview) == _CHECKPOINT_PREVIEW_MAX_CHARS + 1
+    assert researcher["total_chars"] > len(stored_preview)
+
+    # (3) — AC1 nomme `mise_en_place` et `acknowledgement` ; ils n'avaient
+    # aucune couverture positive, seulement des assertions `is None`.
+    assert body["mise_en_place"]["all_passed"] is True
+    assert len(body["mise_en_place"]["checks"]) == 4
+    assert body["acknowledgement"]["agents"] == ["Dev Lead", "Code Researcher"]
+    assert body["acknowledgement"]["eta_source"] in {"history", "heuristic"}
+    assert body["acknowledgement"]["message"].startswith("Compris.")
+
+    # (4) — LE chaînon non circulaire : ce que le sous-processus a rendu.
+    tool_messages = [message for message in provider.calls[3]["messages"] if message.role == "tool"]
+    assert tool_messages, "le résultat de l'outil n'a pas été renvoyé au modèle"
+    from_disk = set(
+        re.findall(rf"{re.escape(str(_CORPUS_FEATURES))}/[\w/]+\.py", tool_messages[0].content)
+    )
+    assert from_disk, "le serveur MCP n'a rendu aucun chemin : il n'y a rien à corroborer"
+
+    payload = json.loads(researcher["output"])
+    cited = [entry["path"] for entry in payload["relevant_files"]]
+    assert cited, "la sortie ne cite aucun chemin : il n'y a rien à vérifier"
+    assert set(cited) <= from_disk, (
+        "l'endpoint rend des chemins que le sous-processus n'a jamais lus : "
+        f"cités={cited}, rendus par l'outil={sorted(from_disk)}"
+    )
+    for path in cited:
+        assert Path(path).is_file(), f"l'endpoint rend un chemin inexistant : {path}"
+
+
+@pytest.mark.asyncio
+async def test_a_long_node_output_is_reassembled_page_by_page_over_http(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """Story 5.7 T6.4 — la troncature annoncée, sur la vraie surface HTTP.
+
+    L'unitaire garde la fonction de découpe ; celui-ci garde la PROMESSE de
+    l'AC2 (« la sortie complète est atteignable ») de bout en bout : un
+    plafond volontairement minuscule, puis les pages recollées doivent rendre
+    exactement ce que la route de détail annonce comme total.
+
+    Sans ce test, `next_offset` serait une intention — c'est la formulation
+    de T3.2, et elle s'applique à la surface autant qu'à la fonction.
+    """
+    report = await _seed(app_session_factory)
+    objective, canned = _CASES["scaffolding"]
+
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(canned),
+            _completion(_HANDOFF_SUMMARY),
+            _completion(_RESEARCHER_ANSWER),
+        ],
+    )
+
+    app = _make_app(session_factory=app_session_factory)
+    app.state.workflow_checkpointer = workflow_checkpointer
+    app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    wire_execution_service(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_resp = await client.post(
+            f"/api/v1/workflows/{report.workflow_id}/runs",
+            headers=_auth_headers(),
+            json={"input": {"objective": objective}},
+        )
+        assert run_resp.status_code == 201, run_resp.text
+        run_id = run_resp.json()["run_id"]
+        assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
+
+        # Un plafond de 64 caractères : la sortie du Chercheur en fait des
+        # milliers, donc la coupure est certaine et doit être DITE.
+        detail = await client.get(
+            f"/api/v1/workflows/runs/{run_id}",
+            headers=_auth_headers(),
+            params={"limit": 64},
+        )
+        assert detail.status_code == 200, detail.text
+        cut = next(
+            entry
+            for entry in detail.json()["node_outputs"]
+            if entry["node_id"] == CODE_RESEARCHER_NODE_ID
+        )
+        assert cut["truncated"] is True, (
+            "une coupure non annoncée fait croire au lecteur qu'il a tout vu"
+        )
+        assert cut["returned_chars"] == 64
+        assert cut["next_offset"] == 64
+        total = cut["total_chars"]
+
+        # Ce qui est annoncé est reprenable : on recolle, et on compare au
+        # total que la route de détail a annoncé.
+        rebuilt = cut["output"]
+        offset = cut["next_offset"]
+        pages = 1
+        while offset is not None:
+            page_resp = await client.get(
+                f"/api/v1/workflows/runs/{run_id}/nodes/{CODE_RESEARCHER_NODE_ID}/output",
+                headers=_auth_headers(),
+                params={"offset": offset, "limit": 64},
+            )
+            assert page_resp.status_code == 200, page_resp.text
+            page = page_resp.json()["output"]
+            assert page["offset"] == offset, "une page doit dire où elle commence"
+            rebuilt += page["output"]
+            offset = page["next_offset"]
+            pages += 1
+
+        assert len(rebuilt) == total
+        assert pages > 1, "le plafond de 64 n'a rien coupé : le test ne prouve rien"
+        assert json.loads(rebuilt) == json.loads(_RESEARCHER_ANSWER)

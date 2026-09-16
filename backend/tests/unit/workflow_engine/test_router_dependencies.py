@@ -334,3 +334,71 @@ def test_unwired_execution_service_reports_the_missing_lifespan_resources() -> N
         "workflow_checkpointer",
         "routing_rules",
     ]
+
+
+# ─── Story 5.7 T2.1 — run-detail route-collision lock ────────────────────
+
+
+def test_the_run_detail_route_does_not_capture_its_three_segment_neighbours() -> None:
+    """`GET /workflows/runs/{run_id}` (Story 5.7) joins the 3-segment space
+    already occupied by `routing-stats` and `handoff-stats`, from the other
+    side: its literal is the MIDDLE segment (`runs`), theirs is the last.
+
+    The pair only stays unambiguous because `routing-stats`/`handoff-stats`
+    are declared FIRST — which is exactly the kind of fact that survives a
+    refactor only if something asserts it.
+    """
+    run_id = "0199d0a1-7777-7000-8000-000000000000"
+    workflow_id = "0199d0a1-8888-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}") == "get_workflow_run"
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+    assert _resolve_endpoint_name(f"/api/v1/workflows/{workflow_id}/handoff-stats") == (
+        "get_workflow_handoff_stats"
+    )
+    # GET-only: the run-detail path must not answer the control verbs' POST.
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}") is None
+
+
+def test_the_run_detail_route_does_not_swallow_the_sse_stream_or_the_controls() -> None:
+    """4-segment neighbours under the same `/workflows/runs/{run_id}` prefix.
+    They cannot overlap (3 segments vs 4), and this says so rather than
+    leaving it to inspection — the same posture T5.3/T10.4 already take."""
+    run_id = "0199d0a1-9999-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/events") == (
+        "stream_workflow_run_events"
+    )
+    assert _resolve_post_endpoint_name(f"/api/v1/workflows/runs/{run_id}/pause") == (
+        "pause_workflow_run"
+    )
+
+
+def test_a_workflow_literally_named_runs_still_wins_the_stats_routes() -> None:
+    """The inverse direction, mirroring
+    `test_a_workflow_literally_named_runs_does_not_steal_the_events_route`:
+    `/workflows/runs/routing-stats` stays the stats route (declared first),
+    and the run-detail route would 422 on the UUID anyway."""
+    assert _resolve_endpoint_name("/api/v1/workflows/runs/routing-stats") == (
+        "get_workflow_routing_stats"
+    )
+    assert _resolve_endpoint_name("/api/v1/workflows/runs/handoff-stats") == (
+        "get_workflow_handoff_stats"
+    )
+
+
+def test_the_per_node_output_route_resolves_to_its_own_endpoint() -> None:
+    """5 segments — deeper than every other route of this prefix, so nothing
+    can capture it and it can capture nothing."""
+    run_id = "0199d0a1-aaaa-7000-8000-000000000000"
+
+    assert _resolve_endpoint_name(
+        f"/api/v1/workflows/runs/{run_id}/nodes/code_researcher/output"
+    ) == ("get_workflow_run_node_output")
+    # A node id that looks like one of the control verbs changes nothing:
+    # the literal `nodes`/`output` segments are what disambiguates.
+    assert _resolve_endpoint_name(f"/api/v1/workflows/runs/{run_id}/nodes/pause/output") == (
+        "get_workflow_run_node_output"
+    )

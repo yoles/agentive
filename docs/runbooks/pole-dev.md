@@ -13,8 +13,18 @@
 ## 2. Prérequis
 
 - Le stack tourne (`make up`) et les migrations sont appliquées (`make migrate`).
-- Une clé LLM valide (`ANTHROPIC_API_KEY` ou `OPENAI_API_KEY`) — sinon la Mise en Place refuse
-  le lancement sur son check `llm_providers_healthy`.
+- Une clé LLM **valide** (`ANTHROPIC_API_KEY` ou `OPENAI_API_KEY`).
+
+  > ⚠️ **La Mise en Place ne vérifie PAS qu'elle est valide, et ce runbook a affirmé le
+  > contraire jusqu'à la Story 5.7.** Il n'existe aucun check nommé `llm_providers_healthy` :
+  > le vrai s'appelle `llm_providers_configured` et contrôle la **présence** d'une clé, pas sa
+  > validité — il n'y a pas de ping de provider dans ce dépôt, et
+  > [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) le dit depuis toujours.
+  > Conséquence observée, pas supposée (passage du § 7 bis du 2026-09-15) : avec une clé
+  > syntaxiquement présente mais invalide, les **quatre** checks passent, le `201` part avec son
+  > accusé de réception, et le run meurt sur son PREMIER node en `401`. Le symptôme se lit sur
+  > `GET /api/v1/workflows/runs/$RUN` : `status: "error"`, `node_statuses: {"dev_lead": "error"}`,
+  > `last_error` portant le `401` du provider, et `metrics.per_node` **vide**.
 - `AGENTIVE_API_TOKEN` pour l'en-tête `Authorization`.
 
 ## 3. Provisionner
@@ -208,9 +218,8 @@ un résultat d'erreur exploitable (`isError`), avec son motif, et l'agent peut c
 chemin. On le lit dans les métriques du run :
 
 ```bash
-docker compose exec -T db psql -qtAX -U postgres -d agentive \
-  -c "SELECT metrics->'per_node'->'code_researcher' FROM workflow_runs WHERE id = '$RUN';" \
-  | jq '{tool_calls, tool_names, tool_failures}'
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node.code_researcher | {tool_calls, tool_names, tool_failures}'
 ```
 
 `tool_failures > 0` avec `tool_calls > 0` = des refus, des timeouts, ou un sous-processus tué
@@ -296,6 +305,38 @@ que le `201` — y compris si le run a déjà progressé (rattrapage). Puis vien
 Pilotage : `POST /api/v1/workflows/runs/$RUN/pause|resume|cancel|retract`
 (cf [`run-control-et-fallback.md`](./run-control-et-fallback.md)).
 
+### Lire le détail d'un run (Story 5.7)
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+**Ce qu'elle rend** : `status`, `started_at`/`ended_at`, `correlation_id`, le bloc `metrics`
+(dont `per_node` et ses quatre compteurs d'outils), le rapport `mise_en_place`, l'accusé de
+réception, la progression applicative (`last_node_id`, `node_statuses`, `control_signal`,
+`last_error`), et **un extrait de la sortie de chaque node exécuté**.
+
+**Ce qu'elle NE rend PAS**, et il vaut mieux le savoir avant de le chercher :
+
+- le **checkpoint technique LangGraph** — ni ses versions, ni son historique ;
+- les blocs `routing_decisions` / `handoffs` de `workflow_runs.checkpoint` : ils s'agrègent sur
+  `GET /workflows/{id}/routing-stats` et `GET /workflows/{id}/handoff-stats` ;
+- la **sortie complète** d'un node quand elle dépasse le plafond par node
+  (`AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`, 8 000 par défaut). Elle se lit page par page :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN/nodes/code_researcher/output?offset=0" \
+  -H "Authorization: Bearer $TOKEN" | jq '.output | {truncated, next_offset, returned_chars}'
+```
+
+**Aucune coupure n'est silencieuse** : `truncated`, `total_chars`, `returned_chars` et
+`next_offset` disent ce qui manque et par où reprendre — voir la grille de lecture des quatre
+cas au § 6 bis. Un `limit` au-delà du plafond du déploiement est refusé par un `422` qui
+**nomme le réglage**, jamais rogné en silence.
+
+`404` sur un run inconnu **et** sur un run d'un autre tenant, indistinctement : un `403`
+confirmerait l'existence de la ligne.
+
 ## 6. Lire la décomposition
 
 La sortie du Dev Lead est un objet JSON :
@@ -344,22 +385,21 @@ La clé `contract_problems` est **absente** quand il n'y a rien à dire : c'est 
 le signal.
 
 ```bash
-docker compose exec -T db psql -qtAX -U postgres -d agentive \
-  -c "SELECT jsonb_path_query(metrics, '\$.per_node.*.contract_problems') FROM workflow_runs WHERE id = '$RUN';"
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node | to_entries[]
+        | select(.value.contract_problems)
+        | {node: .key, problems: .value.contract_problems}'
 ```
 
 ### 6 bis. Lire l'exploration du Code Researcher
 
-> ⚠️ **`GET /api/v1/workflows/runs/{run_id}` N'EXISTE PAS.** Les seules routes de ce préfixe
-> sont `/events` (SSE), `/pause`, `/resume`, `/cancel`, `/retract`, plus `/instances` côté
-> `agent_registry` — et `node_outputs` est une clé d'**état LangGraph**, jamais projetée en HTTP
-> (`workflow_engine/router.py` : « Deliberately NOT forwarded: `node_outputs_preview` »). Les
-> recettes ci-dessous lisent donc `workflow_runs` **en base**, ce que font déjà les tests.
-> Ouvrir une route qui projette `metrics` reste à faire ; tant qu'elle n'existe pas, c'est
-> `psql` ou rien.
+> ℹ️ **Depuis la Story 5.7, tout se lit en `curl`.** `GET /api/v1/workflows/runs/{run_id}` rend
+> l'état du run, ses `metrics` (dont `per_node`) **et la sortie de chaque node**, lue à la
+> demande dans le checkpointer LangGraph. Le flux SSE, lui, n'a pas changé : il ne porte
+> toujours pas les sorties de node, et c'est ce qui garde sa première frame sous les 2 s
+> (arbitrage complet : [`run-node-output-exposure.md`](../decisions/run-node-output-exposure.md)).
 
-Le second node rend un objet JSON de cette forme (la sortie elle-même vit dans le checkpoint
-LangGraph ; ce qui est interrogeable aujourd'hui est `workflow_runs.metrics` et le flux SSE) :
+Le second node rend un objet JSON de cette forme :
 
 ```json
 {
@@ -380,9 +420,8 @@ l'émetteur) et consommables tels quels par l'Architect Analyst de la Story 5.3.
 **La question à se poser en premier n'est pas « le plan est-il bon » mais « a-t-il lu ? »** :
 
 ```bash
-docker compose exec -T db psql -qtAX -U postgres -d agentive \
-  -c "SELECT metrics->'per_node'->'code_researcher' FROM workflow_runs WHERE id = '$RUN';" \
-  | jq '{tool_calls, tool_names, tool_failures}'
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node.code_researcher | {tool_calls, tool_names, tool_failures}'
 ```
 
 `tool_calls: 0` avec des `relevant_files` non vides = **une sortie inventée**. Le prompt
@@ -394,9 +433,43 @@ Vérification du contraire — **elle compte ce qu'elle a vérifié**, parce qu'
 doit pas se lire comme un succès :
 
 ```bash
-docker compose exec -T db psql -qtAX -U postgres -d agentive \
-  -c "SELECT jsonb_path_query(state_snapshot, '\$.**.relevant_files[*].path') FROM workflow_runs WHERE id = '$RUN';" \
-  | tr -d '"' | sed '/^$/d' > /tmp/paths.txt
+# 1. La sortie du Chercheur, et ce que la réponse dit d'elle. LIRE `truncated`
+#    AVANT de parser : le plafond par défaut est de 8 000 caractères par node.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.node_outputs[] | select(.node_id == "code_researcher")
+        | {source, truncated, total_chars, returned_chars, next_offset}'
+```
+
+**Deux questions, deux champs — ne pas les confondre, la réponse ne les confond plus.**
+
+`checkpointer_reachable` dit si la source faisant autorité a pu être consultée :
+
+- `true` → ce que vous lisez est fiable, quel que soit `node_outputs_source`.
+- `false` → **le checkpointer est injoignable** (lifespan non câblé, pool saturé). Ce n'est
+  **pas** un run qui n'a rien produit, et ce n'est **pas** une purge : réessayer a du sens.
+
+`node_outputs_source` dit seulement d'où vient ce qui est rendu (`checkpointer`, `preview`,
+`none`). Puis, par node, `truncated` et `next_offset` :
+
+- `truncated: false` + `next_offset: null` → c'est tout, passer à l'étape 2.
+- `truncated: true` + un `next_offset` → il en reste, et c'est **reprenable** : paginer sur
+  `GET /workflows/runs/$RUN/nodes/code_researcher/output?offset=<next_offset>` et recoller, ou
+  relever `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`. **Vaut aussi pour un aperçu** : une coupure faite
+  par le serveur est toujours repaginable, quelle que soit la provenance du texte.
+- `truncated: true` + `next_offset: null` → tout ce que le serveur tient a été rendu, **et
+  l'original avait déjà été coupé avant d'arriver**. `source` vaut alors `preview` : le fil
+  LangGraph n'est plus là (`checkpoint_purged_at` le date, cf Story 4.10), et les 500 caractères
+  restants ne sont pas la sortie.
+
+> Un node peut sortir en `source: "preview"` alors que `checkpointer_reachable` vaut `true` :
+> c'est le cas d'un node dont la **décision de routage** a échoué. Il a produit une sortie, mais
+> LangGraph jette l'update d'un node qui lève, donc seul l'aperçu applicatif la porte.
+
+```bash
+# 2. Les chemins cités, extraits puis vérifiés un par un.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "code_researcher") | .output' \
+  | jq -r '.relevant_files[].path' > /tmp/paths.txt
 test -s /tmp/paths.txt || echo "AUCUN CHEMIN À VÉRIFIER — ce n'est PAS un succès"
 n=0; bad=0
 while read -r f; do
@@ -407,6 +480,10 @@ while read -r f; do
 done < /tmp/paths.txt
 echo "$n chemin(s) vérifié(s), $bad inexistant(s)"
 ```
+
+> ⚠️ L'étape 2 **suppose l'étape 1 verte**. Sur une sortie coupée, le second `jq` échoue sur du
+> JSON incomplet — un échec bruyant, et c'est voulu : il vaut mieux qu'une extraction s'arrête
+> qu'un `relevant_files` amputé se lise comme la liste entière.
 
 > ⚠️ **Ce que le Code Researcher voit du Dev Lead n'est pas son plan complet.** `agent_node`
 > condense la sortie de chaque node amont en un résumé de passage (Story 4.7) avant de la
@@ -492,13 +569,53 @@ Critères de lecture, dans cet ordre — **le premier est éliminatoire** :
 
 | Date | Modèle | `tool_calls` | (2) chemins réels | (3) ≥ 2 modules | (4) patterns | (5) risques | (6) méthode |
 |---|---|---|---|---|---|---|---|
-| — | — | non exécuté | non exécuté | non exécuté | non exécuté | non exécuté | non exécuté |
+| 2026-09-15 | *aucun — aucun appel n'a abouti* | **0 — éliminatoire** | non atteint | non atteint | non atteint | non atteint | non atteint |
 
-> ⚠️ **Ce protocole n'a encore jamais été exécuté avec de vraies clés.** Tant que cette table
-> est vide, la qualité du jugement d'exploration est **non vérifiée**. La table est versionnée
-> vide plutôt qu'absente, exactement comme celle du § 7 : une table vide affirme visiblement
-> que le protocole n'a pas tourné, là où l'absence de table laisse croire qu'il n'en fallait
-> pas. Remplir au premier passage réel.
+**Ce que ce passage a établi, et ce qu'il n'a pas établi.**
+
+Le protocole a été **lancé en le suivant**, pour la première fois, et le diagnostic ci-dessous a
+été produit **sans `psql`** — c'est ce que la Story 5.7 débloque. Le run est
+`419619d2-d2dc-4f42-a6a6-57652d8495b0`, sur le workflow d'entrée v2.
+
+⚠️ **Il n'est PAS allé de bout en bout, et une version antérieure de ce paragraphe l'affirmait.**
+Seule la route de détail a été exercée. Les deux recettes de lecture du § 6 bis — celles qui
+lisent la sortie d'un node, c'est-à-dire l'essentiel de ce que cette story ajoute — n'ont rien eu
+à lire : `metrics.per_node` est vide et `node_outputs` aussi, donc l'étape 1 rend un flux `jq`
+vide et l'étape 2 en dépend. Ce qui est vérifié ici est que le protocole **démarre et diagnostique**
+en `curl` ; ce qui ne l'est pas est qu'il aille jusqu'au jugement.
+
+Il s'est arrêté sur le **critère 1**, qui est éliminatoire, et pour une raison
+d'environnement et non de modèle : la clé `ANTHROPIC_API_KEY` de cet environnement est un
+**bouchon** (`sk-ant-…`, 20 caractères), donc le premier appel LLM est rendu en `401`. Lu sur
+`GET /api/v1/workflows/runs/$RUN` :
+
+```json
+{ "status": "error",
+  "node_statuses": {"dev_lead": "error"},
+  "last_error": "Error code: 401 - … 'authentication_error' … 'API key is invalid.'",
+  "metrics": {"per_node": {}},
+  "node_outputs": [], "node_outputs_source": "checkpointer" }
+```
+
+`per_node` est **vide** : aucun node n'a terminé, donc `tool_calls` n'est pas « à zéro parce que
+l'agent n'a rien lu » — il n'existe pas. Les critères 2 à 6 portent sur une sortie qui n'a jamais
+été produite ; les noter aurait été inventer un résultat, ce que le critère 1 interdit
+précisément pour les suivants.
+
+**La colonne « Modèle » est vide pour la même raison, et une version antérieure y avait écrit
+`claude-haiku-4-5` — un modèle qui n'est celui d'aucun node.** Les deux templates du DAG d'entrée
+omettent `llm_model` **à dessein** (`templates/dev/dev_lead.yaml`, `code_researcher.yaml`) pour
+laisser s'appliquer le défaut du moteur, `agent_node.DEFAULT_LLM_MODEL` = `claude-sonnet-4-6` ;
+`claude-haiku-4-5` est le modèle des appels auxiliaires (`AGENTIVE_ROUTING_ESCALATION_MODEL`,
+`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MODEL`). Et de toute façon, un run qui meurt en `401` sur son
+premier appel n'a fait produire aucun modèle : il n'y avait rien à consigner.
+
+> ⚠️ **La qualité du jugement d'exploration reste donc NON VÉRIFIÉE**, et cette ligne le dit
+> plutôt que de le masquer. Ce qui a changé depuis la version vide de cette table : on sait
+> maintenant que le protocole est exécutable en le suivant, et on sait exactement où il bute.
+> **Pour le terminer : rejouer à l'identique avec une vraie clé** — rien d'autre ne manque,
+> le provisioning, le serveur MCP et les quatre outils sont verts (les quatre checks de Mise en
+> Place passent). Remplacer alors cette ligne par le résultat obtenu.
 
 ## 8. Rollback
 
