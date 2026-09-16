@@ -1346,6 +1346,27 @@ def _aggregate_metrics(
         contract_problems = metric.get("contract_problems")
         if isinstance(contract_problems, list) and contract_problems:
             node_per_node["contract_problems"] = [str(problem) for problem in contract_problems]
+        # Revue de la Story 5.3 — la troncature de la charge amont, même
+        # posture d'absence-signifiante. ⚠️ Cette projection est la MOITIÉ qui
+        # manque toujours : `agent_node` écrit dans `node_metrics`, et ce
+        # dict-ci est reconstruit clé par clé, donc toute clé non recopiée ici
+        # est jetée avant d'atteindre la seule surface qu'un opérateur puisse
+        # interroger. C'est exactement le défaut trouvé sur les quatre
+        # compteurs d'outils de la 5.2.
+        upstream_truncation = metric.get("upstream_truncation")
+        if isinstance(upstream_truncation, dict) and upstream_truncation:
+            node_per_node["upstream_truncation"] = {
+                "dropped_nodes": [
+                    str(nid) for nid in upstream_truncation.get("dropped_nodes") or []
+                ],
+                "truncated_node_id": (
+                    str(truncated)
+                    if (truncated := upstream_truncation.get("truncated_node_id")) is not None
+                    else None
+                ),
+                "result_empty": bool(upstream_truncation.get("result_empty")),
+                "cap_chars": _coerce_token_count(upstream_truncation.get("cap_chars")),
+            }
         handoff_entry = handoffs.get(node_id)
         if isinstance(handoff_entry, dict):
             node_per_node["handoff_summary_tokens"] = {

@@ -30,7 +30,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from agentive_backend.features.agent_registry.schemas import (
@@ -105,7 +105,14 @@ class DevAgentDefinition(BaseModel):
     #: ne possède pas ce champ ») par défaut, pour que les templates des
     #: Stories 5.1 et 5.2 ne se voient pas attribuer une intention que personne
     #: n'a exprimée. Voir ``docs/decisions/dev-pole-agent-handoff-contract.md``.
-    include_raw_previous_output: bool | None = None
+    #:
+    #: ⚠️ ``StrictBool`` et non ``bool``, comme ``UpdateTemplateRequest``.
+    #: Relevé en revue : cette frontière-ci était restée permissive, donc un
+    #: YAML portant ``"true"`` (chaîne) était coercé en ``True`` sans un mot.
+    #: L'argument de l'ADR vaut mot pour mot ici — le moteur ne reconnaît QUE
+    #: le littéral booléen, et fermer une seule des deux portes d'écriture ne
+    #: ferme rien.
+    include_raw_previous_output: StrictBool | None = None
     namespaces: list[DevNamespaceRequirement] = Field(default_factory=list)
     #: Noms d'outils MCP à assigner, résolus au provisioning. Un nom
     #: introuvable fait ÉCHOUER le provisioning : un template silencieusement

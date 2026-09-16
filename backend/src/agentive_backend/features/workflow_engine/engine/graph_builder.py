@@ -29,6 +29,7 @@ from agentive_backend.features.workflow_engine.domain.routing_rules import Routi
 from agentive_backend.features.workflow_engine.domain.value_objects import WorkflowState
 from agentive_backend.features.workflow_engine.engine.agent_node import execute_agent_node
 from agentive_backend.shared.llm.exceptions import LLMError
+from agentive_backend.shared.logging import get_logger
 
 if TYPE_CHECKING:
     from agentive_backend.features.workflow_engine.domain.routing_rules import RoutingRule
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
     from agentive_backend.infra.db.models import AgentTemplate
     from agentive_backend.infra.mcp.tool_executor import ResolvedTool
     from agentive_backend.shared.llm.router import LLMRouter
+
+
+_log = get_logger(__name__)
 
 
 class RoutingDecisionFailedError(RuntimeError):
@@ -255,7 +259,21 @@ def _any_successor_reads_summaries(
         # Mirror `agent_node._build_user_message` EXACTLY, including its
         # strictness: only the literal `True` opts out, so a mistyped value
         # keeps summaries here for the same reason it keeps them there.
-        if config.get("include_raw_previous_output") is not True:
+        opt_out = config.get("include_raw_previous_output")
+        # ...and including its LOG. Revue de la Story 5.3 : la strictness
+        # était bien reflétée, le signal ne l'était pas. `agent_node` émet
+        # `include_raw_previous_output_ignored` quand il ignore une valeur mal
+        # typée ; ici, rien. Un opérateur ne voyait donc que la moitié du
+        # signal — et seulement quand le node s'exécute, alors que ce
+        # chemin-ci décide au BUILD s'il faut payer l'appel LLM de résumé.
+        if opt_out is not None and not isinstance(opt_out, bool):
+            _log.warning(
+                "workflow_engine.include_raw_previous_output_ignored",
+                node_id=successor_id,
+                value_type=type(opt_out).__name__,
+                surface="graph_builder",
+            )
+        if opt_out is not True:
             return True
     return False
 

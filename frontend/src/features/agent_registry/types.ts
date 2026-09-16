@@ -85,6 +85,16 @@ export type UpdateTemplateRequest = {
   llm_params?: LLMParams;
   provider_chain?: ProviderId[];
   error_policy?: ErrorPolicy;
+  /**
+   * Story 5.3 — ce template lit-il les sorties BRUTES de ses nodes amont, au
+   * lieu des résumés de passage ? Absent = les résumés.
+   *
+   * ⚠️ Relevé en revue : `UpdateTemplateRequestSchema` (le miroir Zod)
+   * acceptait déjà ce champ alors que ce type l'interdisait, donc le schéma
+   * validait un payload que le client ne pouvait pas construire. Un miroir à
+   * moitié propagé est la divergence même qu'il sert à éviter.
+   */
+  include_raw_previous_output?: boolean;
 };
 
 export type UpdateTemplateResponse = {

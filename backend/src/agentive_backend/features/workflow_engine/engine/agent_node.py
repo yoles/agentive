@@ -384,7 +384,7 @@ def _handoff_view(entry: Any) -> dict[str, Any] | None:
 
 def _serialize_upstream(
     state: WorkflowState, *, node_id: str, prefer_handoffs: bool
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
     """Serialize the upstream context this node can see, under a size cap.
 
     What LangGraph hands a node is every output committed in a STRICTLY
@@ -500,7 +500,26 @@ def _serialize_upstream(
     else:
         serialized = "{}"
 
+    # Revue de la Story 5.3 — le constat ne vit plus dans le SEUL log.
+    #
+    # Tant que les résumés de passage bornaient la charge amont, ce chemin
+    # était rare. L'opt-out `include_raw_previous_output` l'a rendu ordinaire :
+    # le plafond devient la seule borne, et l'éviction retire LA PLUS GROSSE
+    # entrée d'abord — c'est-à-dire, sur le DAG du Pôle Dev, l'approche ou
+    # l'exploration dont le node aval a précisément besoin. Le node rend alors
+    # un `failed` + `blocking_question` que son contrat juge CONFORME, le run
+    # finit `completed`, et la seule trace de la dégradation était une ligne
+    # de log côté serveur : indiscernable, pour un opérateur, d'un refus
+    # légitime. C'est la « troncature silencieuse » que ce dépôt a déjà payée
+    # quatre fois sur le serveur de code.
+    upstream_truncation: dict[str, Any] | None = None
     if dropped or truncated_node_id is not None:
+        upstream_truncation = {
+            "dropped_nodes": sorted(dropped),
+            "truncated_node_id": truncated_node_id,
+            "result_empty": not outputs,
+            "cap_chars": MAX_UPSTREAM_OUTPUT_CHARS,
+        }
         _log.warning(
             "workflow_engine.upstream_outputs_truncated",
             node_id=node_id,
@@ -533,7 +552,7 @@ def _serialize_upstream(
     if truncated_node_id is not None:
         surviving = surviving - {truncated_node_id}
     if not surviving:
-        return serialized, None
+        return serialized, None, upstream_truncation
     raw_tokens = 0
     summary_tokens = 0
     for nid in surviving:
@@ -550,12 +569,12 @@ def _serialize_upstream(
         # saving from an arithmetic one.
         "sources": sorted(surviving),
     }
-    return serialized, substitution
+    return serialized, substitution, upstream_truncation
 
 
 def _build_user_message(
     state: WorkflowState, *, node_id: str, config: dict[str, Any]
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
     """Compose the node's user message with both untrusted parts wrapped.
 
     CONVENTIONS.md règle d'or #9 (AR44) requires every external input to be
@@ -591,7 +610,7 @@ def _build_user_message(
             value_type=type(opt_out).__name__,
         )
     prefer_handoffs = opt_out is not True
-    upstream, substitution = _serialize_upstream(
+    upstream, substitution, upstream_truncation = _serialize_upstream(
         state, node_id=node_id, prefer_handoffs=prefer_handoffs
     )
     message = (
@@ -600,7 +619,7 @@ def _build_user_message(
         "upstream_outputs:\n"
         f"{wrap_external_input(upstream, 'tool_output')}"
     )
-    return message, substitution
+    return message, substitution, upstream_truncation
 
 
 def _resolve_chain(
@@ -899,7 +918,9 @@ async def execute_agent_node(
     """
     config = template.config if isinstance(template.config, dict) else {}
 
-    user_message, handoff_substitution = _build_user_message(state, node_id=node_id, config=config)
+    user_message, handoff_substitution, upstream_truncation = _build_user_message(
+        state, node_id=node_id, config=config
+    )
 
     model, temperature, max_tokens = _resolve_llm_params(config, node_id=node_id)
     system_prompt = _guarded_system_prompt(str(config.get("system_prompt") or ""))
@@ -983,6 +1004,13 @@ async def execute_agent_node(
         "tool_names": [inv.tool_name for inv in tool_invocations],
         "tool_failures": sum(1 for inv in tool_invocations if inv.status != "success"),
     }
+
+    # La clé n'est émise QUE s'il y a quelque chose à dire — la présence EST
+    # le signal, même posture que `contract_problems`. Une clé toujours
+    # présente à `null` obligerait chaque lecteur à distinguer « pas tronqué »
+    # de « rien mesuré ».
+    if upstream_truncation is not None:
+        node_metric["upstream_truncation"] = upstream_truncation
 
     node_update: dict[str, Any] = {
         "node_outputs": {node_id: node_output},
