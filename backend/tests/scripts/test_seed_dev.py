@@ -802,17 +802,25 @@ async def test_two_homonyms_stop_the_provisioning_and_name_them_both() -> None:
     assert all(str(row.id) in message for row in rows)
 
 
-def test_every_legacy_homonym_is_named_not_just_the_first() -> None:
-    """`legacy[0].id` n'en citait qu'un — alors que la non-unicité est le sujet."""
-    from scripts.seed_dev import DEV_LEAD_WORKFLOW_NAME_V1, DevDepartmentSeeder
+@pytest.mark.asyncio
+async def test_every_legacy_homonym_is_named_not_just_the_first() -> None:
+    """`legacy[0].id` n'en citait qu'un — alors que la non-unicité est le sujet.
+
+    ⚠️ Story 5.3 : le helper est devenu `_report_legacy_entry_workflows` (il y a
+    désormais DEUX générations héritées). La propriété gardée, elle, est
+    inchangée — et c'est la raison pour laquelle ce test a été réécrit plutôt
+    que supprimé.
+    """
+    from scripts.seed_dev import DEV_LEAD_WORKFLOW_NAME_V1
 
     rows = [
         _FakeWorkflowRow(DEV_LEAD_WORKFLOW_NAME_V1, {"dev_lead": uuid.uuid4()}),
         _FakeWorkflowRow(DEV_LEAD_WORKFLOW_NAME_V1, {"dev_lead": uuid.uuid4()}),
     ]
+    seeder = _workflow_seeder({DEV_LEAD_WORKFLOW_NAME_V1: rows})
     report = SeedReport()
 
-    DevDepartmentSeeder._report_legacy_entry_workflow(rows, report)
+    await seeder._report_legacy_entry_workflows(report)
 
     assert len(report.unchanged) == 1
     assert all(str(row.id) in report.unchanged[0] for row in rows)
@@ -838,3 +846,149 @@ def test_a_blank_tool_name_is_refused_by_the_catalog_not_by_the_provisioning() -
                 "tools": ["read_file", "  "],
             }
         )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# include_raw_previous_output — Story 5.3 T1.5
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _probe(**overrides: object) -> Any:
+    from agentive_backend.features.agent_registry.dev_catalog import DevAgentDefinition
+
+    payload: dict[str, object] = {
+        "key": "probe",
+        "name": "Probe",
+        "archetype": "analyste",
+        "system_prompt": "x",
+        "input_contract": {"core": {}, "extras": {}},
+        "output_contract": {"core": {}, "extras": {}},
+    }
+    payload.update(overrides)
+    return DevAgentDefinition.model_validate(payload)
+
+
+def test_the_handoff_opt_out_is_a_config_key_the_provisioning_owns() -> None:
+    """T1.5 — `_OWNED_CONFIG_KEYS` décide de ce que le seed COMPARE.
+
+    Une clé absente de ce tuple est écrite une fois par `update_template` puis
+    plus jamais vérifiée : une divergence entre le YAML et la base passerait
+    pour « inchangé ». C'est le défaut que la normalisation de `push_memory` a
+    déjà dû fermer une fois.
+    """
+    desired = desired_config_subset(_probe(include_raw_previous_output=True))
+    assert desired["include_raw_previous_output"] is True
+
+
+def test_a_catalog_that_does_not_declare_the_opt_out_claims_no_key() -> None:
+    """Le catalogue ne possède que ce qu'il déclare.
+
+    Émettre `False` par défaut ferait écrire la clé sur TOUS les templates du
+    pôle, y compris ceux de la 5.1 et de la 5.2 — donc un `update_template` et
+    un event d'audit sur une intention que personne n'a exprimée.
+    """
+    assert "include_raw_previous_output" not in desired_config_subset(_probe())
+
+
+def test_a_catalog_that_turns_the_opt_out_off_still_owns_the_key() -> None:
+    """`False` n'est pas `None` : le filtre du seed doit les distinguer.
+
+    Un filtre écrit `if value` (au lieu de `if value is not None`) ferait
+    disparaître un opt-out explicitement remis à `False`, et le provisioning
+    cesserait de garder cette décision.
+    """
+    desired = desired_config_subset(_probe(include_raw_previous_output=False))
+    assert desired["include_raw_previous_output"] is False
+
+
+# ─── T5 — le DAG d'entrée passe à QUATRE nodes (Story 5.3) ───────────────
+
+
+def test_the_entry_workflow_mounts_the_four_dev_nodes() -> None:
+    """Le DAG d'entrée monte le pôle tel qu'il existe, pas une moitié.
+
+    `_ENTRY_NODE_KEYS` est ce que `_provision_entry_workflow` exige d'avoir
+    provisionné avant de créer le workflow : une clé oubliée ici donne un
+    workflow amputé qui se lance quand même.
+    """
+    from scripts.seed_dev import _ENTRY_NODE_KEYS
+
+    assert _ENTRY_NODE_KEYS == (
+        "dev_lead",
+        "code_researcher",
+        "architect_analyst",
+        "code_producer",
+    )
+
+
+def test_the_entry_workflow_name_is_versioned_a_third_time() -> None:
+    """T5.3 — `workflows.name` n'est pas unique et l'empreinte couvre le DAG.
+
+    Passer de deux à quatre nodes change l'empreinte : sans changement de nom,
+    le seed créerait une TROISIÈME ligne homonyme et le `workflow_id` que John
+    a noté pointerait toujours sur l'ancienne.
+    """
+    from scripts.seed_dev import (
+        DEV_ENTRY_WORKFLOW_NAME,
+        DEV_ENTRY_WORKFLOW_NAME_V2,
+        DEV_LEAD_WORKFLOW_NAME_V1,
+    )
+
+    names = {DEV_ENTRY_WORKFLOW_NAME, DEV_ENTRY_WORKFLOW_NAME_V2, DEV_LEAD_WORKFLOW_NAME_V1}
+    assert len(names) == 3, "chaque génération doit porter un nom distinct"
+
+
+def test_both_previous_generations_are_looked_up_as_legacy() -> None:
+    """Il y a désormais DEUX générations héritées, pas une.
+
+    Ne chercher que la v1 laisserait le workflow à deux nodes de la Story 5.2
+    invisible dans le rapport — donc un opérateur qui lance l'ancien `workflow_id`
+    sans jamais apprendre qu'il existe une suite.
+    """
+    from scripts.seed_dev import (
+        _LEGACY_ENTRY_WORKFLOW_NAMES,
+        DEV_ENTRY_WORKFLOW_NAME_V2,
+        DEV_LEAD_WORKFLOW_NAME_V1,
+    )
+
+    assert _LEGACY_ENTRY_WORKFLOW_NAMES == (
+        DEV_LEAD_WORKFLOW_NAME_V1,
+        DEV_ENTRY_WORKFLOW_NAME_V2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_legacy_report_names_each_generation_separately() -> None:
+    """Deux générations, deux lignes de rapport — et chacune nomme SES rows.
+
+    Les fondre en une seule ligne redonnerait le défaut que la revue de la 5.2
+    a corrigé sur `legacy[0].id` : un rapport qui masque des lignes en base.
+    """
+    from scripts.seed_dev import DEV_ENTRY_WORKFLOW_NAME_V2, DEV_LEAD_WORKFLOW_NAME_V1
+
+    v1 = _FakeWorkflowRow(DEV_LEAD_WORKFLOW_NAME_V1, {"dev_lead": uuid.uuid4()})
+    v2 = _FakeWorkflowRow(
+        DEV_ENTRY_WORKFLOW_NAME_V2, {"dev_lead": uuid.uuid4(), "code_researcher": uuid.uuid4()}
+    )
+    seeder = _workflow_seeder({DEV_LEAD_WORKFLOW_NAME_V1: [v1], DEV_ENTRY_WORKFLOW_NAME_V2: [v2]})
+    report = SeedReport()
+
+    await seeder._report_legacy_entry_workflows(report)
+
+    assert len(report.unchanged) == 2
+    joined = "\n".join(report.unchanged)
+    assert str(v1.id) in joined
+    assert str(v2.id) in joined
+    assert DEV_LEAD_WORKFLOW_NAME_V1 in joined
+    assert DEV_ENTRY_WORKFLOW_NAME_V2 in joined
+
+
+@pytest.mark.asyncio
+async def test_a_generation_with_no_row_produces_no_report_line() -> None:
+    """Une base neuve n'a aucun workflow hérité : ne rien dire est la vérité."""
+    seeder = _workflow_seeder({})
+    report = SeedReport()
+
+    await seeder._report_legacy_entry_workflows(report)
+
+    assert report.unchanged == []

@@ -311,6 +311,14 @@ class AgentConfig:
     provider_chain: ProviderChain | None = None
     error_policy: ErrorPolicy | None = None
     push_memory: PushMemorySettings | None = None
+    #: Story 5.3 — ce template lit-il les sorties amont BRUTES plutôt que les
+    #: résumés de passage de la Story 4.7 ? Trois états, et les trois sont
+    #: distincts : ``None`` = jamais réglé, ``False`` = résumés (le défaut du
+    #: moteur), ``True`` = sorties brutes. Lu par
+    #: ``agent_node._build_user_message`` et par
+    #: ``graph_builder._any_successor_reads_summaries``, qui n'y reconnaissent
+    #: que le littéral ``True``.
+    include_raw_previous_output: bool | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> AgentConfig:
@@ -354,6 +362,13 @@ class AgentConfig:
                 if "push_memory" in raw
                 else None
             ),
+            # `raw.get(...)` et non `bool(raw.get(...))` : le troisième état
+            # (« jamais réglé ») doit survivre à la lecture. Une valeur non
+            # booléenne déjà présente en JSONB est rendue telle quelle plutôt
+            # que normalisée — le moteur, qui ne reconnaît que le littéral
+            # `True`, la traitera comme un non, et le log qu'il émet est le
+            # seul endroit où un opérateur peut apprendre qu'elle est là.
+            include_raw_previous_output=raw.get("include_raw_previous_output"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -384,6 +399,11 @@ class AgentConfig:
             out["error_policy"] = self.error_policy.to_mapping()
         if self.push_memory is not None:
             out["push_memory"] = self.push_memory.to_mapping()
+        # `is not None`, jamais un test de vérité : `False` est une valeur
+        # SIGNIFIANTE (« remets-moi les résumés »), et la faire disparaître ici
+        # rendrait le réglage impossible à annuler par l'API.
+        if self.include_raw_previous_output is not None:
+            out["include_raw_previous_output"] = self.include_raw_previous_output
         return out
 
     def merge_updates(
@@ -397,6 +417,7 @@ class AgentConfig:
         provider_chain: ProviderChain | None = None,
         error_policy: ErrorPolicy | None = None,
         push_memory: PushMemorySettings | None = None,
+        include_raw_previous_output: bool | None = None,
     ) -> AgentConfig:
         """Return a new ``AgentConfig`` with only the non-``None`` kwargs
         overridden — mirrors ``UpdateTemplateRequest``'s PATCH-like semantics
@@ -418,6 +439,13 @@ class AgentConfig:
             provider_chain=self.provider_chain if provider_chain is None else provider_chain,
             error_policy=self.error_policy if error_policy is None else error_policy,
             push_memory=self.push_memory if push_memory is None else push_memory,
+            # `if ... is None else ...` et non `or` : un `False` explicite doit
+            # écraser un `True` persisté, sinon l'opt-out ne se désactive plus.
+            include_raw_previous_output=(
+                self.include_raw_previous_output
+                if include_raw_previous_output is None
+                else include_raw_previous_output
+            ),
         )
 
 

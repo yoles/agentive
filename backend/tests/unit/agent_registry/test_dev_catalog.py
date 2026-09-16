@@ -308,3 +308,118 @@ def test_code_researcher_declares_no_namespace_it_would_not_use() -> None:
     definition = load_dev_catalog()["code_researcher"]
     assert definition.push_memory is None
     assert definition.namespaces == []
+
+
+def test_no_dev_template_declares_more_tokens_than_the_engine_allows() -> None:
+    """Un `max_tokens` au-dessus du plafond moteur est une capacité annoncée
+    et jamais obtenue.
+
+    `agent_node` rabote à `MAX_TOKENS_HARD_CAP` et émet un
+    `workflow_engine.node_max_tokens_clamped` à CHAQUE run : le template
+    promet alors une marge qu'il n'a pas, et le seul signal est une ligne de
+    log que personne ne lit. Trouvé sur le premier run E2E de la Story 5.3,
+    où `code_producer` demandait 16 384 contre un plafond de 16 000.
+
+    Le test importe les deux côtés — c'est précisément ce que ni
+    `agent_registry` ni `workflow_engine` ne peuvent faire l'un de l'autre
+    (`.import-linter` Contract 1), donc l'endroit où la parité peut être
+    gardée.
+    """
+    from agentive_backend.features.workflow_engine.engine.agent_node import MAX_TOKENS_HARD_CAP
+
+    for key, definition in load_dev_catalog().items():
+        if definition.llm_params is None:
+            continue
+        assert definition.llm_params.max_tokens <= MAX_TOKENS_HARD_CAP, (
+            f"{key} déclare max_tokens={definition.llm_params.max_tokens}, "
+            f"au-dessus du plafond moteur {MAX_TOKENS_HARD_CAP}"
+        )
+
+
+# ─── Story 5.3 — les deux templates de la chaîne de production ────────
+
+
+def test_the_two_new_agents_declare_exactly_the_tools_their_role_needs() -> None:
+    """Une liste d'outils est une DÉCISION, pas un détail de configuration.
+
+    ⚠️ Ce test existe parce qu'une mutation l'a exigé : vider `tools` du Code
+    Producer ne faisait tomber AUCUN test. Le mock LLM n'appelle jamais d'outil
+    pour ce node, donc aucun E2E ne le voit — exactement la forme « livré mais
+    non exercé » que la revue de la Story 5.1 avait relevée sur le mécanisme
+    d'assignation lui-même.
+    """
+    catalog = load_dev_catalog()
+    assert catalog["architect_analyst"].tools == ["read_file", "search_content"]
+    assert catalog["code_producer"].tools == ["read_file", "search_content", "find_files"]
+
+
+def test_no_dev_agent_is_assigned_a_write_capable_tool() -> None:
+    """La contrainte « lecture seule en Sprint 2 » (Story 5.0 AC5) n'est pas
+    une prudence vague : un nœud rejoué RÉ-APPELLE ses outils, et le moteur ne
+    sait pas distinguer un outil idempotent d'un outil qui ne l'est pas.
+
+    Le serveur `dev-code-search` n'expose que de la lecture, donc la liste
+    ci-dessous est aujourd'hui la seule possible ; ce test garde le jour où un
+    second serveur apparaîtra.
+    """
+    read_only = {"list_directory", "read_file", "find_files", "search_content"}
+    for key, definition in load_dev_catalog().items():
+        assert set(definition.tools) <= read_only, f"{key} porte un outil hors lecture seule"
+
+
+def test_the_two_new_agents_prompts_name_every_tool_they_are_assigned() -> None:
+    """Même propriété que pour le Chercheur : un outil assigné que le prompt ne
+    nomme pas est découvert par son seul schéma, et un outil nommé non assigné
+    produit une hallucination de nom que `McpToolExecutor` doit rattraper."""
+    catalog = load_dev_catalog()
+    for key in ("architect_analyst", "code_producer"):
+        definition = catalog[key]
+        for tool in definition.tools:
+            assert f"`{tool}(" in definition.system_prompt, f"{key} : {tool}"
+
+
+def test_the_producer_prompt_states_that_it_writes_nothing() -> None:
+    """C'est la règle qui empêche le Producteur d'annoncer un travail qu'il n'a
+    pas fait. Ses outils sont en lecture seule ; son prompt doit le DIRE, sinon
+    il rendra « j'ai modifié le fichier » sur un diff jamais appliqué."""
+    prompt = load_dev_catalog()["code_producer"].system_prompt
+    assert "TU N'ÉCRIS AUCUN FICHIER" in prompt
+    assert "approach_ref" in prompt, "la traçabilité de l'AC3 doit être énoncée au modèle"
+
+
+def test_the_analyst_prompt_requires_a_rejected_alternative() -> None:
+    """AC3 — sans cette règle, une recommandation sans option écartée reste
+    formellement conforme au contrat. Le validateur la refuse ; encore faut-il
+    que le prompt l'ait demandée, sinon on punit un modèle qu'on n'a pas
+    prévenu."""
+    prompt = load_dev_catalog()["architect_analyst"].system_prompt
+    assert '"chosen": false' in prompt
+    assert "complexity" in prompt
+
+
+def test_the_two_new_agents_read_raw_upstream_output() -> None:
+    """T1 — c'est la déclaration qui rend l'AC3 vérifiable.
+
+    Sous le régime de résumé, les `approach.steps[].id` de l'Analyste ne
+    survivent pas jusqu'au Producteur, et `code_diffs[].approach_ref` ne peut
+    référencer plus rien.
+    """
+    catalog = load_dev_catalog()
+    assert catalog["architect_analyst"].include_raw_previous_output is True
+    assert catalog["code_producer"].include_raw_previous_output is True
+    # Le Chercheur reste sur les résumés — décision documentée dans l'ADR, et
+    # inverser ce choix bumperait son prompt donc son protocole de qualité.
+    assert catalog["code_researcher"].include_raw_previous_output is None
+
+
+def test_the_producer_declares_the_metier_namespace_identically_to_the_dev_lead() -> None:
+    """`catalog_namespaces` LÈVE sur deux déclarations divergentes du même nom.
+
+    Le provisioning n'aurait aucune raison d'en préférer une, et créer la
+    première rencontrée ferait dépendre le résultat de l'ordre alphabétique des
+    fichiers.
+    """
+    catalog = load_dev_catalog()
+    assert catalog["code_producer"].namespaces == catalog["dev_lead"].namespaces
+    assert catalog["code_producer"].push_memory is not None
+    assert catalog["code_producer"].push_memory.namespace == "dev-metier"

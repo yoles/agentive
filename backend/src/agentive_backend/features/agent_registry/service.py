@@ -437,6 +437,7 @@ class AgentTemplateService:
                 push_memory=(
                     payload.push_memory.to_domain() if payload.push_memory is not None else None
                 ),
+                include_raw_previous_output=payload.include_raw_previous_output,
             )
 
             revision = aggregate.revise(merged_config)

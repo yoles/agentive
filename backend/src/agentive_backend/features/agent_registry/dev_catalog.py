@@ -100,6 +100,12 @@ class DevAgentDefinition(BaseModel):
     llm_params: LLMParams | None = None
     error_policy: ErrorPolicy | None = None
     push_memory: PushMemoryConfig | None = None
+    #: Story 5.3 — cet agent lit-il la sortie BRUTE de ses amonts, plutôt que
+    #: le résumé de passage de la Story 4.7 ? Laissé à ``None`` (« le catalogue
+    #: ne possède pas ce champ ») par défaut, pour que les templates des
+    #: Stories 5.1 et 5.2 ne se voient pas attribuer une intention que personne
+    #: n'a exprimée. Voir ``docs/decisions/dev-pole-agent-handoff-contract.md``.
+    include_raw_previous_output: bool | None = None
     namespaces: list[DevNamespaceRequirement] = Field(default_factory=list)
     #: Noms d'outils MCP à assigner, résolus au provisioning. Un nom
     #: introuvable fait ÉCHOUER le provisioning : un template silencieusement
@@ -147,6 +153,7 @@ class DevAgentDefinition(BaseModel):
             llm_params=self.llm_params,
             error_policy=self.error_policy,
             push_memory=self.push_memory,
+            include_raw_previous_output=self.include_raw_previous_output,
         )
 
 

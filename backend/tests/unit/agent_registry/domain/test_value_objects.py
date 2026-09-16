@@ -273,3 +273,55 @@ def test_agent_config_merge_updates_push_memory_does_not_touch_other_fields() ->
     assert out["push_memory"] == {"namespace": "team-alpha", "optin": True}
     # Original is untouched (frozen VO — merge returns a new instance).
     assert base.push_memory is None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AgentConfig.include_raw_previous_output — Story 5.3 T1
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def test_the_handoff_opt_out_survives_the_config_round_trip() -> None:
+    """``from_mapping`` → ``to_mapping`` ne doit rien perdre.
+
+    La clé vit dans le JSONB ``agent_templates.config`` et c'est ce JSONB que
+    ``graph_builder`` et ``agent_node`` relisent. Une clé lue mais non
+    réémise ferait disparaître le réglage au premier ``update_template``.
+    """
+    config = AgentConfig.from_mapping({"include_raw_previous_output": True})
+    assert config.include_raw_previous_output is True
+    assert config.to_mapping()["include_raw_previous_output"] is True
+
+
+def test_an_absent_handoff_opt_out_emits_no_key_at_all() -> None:
+    """Sémantique de construction progressive : absent ≠ ``False``.
+
+    ``to_mapping`` n'émet que les champs non-``None`` — un template qui n'a
+    jamais réglé ce point ne doit pas se voir attribuer une valeur qu'il n'a
+    pas choisie, sans quoi le provisioning verrait une divergence perpétuelle.
+    """
+    assert "include_raw_previous_output" not in AgentConfig.from_mapping({}).to_mapping()
+
+
+def test_turning_the_handoff_opt_out_off_is_kept_not_dropped() -> None:
+    """``False`` est signifiant et doit être ÉMIS.
+
+    Le piège est un `if self.x:` au lieu d'un `if self.x is not None:` — il
+    ferait disparaître un opt-out explicitement remis à `False`, donc rendrait
+    le réglage impossible à annuler.
+    """
+    config = AgentConfig.from_mapping({"include_raw_previous_output": False})
+    assert config.include_raw_previous_output is False
+    assert config.to_mapping()["include_raw_previous_output"] is False
+
+
+def test_merging_the_handoff_opt_out_follows_patch_semantics() -> None:
+    """``None`` laisse la valeur en place, ``False`` l'écrase.
+
+    Même piège que ci-dessus, du côté du merge : `x or self.x` garderait
+    `True` alors que l'appelant demandait `False`.
+    """
+    current = AgentConfig.from_mapping({"include_raw_previous_output": True})
+    assert current.merge_updates().include_raw_previous_output is True
+    assert current.merge_updates(include_raw_previous_output=False).include_raw_previous_output is (
+        False
+    )

@@ -26,6 +26,7 @@ jugement-là est manuel, et son protocole est au runbook
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import re
 from decimal import Decimal
@@ -35,6 +36,8 @@ from typing import Any
 import httpx
 import pytest
 from scripts.seed_dev import (
+    ARCHITECT_ANALYST_NODE_ID,
+    CODE_PRODUCER_NODE_ID,
     CODE_RESEARCHER_NODE_ID,
     DEV_ENTRY_WORKFLOW_NAME,
     DEV_LEAD_NODE_ID,
@@ -212,6 +215,103 @@ _RESEARCHER_ANSWER = json.dumps(
 )
 
 
+#: Une sortie d'Architect Analyst bien formée (Story 5.3).
+#:
+#: Les `approach.steps[].id` sont ce que le Code Producer doit citer dans
+#: `code_diffs[].approach_ref` — c'est le chaînon de l'AC3, et le test qui le
+#: vérifie ne lit PAS cette constante : il extrait les `id` de la sortie que le
+#: MOTEUR a réellement produite pour le node `architect_analyst`.
+_ANALYST_ANSWER = json.dumps(
+    {
+        "status": "done",
+        "summary": "Suivre le gabarit router/service/schemas des modules existants",
+        "approach": {
+            "summary": "Créer le package sur le gabarit relevé, brancher le repo partagé.",
+            "complexity": "medium",
+            "steps": [
+                {
+                    "id": "a1",
+                    "title": "Créer le package avec router/service/schemas",
+                    "rationale": "douze modules portent déjà cette forme",
+                },
+                {
+                    "id": "a2",
+                    "title": "Brancher l'accès base par shared/repositories",
+                    "rationale": "règle d'or #4",
+                },
+            ],
+        },
+        "tradeoffs": [
+            {
+                "option": "Suivre le gabarit existant",
+                "pros": ["cohérence avec M2-M12"],
+                "cons": ["peu de marge de manœuvre"],
+                "chosen": True,
+                "rationale": "la cohérence prime sur la liberté pour un module de plus",
+            },
+            {
+                "option": "Repartir d'une structure neuve",
+                "pros": ["liberté de conception"],
+                "cons": ["divergence avec douze modules"],
+                "chosen": False,
+                "rationale": "aucun bénéfice qui paie la divergence",
+            },
+        ],
+        "risks": [
+            {
+                "risk": "Violation d'un contrat import-linter",
+                "severity": "high",
+                "mitigation": "passer par shared/contracts, jamais par un import croisé",
+            }
+        ],
+        "test_strategy": {
+            "levels": ["unit", "integration"],
+            "focus": ["le routeur refuse un payload inconnu"],
+        },
+    },
+    ensure_ascii=False,
+)
+
+#: Une sortie de Code Producer bien formée (Story 5.3).
+#:
+#: Les `approach_ref` valent `a1` et `a2` — les `id` que `_ANALYST_ANSWER`
+#: déclare. Le test de l'AC3 vérifie cette correspondance en lisant les DEUX
+#: sorties depuis le moteur, jamais depuis ces deux littéraux : une assertion
+#: sur la constante serait circulaire, exactement le défaut que la revue de la
+#: Story 5.7 a dû corriger sur son propre test « qui compte ».
+_PRODUCER_ANSWER = json.dumps(
+    {
+        "status": "done",
+        "summary": "Squelette du module, ses tests et son entrée de runbook",
+        "code_diffs": [
+            {
+                "path": "backend/src/agentive_backend/features/m13/router.py",
+                "diff": "+from fastapi import APIRouter\n+router = APIRouter()\n",
+                "approach_ref": "a1",
+                "rationale": "étape a1 : créer le package sur le gabarit relevé",
+            },
+            {
+                "path": "backend/src/agentive_backend/features/m13/service.py",
+                "diff": "+class M13Service:\n+    ...\n",
+                "approach_ref": "a2",
+                "rationale": "étape a2 : l'accès base passe par shared/repositories",
+            },
+        ],
+        "tests": [
+            {
+                "path": "backend/tests/unit/m13/test_router.py",
+                "level": "unit",
+                "content": "def test_unknown_payload_is_refused() -> None: ...",
+                "covers": ["a1"],
+            }
+        ],
+        "docs_snippets": [{"target": "docs/runbooks/m13.md", "content": "# M13 — mise en service"}],
+        "unaddressed": [],
+    },
+    ensure_ascii=False,
+)
+
+
 def _completion(text_: str) -> Completion:
     return Completion(
         text=text_,
@@ -255,18 +355,35 @@ _HANDOFF_SUMMARY = json.dumps(
 )
 
 
+#: Ce que le DAG consomme APRÈS le node `code_researcher` (Story 5.3).
+#:
+#: ⚠️ Aucun résumé de passage entre ces trois nodes, et ce n'est pas un oubli :
+#: `architect_analyst` et `code_producer` déclarent
+#: `include_raw_previous_output: true`, donc
+#: `graph_builder._any_successor_reads_summaries` rend `False` pour leurs
+#: émetteurs et le moteur ne DEMANDE PLUS le résumé — l'appel LLM est
+#: économisé, pas seulement ignoré. Le seul résumé qui subsiste est celui du
+#: Dev Lead, dont le successeur (`code_researcher`) lit encore les résumés.
+_DOWNSTREAM_COMPLETIONS: list[str] = [_ANALYST_ANSWER, _PRODUCER_ANSWER]
+
+
 def _dag_completions(plan_json: str) -> list[Completion]:
-    """Les TROIS réponses qu'un run du DAG d'entrée consomme, dans l'ordre.
+    """Les CINQ réponses qu'un run du DAG d'entrée consomme, dans l'ordre.
 
     `MockProvider` est FIFO, et l'ordre est : le node `dev_lead`, le résumé de
-    passage de l'arête, puis le node `code_researcher`. Une liste plus courte
-    fait échouer le dernier node sur une file vide — le run finit `error` et
-    le test échoue très loin de son sujet.
+    passage de SON arête, puis `code_researcher`, `architect_analyst` et
+    `code_producer`. Une liste plus courte fait échouer le dernier node sur une
+    file vide — le run finit `error` et le test échoue très loin de son sujet.
+
+    ⚠️ Story 5.3 — c'était TROIS avant que le DAG passe à quatre nodes. Le
+    décompte ne suit pas le nombre de nodes : il suit le nombre de nodes PLUS
+    le nombre d'arêtes dont la cible lit encore les résumés de passage.
     """
     return [
         _completion(plan_json),
         _completion(_HANDOFF_SUMMARY),
         _completion(_RESEARCHER_ANSWER),
+        *(_completion(answer) for answer in _DOWNSTREAM_COMPLETIONS),
     ]
 
 
@@ -511,18 +628,23 @@ async def test_the_entry_workflow_mounts_the_dev_lead_template(
         dag = row.scalar_one()
     payload = dag if isinstance(dag, dict) else json.loads(dag)
     nodes = payload["nodes"]
-    assert [node["node_id"] for node in nodes] == [DEV_LEAD_NODE_ID, CODE_RESEARCHER_NODE_ID]
-    assert nodes[0]["agent_template_id"] == str(report.template_ids["dev_lead"])
-    assert nodes[1]["agent_template_id"] == str(report.template_ids["code_researcher"])
-    # L'edge, sans condition : le Chercheur s'exécute quoi que le Dev Lead ait
-    # rendu — y compris un plan `failed`, cas où c'est justement le codebase
-    # qu'il faut regarder pour répondre à la `blocking_question`.
+    # Story 5.3 — la chaîne complète du pôle, dans son ordre naturel : on
+    # explore avant d'analyser, on analyse avant de produire.
+    expected_order = [
+        DEV_LEAD_NODE_ID,
+        CODE_RESEARCHER_NODE_ID,
+        ARCHITECT_ANALYST_NODE_ID,
+        CODE_PRODUCER_NODE_ID,
+    ]
+    assert [node["node_id"] for node in nodes] == expected_order
+    for node in nodes:
+        assert node["agent_template_id"] == str(report.template_ids[node["node_id"]])
+    # Les edges, sans condition : chaque node s'exécute quoi que son amont ait
+    # rendu — y compris un `failed`, cas où c'est justement l'aval qui peut
+    # répondre à la `blocking_question`.
     assert payload["edges"] == [
-        {
-            "from_node_id": DEV_LEAD_NODE_ID,
-            "to_node_id": CODE_RESEARCHER_NODE_ID,
-            "condition": None,
-        }
+        {"from_node_id": source, "to_node_id": target, "condition": None}
+        for source, target in itertools.pairwise(expected_order)
     ]
 
 
@@ -573,14 +695,22 @@ async def test_a_natural_language_request_is_acknowledged_on_the_first_sse_frame
 
         # L'accusé est déjà sur le 201 : le dogfooding de Sprint 2 se fait en
         # client HTTP, pas dans une UI.
-        # T5.4 — le DAG a un node de plus, donc l'accusé nomme un agent de
-        # plus ET son ETA (somme des médianes PAR NODE) double. Ce test
-        # épinglait déjà la phrase exacte, et c'est ce qui rend la bascule
-        # visible plutôt que subie.
+        # T5.5 (Story 5.3) — le DAG a DEUX nodes de plus qu'en 5.2, donc
+        # l'accusé nomme deux agents de plus ET son ETA (somme des médianes PAR
+        # NODE) passe de 2 à 4 minutes. Ce test épinglait déjà la phrase
+        # exacte, et c'est ce qui rend la bascule visible plutôt que subie.
         ack = body["acknowledgement"]
-        assert ack["message"] == "Compris. Je mobilise Dev Lead et Code Researcher. ETA ~2 min."
-        assert ack["agents"] == ["Dev Lead", "Code Researcher"]
-        assert ack["eta_minutes"] == 2
+        assert ack["message"] == (
+            "Compris. Je mobilise Dev Lead, Code Researcher, Architect Analyst "
+            "et Code Producer. ETA ~4 min."
+        )
+        assert ack["agents"] == [
+            "Dev Lead",
+            "Code Researcher",
+            "Architect Analyst",
+            "Code Producer",
+        ]
+        assert ack["eta_minutes"] == 4
         # ⚠️ `eta_source` est asserté ICI parce que le package n'a AUCUNE
         # fixture de purge : tous les tests du module partagent le même
         # `workflow_id` et voient l'historique des runs précédents. L'ancienne
@@ -684,9 +814,14 @@ async def test_the_acknowledgement_is_built_without_calling_the_llm(
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
 
-    # Exactement TROIS appels : un par node du DAG, plus le résumé de passage
-    # de l'arête. Aucun pour l'accusé — c'est ce que ce test garde.
-    assert len(provider.calls) == 3
+    # Exactement CINQ appels : un par node du DAG (quatre), plus UN seul résumé
+    # de passage — celui du Dev Lead, dont le successeur `code_researcher` lit
+    # encore les résumés. Les deux arêtes suivantes n'en produisent aucun,
+    # leurs cibles déclarant `include_raw_previous_output: true`
+    # (`graph_builder._any_successor_reads_summaries`). Aucun appel pour
+    # l'accusé — c'est ce que ce test garde, et le décompte exact est ce qui le
+    # rend capable de le prouver.
+    assert len(provider.calls) == 5
 
 
 @pytest.mark.asyncio
@@ -802,8 +937,15 @@ async def test_a_run_reads_its_eta_from_the_measured_history_of_past_runs(
                 "m": json.dumps(
                     {
                         "per_node": {
+                            # Story 5.3 — les QUATRE nodes, et c'est nécessaire :
+                            # `build_acknowledgement` ne rend `eta_source:
+                            # history` que si CHAQUE node du DAG a un
+                            # échantillon. Un seul node sans mesure fait
+                            # basculer tout l'accusé en `heuristic`.
                             DEV_LEAD_NODE_ID: {"duration_ms": 180_000},
                             CODE_RESEARCHER_NODE_ID: {"duration_ms": 120_000},
+                            ARCHITECT_ANALYST_NODE_ID: {"duration_ms": 90_000},
+                            CODE_PRODUCER_NODE_ID: {"duration_ms": 150_000},
                         }
                     }
                 ),
@@ -826,9 +968,10 @@ async def test_a_run_reads_its_eta_from_the_measured_history_of_past_runs(
             "le node du DAG n'a pas retrouvé sa durée mesurée — les clés de "
             "`templates` et de `metrics.per_node` ont divergé"
         )
-        # 180 s + 120 s ⇒ 5 min. Le repli heuristique aurait rendu 2 min.
-        assert ack["eta_minutes"] == 5
-        assert "ETA ~5 min." in ack["message"]
+        # 180 + 120 + 90 + 150 s ⇒ 540 s ⇒ 9 min. Le repli heuristique aurait
+        # rendu 4 min (quatre nodes au défaut de 60 s).
+        assert ack["eta_minutes"] == 9
+        assert "ETA ~9 min." in ack["message"]
 
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
@@ -866,8 +1009,15 @@ async def test_a_workflow_whose_recent_runs_all_failed_still_finds_its_measured_
                 "m": json.dumps(
                     {
                         "per_node": {
+                            # Story 5.3 — les QUATRE nodes, et c'est nécessaire :
+                            # `build_acknowledgement` ne rend `eta_source:
+                            # history` que si CHAQUE node du DAG a un
+                            # échantillon. Un seul node sans mesure fait
+                            # basculer tout l'accusé en `heuristic`.
                             DEV_LEAD_NODE_ID: {"duration_ms": 180_000},
                             CODE_RESEARCHER_NODE_ID: {"duration_ms": 120_000},
+                            ARCHITECT_ANALYST_NODE_ID: {"duration_ms": 90_000},
+                            CODE_PRODUCER_NODE_ID: {"duration_ms": 150_000},
                         }
                     }
                 ),
@@ -904,7 +1054,7 @@ async def test_a_workflow_whose_recent_runs_all_failed_still_finds_its_measured_
             "25 échecs récents ont masqué l'historique mesuré — le filtre de statut "
             "est appliqué APRÈS la troncature"
         )
-        assert ack["eta_minutes"] == 5
+        assert ack["eta_minutes"] == 9
 
         run_id = run_resp.json()["run_id"]
         assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
@@ -1254,6 +1404,9 @@ async def test_the_code_researcher_really_calls_its_tools_during_a_run(
             _completion(_HANDOFF_SUMMARY),  # résumé de passage de l'arête
             asking_for_a_tool,  # node `code_researcher`, tour 1
             _completion(_RESEARCHER_ANSWER),  # node `code_researcher`, tour 2
+            # Story 5.3 — le DAG continue : `architect_analyst` puis
+            # `code_producer`, sans résumé entre eux (ils lisent le brut).
+            *(_completion(answer) for answer in _DOWNSTREAM_COMPLETIONS),
         ],
     )
 
@@ -1370,6 +1523,9 @@ async def test_a_refused_path_inside_a_run_does_not_kill_the_run(
             _completion(_HANDOFF_SUMMARY),
             asking_for_a_forbidden_path,
             _completion(_RESEARCHER_ANSWER),
+            # Story 5.3 — le DAG continue : `architect_analyst` puis
+            # `code_producer`, sans résumé entre eux (ils lisent le brut).
+            *(_completion(answer) for answer in _DOWNSTREAM_COMPLETIONS),
         ],
     )
 
@@ -1481,6 +1637,9 @@ async def test_an_operator_can_read_the_researchers_output_over_http(
             _completion(_HANDOFF_SUMMARY),  # résumé de passage de l'arête
             asking_for_a_tool,  # node `code_researcher`, tour 1
             _completion(_RESEARCHER_ANSWER),  # node `code_researcher`, tour 2
+            # Story 5.3 — le DAG continue : `architect_analyst` puis
+            # `code_producer`, sans résumé entre eux (ils lisent le brut).
+            *(_completion(answer) for answer in _DOWNSTREAM_COMPLETIONS),
         ],
     )
 
@@ -1518,7 +1677,12 @@ async def test_an_operator_can_read_the_researchers_output_over_http(
     # (2) — la sortie, en entier, avec sa provenance dite.
     assert body["node_outputs_source"] == "checkpointer"
     outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
-    assert set(outputs) == {DEV_LEAD_NODE_ID, CODE_RESEARCHER_NODE_ID}
+    assert set(outputs) == {
+        DEV_LEAD_NODE_ID,
+        CODE_RESEARCHER_NODE_ID,
+        ARCHITECT_ANALYST_NODE_ID,
+        CODE_PRODUCER_NODE_ID,
+    }
     researcher = outputs[CODE_RESEARCHER_NODE_ID]
     assert researcher["source"] == "checkpointer"
     assert researcher["truncated"] is False
@@ -1543,7 +1707,12 @@ async def test_an_operator_can_read_the_researchers_output_over_http(
     # aucune couverture positive, seulement des assertions `is None`.
     assert body["mise_en_place"]["all_passed"] is True
     assert len(body["mise_en_place"]["checks"]) == 4
-    assert body["acknowledgement"]["agents"] == ["Dev Lead", "Code Researcher"]
+    assert body["acknowledgement"]["agents"] == [
+        "Dev Lead",
+        "Code Researcher",
+        "Architect Analyst",
+        "Code Producer",
+    ]
     assert body["acknowledgement"]["eta_source"] in {"history", "heuristic"}
     assert body["acknowledgement"]["message"].startswith("Compris.")
 
@@ -1591,6 +1760,9 @@ async def test_a_long_node_output_is_reassembled_page_by_page_over_http(
             _completion(canned),
             _completion(_HANDOFF_SUMMARY),
             _completion(_RESEARCHER_ANSWER),
+            # Story 5.3 — le DAG continue : `architect_analyst` puis
+            # `code_producer`, sans résumé entre eux (ils lisent le brut).
+            *(_completion(answer) for answer in _DOWNSTREAM_COMPLETIONS),
         ],
     )
 
@@ -1651,3 +1823,290 @@ async def test_a_long_node_output_is_reassembled_page_by_page_over_http(
         assert len(rebuilt) == total
         assert pages > 1, "le plafond de 64 n'a rien coupé : le test ne prouve rien"
         assert json.loads(rebuilt) == json.loads(_RESEARCHER_ANSWER)
+
+
+# ─── Story 5.3 — la chaîne Analyste → Producteur ─────────────────────
+
+
+async def _run_the_full_chain(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    *,
+    producer_answer: str = _PRODUCER_ANSWER,
+) -> tuple[dict[str, Any], MockProvider]:
+    """Lance un run du DAG à quatre nodes et rend (détail HTTP, provider).
+
+    Le détail vient de l'endpoint de la Story 5.7 — la seule surface qu'un
+    opérateur ait réellement, et celle que le protocole manuel utilise. Lire
+    la base ici prouverait moins.
+    """
+    report = await _seed(app_session_factory)
+    objective, canned = _CASES["scaffolding"]
+    provider = MockProvider(
+        "mock",
+        [
+            _completion(canned),
+            _completion(_HANDOFF_SUMMARY),
+            _completion(_RESEARCHER_ANSWER),
+            _completion(_ANALYST_ANSWER),
+            _completion(producer_answer),
+        ],
+    )
+    app = _make_app(session_factory=app_session_factory)
+    app.state.workflow_checkpointer = workflow_checkpointer
+    app.state.llm_router = LLMRouter(providers={"mock": provider}, default_chain=["mock"])
+    wire_execution_service(app)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_resp = await client.post(
+            f"/api/v1/workflows/{report.workflow_id}/runs",
+            headers=_auth_headers(),
+            json={"input": {"objective": objective}},
+        )
+        assert run_resp.status_code == 201, run_resp.text
+        run_id = run_resp.json()["run_id"]
+        assert await _wait_for_terminal(client, app_session_factory, run_id) == "completed"
+        detail = await client.get(f"/api/v1/workflows/runs/{run_id}", headers=_auth_headers())
+
+    assert detail.status_code == 200, detail.text
+    return detail.json(), provider
+
+
+@pytest.mark.asyncio
+async def test_the_producer_cites_approach_steps_the_analyst_actually_produced(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """AC3 — LE test de cette story, et il n'est pas circulaire.
+
+    Les deux côtés du chaînon sont lus dans la sortie que le MOTEUR a
+    persistée et que l'endpoint de la Story 5.7 rend : les `id` d'étape
+    viennent du node `architect_analyst`, les `approach_ref` du node
+    `code_producer`. Aucune assertion contre une constante de ce fichier — ce
+    qui est exactement le défaut que la revue de la Story 5.7 a dû corriger
+    sur son propre test « qui compte », où `is_file()` acceptait un chemin réel
+    que l'outil n'avait jamais rendu.
+
+    Vérifié par mutation : faire citer au Producteur un `approach_ref` que
+    l'Analyste n'a pas déclaré fait tomber ce test.
+    """
+    body, _provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
+
+    outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
+    analyst = json.loads(outputs[ARCHITECT_ANALYST_NODE_ID]["output"])
+    producer = json.loads(outputs[CODE_PRODUCER_NODE_ID]["output"])
+
+    declared_steps = {step["id"] for step in analyst["approach"]["steps"]}
+    assert declared_steps, "l'Analyste n'a déclaré aucune étape : il n'y a rien à référencer"
+
+    cited = {diff["approach_ref"] for diff in producer["code_diffs"]}
+    assert cited, "le Producteur ne cite aucune étape : l'AC3 n'a rien à vérifier"
+    assert cited <= declared_steps, (
+        f"le Producteur cite des étapes que l'Analyste n'a pas produites : "
+        f"{sorted(cited - declared_steps)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_new_contracts_are_honoured_at_runtime_not_only_declared(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """AC1, second niveau — « déclaré » et « honoré » sont deux affirmations.
+
+    La Story 5.2 avait déclaré quatre clés sans rien brancher dessus : son
+    contrat était vérifiable à l'œil et par rien d'autre. Ici les deux
+    nouveaux nodes portent réellement les clés de leur `output_contract.core`,
+    et le moteur ne relève AUCUN `contract_problems` — l'absence de la clé
+    étant elle-même le signal.
+    """
+    body, _provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
+
+    outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
+    analyst = json.loads(outputs[ARCHITECT_ANALYST_NODE_ID]["output"])
+    producer = json.loads(outputs[CODE_PRODUCER_NODE_ID]["output"])
+
+    assert {"approach", "tradeoffs", "risks", "test_strategy"} <= set(analyst)
+    assert {"code_diffs", "tests", "docs_snippets"} <= set(producer)
+
+    for node_id in (ARCHITECT_ANALYST_NODE_ID, CODE_PRODUCER_NODE_ID):
+        assert "contract_problems" not in body["metrics"]["per_node"][node_id], (
+            f"{node_id} : une sortie conforme ne doit produire aucun constat"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_production_that_cites_no_approach_is_reported_not_swallowed(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """AC1 — la contrepartie : une sortie NON conforme est NOMMÉE.
+
+    Sans ce test, le précédent prouverait seulement que le chemin nominal
+    passe — et un validateur qui rendrait `[]` inconditionnellement le
+    passerait aussi. C'est exactement la circularité que la revue de la Story
+    5.1 a trouvée sur son test d'AC3.
+
+    Le run reste `completed` : on marque, on ne refuse pas. Tuer un run sur une
+    maladresse de format serait disproportionné quand le cas non parsable est
+    déjà traité par le repli `raw_output`.
+    """
+    rogue = json.loads(_PRODUCER_ANSWER)
+    for diff in rogue["code_diffs"]:
+        del diff["approach_ref"]
+
+    body, _provider = await _run_the_full_chain(
+        app_session_factory,
+        workflow_checkpointer,
+        producer_answer=json.dumps(rogue, ensure_ascii=False),
+    )
+
+    problems = body["metrics"]["per_node"][CODE_PRODUCER_NODE_ID]["contract_problems"]
+    assert problems
+    assert any("approach_ref" in problem for problem in problems)
+    assert body["status"] == "completed", "un contrat non honoré se signale, il ne tue pas le run"
+
+
+@pytest.mark.asyncio
+async def test_the_producer_reads_the_analysts_raw_output_not_a_handoff_summary(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """T1 — la preuve que l'arbitrage du régime de passage est réellement posé.
+
+    Un résumé de passage rend `{decisions, artifacts_refs, blockers,
+    next_questions}` : les `id` d'étape de l'Analyste n'y survivent PAS, et
+    l'AC3 deviendrait invérifiable. Ce test regarde ce que le modèle a
+    réellement reçu — `provider.calls`, le seul endroit où le prompt est
+    observable — plutôt que ce que la configuration prétend.
+
+    Il garde AUSSI le décompte d'appels, qui est l'autre moitié de
+    l'arbitrage : deux arêtes ne produisent plus de résumé du tout, donc cinq
+    appels et non sept.
+    """
+    _body, provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
+
+    assert len(provider.calls) == 5, (
+        "attendu : 4 nodes + 1 seul résumé de passage (celui du Dev Lead). "
+        "Sept appels voudraient dire que les résumés n'ont pas été supprimés."
+    )
+
+    producer_prompt = "".join(
+        message.content for message in provider.calls[4]["messages"] if message.role == "user"
+    )
+    analyst_steps = [step["id"] for step in json.loads(_ANALYST_ANSWER)["approach"]["steps"]]
+    for step_id in analyst_steps:
+        assert f'"id": "{step_id}"' in producer_prompt, (
+            f"l'étape {step_id} n'est pas arrivée jusqu'au Producteur — "
+            "il a reçu un résumé, pas la sortie de l'Analyste"
+        )
+    # Le marqueur inverse : aucune des quatre clés d'un résumé de passage.
+    assert "next_questions" not in producer_prompt
+
+
+@pytest.mark.asyncio
+async def test_the_upstream_reaching_the_producer_is_wrapped_exactly_once(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workflow_checkpointer: Any,
+    outbox_worker: Any,
+) -> None:
+    """AC2 — « il wrappe tous les `<tool_output>` de Code Researcher ».
+
+    Le moteur le fait déjà (`_build_user_message`) : ce que cette AC exige est
+    donc une PREUVE sur ce node, et l'absence d'une seconde enveloppe. Une
+    double enveloppe échapperait les `<` de la première et donnerait du bruit
+    au modèle — piège #6 de la Story 5.1, repris par T5.3 de la 5.2.
+    """
+    _body, provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
+
+    producer_prompt = "".join(
+        message.content for message in provider.calls[4]["messages"] if message.role == "user"
+    )
+    assert producer_prompt.count("<tool_output>") == 1
+    assert producer_prompt.count("</tool_output>") == 1
+    assert producer_prompt.count("<user_input>") == 1
+    # La marque d'une double enveloppe : le `<` de la première, échappé par la
+    # seconde. Son absence est ce qui distingue « enveloppé » de « enveloppé
+    # deux fois ».
+    assert "&lt;tool_output&gt;" not in producer_prompt
+    # Et l'enveloppe porte bien la sortie amont, pas une coquille vide.
+    assert "relevant_files" in producer_prompt
+
+    # La borne qui remplace les résumés, mesurée là où elle s'applique.
+    #
+    # ⚠️ Ce que cette assertion établit et ce qu'elle n'établit pas : sur les
+    # fixtures de ce fichier, le prompt du dernier node pèse quelques kilo-
+    # octets, donc le plafond n'est PAS exercé — il est seulement prouvé que la
+    # borne est celle qui gouverne ce chemin. Sur une exploration réelle, la
+    # sortie du Chercheur est bien plus grosse et c'est ELLE que l'éviction
+    # retirerait en premier (la plus grosse entrée d'abord). La vérification
+    # sur un vrai run est une recette du runbook, § 6 ter, pas un test.
+    from agentive_backend.features.workflow_engine.engine.agent_node import (
+        MAX_UPSTREAM_OUTPUT_CHARS,
+    )
+
+    assert len(producer_prompt) < MAX_UPSTREAM_OUTPUT_CHARS
+    assert "...[TRUNCATED]" not in producer_prompt
+
+
+@pytest.mark.asyncio
+async def test_the_two_new_templates_are_provisioned_with_their_tools_and_contracts(
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AC1, premier niveau — vu depuis l'API, pas depuis le catalogue.
+
+    C'est la surface que l'AC nomme (`GET /api/v1/agents/templates/{id}` et
+    `.../tools`), et c'est la seule qui prouve que la déclaration a traversé
+    le provisioning : la revue de la Story 5.1 a trouvé que `tools: []` faisait
+    sortir `_assign_tools` avant toute résolution, donc qu'un mécanisme
+    « livré » n'était atteint par aucun test.
+    """
+    report = await _seed(app_session_factory)
+    app = _make_app(session_factory=app_session_factory)
+    transport = httpx.ASGITransport(app=app)
+
+    expected = {
+        ARCHITECT_ANALYST_NODE_ID: (
+            "analyste",
+            {"approach", "tradeoffs", "risks", "test_strategy"},
+            {"read_file", "search_content"},
+        ),
+        CODE_PRODUCER_NODE_ID: (
+            "producteur",
+            {"code_diffs", "tests", "docs_snippets"},
+            {"read_file", "search_content", "find_files"},
+        ),
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for key, (archetype, core, tools) in expected.items():
+            template_id = report.template_ids[key]
+            detail = await client.get(
+                f"/api/v1/agents/templates/{template_id}", headers=_auth_headers()
+            )
+            assert detail.status_code == 200, detail.text
+            body = detail.json()
+            assert body["archetype"] == archetype
+            assert set(body["config"]["output_contract"]["core"]) == core
+            # T1 — la clé a bien traversé le DTO, le VO et le provisioning.
+            assert body["config"]["include_raw_previous_output"] is True
+
+            tools_resp = await client.get(
+                f"/api/v1/agents/templates/{template_id}/tools", headers=_auth_headers()
+            )
+            assert tools_resp.status_code == 200, tools_resp.text
+            assigned = tools_resp.json()["assigned_tools"]
+            assert {tool["name"] for tool in assigned} == tools, (
+                f"{key} : les outils déclarés n'ont pas atteint la base"
+            )
+
+    # AC2 — le Producteur déclare le namespace `métier` que son AC nomme.
+    producer = report.template_ids[CODE_PRODUCER_NODE_ID]
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        detail = await client.get(f"/api/v1/agents/templates/{producer}", headers=_auth_headers())
+    assert detail.json()["config"]["push_memory"] == {"namespace": "dev-metier", "optin": False}

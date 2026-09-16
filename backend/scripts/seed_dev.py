@@ -49,6 +49,7 @@ Ce module n'appelle AUCUN LLM et ne lance aucun run : il configure.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import sys
 from collections.abc import Sequence
@@ -125,15 +126,42 @@ DEV_LEAD_WORKFLOW_NAME_V1 = "Dev Lead — prise de demande"
 #: laisserait deux lignes homonymes en base, donc exactement l'ambiguïté qu'on
 #: cherche à supprimer. Un nom versionné rend les deux workflows distincts
 #: DANS la table, lisibles par un opérateur, et sans code de suppression.
-DEV_ENTRY_WORKFLOW_NAME = "Pôle Dev — prise de demande (v2 : dev_lead → code_researcher)"
+#: La génération de la Story 5.2 : `dev_lead → code_researcher`. Laissée en
+#: place et toujours lançable, comme la v1 — cf `_report_legacy_entry_workflows`.
+DEV_ENTRY_WORKFLOW_NAME_V2 = "Pôle Dev — prise de demande (v2 : dev_lead → code_researcher)"
+
+#: Story 5.3 — TROISIÈME versionnement du nom, pour la même raison mécanique
+#: que le second : `create_workflow` est idempotent par empreinte SHA-256 de
+#: `{name, dag}` et `workflows.name` n'est PAS unique. Passer le DAG de deux à
+#: quatre nodes change l'empreinte ; sans changer le nom, cette story créerait
+#: une TROISIÈME ligne homonyme et le `workflow_id` que John a noté pointerait
+#: toujours sur la v2.
+DEV_ENTRY_WORKFLOW_NAME = (
+    "Pôle Dev — prise de demande "
+    "(v3 : dev_lead → code_researcher → architect_analyst → code_producer)"
+)
+
+#: Les générations précédentes, dans l'ordre chronologique. Il y en a
+#: désormais DEUX : ne chercher que la v1 laisserait le workflow à deux nodes
+#: invisible au rapport, donc un opérateur lançant un `workflow_id` périmé sans
+#: jamais apprendre qu'il existe une suite.
+_LEGACY_ENTRY_WORKFLOW_NAMES = (DEV_LEAD_WORKFLOW_NAME_V1, DEV_ENTRY_WORKFLOW_NAME_V2)
+
 DEV_LEAD_NODE_ID = "dev_lead"
 CODE_RESEARCHER_NODE_ID = "code_researcher"
+ARCHITECT_ANALYST_NODE_ID = "architect_analyst"
+CODE_PRODUCER_NODE_ID = "code_producer"
 
 #: Les clés de catalogue que le workflow d'entrée exige. Le `node_id` du
 #: DAG et la `key` du catalogue coïncident délibérément : c'est ce qui rend
-#: `metrics.per_node["code_researcher"]` lisible sans table de
-#: correspondance, et c'est la clé que l'AC2 nomme.
-_ENTRY_NODE_KEYS = ("dev_lead", "code_researcher")
+#: `metrics.per_node["code_producer"]` lisible sans table de correspondance,
+#: et c'est la clé que les AC nomment.
+_ENTRY_NODE_KEYS = (
+    "dev_lead",
+    "code_researcher",
+    "architect_analyst",
+    "code_producer",
+)
 
 #: Les clés de ``agent_templates.config`` que ce provisioning possède. Une clé
 #: absente d'ici est laissée intacte (``update_template`` a une sémantique
@@ -148,6 +176,11 @@ _OWNED_CONFIG_KEYS = (
     "llm_params",
     "error_policy",
     "push_memory",
+    # Story 5.3 — possédée comme les autres, et pas seulement écrite : sans
+    # cette entrée, le régime de passage d'un agent serait posé une fois puis
+    # jamais re-vérifié, et une divergence YAML ↔ base serait rapportée
+    # « inchangé ».
+    "include_raw_previous_output",
 )
 
 
@@ -776,22 +809,36 @@ class DevDepartmentSeeder:
         return {tool.id for tool, _assigned_at in rows}
 
     async def _provision_entry_workflow(self, report: SeedReport) -> None:
-        """Le DAG à deux nodes sur lequel John poste ses demandes (Story 5.2 AC2).
+        """Le DAG sur lequel John poste ses demandes (Story 5.3, quatre nodes).
 
-        ``dev_lead → code_researcher``, sans condition d'edge : le Chercheur
-        s'exécute quoi que le Dev Lead ait rendu, et lit son plan dans
-        ``upstream_outputs``. Une condition aurait été possible
-        (``output.status == 'done'`` est dans le ``core`` du Dev Lead, donc
-        légale au regard de la validation d'edge de la Story 4.1), et elle est
-        écartée délibérément : un plan `failed` porte une
+        ``dev_lead → code_researcher → architect_analyst → code_producer`` :
+        la chaîne complète du pôle, dans son ordre naturel — on explore avant
+        d'analyser, on analyse avant de produire. C'est exactement l'ordre que
+        le prompt du Dev Lead impose à ses propres délégations.
+
+        **Aucune condition d'edge, et c'est délibéré.** Une condition aurait
+        été légale sur le Dev Lead (``output.status == 'done'`` est dans son
+        ``core``, donc acceptée par la validation d'edge de la Story 4.1), mais
+        elle est écartée pour la raison posée par la Story 5.2 et qui vaut
+        maintenant trois fois : un node qui rend ``failed`` porte une
         ``blocking_question``, et couper le DAG à cet endroit priverait
-        l'opérateur du seul node qui pourrait lui dire ce que le codebase
-        contient réellement — c'est-à-dire de quoi répondre à la question.
+        l'opérateur des nodes qui pourraient justement y répondre. Les deux
+        nouveaux nodes ne déclarent d'ailleurs pas ``status`` dans leur
+        ``core`` — ils n'offrent donc aucun point de branchement, ce qui est
+        cohérent avec un DAG linéaire.
+
+        ⚠️ **Le coût d'un run n'est plus celui de la Story 5.2.** Quatre appels
+        LLM d'agent, plus UN résumé de passage (celui du Dev Lead, seul node
+        dont le successeur lit encore les résumés — les deux nouveaux agents
+        déclarent ``include_raw_previous_output: true``, donc
+        ``graph_builder._any_successor_reads_summaries`` supprime les résumés
+        du Chercheur et de l'Analyste), plus une itération facturée par tour de
+        boucle d'outils. Cf ``docs/runbooks/pole-dev.md`` § 6 ter.
 
         ``create_workflow`` reste idempotent par empreinte (Story 4.8) : même
         nom + même DAG ⇒ la row d'origine est rendue. Ce qui est ajouté ici est
         le contrôle que l'empreinte NE COUVRE PAS — cf
-        :meth:`_assert_entry_workflow_is_unique`.
+        :meth:`_assert_entry_workflow_can_be_created`.
         """
         missing = [key for key in _ENTRY_NODE_KEYS if key not in report.template_ids]
         if missing:
@@ -802,27 +849,22 @@ class DevDepartmentSeeder:
                 "nodes à monter. Si `run(catalog=...)` a reçu un sous-ensemble volontaire, "
                 "c'est l'appel qu'il faut corriger, pas le catalogue."
             )
-        dev_lead_id = report.template_ids["dev_lead"]
-        researcher_id = report.template_ids["code_researcher"]
-
-        expected_nodes = {
-            DEV_LEAD_NODE_ID: dev_lead_id,
-            CODE_RESEARCHER_NODE_ID: researcher_id,
-        }
-        self._report_legacy_entry_workflow(await self._legacy_entry_workflows(), report)
+        expected_nodes = {node_id: report.template_ids[node_id] for node_id in _ENTRY_NODE_KEYS}
+        await self._report_legacy_entry_workflows(report)
         await self._assert_entry_workflow_can_be_created(expected_nodes)
+        # La chaîne est LINÉAIRE et dans l'ordre naturel du pôle : on explore
+        # avant d'analyser, on analyse avant de produire. C'est exactement
+        # l'ordre que le prompt du Dev Lead impose à ses délégations.
+        ordered = list(_ENTRY_NODE_KEYS)
         result = await self._workflow_service.create_workflow(
             name=DEV_ENTRY_WORKFLOW_NAME,
             nodes=[
-                WorkflowNodeRequest(node_id=DEV_LEAD_NODE_ID, agent_template_id=dev_lead_id),
-                WorkflowNodeRequest(
-                    node_id=CODE_RESEARCHER_NODE_ID, agent_template_id=researcher_id
-                ),
+                WorkflowNodeRequest(node_id=node_id, agent_template_id=expected_nodes[node_id])
+                for node_id in ordered
             ],
             edges=[
-                WorkflowEdgeRequest(
-                    from_node_id=DEV_LEAD_NODE_ID, to_node_id=CODE_RESEARCHER_NODE_ID
-                )
+                WorkflowEdgeRequest(from_node_id=source, to_node_id=target)
+                for source, target in itertools.pairwise(ordered)
             ],
             tenant_id=self._tenant_id,
         )
@@ -833,30 +875,31 @@ class DevDepartmentSeeder:
         else:
             report.created.append(label)
 
-    async def _legacy_entry_workflows(self) -> list[Any]:
-        return await self._workflow_repo.list_by_name(
-            DEV_LEAD_WORKFLOW_NAME_V1, tenant_id=self._tenant_id
-        )
+    async def _report_legacy_entry_workflows(self, report: SeedReport) -> None:
+        """Signale CHAQUE génération précédente du workflow d'entrée.
 
-    @staticmethod
-    def _report_legacy_entry_workflow(legacy: list[Any], report: SeedReport) -> None:
-        """Signale le workflow mono-node de la Story 5.1, TOUS les homonymes.
+        Il y en a deux depuis la Story 5.3 (mono-node de la 5.1, deux nodes de
+        la 5.2), et elles restent en base et lançables : il n'existe aucun
+        chemin de suppression de workflow dans le dépôt (constat 4.15). Une
+        ligne de rapport par génération, chacune nommant TOUS ses homonymes.
 
-        Revue 5.2, deux corrections. (1) Ne cite plus `legacy[0].id` seul :
-        `workflows.name` n'est pas unique, c'est tout le sujet du garde-fou
-        d'à côté, et masquer les autres lignes ici serait contradictoire.
-        (2) Ce rapport ne vit plus dans une méthode `_assert_*` — muter le
-        rapport avant de potentiellement lever laissait un rapport partiel
-        affirmant un état qui n'avait pas été atteint.
+        Revue 5.2, deux corrections conservées ici. (1) Ne cite plus
+        `legacy[0].id` seul : `workflows.name` n'est pas unique, c'est tout le
+        sujet du garde-fou d'à côté, et masquer les autres lignes serait
+        contradictoire. (2) Ce rapport ne vit pas dans une méthode `_assert_*`
+        — muter le rapport avant de potentiellement lever laissait un rapport
+        partiel affirmant un état qui n'avait pas été atteint.
         """
-        if not legacy:
-            return
-        ids = ", ".join(str(row.id) for row in legacy)
-        plural = "s" if len(legacy) > 1 else ""
-        report.unchanged.append(
-            f"workflow{plural} «{DEV_LEAD_WORKFLOW_NAME_V1}» (Story 5.1, mono-node) — "
-            f"laissé{plural} en place, toujours lançable{plural} : {ids}"
-        )
+        for name in _LEGACY_ENTRY_WORKFLOW_NAMES:
+            legacy = await self._workflow_repo.list_by_name(name, tenant_id=self._tenant_id)
+            if not legacy:
+                continue
+            ids = ", ".join(str(row.id) for row in legacy)
+            plural = "s" if len(legacy) > 1 else ""
+            report.unchanged.append(
+                f"workflow{plural} «{name}» — laissé{plural} en place, "
+                f"toujours lançable{plural} : {ids}"
+            )
 
     async def _assert_entry_workflow_can_be_created(self, expected_nodes: dict[str, UUID]) -> None:
         """Refuse de créer un SECOND workflow d'entrée — AVANT de le créer.

@@ -10,7 +10,14 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from agentive_backend.features.agent_registry.domain import value_objects as vo
 
@@ -241,6 +248,32 @@ class UpdateTemplateRequest(BaseModel):
     provider_chain: list[ProviderId] | None = Field(default=None, min_length=1, max_length=4)
     error_policy: ErrorPolicy | None = None
     push_memory: PushMemoryConfig | None = None
+    # Story 5.3 T1 — le seul chemin déclaratif vers `include_raw_previous_output`.
+    #
+    # Le moteur lit cette clé depuis `agent_templates.config` depuis la Story
+    # 4.7 (`agent_node._build_user_message`), mais AUCUN champ ne permettait de
+    # l'écrire : un template ne pouvait pas se déclarer consommateur de sorties
+    # BRUTES, et la Story 5.2 a dû documenter dans son YAML qu'elle subissait
+    # le résumé de passage faute de ce chemin.
+    #
+    # `StrictBool` et pas `bool` : en mode permissif Pydantic coercerait
+    # `"true"` en `True`, or le moteur ne reconnaît QUE le littéral booléen
+    # (toute autre valeur est ignorée, avec un log
+    # `workflow_engine.include_raw_previous_output_ignored`). Accepter ici une
+    # chaîne produirait un `True` en base pour un appelant, et un silence pour
+    # le suivant qui écrirait la même chaîne directement dans le JSONB.
+    include_raw_previous_output: StrictBool | None = Field(
+        default=None,
+        description=(
+            "Ce template lit-il les sorties BRUTES de ses nodes amont, au lieu des résumés "
+            "de passage ? Défaut (absent) : les résumés. Ce que cela coûte : la charge amont "
+            "n'est plus condensée et croît à chaque étape — la seule borne devient alors le "
+            "plafond de 50 000 caractères du moteur, dont l'éviction retire la plus grosse "
+            "entrée d'abord. Ce que cela rend : un contrat de sortie structuré arrive intact "
+            "chez son consommateur. Quand TOUS les successeurs d'un node l'activent, le résumé "
+            "de ce node n'est plus produit du tout — l'appel LLM est économisé."
+        ),
+    )
 
     @field_validator("provider_chain", mode="after")
     @classmethod
@@ -269,6 +302,7 @@ class UpdateTemplateRequest(BaseModel):
                 "provider_chain",
                 "error_policy",
                 "push_memory",
+                "include_raw_previous_output",
             )
         ):
             raise ValueError("at least one field must be provided in the update payload")

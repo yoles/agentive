@@ -192,7 +192,7 @@ migrate-init: ## Crée la migration initiale (manuel, pas autogenerate)
 	$(DC_DEV) run --rm backend uv run alembic revision -m "initial schema"
 
 .PHONY: seed-dev
-seed-dev: ## Provisionne le Pôle Dev (serveurs MCP + namespaces + agent-templates + workflow) — Stories 5.1/5.2
+seed-dev: ## Provisionne le Pôle Dev (serveurs MCP + namespaces + agent-templates + workflow) — Stories 5.1/5.2/5.3
 	# Idempotent tant que le DAG du workflow d'entrée et les UUID de templates
 	# ne changent pas : une seconde exécution ne crée rien et ne duplique rien.
 	# Suppose les migrations appliquées (`make migrate`).

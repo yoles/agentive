@@ -78,6 +78,12 @@ export const UpdateTemplateRequestSchema = z
       })
       .optional(),
     error_policy: ErrorPolicySchema.optional(),
+    // Story 5.3 — miroir du champ ajouté à `UpdateTemplateRequest` côté
+    // Pydantic. `z.boolean()` et non `z.coerce.boolean()` : le backend le
+    // déclare en `StrictBool` parce que le moteur ne reconnaît QUE le littéral
+    // booléen ; coercer ici ferait diverger les deux validateurs sur la seule
+    // valeur qui compte.
+    include_raw_previous_output: z.boolean().optional(),
   })
   .strict()
   .refine(

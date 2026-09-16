@@ -1,6 +1,6 @@
 # Pôle Dev — provisionner, lancer une demande, lire la réponse
 
-> Story 5.1 (FR43/FR44). **Sprint 2 : le Pôle Dev se pilote en client HTTP, pas dans une UI** —
+> Stories 5.1 → 5.3 et 5.7 (FR43/FR44/FR51). **Sprint 2 : le Pôle Dev se pilote en client HTTP, pas dans une UI** —
 > décision de John du 2026-09-14. Le Chat est l'Epic 6 (Sprint 3) ; quand il arrivera, il se
 > branchera sur exactement les endpoints ci-dessous sans toucher aux agents.
 
@@ -175,6 +175,13 @@ volumineux ou répertoire illisible. Un résultat coupé en
 silence fait croire au modèle qu'il a tout vu, et un Chercheur qui rend « je n'ai rien trouvé »
 sur une troncature est pire qu'un Chercheur qui échoue.
 
+> ⚠️ **Un seul serveur, mais TROIS templates en dépendent depuis la Story 5.3.** La Mise en
+> Place ping chaque serveur MCP **distinct** avant chaque run et vérifie que chaque outil
+> *assigné* est toujours exposé (`mcp_tools_reachable`). Assigner les mêmes outils à trois
+> templates n'ajoute donc pas trois pings — mais un `dev-code-search` qui ne démarre pas fait
+> désormais refuser le lancement de **tout** le DAG, et non plus du seul Chercheur. C'est la
+> bonne nouvelle de ce check : l'échec est au lancement, bruyamment, pas au milieu d'un run.
+
 ### Diagnostiquer les deux échecs attendus
 
 **(a) Le serveur ne démarre pas** → le lancement d'un run est refusé par la Mise en Place, sur
@@ -240,10 +247,13 @@ curl -sS "http://localhost:8000/api/v1/agents/templates/$TPL/tools" -H "Authoriz
 ```bash
 export TOKEN="$AGENTIVE_API_TOKEN"
 export WF="<workflow_id rendu par make seed-dev>"
-# ⚠️ Depuis la Story 5.2 le workflow d'entrée s'appelle
-# « Pôle Dev — prise de demande (v2 : dev_lead → code_researcher) » et porte un
-# NOUVEAU `workflow_id`. Le mono-node de la Story 5.1 reste en base, reste
-# lançable, et son id reste valide — il exécute simplement le Dev Lead seul.
+# ⚠️ Depuis la Story 5.3 le workflow d'entrée s'appelle
+# « Pôle Dev — prise de demande (v3 : dev_lead → code_researcher →
+#   architect_analyst → code_producer) » et porte un NOUVEAU `workflow_id`.
+# Les DEUX générations précédentes restent en base, restent lançables, et leurs
+# ids restent valides — la v1 (Story 5.1) exécute le Dev Lead seul, la v2
+# (Story 5.2) s'arrête après le Chercheur. `make seed-dev` les liste toutes les
+# deux dans sa section « inchangés ».
 # Cf § 8 pour pourquoi le nom est versionné plutôt que réutilisé.
 
 curl -sS -X POST "http://localhost:8000/api/v1/workflows/$WF/runs" \
@@ -264,9 +274,9 @@ Réponse `201`, immédiate (le run tourne en arrière-plan) :
   "run_id": "...",
   "status": "running",
   "acknowledgement": {
-    "message": "Compris. Je mobilise Dev Lead et Code Researcher. ETA ~2 min.",
-    "agents": ["Dev Lead", "Code Researcher"],
-    "eta_minutes": 2,
+    "message": "Compris. Je mobilise Dev Lead, Code Researcher, Architect Analyst et Code Producer. ETA ~4 min.",
+    "agents": ["Dev Lead", "Code Researcher", "Architect Analyst", "Code Producer"],
+    "eta_minutes": 4,
     "eta_source": "heuristic"
   },
   "mise_en_place": { "...": "..." }
@@ -364,16 +374,34 @@ Elle **signale, ne corrige pas** : réécrire un plan incohérent serait décide
 l'orchestrateur.
 
 **Le moteur applique ce contrôle lui-même** (T6.3, tranchée en revue). Quand un node rend une
-sortie parsable et que son `output_contract.core` déclare `plan` ET `delegations`, `agent_node`
-passe cette sortie au validateur et écrit les incohérences dans
-`metrics.per_node[<node_id>].contract_problems` — avec un log `workflow_engine.delegation_plan_incoherent`.
+sortie parsable, `agent_node` passe cette sortie au validateur correspondant à son
+`output_contract.core` **déclaré**, et écrit les incohérences dans
+`metrics.per_node[<node_id>].contract_problems` — avec un log
+`workflow_engine.output_contract_incoherent`.
+
+**Trois contrats sont reconnus aujourd'hui** (`shared/contracts/dev_outputs.py`, registre
+`_VALIDATORS`) :
+
+| `output_contract.core` déclare… | …et la sortie est jugée contre |
+|---|---|
+| `plan` + `delegations` | le plan de délégation du Dev Lead (`dev_roles.validate_delegation_plan`) |
+| `approach` + `tradeoffs` + `risks` + `test_strategy` | l'approche de l'Architect Analyst |
+| `code_diffs` + `tests` + `docs_snippets` | la production du Code Producer |
+
+Un template dont le contrat n'est reconnu par aucune entrée n'est **pas jugé** — ni faussement
+conforme, ni faussement fautif.
 
 Trois précisions sur ce choix :
 
 - **Le déclencheur est le CONTRAT déclaré, pas le nom de l'agent.** Ce n'est pas un point
   d'application inventé pour le Dev Lead : c'est le moteur qui vérifie ce qu'un template a déclaré
-  produire. Un agent des Stories 5.2 → 5.6 déclarant le même contrat est vérifié sans une ligne de
-  plus.
+  produire.
+  ⚠️ Cette phrase promettait, dans sa version d'origine, qu'« un agent des Stories 5.2 → 5.6
+  déclarant le même contrat est vérifié sans une ligne de plus ». C'était vrai du *mécanisme* et
+  faux du *résultat* : la Story 5.2 a déclaré quatre clés et **aucune entrée de registre ne les
+  couvrait**, donc son contrat était déclaré et jamais tenu. La Story 5.3 a généralisé le point
+  d'application ; les Stories 5.4 → 5.6 devront **ajouter leur entrée**, pas seulement déclarer
+  leurs clés.
 - **Marquer, pas refuser.** T6.3 permettait les deux ; tuer un run sur une maladresse de format
   serait disproportionné, d'autant que le cas *non parsable* est déjà traité ailleurs (repli
   `raw_output` + règle `no-parsable-output` à 0.9). Ce qui est traité ici est le cas
@@ -399,7 +427,7 @@ curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: B
 > toujours pas les sorties de node, et c'est ce qui garde sa première frame sous les 2 s
 > (arbitrage complet : [`run-node-output-exposure.md`](../decisions/run-node-output-exposure.md)).
 
-Le second node rend un objet JSON de cette forme :
+Le deuxième node du DAG rend un objet JSON de cette forme :
 
 ```json
 {
@@ -415,7 +443,9 @@ Le second node rend un objet JSON de cette forme :
 
 **Les quatre champs sont dans `output_contract.core`**, donc branchables par une edge (la
 validation de la Story 4.1 refuse toute condition portant une variable absente du `core` de
-l'émetteur) et consommables tels quels par l'Architect Analyst de la Story 5.3.
+l'émetteur) et consommables tels quels par l'Architect Analyst — ce qui est vrai **depuis la
+Story 5.3** et ne l'était pas avant : jusque-là le node suivant n'aurait reçu qu'un résumé de
+passage. Cf § 6 ter et [`dev-pole-agent-handoff-contract.md`](../decisions/dev-pole-agent-handoff-contract.md).
 
 **La question à se poser en premier n'est pas « le plan est-il bon » mais « a-t-il lu ? »** :
 
@@ -485,16 +515,117 @@ echo "$n chemin(s) vérifié(s), $bad inexistant(s)"
 > JSON incomplet — un échec bruyant, et c'est voulu : il vaut mieux qu'une extraction s'arrête
 > qu'un `relevant_files` amputé se lise comme la liste entière.
 
-> ⚠️ **Ce que le Code Researcher voit du Dev Lead n'est pas son plan complet.** `agent_node`
-> condense la sortie de chaque node amont en un résumé de passage (Story 4.7) avant de la
-> donner au suivant : ce qui arrive est `{decisions, artifacts_refs, blockers,
-> next_questions}`, pas le tableau `delegations`. Un run du DAG d'entrée coûte de ce fait
-> **trois** appels LLM, pas deux. Le levier existe (`config.include_raw_previous_output`,
-> lu par `agent_node`) mais aucun champ de `UpdateTemplateRequest` ne permet de l'écrire, donc
-> le catalogue ne peut pas le déclarer aujourd'hui — élargir ce DTO change le contrat HTTP
-> public pour un seul template, et l'arbitrage revient à la **Story 5.3**, qui ajoute des
-> nodes et sentira le sujet plus fort. Le prompt du Code Researcher est écrit pour cette
-> réalité : il cherche ce qui le concerne dans le résumé, et se rabat sur `objective` sinon.
+> ⚠️ **Ce que le Code Researcher voit du Dev Lead n'est pas son plan complet — et c'est le seul
+> node du DAG dans ce cas.** `agent_node` condense la sortie d'un node amont en un résumé de
+> passage (Story 4.7) avant de la donner au suivant : ce qui arrive au Chercheur est
+> `{decisions, artifacts_refs, blockers, next_questions}`, pas le tableau `delegations`. Son
+> `system_prompt` est écrit POUR cette réalité — il cherche ce qui le concerne dans le résumé,
+> et se rabat sur `objective` sinon.
+>
+> **La Story 5.3 a tranché l'arbitrage que cet encart annonçait.** `UpdateTemplateRequest` porte
+> désormais `include_raw_previous_output`, et les deux nouveaux agents le déclarent à `true` :
+> ils lisent les sorties **brutes** de leurs amonts. Le Chercheur, lui, reste sur les résumés —
+> changer son prompt bumperait sa version et imposerait de rejouer le protocole du § 7 bis, pour
+> un gain nul sur un plan de délégation dont il ne lit qu'une ligne. Dossier complet :
+> [`dev-pole-agent-handoff-contract.md`](../decisions/dev-pole-agent-handoff-contract.md).
+
+### 6 ter. Lire l'approche de l'Analyste et la production du Producteur
+
+Les deux derniers nodes du DAG se lisent par le **même** endpoint, et leurs sorties ont la même
+forme de contrat : quelques clés déclarées dans `output_contract.core`, vérifiées à chaque run.
+
+> ⚠️ **Lire `truncated` AVANT de parser**, comme au § 6 bis — et c'est ici que ça mord le plus :
+> la sortie du Code Producer porte des diffs et des tests, donc c'est **la plus grosse du DAG** et
+> la première à atteindre `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`. Sur une sortie coupée, les
+> recettes ci-dessous échouent sur du JSON incomplet — un échec bruyant, et c'est voulu. Paginer
+> avec `?offset=<next_offset>` sur `GET /workflows/runs/$RUN/nodes/code_producer/output`, ou
+> relever le plafond :
+>
+> ```bash
+> curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+>   | jq '.node_outputs[] | {node_id, truncated, next_offset, total_chars, returned_chars}'
+> ```
+
+```bash
+# L'approche : ce qui a été retenu, et ce qui a été écarté.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "architect_analyst") | .output' \
+  | jq '{complexity: .approach.complexity,
+         steps: [.approach.steps[] | {id, title}],
+         rejected: [.tradeoffs[] | select(.chosen == false) | {option, rationale}],
+         risks: [.risks[] | {risk, severity}]}'
+```
+
+**La question à se poser en premier n'est pas « l'approche est-elle bonne » mais « y a-t-il un
+arbitrage ? »** : `rejected` vide signifie que l'Analyste a recommandé la première idée venue.
+Le contrat l'interdit (au moins une option `chosen: false`, avec sa raison), et une violation
+apparaît dans `contract_problems` — mais la lire soi-même coûte une commande.
+
+```bash
+# La production : chaque diff, et l'étape d'approche qui le justifie.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "code_producer") | .output' \
+  | jq '{diffs: [.code_diffs[] | {path, approach_ref}],
+         tests: [.tests[] | {path, level}],
+         gaps: .unaddressed}'
+```
+
+**Le chaînon qui compte, et il se vérifie en une commande.** Chaque `approach_ref` doit exister
+parmi les `approach.steps[].id` de l'Analyste. Un `approach_ref` inventé est du code que rien ne
+justifie :
+
+```bash
+DETAIL=$(curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN")
+STEPS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="architect_analyst") | .output' \
+  | jq -r '[.approach.steps[].id] | sort | join(",")')
+REFS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="code_producer") | .output' \
+  | jq -r '[.code_diffs[].approach_ref] | unique | sort | join(",")')
+echo "étapes déclarées : $STEPS"
+echo "étapes citées    : $REFS"
+```
+
+> ⚠️ **`unaddressed` non vide n'est PAS un échec.** Le prompt du Producteur lui impose de
+> signaler ce qu'il ne peut pas couvrir plutôt que d'improviser. Une production vide
+> ACCOMPAGNÉE d'écarts déclarés est conforme ; ce qui est refusé, c'est un `status: "done"` sans
+> aucun diff **et** sans aucun écart — une sortie qui ne décrit aucun travail.
+
+> ⚠️ **Le Producteur n'écrit aucun fichier.** Ses outils sont en lecture seule et il n'en a pas
+> d'autres. Ses `code_diffs` sont des propositions ; les appliquer est un geste humain. La raison
+> est mécanique : un nœud rejoué ré-appelle ses outils (§ `rejeu-et-outils.md`), et le moteur ne
+> sait pas distinguer un outil idempotent d'un outil qui ne l'est pas.
+
+### Ce qu'un run coûte, et comment le vérifier
+
+Quatre nodes, mais **cinq** appels LLM — pas sept :
+
+| Appel | Pourquoi |
+|---|---|
+| `dev_lead` | le node |
+| résumé de passage de `dev_lead` | son successeur (`code_researcher`) lit les résumés |
+| `code_researcher` | le node |
+| `architect_analyst` | le node |
+| `code_producer` | le node |
+
+Les arêtes `code_researcher → architect_analyst` et `architect_analyst → code_producer` ne
+produisent **aucun** résumé : leurs cibles déclarent `include_raw_previous_output: true`, et
+`graph_builder._any_successor_reads_summaries` supprime alors la production du résumé — l'appel
+est économisé, pas seulement ignoré.
+
+S'y ajoute **une itération facturée par tour de boucle d'outils** (Story 5.0) :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node | to_entries
+        | map({node: .key, tool_calls: .value.tool_calls, iters: .value.tool_loop_iterations,
+               in: .value.input_tokens, out: .value.output_tokens})'
+```
+
+> ⚠️ **La borne qui compte quand on lit du brut est `MAX_UPSTREAM_OUTPUT_CHARS` (50 000).** Sous
+> le régime de résumé, la charge amont était condensée à chaque étape ; en brut, elle
+> s'accumule. Au-delà du plafond, `agent_node` évince **la plus grosse entrée d'abord** — et sur
+> ce DAG, c'est la sortie du Chercheur, celle dont l'Analyste a le plus besoin. L'éviction est
+> loggée (`workflow_engine.upstream_outputs_truncated`), jamais silencieuse : si
+> les analyses se dégradent sans raison apparente, c'est le premier log à chercher.
 
 ## 7. Juger la qualité du prompt (manuel)
 
@@ -617,6 +748,54 @@ premier appel n'a fait produire aucun modèle : il n'y avait rien à consigner.
 > le provisioning, le serveur MCP et les quatre outils sont verts (les quatre checks de Mise en
 > Place passent). Remplacer alors cette ligne par le résultat obtenu.
 
+## 7 ter. Juger la qualité de l'approche et de la production (manuel)
+
+Même limite, même traitement que les deux protocoles précédents : les tests E2E tournent sur
+`MockProvider`. Ce qu'ils prouvent — et c'est la nouveauté de la Story 5.3 — c'est que le
+**chaînon** tient : les `approach_ref` du Producteur référencent des étapes que l'Analyste a
+réellement produites, les deux sorties étant lues depuis le moteur et non depuis une constante de
+test. Ce qu'ils ne prouvent pas : que l'approche est la bonne, ni que le code proposé est juste.
+
+### Protocole
+
+Prérequis identiques au § 7 bis, **y compris une vraie clé LLM**. Même demande de référence.
+
+Critères de lecture, dans cet ordre — **les deux premiers sont éliminatoires** :
+
+1. **Le run atteint `code_producer`** (`node_statuses.code_producer == "completed"`). Sinon les
+   critères suivants portent sur une sortie qui n'existe pas.
+2. **`contract_problems` est absent de `architect_analyst` ET de `code_producer`.** Sa présence
+   signale que la sortie ne tient pas son propre contrat déclaré — la commande `jq` est au § 6.
+   Le noter avant les critères suivants évite de juger le fond d'une sortie qui n'a déjà pas la
+   forme qu'elle annonce.
+3. **`tradeoffs` porte une alternative réellement écartée**, avec une raison qui nomme quelque
+   chose de ce dépôt (un module, une règle d'or, une contrainte `.import-linter`) et non un
+   argument générique.
+4. **`approach.complexity` est cohérente avec `approach.steps`** : deux étapes triviales notées
+   `high`, ou huit étapes structurantes notées `low`, sont un signal.
+5. **Chaque `code_diffs[].path` existe, ou est un fichier neuf plausible** au regard des
+   `existing_patterns` que le Chercheur a rendus. Un diff sur un fichier inexistant qui se
+   présente comme une modification est le défaut le plus coûteux de la chaîne : il se lit comme
+   applicable.
+6. **Les conventions du prompt sont respectées dans le code proposé** : pas d'import croisé entre
+   features, accès base par `shared/repositories`, accès LLM par `shared.llm`, `snake_case`.
+7. **`unaddressed` est honnête** : ce qui n'a pas été couvert y figure, avec sa raison, plutôt
+   que d'avoir été improvisé.
+
+### Résultat du dernier passage
+
+| Date | Modèle | (1) run complet | (2) contrats | (3) arbitrage | (4) complexité | (5) chemins | (6) conventions | (7) écarts |
+|---|---|---|---|---|---|---|---|---|
+| — | — | *jamais joué* | — | — | — | — | — | — |
+
+> ⚠️ **Cette table est vide, et c'est une affirmation visible : le protocole n'a jamais tourné.**
+> Il ne le peut pas dans cet environnement, pour exactement la raison consignée au § 7 bis — la
+> clé `ANTHROPIC_API_KEY` y est un bouchon de 20 caractères et le premier appel LLM rend `401`.
+> Le protocole du § 7 bis, qui est en amont de celui-ci, n'a lui-même jamais produit de verdict :
+> **la qualité d'exploration sur laquelle cette approche s'appuie est donc elle aussi non
+> vérifiée.** Pour terminer les deux : rejouer à l'identique avec une vraie clé, dans l'ordre
+> (§ 7 bis puis § 7 ter), et remplacer ces lignes par les résultats obtenus.
+
 ## 8. Rollback
 
 - Le provisioning n'efface rien, et c'est une limite à connaître : `update_template` a une
@@ -630,11 +809,23 @@ premier appel n'a fait produire aucun modèle : il n'y avait rien à consigner.
   les runs partiraient et écriraient dans un namespace du mauvais type.
 - **Le workflow d'entrée est versionné DANS SON NOM, et ce n'est pas cosmétique.**
   `create_workflow` est idempotent par empreinte SHA-256 de `{name, dag}`, et `workflows.name`
-  n'est **pas** unique (`infra/db/models.py`). Passer le DAG de un à deux nodes change
-  l'empreinte : sans changer le nom, la Story 5.2 aurait créé une **seconde** ligne
-  « Dev Lead — prise de demande » à côté de celle de la 5.1, et le `workflow_id` noté par
-  l'opérateur pointerait toujours sur l'ancienne — un seed qui rapporte « créé » à chaque
-  exécution, et deux homonymes que rien ne distingue. Les deux autres options ont été
+  n'est **pas** unique (`infra/db/models.py`). Changer le DAG change l'empreinte : sans changer
+  le nom, la Story 5.2 aurait créé une **seconde** ligne « Dev Lead — prise de demande » à côté
+  de celle de la 5.1, et la Story 5.3 une **troisième**, pendant que le `workflow_id` noté par
+  l'opérateur pointerait toujours sur la première — un seed qui rapporte « créé » à chaque
+  exécution, et des homonymes que rien ne distingue.
+
+  **Il y a donc TROIS générations en base**, toutes lançables, chacune avec son propre
+  `workflow_id` :
+
+  | Génération | Nom | DAG |
+  |---|---|---|
+  | v1 (Story 5.1) | `Dev Lead — prise de demande` | `dev_lead` |
+  | v2 (Story 5.2) | `Pôle Dev — prise de demande (v2 : …)` | `dev_lead → code_researcher` |
+  | v3 (Story 5.3) | `Pôle Dev — prise de demande (v3 : …)` | les quatre nodes |
+
+  Le provisioning **liste les deux générations précédentes** dans sa section « inchangés », avec
+  tous leurs homonymes — ne rapporter que la plus ancienne laisserait la v2 invisible. Les deux autres options ont été
   écartées : **retirer** l'ancien demanderait un chemin de suppression de workflow qui n'existe
   nulle part dans le dépôt (constat de la Story 4.15), et se contenter d'une **recherche par
   nom** laisserait deux homonymes en base. Le provisioning signale explicitement l'ancien
@@ -682,7 +873,25 @@ make check-stories                                   # cohérence des statuts de
   vide du dépôt** — la Story 5.0 a livré la boucle d'outils, la 5.1 le mécanisme d'assignation,
   et aucun template n'en portait un seul.
 
+**Architect Analyst**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "analyste"`,
+  `config.output_contract.core` = `{approach, tradeoffs, risks, test_strategy}`,
+  `config.include_raw_previous_output = true`.
+- `GET /api/v1/agents/templates/{id}/tools` → **deux** outils : `read_file`, `search_content`.
+
+**Code Producer**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "producteur"`,
+  `config.output_contract.core` = `{code_diffs, tests, docs_snippets}`,
+  `config.include_raw_previous_output = true`,
+  `config.push_memory.namespace = "dev-metier"`.
+- `GET /api/v1/agents/templates/{id}/tools` → **trois** outils : `read_file`, `search_content`,
+  `find_files`. **Aucun outil d'écriture** — c'est vérifiable et c'est le point.
+
 **Le run**
-- Un `POST /runs` rend un `201` avec un `acknowledgement` non vide nommant **deux** agents.
+- Un `POST /runs` rend un `201` avec un `acknowledgement` non vide nommant **quatre** agents.
 - `metrics.per_node.code_researcher.tool_calls > 0` et `tool_names` non vide — la seule preuve
   que la sortie est appuyée sur une lecture réelle.
+- `metrics.per_node` porte **quatre** entrées, et `contract_problems` n'apparaît sur aucune quand
+  les sorties tiennent leur contrat (l'absence de la clé EST le signal).
+- Le total d'appels LLM d'un run nominal est de **cinq** : quatre nodes plus un unique résumé de
+  passage. Cf § 6 ter.

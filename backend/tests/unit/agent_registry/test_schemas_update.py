@@ -238,3 +238,43 @@ def test_llm_params_max_tokens_bounds() -> None:
         LLMParams(max_tokens=0)
     with pytest.raises(PydanticValidationError):
         LLMParams(max_tokens=200_001)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# include_raw_previous_output — Story 5.3 T1
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def test_a_payload_carrying_only_the_handoff_opt_out_is_not_rejected_as_empty() -> None:
+    """T1.4 — ``_at_least_one_field`` énumère ses champs À LA MAIN.
+
+    Un champ ajouté au DTO sans être ajouté à ce tuple fait partir en 422 un
+    payload qui ne porte QUE lui : le défaut est silencieux à l'écriture et ne
+    se voit qu'à l'usage. C'est le seul test qui l'attrape.
+    """
+    payload = UpdateTemplateRequest(include_raw_previous_output=True)
+    assert payload.include_raw_previous_output is True
+    assert payload.system_prompt is None
+
+
+def test_the_handoff_opt_out_is_a_real_boolean_not_a_truthy_string() -> None:
+    """Le moteur ne reconnaît QUE le littéral ``True``.
+
+    ``agent_node._build_user_message`` ignore (et logge) toute valeur non
+    booléenne : une chaîne ``"true"`` écrite en base produisait des résumés
+    sans que rien ne relie la cause à l'effet. Un champ typé ferme le sujet à
+    la source — encore faut-il que le type soit strict.
+    """
+    with pytest.raises(PydanticValidationError):
+        UpdateTemplateRequest.model_validate({"include_raw_previous_output": "true"})
+
+
+def test_the_handoff_opt_out_can_be_turned_back_off() -> None:
+    """``False`` est une valeur, pas une absence.
+
+    Sémantique PATCH oblige : ``None`` veut dire « ne touche pas », ``False``
+    veut dire « remets les résumés ». Les confondre rendrait le réglage
+    irréversible par l'API.
+    """
+    payload = UpdateTemplateRequest(include_raw_previous_output=False)
+    assert payload.include_raw_previous_output is False

@@ -21,6 +21,20 @@ import {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 describe("UpdateTemplateRequestSchema (Zod ↔ Pydantic mirror)", () => {
+  it("accepts a payload carrying only the handoff opt-out (mirror of test_a_payload_carrying_only_the_handoff_opt_out_is_not_rejected_as_empty)", () => {
+    const result = UpdateTemplateRequestSchema.safeParse({
+      include_raw_previous_output: true,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a truthy string for the handoff opt-out (mirror of test_the_handoff_opt_out_is_a_real_boolean_not_a_truthy_string)", () => {
+    const result = UpdateTemplateRequestSchema.safeParse({
+      include_raw_previous_output: "true",
+    });
+    expect(result.success).toBe(false);
+  });
+
   it("accepts a full payload (mirror of test_update_request_accepts_full_payload)", () => {
     const result = UpdateTemplateRequestSchema.safeParse({
       system_prompt: "Tu es un agent Producteur expert TypeScript.",

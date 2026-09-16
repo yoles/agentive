@@ -12,16 +12,24 @@
 # `agent_node` condense la sortie de chaque node amont en un résumé de passage
 # (Story 4.7) avant de la donner au node suivant : le Code Researcher lit donc
 # `{decisions, artifacts_refs, blockers, next_questions}`, PAS le tableau
-# `delegations` du Dev Lead. Un run du DAG d'entrée coûte de ce fait TROIS
-# appels LLM, pas deux.
-# Le levier existe — `config.include_raw_previous_output = true`
-# (`agent_node._build_user_message`) — mais aucun champ de
-# `UpdateTemplateRequest` ne permet de l'écrire, donc le catalogue ne peut pas
-# le déclarer aujourd'hui. Élargir ce DTO change le contrat HTTP public pour un
-# seul template ; l'arbitrage revient à la Story 5.3, qui ajoute des nodes et
-# sentira le sujet plus fort. Le prompt ci-dessous est écrit POUR cette
-# réalité : il dit de chercher ce qui le concerne dans un résumé, et de se
-# rabattre sur `objective` sinon.
+# `delegations` du Dev Lead. ⚠️ Le « TROIS appels LLM » qu'annonçait ce
+# paragraphe est périmé depuis la Story 5.3 : le DAG en a quatre nodes, et le
+# résumé ci-dessous est le SEUL qui subsiste — soit CINQ appels.
+# ⚠️ AMENDÉ PAR LA STORY 5.3 — la seconde moitié de ce constat n'est plus vraie.
+# La 5.3 a tranché l'arbitrage que ce commentaire lui confiait :
+# `UpdateTemplateRequest` porte désormais `include_raw_previous_output`, et le
+# catalogue PEUT le déclarer (`DevAgentDefinition.include_raw_previous_output`).
+# Les deux agents qu'elle ajoute le mettent à `true`.
+#
+# **Ce template, lui, reste DÉLIBÉRÉMENT sur les résumés.** Son amont est un
+# plan de délégation dont il ne lit qu'une ligne — la sienne — et son
+# `system_prompt` ci-dessous est écrit POUR le résumé, en toutes lettres. Le
+# passer au brut imposerait de réécrire ce prompt, donc de bumper sa version,
+# donc de rejouer le protocole de qualité manuel du runbook § 7 bis
+# (`docs/decisions/dev-lead-prompt-quality-protocol.md`) — pour un gain nul.
+# Le coût de ce choix est UN appel LLM de résumé par run, et c'est le seul qui
+# subsiste sur le DAG d'entrée.
+# Dossier : `docs/decisions/dev-pole-agent-handoff-contract.md`.
 #
 # Pas de `push_memory`, donc pas de bloc `namespaces` : Push Memory n'injecte
 # rien au runtime dans un workflow (`agent_node` l'anti-scope, D91 point 7), et
@@ -90,10 +98,17 @@ output_contract:
     existing_patterns: array
     risk_areas: array
   # `status` est dans `extras` et pas dans `core` : la règle
-  # `terminal-output-status` route sur `output.status == 'done'`, mais ce node
-  # est TERMINAL dans le DAG de cette story — rien ne branche derrière lui.
-  # Le mettre dans `core` prétendrait offrir un point de branchement que la
-  # Story 5.3 devra de toute façon rouvrir avec son propre contrat.
+  # `terminal-output-status` route sur `output.status == 'done'`, et `core` est
+  # la seule zone sur laquelle la validation d'edge de la Story 4.1 autorise
+  # une condition.
+  # ⚠️ La raison d'origine — « ce node est TERMINAL, rien ne branche derrière
+  # lui » — a cessé d'être vraie avec la Story 5.3, qui lui donne un
+  # successeur. Le choix ne change pas pour autant : la 5.3 a délibérément posé
+  # des edges SANS condition (un node qui rend `failed` porte une
+  # `blocking_question`, et couper le DAG là priverait l'opérateur des nodes
+  # qui pourraient y répondre). Déplacer `status` dans `core` offrirait donc un
+  # point de branchement que personne n'utilise. À rouvrir le jour où un DAG du
+  # pôle branche réellement sur ce statut.
   extras:
     status: string
     summary: string
