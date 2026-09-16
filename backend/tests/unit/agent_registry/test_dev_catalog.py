@@ -423,3 +423,133 @@ def test_the_producer_declares_the_metier_namespace_identically_to_the_dev_lead(
     assert catalog["code_producer"].namespaces == catalog["dev_lead"].namespaces
     assert catalog["code_producer"].push_memory is not None
     assert catalog["code_producer"].push_memory.namespace == "dev-metier"
+
+
+#: Les agents du pôle dont le contrat de sortie n'a PAS encore d'entrée au
+#: registre `shared/contracts/dev_outputs`. Une clé ici est une dette nommée,
+#: pas une exemption : elle dit « ce template déclare un contrat que rien ne
+#: vérifie au runtime ».
+#:
+#: `code_researcher` (Story 5.2) déclare quatre clés sans validateur. La
+#: Story 5.3 a généralisé le point d'application et branché DEUX contrats sur
+#: les trois qui restaient ; le troisième est porté par la Story 5.4, qui
+#: ajoute ses propres entrées au registre. Le retirer d'ici est ce qui
+#: fermera la dette — et le test tombera tout seul si on l'oublie dans l'autre
+#: sens (un contrat branché mais laissé dans cette liste).
+_CONTRACTS_NOT_YET_WIRED = frozenset({"code_researcher"})
+
+
+def test_every_dev_template_declares_a_contract_the_registry_recognises() -> None:
+    """Un `core` que le registre ne reconnaît pas ne rend AUCUN constat.
+
+    `contract_problems` rend `[]` dans deux cas indiscernables : « contrat
+    reconnu et conforme » et « contrat reconnu par personne ». Une faute de
+    frappe sur une clé de `output_contract.core` — ou un opérateur qui édite
+    le contrat par l'API — désactive donc silencieusement toute la
+    vérification, et on retombe exactement sur l'état que la Story 5.3 dit
+    corriger.
+
+    Le moteur ne peut pas signaler ce cas sans devenir bruyant sur tous les
+    templates hors pôle, qui n'ont légitimement aucun contrat au registre.
+    C'est donc ICI que la propriété se garde : côté catalogue, où l'on sait
+    quels templates DOIVENT être reconnus.
+    """
+    from agentive_backend.shared.contracts.dev_outputs import declared_contracts
+
+    contracts = declared_contracts()
+    for key, definition in load_dev_catalog().items():
+        if key in _CONTRACTS_NOT_YET_WIRED:
+            continue
+        core = set(definition.output_contract.core)
+        assert any(required <= core for required in contracts), (
+            f"{key} déclare le contrat {sorted(core)}, qu'aucune entrée du registre "
+            "`shared/contracts/dev_outputs` ne reconnaît : sa sortie ne sera jamais "
+            "vérifiée, et l'absence de `contract_problems` se lira comme une conformité"
+        )
+
+
+def test_the_unwired_contracts_list_names_only_templates_that_exist() -> None:
+    """Une dette nommée sur une clé disparue est une dette perdue.
+
+    Si `code_researcher` était renommé, `_CONTRACTS_NOT_YET_WIRED` porterait
+    une exemption sans objet et le test au-dessus deviendrait vert pour la
+    mauvaise raison — la forme exacte de dette que ce dépôt a déjà perdue
+    deux fois.
+    """
+    assert _CONTRACTS_NOT_YET_WIRED.issubset(load_dev_catalog())
+
+
+def test_architect_analyst_input_contract_matches_the_key_the_engine_really_passes() -> None:
+    """T3.3 — les TROIS surfaces alignées : contrat déclaré, prompt, clé lue.
+
+    ⚠️ Ce test manquait : T7.1 l'exigeait mot pour mot (« leurs
+    `input_contract` sont alignés avec ce que le prompt dit lire ») et les
+    deux agents précédents le portent, mais aucun des huit tests ajoutés par
+    la Story 5.3 ne l'a repris. Or T3.3 dit lui-même pourquoi il compte :
+    rien ne valide `input_contract` au runtime, donc une divergence ne lève
+    RIEN — elle produit un agent qui ne voit pas sa tâche. Ce test unitaire
+    est le seul garde-fou de cette surface.
+
+    Le `task_input` du run n'est pas réécrit entre deux nodes : c'est toujours
+    l'`objective` que l'appelant HTTP a posté qui arrive, au rang 3 comme au
+    rang 1. Déclarer `findings` ou `brief` serait exact au sens de
+    l'archétype, et faux au sens du moteur.
+    """
+    definition = load_dev_catalog()["architect_analyst"]
+    assert set(definition.input_contract.core) == {"objective"}
+    assert "`objective`" in definition.system_prompt
+    # Les contrats d'archétype de l'Analyste, que le moteur ne passera jamais.
+    assert "brief" not in definition.input_contract.core
+    assert "query" not in definition.input_contract.core
+
+
+def test_code_producer_input_contract_matches_the_key_the_engine_really_passes() -> None:
+    """T3.3, côté Producteur. Même raison, même garde — cf. le test au-dessus."""
+    definition = load_dev_catalog()["code_producer"]
+    assert set(definition.input_contract.core) == {"objective"}
+    assert "`objective`" in definition.system_prompt
+    assert "spec" not in definition.input_contract.core
+    assert "approach" not in definition.input_contract.core
+
+
+def test_the_two_new_templates_replace_their_archetype_contract_rather_than_extending_it() -> None:
+    """T3.2 — les clés de l'AC1, et RIEN de l'archétype.
+
+    Gabarit :
+    `test_code_researcher_replaces_the_archetype_contract_rather_than_extending_it`.
+    Un `output_contract` qui GARDERAIT les clés d'archétype déclencherait le
+    bon validateur (le dispatch teste l'inclusion) tout en promettant des
+    clés que le prompt ne demande jamais — un contrat déclaré plus large que
+    le contrat tenu.
+    """
+    analyst_core = set(load_dev_catalog()["architect_analyst"].output_contract.core)
+    assert {"approach", "tradeoffs", "risks", "test_strategy"} <= analyst_core
+    # Contrat de l'archétype `analyste`.
+    assert "insights" not in analyst_core
+    assert "recommendations" not in analyst_core
+
+    producer_core = set(load_dev_catalog()["code_producer"].output_contract.core)
+    assert {"code_diffs", "tests", "docs_snippets"} <= producer_core
+    # Contrat de l'archétype `producteur`.
+    assert "artifact" not in producer_core
+    assert "metadata" not in producer_core
+
+
+def test_no_dev_template_pins_an_llm_model() -> None:
+    """T3.6 — le silence est VOULU, et il a une conséquence nommée.
+
+    La whitelist `LLMModel` est restée aux quatre modèles de Sprint 1 alors
+    que `agent_node.DEFAULT_LLM_MODEL` vaut `claude-sonnet-4-6` : fixer
+    `llm_model` exigerait d'élargir la whitelist ET son miroir Zod.
+
+    ⚠️ La conséquence à porter à la Story 5.4 : `_to_llm_selection` rend
+    `None` dès que `llm_model` est absent, donc `GET .../diversity-check`
+    rend `is_diverse: null` pour TOUTE paire du pôle Dev. Ce test échouera le
+    jour où quelqu'un en fixera un — et c'est voulu : ce jour-là, la question
+    FR15 devra être tranchée, pas contournée.
+    """
+    for key, definition in load_dev_catalog().items():
+        assert definition.llm_model is None, (
+            f"{key} fixe llm_model={definition.llm_model!r} : élargir la whitelist "
+            "`LLMModel` et son miroir Zod d'abord, et trancher FR15 avec"
+        )

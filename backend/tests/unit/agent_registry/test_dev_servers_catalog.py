@@ -172,3 +172,29 @@ def test_every_declared_tool_is_actually_exposed_by_the_server_module() -> None:
 
     exposed = {tool.name for tool in tool_definitions()}
     assert set(load_dev_servers()[0].tools) <= exposed
+
+
+def test_every_dev_template_assigns_only_tools_the_server_really_declares() -> None:
+    """T6.3 — la parité catalogue ↔ serveur, pour TOUS les agents outillés.
+
+    ⚠️ Revue de la Story 5.3 : la parité n'était gardée que pour le
+    Chercheur. Les deux nouveaux agents n'étaient couverts que par un
+    `set(definition.tools) <= read_only` dont l'ensemble de droite était
+    RECOPIÉ EN DUR dans le test. Si `mcp-servers.yaml` perdait `find_files`,
+    le test du Chercheur tombait (il compare par égalité) et celui du
+    Producteur passait — contre un littéral périmé — pendant que le
+    provisioning échouait en base. C'est exactement l'écart que T6.3 demande
+    d'attraper SANS base de données.
+
+    La propriété gardée est l'inclusion et non l'égalité : un agent a le droit
+    de n'assigner qu'un sous-ensemble des outils du serveur (l'Analyste en
+    prend moins que le Producteur, et chaque outil de plus est proposé au
+    modèle à chaque itération, donc facturé).
+    """
+    declared = set(load_dev_servers()[0].tools)
+    for key, definition in load_dev_catalog().items():
+        assigned = set(definition.tools)
+        assert assigned <= declared, (
+            f"{key} assigne {sorted(assigned - declared)}, que le serveur ne déclare pas : "
+            "le provisioning échouera APRÈS avoir créé le template"
+        )

@@ -566,6 +566,14 @@ async def test_seeding_twice_creates_nothing_new(
     assert second.workflow_id == first.workflow_id
     assert "agent-template Dev Lead" in second.unchanged
     assert "agent-template Code Researcher" in second.unchanged
+    # ⚠️ T7.4 exigeait « les DEUX nouveaux templates créés puis `unchanged` à
+    # la seconde exécution », et ce test n'avait pas été étendu : seul
+    # `second.created == []` les couvrait, implicitement. Les nommer est ce
+    # qui distingue « rien n'a été créé » de « ces deux-là ont bien été
+    # reconnus » — un template que le seeder ne retrouverait plus par son nom
+    # satisferait la première affirmation en échouant la seconde.
+    assert "agent-template Architect Analyst" in second.unchanged
+    assert "agent-template Code Producer" in second.unchanged
     assert "serveur MCP dev-code-search" in second.unchanged
 
     # Les assertions ci-dessus portent sur ce que le seeder dit de LUI-MÊME.
@@ -576,11 +584,21 @@ async def test_seeding_twice_creates_nothing_new(
     from sqlalchemy import text
 
     async with app_session_factory() as session:
-        templates = await session.execute(
-            text("SELECT count(*) FROM agent_templates WHERE name = :name"),
-            {"name": "Dev Lead"},
-        )
-        assert templates.scalar_one() == 1
+        # Compté PAR NOM pour chacun des quatre : ce package n'a aucune
+        # fixture de purge, et la même précaution n'avait été prise que pour
+        # le Dev Lead — un doublon sur « Architect Analyst » serait donc resté
+        # invisible.
+        for template_name in (
+            "Dev Lead",
+            "Code Researcher",
+            "Architect Analyst",
+            "Code Producer",
+        ):
+            templates = await session.execute(
+                text("SELECT count(*) FROM agent_templates WHERE name = :name"),
+                {"name": template_name},
+            )
+            assert templates.scalar_one() == 1, f"doublon de template : {template_name}"
         workflows = await session.execute(
             text("SELECT count(*) FROM workflows WHERE name = :name"),
             {"name": DEV_ENTRY_WORKFLOW_NAME},
@@ -1879,28 +1897,59 @@ async def test_the_producer_cites_approach_steps_the_analyst_actually_produced(
     workflow_checkpointer: Any,
     outbox_worker: Any,
 ) -> None:
-    """AC3 — LE test de cette story, et il n'est pas circulaire.
+    """AC3 — LE test de cette story, et le chaînon y est fermé des DEUX côtés.
 
-    Les deux côtés du chaînon sont lus dans la sortie que le MOTEUR a
-    persistée et que l'endpoint de la Story 5.7 rend : les `id` d'étape
-    viennent du node `architect_analyst`, les `approach_ref` du node
-    `code_producer`. Aucune assertion contre une constante de ce fichier — ce
-    qui est exactement le défaut que la revue de la Story 5.7 a dû corriger
-    sur son propre test « qui compte », où `is_file()` acceptait un chemin réel
-    que l'outil n'avait jamais rendu.
+    Les deux bouts sont lus dans la sortie que le MOTEUR a persistée et que
+    l'endpoint de la Story 5.7 rend : les `id` d'étape viennent du node
+    `architect_analyst`, les `approach_ref` du node `code_producer`.
 
-    Vérifié par mutation : faire citer au Producteur un `approach_ref` que
-    l'Analyste n'a pas déclaré fait tomber ce test.
+    ⚠️ **Ce que la revue de la 5.3 a dû ajouter, et pourquoi.** La version
+    d'origine s'arrêtait à `cited <= declared_steps`. C'est vrai, mais ça ne
+    mord pas : les deux côtés sont des réponses du `MockProvider` écrites
+    l'une pour l'autre, et le moteur se contente de les recopier dans
+    `node_outputs`. AUCUNE mutation du code de production ne pouvait faire
+    échouer cette comparaison pour la bonne raison — la mutation n°1 de la
+    story la faisait bien tomber, mais par décalage de la file FIFO, avec un
+    run qui finissait `error`. Un test qui tombe pour la mauvaise raison ne
+    garde pas la propriété que son nom annonce.
+
+    Le maillon manquant est posé ici : les étapes lues DEPUIS LE MOTEUR
+    doivent se retrouver dans le prompt que le Producteur a réellement reçu.
+    Si le régime de passage repassait au résumé, ou si la sortie de l'Analyste
+    cessait d'atteindre son aval, cette assertion-ci tombe la première, et
+    elle tombe en le disant.
     """
-    body, _provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
+    body, provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
 
     outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
+    for node_id in (ARCHITECT_ANALYST_NODE_ID, CODE_PRODUCER_NODE_ID):
+        # Lire `truncated` AVANT de parser — la sortie du Producteur porte des
+        # diffs et des tests, donc c'est la plus grosse du DAG, et
+        # `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS` vaut 8 000 par défaut contre un
+        # `max_tokens` de 16 000. Sans cette garde, une fixture qui grossirait
+        # ferait échouer le test sur un `JSONDecodeError` très loin du sujet.
+        assert outputs[node_id]["truncated"] is False, (
+            f"{node_id} : la sortie est paginée, le JSON lu ici est un fragment — "
+            "recoller les pages par `next_offset` avant d'asserter quoi que ce soit"
+        )
     analyst = json.loads(outputs[ARCHITECT_ANALYST_NODE_ID]["output"])
     producer = json.loads(outputs[CODE_PRODUCER_NODE_ID]["output"])
 
     declared_steps = {step["id"] for step in analyst["approach"]["steps"]}
     assert declared_steps, "l'Analyste n'a déclaré aucune étape : il n'y a rien à référencer"
 
+    # Le maillon amont : ce que le moteur a produit est ce que le Producteur a VU.
+    producer_prompt = "".join(
+        message.content for message in provider.calls[4]["messages"] if message.role == "user"
+    )
+    for step_id in sorted(declared_steps):
+        assert step_id in producer_prompt, (
+            f"l'étape {step_id}, que l'Analyste a RÉELLEMENT produite d'après la sortie "
+            "lue depuis le moteur, n'apparaît pas dans le prompt du Producteur : il ne "
+            "peut pas s'appuyer sur une approche qu'il n'a pas reçue"
+        )
+
+    # Le maillon aval : ce que le Producteur a cité vient de ce qu'il a vu.
     cited = {diff["approach_ref"] for diff in producer["code_diffs"]}
     assert cited, "le Producteur ne cite aucune étape : l'AC3 n'a rien à vérifier"
     assert cited <= declared_steps, (
@@ -1926,6 +1975,13 @@ async def test_both_new_contracts_are_honoured_at_runtime_not_only_declared(
     body, _provider = await _run_the_full_chain(app_session_factory, workflow_checkpointer)
 
     outputs = {entry["node_id"]: entry for entry in body["node_outputs"]}
+    for node_id in (ARCHITECT_ANALYST_NODE_ID, CODE_PRODUCER_NODE_ID):
+        # Cf. le test d'AC3 : `truncated` se lit AVANT le `json.loads`, sinon
+        # une sortie paginée échoue en `JSONDecodeError` au lieu de dire
+        # qu'elle est coupée.
+        assert outputs[node_id]["truncated"] is False, (
+            f"{node_id} : sortie paginée, ce JSON est un fragment"
+        )
     analyst = json.loads(outputs[ARCHITECT_ANALYST_NODE_ID]["output"])
     producer = json.loads(outputs[CODE_PRODUCER_NODE_ID]["output"])
 
