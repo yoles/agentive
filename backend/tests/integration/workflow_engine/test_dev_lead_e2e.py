@@ -46,6 +46,7 @@ from scripts.seed_dev import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agentive_backend.infra.mcp.client import DEFAULT_DISCOVERY_TIMEOUT_S
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.dev_roles import validate_delegation_plan
 from agentive_backend.shared.correlation import new_correlation_id, set_correlation_id
@@ -1095,6 +1096,19 @@ async def test_the_seeded_pole_starts_through_the_real_mise_en_place(
     « namespaces avant templates » : que le `push_memory.namespace` du
     catalogue est bien celui que le seeder a créé, vu par la porte réelle.
     C'était inféré de deux assertions séparées.
+
+    **Le budget de ping n'est pas celui du conftest.** Ce test est le SEUL
+    du package où `mcp_tools_reachable` spawne réellement le serveur
+    `code_search` sandboxé : les autres câblages de la porte réelle pingent
+    un binaire inexistant (échec immédiat) ou un template sans outil. Ce
+    spawn coûte ~1,3 s sur un poste de dev rapide (import du module + poignée
+    de main MCP + bwrap ou setrlimit), et le défaut de 2 s du conftest tombait
+    en CI, sur un runner partagé et après cinq minutes de suite — la porte
+    répondait 503 « injoignable » pour un serveur que le seeder venait
+    d'enregistrer avec succès. On lui redonne ici le budget de la
+    découverte à l'enregistrement, celui que le seeder vient d'utiliser sur
+    la MÊME commande : ce test prouve le câblage des namespaces, pas le
+    réglage du timeout de ping.
     """
     report = await _seed(app_session_factory)
     objective, canned = _CASES["scaffolding"]
@@ -1105,7 +1119,9 @@ async def test_the_seeded_pole_starts_through_the_real_mise_en_place(
         providers={"mock": MockProvider("mock", _dag_completions(canned))},
         default_chain=["mock"],
     )
-    wire_execution_service_with_real_mise_en_place(app)
+    wire_execution_service_with_real_mise_en_place(
+        app, tool_ping_timeout_s=DEFAULT_DISCOVERY_TIMEOUT_S
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
