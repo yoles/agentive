@@ -65,6 +65,7 @@ from agentive_backend.shared.contracts.events import (
     AgentTemplateToolUnassignedEvent,
     AgentTemplateUpdatedEvent,
 )
+from agentive_backend.shared.correlation import require_correlation_id
 from agentive_backend.shared.event_bus import notify_best_effort, publish
 from agentive_backend.shared.exceptions import NotFoundError, ValidationError
 from agentive_backend.shared.logging import get_logger
@@ -184,7 +185,8 @@ class AgentTemplateService:
         transaction so a partial-failure mid-flight cannot leave the system
         in a state where the template exists with no audit trace. The bound
         ``correlation_id`` ContextVar (set by ``CorrelationIdMiddleware``)
-        is auto-propagated by ``publish`` — no explicit pass.
+        is required up front and passed explicitly to the event and to
+        ``publish`` so the audit row never loses its trace.
 
         Raises
         ------
@@ -206,6 +208,7 @@ class AgentTemplateService:
 
         config = archetype.to_template_config()
         event_type = AgentTemplateCreatedEvent.event_type
+        correlation_id = UUID(require_correlation_id())
 
         # ─── Single transaction: row INSERT + outbox INSERT ───
         # `with_tenant` opens an AsyncSession, binds tenant via SET LOCAL,
@@ -227,10 +230,16 @@ class AgentTemplateService:
                 name=template.name,
                 archetype=template.archetype,
                 version=template.version,
+                correlation_id=correlation_id,
                 actor="system",
                 tenant_id=tenant_id,
             )
-            event_id = await publish(event_type, event, session=session)
+            event_id = await publish(
+                event_type,
+                event,
+                session=session,
+                correlation_id=correlation_id,
+            )
             # commit happens at __aexit__ if no exception is raised.
 
         # ─── Post-commit: best-effort NOTIFY ───
@@ -245,6 +254,7 @@ class AgentTemplateService:
             name=template.name,
             archetype=template.archetype,
             version=template.version,
+            correlation_id=str(correlation_id),
         )
 
         return CreateTemplateResponse(
