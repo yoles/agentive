@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agentive_backend.shared.exceptions import NotFoundError
 from agentive_backend.shared.repositories.base import BaseRepo
 
 
@@ -124,3 +125,30 @@ async def test_with_tenant_uuid_string_canonical_form() -> None:
     bound_params = args[1] if len(args) > 1 else {}
     assert bound_params["tid"] == "01923a8e-7c1d-7e3f-9a4b-0123456789ab"
     assert len(bound_params["tid"]) == 36
+
+
+# ─── _require_found — lookup-or-404 helper (audit A-07) ────────────
+
+
+def test_require_found_returns_entity_when_present() -> None:
+    """A non-``None`` entity is returned unchanged (no exception)."""
+    sentinel = object()
+    assert (
+        BaseRepo._require_found(
+            sentinel, label="Widget", entity_id=uuid4(), context_key="widget_id"
+        )
+        is sentinel
+    )
+
+
+def test_require_found_raises_notfound_with_canonical_message_and_context() -> None:
+    """``None`` raises :class:`NotFoundError` with a uniform detail + context."""
+    entity_id = uuid4()
+    with pytest.raises(NotFoundError) as exc_info:
+        BaseRepo._require_found(
+            None, label="Agent template", entity_id=entity_id, context_key="template_id"
+        )
+    err = exc_info.value
+    assert err.detail == f"Agent template '{entity_id}' not found"
+    assert err.context == {"template_id": str(entity_id)}
+    assert err.status == 404

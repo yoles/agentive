@@ -47,12 +47,32 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       target: dev
+    # Tag stable consommé par `docker run` direct dans Makefile (test-backend, spike-m3-test)
+    # — parité 1:1 avec le job CI test-backend (.github/workflows/ci.yml:174-181).
+    image: agentive-backend:dev
     restart: unless-stopped
+    # Story 4.9 AC6/T6.7 — Docker's own default (SIGKILL at 10s) is not
+    # enough headroom for `app.lifespan`'s shutdown sequence: the recovery
+    # worker's own `stop()` alone has an 8s worst case (see
+    # `features/workflow_engine/recovery.py`'s `_STOP_GRACE_S`/
+    # `_STOP_CANCEL_TIMEOUT_S` comment), and it is only ONE of several
+    # workers stopped one after another. 30s is generous against that
+    # sequence, not a tight fit to a single worker's own number.
+    stop_grace_period: 30s
     environment:
       PYTHONUNBUFFERED: "1"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AGENTIVE_API_TOKEN: ${AGENTIVE_API_TOKEN:?required}
       AGENTIVE_ENCRYPTION_KEY: ${AGENTIVE_ENCRYPTION_KEY:?required}
+      # Story 9.2 AC3 — renseignée UNIQUEMENT pendant une fenêtre de rotation de
+      # clé : l'ancienne clé y est déplacée pour que les lignes pas encore
+      # ré-chiffrées restent lisibles. À vider dès que
+      # `scripts/rotate_encryption_key.py` sort en code 0. Voir la procédure
+      # complète dans le docstring de ce script.
+      AGENTIVE_ENCRYPTION_KEY_PREVIOUS: ${AGENTIVE_ENCRYPTION_KEY_PREVIOUS:-}
+      # Story 2.5 P-23 admin-gate (default false in prod for RCE/SSRF safety
+      # until Story 2.6 sandbox lands). Override per-environment via .env.
+      AGENTIVE_ALLOW_MCP_REGISTRATION: ${AGENTIVE_ALLOW_MCP_REGISTRATION:-false}
       # URLs construites via Pydantic Settings côté app (url-encoded) — ici on
       # passe uniquement les composants et le password sera URL-encodé par la lib.
       POSTGRES_HOST: db

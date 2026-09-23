@@ -2,7 +2,7 @@
  * Domain types for the Agent Registry — Story 2.1.
  *
  * Mirror the backend Pydantic schemas in
- * `backend/src/agentive_backend/features/m2_agent_registry/schemas.py`.
+ * `backend/src/agentive_backend/features/agent_registry/schemas.py`.
  * When backend OpenAPI typegen lands (Story 1.1 stub `make gen-api-types`),
  * we'll regenerate these.
  */
@@ -38,3 +38,92 @@ export type CreateTemplateResponse = {
   version: number;
   created_at: string; // ISO 8601
 };
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Story 2.2 — Template detail + update
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** Whitelist Sprint 1 — sera enrichie via OpenAPI typegen quand `make gen-api-types` existera. */
+export type LLMModel =
+  | "claude-3-5-sonnet-20241022"
+  | "claude-3-5-haiku-20241022"
+  | "gpt-4o"
+  | "gpt-4o-mini";
+
+export type ProviderId = "anthropic" | "openai";
+
+export type LLMParams = {
+  temperature: number;
+  max_tokens: number;
+};
+
+export type ContractDefinition = {
+  core: Record<string, unknown>;
+  extras: Record<string, unknown>;
+};
+
+export type ErrorPolicy = {
+  on_timeout: "retry_with_backoff" | "fail_fast" | "fallback_provider";
+  max_retries: number;
+  backoff_strategy: "exponential" | "linear" | "constant";
+};
+
+export type TemplateDetail = {
+  template_id: string;
+  name: string;
+  archetype: string;
+  version: number;
+  config: Record<string, unknown>;
+  created_at: string;
+};
+
+export type UpdateTemplateRequest = {
+  system_prompt?: string;
+  input_contract?: ContractDefinition;
+  output_contract?: ContractDefinition;
+  llm_model?: LLMModel;
+  llm_params?: LLMParams;
+  provider_chain?: ProviderId[];
+  error_policy?: ErrorPolicy;
+  /**
+   * Story 5.3 — ce template lit-il les sorties BRUTES de ses nodes amont, au
+   * lieu des résumés de passage ? Absent = les résumés.
+   *
+   * ⚠️ Relevé en revue : `UpdateTemplateRequestSchema` (le miroir Zod)
+   * acceptait déjà ce champ alors que ce type l'interdisait, donc le schéma
+   * validait un payload que le client ne pouvait pas construire. Un miroir à
+   * moitié propagé est la divergence même qu'il sert à éviter.
+   */
+  include_raw_previous_output?: boolean;
+};
+
+export type UpdateTemplateResponse = {
+  template_id: string;
+  name: string;
+  archetype: string;
+  version: number;
+  config: Record<string, unknown>;
+  updated_at: string;
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Story 2.4 — Agent instance (frozen snapshot of a template)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** AgentInstance — Story 2.4. Snapshot is a free-shape JSONB blob ; canonical
+ * Sprint 1 keys are `{template_id, template_version, name, archetype, config}`
+ * (cf backend `AgentRegistryService.instantiate_from_template`). */
+export type AgentInstance = {
+  instance_id: string;
+  template_id: string;
+  template_version: number;
+  workflow_run_id: string | null;
+  snapshot: Record<string, unknown>;
+  created_at: string;
+};
+
+export type InstantiateTemplateRequest = {
+  workflow_run_id?: string | null;
+};
+
+export type InstantiateTemplateResponse = AgentInstance;

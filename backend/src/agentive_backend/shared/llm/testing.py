@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
-from agentive_backend.shared.llm.types import ChatMessage, Completion
+from agentive_backend.shared.llm.embedder import EmbeddingPurpose
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 
 
 class MockProvider:
@@ -57,6 +60,7 @@ class MockProvider:
         system: str | None = None,
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         self._calls.append(
             {
@@ -68,6 +72,12 @@ class MockProvider:
                 "system": system,
                 "stop": list(stop) if stop is not None else None,
                 "timeout_s": timeout_s,
+                # Story 5.0 — enregistré comme tous les autres arguments, et
+                # pour la même raison : un test doit pouvoir asserter que les
+                # outils ont bien été proposés au modèle. Jeter ce paramètre
+                # rendrait le câblage invérifiable, ce que la revue 4.14 a
+                # déjà reproché au mock de `with_tenant`.
+                "tools": list(tools) if tools is not None else None,
             }
         )
         return self._consume()
@@ -88,3 +98,66 @@ class MockProvider:
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
+
+
+# Dimension of `text-embedding-3-small` — matches the partial HNSW index
+# `chunk_embeddings_openai_hnsw` (Story 3.1). Kept here rather than imported
+# from the OpenAI adapter so this module has zero production dependencies.
+_MOCK_EMBEDDING_DIMS = 1536
+
+
+class MockEmbedder:
+    """Deterministic hash-derived embedder — drives memory_manager tests
+    without an OpenAI API call (Story 3.1 T1.4).
+
+    .. DANGER:: NEVER instantiate :class:`MockEmbedder` from production code.
+       Same opt-in-only convention as :class:`MockProvider` — imported
+       explicitly from ``agentive_backend.shared.llm.testing``, never
+       re-exported from the package ``__init__``.
+
+    Each text is hashed (``sha256``) into a seed, then expanded into a
+    unit-norm 1536-dim vector. This is deliberately NOT a constant vector:
+    tests asserting that a search ranks distinct contents differently need
+    the mock to actually vary with the input.
+    """
+
+    provider_name: ClassVar[str] = "mock"
+
+    def __init__(self) -> None:
+        self._calls: list[dict[str, Any]] = []
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        """Return a snapshot of the kwargs each call received (for assertions)."""
+        return list(self._calls)
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str,
+        timeout_s: float = 30.0,
+        purpose: EmbeddingPurpose | None = None,
+    ) -> list[list[float]]:
+        self._calls.append(
+            {"texts": list(texts), "model": model, "timeout_s": timeout_s, "purpose": purpose}
+        )
+        return [self.vector_for(text) for text in texts]
+
+    @staticmethod
+    def vector_for(text: str) -> list[float]:
+        """Derive a deterministic unit-norm vector from ``text`` via a
+        seeded PRNG-free expansion of its sha256 digest (no ``random``
+        module — reproducible across processes/interpreters)."""
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        raw: list[float] = []
+        # Repeat/extend the 32-byte digest into 1536 floats by re-hashing
+        # with an incrementing counter each time the digest is exhausted.
+        counter = 0
+        while len(raw) < _MOCK_EMBEDDING_DIMS:
+            block = hashlib.sha256(digest + counter.to_bytes(4, "big")).digest()
+            raw.extend(b / 255.0 - 0.5 for b in block)
+            counter += 1
+        raw = raw[:_MOCK_EMBEDDING_DIMS]
+        norm = math.sqrt(sum(v * v for v in raw)) or 1.0
+        return [v / norm for v in raw]

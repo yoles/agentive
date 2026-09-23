@@ -26,6 +26,8 @@ Direct imports of ``langchain-anthropic`` / ``langchain-openai`` from
 from __future__ import annotations
 
 from agentive_backend.shared.llm.config import AgentLLMConfig
+from agentive_backend.shared.llm.embedder import Embedder, EmbeddingPurpose
+from agentive_backend.shared.llm.embedding_router import EmbeddingRouter
 from agentive_backend.shared.llm.error_classifier import ErrorClass, classify_error
 from agentive_backend.shared.llm.exceptions import (
     LLMAllProvidersFailedError,
@@ -37,7 +39,11 @@ from agentive_backend.shared.llm.exceptions import (
     LLMProviderTimeoutError,
     LLMProviderUnavailableError,
 )
-from agentive_backend.shared.llm.interface import LLMProvider
+from agentive_backend.shared.llm.interface import (
+    Completer,
+    LLMProvider,
+    RawProviderAccess,
+)
 from agentive_backend.shared.llm.router import (
     DEFAULT_MODEL_FALLBACK_MAP,
     FallbackCallback,
@@ -58,7 +64,11 @@ __all__ = [
     "AgentLLMConfig",
     "ChatMessage",
     "ChatRole",
+    "Completer",
     "Completion",
+    "Embedder",
+    "EmbeddingPurpose",
+    "EmbeddingRouter",
     "ErrorClass",
     "FallbackCallback",
     "FallbackContext",
@@ -74,6 +84,7 @@ __all__ = [
     "LLMProviderUnavailableError",
     "LLMRouter",
     "LLMUsage",
+    "RawProviderAccess",
     "RouterCall",
     "classify_error",
 ]

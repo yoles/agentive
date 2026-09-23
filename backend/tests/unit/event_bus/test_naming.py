@@ -18,11 +18,11 @@ from agentive_backend.shared.event_bus.naming import (
         "system.app.started",
         "system.app.shutdown",
         "system.health.checked",
-        "m1.company.bootstrapped",
-        "m3.workflow.started",
-        "m3.workflow.completed",
-        "m4.chunk.indexed",
-        "m12.trace.exported",
+        "company_architect.company.bootstrapped",
+        "workflow_engine.workflow.started",
+        "workflow_engine.workflow.completed",
+        "memory_manager.chunk.indexed",
+        "trace.span.exported",
     ],
 )
 def test_valid_event_types_pass(event_type: str) -> None:

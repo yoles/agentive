@@ -15,6 +15,9 @@
 # Claude Code runtime — session lock (sessionId, pid). NEVER commit.
 .claude/*.lock
 
+# Claude Code personal local overrides (permissions, etc.) — not team-shared.
+.claude/settings.local.json
+
 # Spike M3 (Story 1.2) — thread_id transient file for crash/resume tests
 .spike-thread-id
 backend/.spike-thread-id
@@ -165,3 +168,20 @@ lerna-debug.log*
 
 infrastructure/
 infrastructure_idem_helper/
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Audit sécurité 2026-07-07 — fichiers hors-projet / perso / bloat
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fichiers personnels / hors-projet (P1)
+dream_job.txt
+
+# Assistant IA local — mémoire & profil (machine-specific) (P3)
+.claude/projects/
+
+# Formation — binaires générés (régénérables depuis le Markdown) (P4)
+formation/*.pdf
+formation/*.epub
+
+# Framework/planning BMAD — hors code, ne doit pas vivre dans ce repo (P5)
+_bmad/
+_bmad-output/

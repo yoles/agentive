@@ -3,7 +3,7 @@
 Covers AC3 422 paths *without* hitting the DB. The repo + service are
 mocked so we test only the request/response shape and the RFC 7807
 content-type. End-to-end happy path lives in
-``tests/integration/m2_agent_registry/test_create_template_e2e.py``.
+``tests/integration/agent_registry/test_create_template_e2e.py``.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agentive_backend.app.main import create_app
-from agentive_backend.features.m2_agent_registry.schemas import CreateTemplateResponse
-from agentive_backend.features.m2_agent_registry.service import AgentRegistryService
+from agentive_backend.features.agent_registry.schemas import CreateTemplateResponse
+from agentive_backend.features.agent_registry.service import AgentTemplateService
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
 
 @pytest.fixture
 def client(app: FastAPI) -> TestClient:
-    from agentive_backend.features.m2_agent_registry import load_registry
+    from agentive_backend.features.agent_registry import load_registry
 
     app.state.archetype_registry = load_registry()
     # Story 2.1 P-08 — sentinel so `_build_service` doesn't 503. The unknown-
@@ -146,18 +146,20 @@ def test_post_template_happy_path_uses_service(
         version=1,
         created_at=datetime.now(tz=UTC),
     )
-    fake_service_instance = AsyncMock(spec=AgentRegistryService)
+    fake_service_instance = AsyncMock(spec=AgentTemplateService)
     fake_service_instance.create_template.return_value = fake_response
 
     # Patch the build helper so any caller (router) gets our mock.
     # NOTE: the package re-exports the APIRouter as `router` from
     # ``__init__.py``, so the dotted path
-    # ``agentive_backend.features.m2_agent_registry.router`` is ambiguous.
+    # ``agentive_backend.features.agent_registry.router`` is ambiguous.
     # We import the submodule via importlib to disambiguate.
     import importlib
 
-    router_module = importlib.import_module("agentive_backend.features.m2_agent_registry.router")
-    monkeypatch.setattr(router_module, "_build_service", lambda _request: fake_service_instance)
+    router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
+    monkeypatch.setattr(
+        router_module, "_build_template_service", lambda _request: fake_service_instance
+    )
 
     resp = client.post(
         "/api/v1/agents/templates",
@@ -171,3 +173,118 @@ def test_post_template_happy_path_uses_service(
     assert body["archetype"] == "producteur"
     assert body["version"] == 1
     assert "created_at" in body
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Story 2.2 — GET + PUT /agents/templates/{id}
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _patch_service(monkeypatch: pytest.MonkeyPatch, mock_service: AsyncMock) -> None:
+    import importlib
+
+    router_module = importlib.import_module("agentive_backend.features.agent_registry.router")
+    monkeypatch.setattr(router_module, "_build_template_service", lambda _request: mock_service)
+
+
+def test_put_template_invalid_uuid_returns_422(client: TestClient) -> None:
+    """AC1 / D4 — UUID invalide en path ⇒ 422 (FastAPI Path UUID auto-validate)."""
+    resp = client.put(
+        "/api/v1/agents/templates/not-a-uuid",
+        headers=_auth_headers(),
+        json={"system_prompt": "x"},
+    )
+    assert resp.status_code == 422
+    assert resp.headers["content-type"] == "application/problem+json"
+
+
+def test_put_template_extra_field_rejected(client: TestClient) -> None:
+    """AC1 — extra=forbid ⇒ 422 sur champ inconnu."""
+    resp = client.put(
+        f"/api/v1/agents/templates/{uuid4()}",
+        headers=_auth_headers(),
+        json={"system_prompt": "x", "rogue": "field"},
+    )
+    assert resp.status_code == 422
+
+
+def test_put_template_invalid_llm_model_returns_422(client: TestClient) -> None:
+    """AC1 — llm_model hors whitelist ⇒ 422."""
+    resp = client.put(
+        f"/api/v1/agents/templates/{uuid4()}",
+        headers=_auth_headers(),
+        json={"llm_model": "gpt-7-omega"},
+    )
+    assert resp.status_code == 422
+
+
+def test_put_template_happy_path_uses_service(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """AC1 — Happy path 200 avec mock service."""
+    from agentive_backend.features.agent_registry.schemas import UpdateTemplateResponse
+
+    template_id = uuid4()
+    fake_response = UpdateTemplateResponse(
+        template_id=template_id,
+        name="Code Producer",
+        archetype="producteur",
+        version=2,
+        config={"system_prompt": "v2 prompt", "llm_model": "claude-3-5-sonnet-20241022"},
+        updated_at=datetime.now(tz=UTC),
+    )
+    fake_service = AsyncMock(spec=AgentTemplateService)
+    fake_service.update_template.return_value = fake_response
+    _patch_service(monkeypatch, fake_service)
+
+    resp = client.put(
+        f"/api/v1/agents/templates/{template_id}",
+        headers=_auth_headers(),
+        json={
+            "system_prompt": "v2 prompt",
+            "llm_model": "claude-3-5-sonnet-20241022",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["version"] == 2
+    assert body["template_id"] == str(template_id)
+    assert "updated_at" in body
+
+
+def test_get_template_invalid_uuid_returns_422(client: TestClient) -> None:
+    """AC6 — UUID invalide en path ⇒ 422."""
+    resp = client.get(
+        "/api/v1/agents/templates/abc",
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_get_template_happy_path_uses_service(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """AC6 — Happy path 200 avec mock service."""
+    from agentive_backend.features.agent_registry.schemas import TemplateDetailResponse
+
+    template_id = uuid4()
+    fake_response = TemplateDetailResponse(
+        template_id=template_id,
+        name="Code Producer",
+        archetype="producteur",
+        version=1,
+        config={"prompt_base": "x", "role": "producer"},
+        created_at=datetime.now(tz=UTC),
+    )
+    fake_service = AsyncMock(spec=AgentTemplateService)
+    fake_service.get_template_by_id.return_value = fake_response
+    _patch_service(monkeypatch, fake_service)
+
+    resp = client.get(
+        f"/api/v1/agents/templates/{template_id}",
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["template_id"] == str(template_id)
+    assert body["version"] == 1

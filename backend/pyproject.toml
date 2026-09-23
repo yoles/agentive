@@ -9,11 +9,14 @@ dependencies = [
     "bcrypt>=4.3",
     "cryptography>=46.0.7",
     "fastapi>=0.136.0",
-    # NOTE: `fastembed` (local embedding backend) n'a pas de wheel prebuild Python 3.14
-    # (dépendance transitoire `py-rust-stemmers` sans wheel cp314). Ajouté dans Story 3.6
-    # quand l'Embedding Router est implémenté. Utiliser une image Python avec Rust toolchain
-    # ou pin une version compatible à ce moment-là.
-    # "fastembed>=0.3",
+    # Story 3.6 T5.1 — le blocage documenté ci-dessus (pas de wheel cp314 pour
+    # la dépendance transitoire `py-rust-stemmers`) est LEVÉ : vérifié en
+    # direct le 2026-09-08 via `pip download --python-version 3.14
+    # --only-binary=:all: --platform manylinux_2_28_x86_64` (résolution PyPI
+    # pure, sans toolchain Rust) — `fastembed==0.8.0` et toute sa chaîne
+    # (onnxruntime, tokenizers, py-rust-stemmers, mmh3, pillow, numpy) ont des
+    # wheels cp314/abi3 manylinux disponibles.
+    "fastembed>=0.8",
     "langchain-anthropic>=1.4.1",
     "langchain-openai>=1.1.14",
     # ━━━ LangGraph version policy (Story 1.2 / Architecture G3) ━━━
@@ -28,6 +31,15 @@ dependencies = [
     # casser le format checkpoint sans déclencher le bump de langgraph lui-même.
     "langgraph-checkpoint-postgres==3.0.5",
     "mcp>=1.27.0",
+    # Story 2.7 fix-batch (C-01, 2026-09-02) : already a transitive dep of
+    # langsmith[otel] (via langgraph) in uv.lock's graph, but NOT part of
+    # this project's resolved/installed set (`from opentelemetry import
+    # trace` raised ModuleNotFoundError before this line). Declared
+    # directly per direct usage in playground/service.py (AC2 span
+    # attribute). API-only package (no SDK/exporter) : `set_attribute` on
+    # `get_current_span()` is a safe no-op when no tracer provider is
+    # configured, so this stays inert until Story 9.x wires a real one.
+    "opentelemetry-api>=1.41.0",
     "pgvector>=0.4.2",
     "prometheus-client>=0.20",
     # ━━━ psycopg version policy (Story 1.4 / event_bus LISTEN/NOTIFY) ━━━
@@ -41,14 +53,20 @@ dependencies = [
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
     "python-multipart>=0.0.26",
-    # Story 2.1 — used to load `features/m2_agent_registry/templates/archetype-schema.yaml`.
+    # Story 2.1 — used to load `features/agent_registry/templates/archetype-schema.yaml`.
     # Already a transitive dep (langgraph), now declared explicitly per direct usage.
     "pyyaml>=6.0",
-    "slowapi>=0.1.9",
+    # slowapi retiré (audit A-04 2026-07) : déclaré depuis le scaffolding mais
+    # jamais câblé (aucun Limiter/@limit dans src/). Dépendance morte = surface
+    # supply-chain inutile. Le rate limiting sera réintroduit AVEC son design
+    # (par-endpoint, storage partagé) en Story 9.5 — prérequis multi-user.
     "sqlalchemy[asyncio]>=2.0.49",
     "sse-starlette>=3.3.4",
     "structlog>=25.5.0",
     "uvicorn[standard]>=0.44.0",
+    # Story 3.6 T5.1 — Embedding Router "voyage" backend (optional, cf. Dev
+    # Notes § Scope Voyage). Wheel cp314 vérifié disponible le 2026-09-08.
+    "voyageai>=0.5",
 ]
 
 [project.scripts]
@@ -66,6 +84,11 @@ build-backend = "uv_build"
 line-length = 100
 target-version = "py314"
 src = ["src"]
+# `.uv-cache/` vit dans WORKDIR (`/app`) depuis le commit 21b2eff (fix EACCES
+# sur l'user non-root en prod). Ruff exclut par défaut .mypy_cache / .ruff_cache
+# / .pytest_cache mais pas .uv-cache, donc `ruff check .` walk dans les deps
+# tierces et signale leurs warnings/erreurs comme s'ils étaient à nous.
+extend-exclude = [".uv-cache"]
 
 [tool.ruff.lint]
 select = [
@@ -82,11 +105,21 @@ select = [
     "ARG",  # flake8-unused-arguments
     "PTH",  # flake8-use-pathlib
     "RUF",  # ruff-specific
+    "C90",  # mccabe — cyclomatic complexity gate (audit A-15/B-01)
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
     "B008",   # do not perform function calls in argument defaults (FastAPI Depends)
 ]
+
+# Audit A-15 (B-01) — gate de complexité cyclomatique via ruff/mccabe (déjà
+# dans la toolchain, contrairement à radon/xenon proposés par l'audit).
+# État au 2026-07-09 : max mesuré = 15 (`shared/llm/router.py::complete`),
+# 6 fonctions entre 11 et 15. Seuil ratchet calé sur l'existant : ne PAS
+# l'augmenter pour faire passer une nouvelle fonction — la découper. À
+# resserrer (12 puis 10) au fil du refactoring SRP (audit A-09, Vague 2).
+[tool.ruff.lint.mccabe]
+max-complexity = 15
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ARG", "B", "N"]
@@ -113,7 +146,7 @@ strict = false
 disallow_untyped_defs = false
 
 # `spike/` contient du code de validation isolé (Story 1.2). Il sera réécrit
-# proprement dans `features/m3_workflow_engine/` à l'Epic 4 — jusque là, on
+# proprement dans `features/workflow_engine/` à l'Epic 4 — jusque là, on
 # relâche mypy sur les retours de LangGraph (`StateGraph.compile()` retourne un
 # type interne complexe qu'il n'est pas utile de propager dans les signatures
 # du spike). Les tests `tests/spike/` valident la correction d'exécution.

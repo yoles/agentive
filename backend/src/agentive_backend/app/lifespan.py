@@ -13,22 +13,112 @@ from typing import Any
 
 import bcrypt
 from fastapi import FastAPI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
+from pydantic import SecretStr
 
-from agentive_backend.features.m2_agent_registry import load_registry
+from agentive_backend.features.agent_registry import load_registry
+from agentive_backend.features.memory_manager.push_memory import (
+    MemoryManagerPushMemoryProvider,
+)
+from agentive_backend.features.memory_manager.service import MemoryManagerService
+from agentive_backend.features.memory_manager.ttl import MemoryArchivalWorker
+from agentive_backend.features.workflow_engine.dry_run import DryRunService, DryRunSettings
+from agentive_backend.features.workflow_engine.mise_en_place import (
+    MiseEnPlaceService,
+    MiseEnPlaceSettings,
+)
+from agentive_backend.features.workflow_engine.recovery import (
+    WorkflowRecoveryWorker,
+    derive_stale_threshold_s,
+)
+from agentive_backend.features.workflow_engine.retention import CheckpointRetentionWorker
+from agentive_backend.features.workflow_engine.routing_catalog import load_routing_rules
+from agentive_backend.features.workflow_engine.service import (
+    WorkflowExecutionService,
+    cancel_inflight_runs,
+)
 from agentive_backend.infra.db.session import get_session_factory
-from agentive_backend.infra.llm import AnthropicProvider, OpenAIProvider
+from agentive_backend.infra.llm import (
+    AnthropicProvider,
+    FastEmbedProvider,
+    OpenAIProvider,
+    VoyageProvider,
+)
+from agentive_backend.infra.llm.fastembed_adapter import (
+    EMBEDDING_DIMENSIONS as FASTEMBED_EMBEDDING_DIMENSIONS,
+)
+from agentive_backend.infra.llm.fastembed_adapter import (
+    EMBEDDING_MODEL_NAME as FASTEMBED_EMBEDDING_MODEL_NAME,
+)
+from agentive_backend.infra.llm.openai_adapter import (
+    EMBEDDING_DIMENSIONS as OPENAI_EMBEDDING_DIMENSIONS,
+)
+from agentive_backend.infra.llm.openai_adapter import (
+    EMBEDDING_MODEL_NAME as OPENAI_EMBEDDING_MODEL_NAME,
+)
+from agentive_backend.infra.llm.voyage_adapter import (
+    EMBEDDING_DIMENSIONS as VOYAGE_EMBEDDING_DIMENSIONS,
+)
+from agentive_backend.infra.llm.voyage_adapter import (
+    EMBEDDING_MODEL_NAME as VOYAGE_EMBEDDING_MODEL_NAME,
+)
 from agentive_backend.shared.config import settings
 from agentive_backend.shared.contracts.events import (
+    LLMFallbackTriggeredEvent,
     SystemShutdownEvent,
     SystemStartedEvent,
 )
 from agentive_backend.shared.correlation import _correlation_id_var, new_correlation_id
 from agentive_backend.shared.event_bus import OutboxWorker, publish_and_commit
-from agentive_backend.shared.llm import Completion, FallbackCallback, FallbackContext, LLMRouter
-from agentive_backend.shared.llm.testing import MockProvider
+from agentive_backend.shared.llm import (
+    Completion,
+    Embedder,
+    EmbeddingRouter,
+    FallbackCallback,
+    FallbackContext,
+    LLMRouter,
+)
+from agentive_backend.shared.llm.router import DEFAULT_MODEL_FALLBACK_MAP
+from agentive_backend.shared.llm.testing import MockEmbedder, MockProvider
 from agentive_backend.shared.logging import configure_logging, get_logger
+from agentive_backend.shared.repositories import (
+    AgentTemplateRepo,
+    AgentTemplateToolRepo,
+    ChunkEmbeddingRepo,
+    MemoryChunkRepo,
+    NamespaceRepo,
+    ToolServerRepo,
+    WorkflowRepo,
+    WorkflowRunRepo,
+)
 
 log = get_logger(__name__)
+
+# LangGraph checkpointer pool (Story 4.2 T9.1, review finding #8). Small on
+# purpose: checkpoint writes are short and serialized per run, so this sizes
+# for concurrent RUNS, not for request throughput. `max_lifetime` recycles
+# connections so a long-lived process never accumulates stale sockets behind
+# a load balancer or a Postgres `idle_session_timeout`.
+_CHECKPOINT_POOL_MIN_SIZE = 1
+_CHECKPOINT_POOL_MAX_SIZE = 10
+_CHECKPOINT_POOL_MAX_LIFETIME_S = 30 * 60.0
+_CHECKPOINT_POOL_OPEN_TIMEOUT_S = 10.0
+
+# Shutdown budget for cancelling in-flight runs. Sized against the same
+# `stop_grace_period: 30s` the workers' own budgets are sized against, and
+# deliberately smaller than what remains of it after they have all stopped.
+_CANCEL_INFLIGHT_TIMEOUT_S = 5.0
+
+
+def _workflow_checkpoint_dsn() -> str:
+    """Canonical ``postgresql://`` DSN for the runtime :class:`AsyncPostgresSaver`
+    (Story 4.2 T9.1) — mirror ``spike/m3_langgraph.py::_checkpoint_dsn``, but
+    on ``settings.database_url`` (``agentive_app`` role, DML-only grants)
+    rather than the owner DSN the T1.2 migration used for ``CREATE TABLE``.
+    """
+    return settings.psycopg_dsn
 
 
 # bcrypt hash version prefixes — 2a/2b/2y are all valid bcrypt outputs from
@@ -104,6 +194,79 @@ def _init_auth_token(app: FastAPI) -> None:
     log.info("auth.token_initialized", mode=mode, env=settings.environment)
 
 
+def _enforce_mcp_sandbox_policy(backend: str) -> None:
+    """Guard the flag/sandbox-backend combination at boot (audit A-03 / 5.3).
+
+    The ``setrlimit`` fallback caps CPU/memory/nproc but CANNOT isolate
+    network or filesystem (documented in ``infra/mcp/sandbox.py``). With
+    ``AGENTIVE_ALLOW_MCP_REGISTRATION=true`` on such a backend, executing
+    an untrusted MCP tool is an uncontained RCE/SSRF surface. Before this
+    guard the degradation was silent (a lone WARNING at detection time,
+    not correlated with the flag).
+
+    Policy — same fail-fast philosophy as :func:`_init_auth_token`:
+    * production → refuse to boot (``RuntimeError`` with operator hint) ;
+    * dev/test   → loud WARNING (bwrap is commonly inoperative in local
+      Docker profiles ; blocking dev would hurt more than it protects).
+    """
+    if not settings.mcp_allow_registration or backend != "setrlimit":
+        return
+    if settings.is_production:
+        log.critical(
+            "mcp_sandbox.refusing_boot_degraded_backend",
+            backend=backend,
+            env=settings.environment,
+        )
+        raise RuntimeError(
+            "AGENTIVE_ALLOW_MCP_REGISTRATION=true but the effective sandbox "
+            "backend is 'setrlimit' — no network/filesystem isolation for "
+            "MCP tool execution. Refusing to boot in production. Fix: run "
+            "the backend with a bwrap-capable kernel (CAP_SYS_ADMIN or "
+            "kernel.unprivileged_userns_clone=1), or set "
+            "AGENTIVE_ALLOW_MCP_REGISTRATION=false."
+        )
+    log.warning(
+        "mcp_sandbox.degraded_backend_with_registration_enabled",
+        backend=backend,
+        risk="MCP tools run WITHOUT network/filesystem isolation (RCE/SSRF uncontained)",
+        remediation=(
+            "enable bwrap (CAP_SYS_ADMIN / kernel.unprivileged_userns_clone=1) "
+            "or set AGENTIVE_ALLOW_MCP_REGISTRATION=false"
+        ),
+    )
+
+
+def _api_key_configured(key: SecretStr | None) -> bool:
+    """Whether a provider's API key is usable — present AND non-empty.
+
+    `AGENTIVE_ANTHROPIC_API_KEY=` (exported but blank, a common CI/compose
+    accident) yields ``SecretStr('')``, not ``None``, so an
+    ``is not None`` test alone reports a key that no provider can
+    authenticate with. Single predicate on purpose: :func:`_build_llm_router`
+    uses it to decide whether to fall back to :class:`MockProvider`, and
+    Story 4.5's ``MiseEnPlaceSettings`` uses it for the
+    ``llm_providers_configured`` check — the two MUST agree, or the
+    pre-workflow gate clears a launch the router cannot serve.
+    """
+    return key is not None and bool(key.get_secret_value())
+
+
+def _mock_llm_provider_active() -> bool:
+    """Whether this process runs on the :class:`MockProvider` fallback.
+
+    True exactly when :func:`_build_llm_router` takes its "no key at all"
+    branch — which, since that branch refuses to boot in production, can
+    only happen in dev/test. Every run then completes against the mock, so
+    Story 4.5's ``llm_providers_configured`` check MUST pass: a missing key
+    predicts no failure here, and blocking the launch would be a false
+    positive that makes local development impossible without secrets
+    (review IG1).
+    """
+    return not _api_key_configured(settings.anthropic_api_key) and not _api_key_configured(
+        settings.openai_api_key
+    )
+
+
 def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRouter:
     """Build the singleton :class:`LLMRouter` for the process.
 
@@ -127,10 +290,10 @@ def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRout
     anthropic_key = settings.anthropic_api_key
     openai_key = settings.openai_api_key
 
-    has_anthropic = anthropic_key is not None and anthropic_key.get_secret_value()
-    has_openai = openai_key is not None and openai_key.get_secret_value()
+    has_anthropic = _api_key_configured(anthropic_key)
+    has_openai = _api_key_configured(openai_key)
 
-    if not has_anthropic and not has_openai:
+    if _mock_llm_provider_active():
         if settings.is_production:
             raise RuntimeError(
                 "Refusing to boot in production without any LLM provider "
@@ -186,6 +349,92 @@ def _build_llm_router(*, on_fallback: FallbackCallback | None = None) -> LLMRout
     )
 
 
+def _build_embedding_router() -> EmbeddingRouter:
+    """Build the singleton :class:`EmbeddingRouter` for the process
+    (Story 3.6 T6.1) — replaces the single-provider :func:`_build_embedder`
+    it superseded (Story 3.1 T1.5).
+
+    Decision matrix
+    ---------------
+    * ``cloud`` (OpenAI) — mandatory, unchanged decision from the old
+      ``_build_embedder``: no key + production → :class:`RuntimeError`; no
+      key + dev/test → :class:`MockEmbedder`.
+    * ``local`` (FastEmbed) — always ATTEMPTED, no API key needed, but the
+      load can fail (network unreachable to the HuggingFace Hub, or the
+      first-run download not yet cached — T2.1 loads eagerly at
+      construction). Decision: catch that failure, log it, and simply leave
+      ``"local"`` out of ``providers`` in EVERY environment (dev AND
+      production) — the same "optional backend that may not be wired"
+      posture as ``voyage`` below, not a boot-blocking failure. Décision
+      John 2026-09-09 (Story 3.6 code review) : namespaces configured for
+      ``local`` get an explicit 503 from :meth:`EmbeddingRouter.resolve`
+      until the model is reachable — NOT a silent fallback to ``cloud``,
+      which would break write/read backend symmetry. Crashing the WHOLE
+      process — search and chunk writes on every other namespace included —
+      over one optional backend would still be a strictly worse failure
+      mode than serving every other namespace while this one 503s.
+    * ``voyage`` — built only when ``VOYAGE_API_KEY`` is configured;
+      absent, the backend simply does not exist in ``providers`` (same
+      "optional, refuses explicitly rather than silently" contract as
+      ``local``'s failure path above).
+    """
+    providers: dict[str, Embedder] = {}
+    model_by_backend: dict[str, str] = {}
+    dimensions_by_backend: dict[str, int] = {}
+
+    # `.strip()`: a whitespace-only secret is truthy, and used to let the
+    # production boot succeed with a key that fails 401 on every request
+    # instead of refusing to start. The `is None` / falsy test also narrows
+    # for mypy, replacing an `assert` that `python -O` would have erased
+    # (code review Story 3.1, P12).
+    openai_key = settings.openai_api_key
+    if openai_key is None or not openai_key.get_secret_value().strip():
+        if settings.is_production:
+            raise RuntimeError(
+                "Refusing to boot in production without OPENAI_API_KEY — "
+                "the memory manager embedding backend requires it."
+            )
+        log.warning(
+            "embedding_router.cloud_built_with_mock",
+            reason="no_openai_api_key_configured",
+            environment=settings.environment,
+        )
+        providers["cloud"] = MockEmbedder()
+    else:
+        providers["cloud"] = OpenAIProvider(api_key=openai_key)
+    model_by_backend["cloud"] = OPENAI_EMBEDDING_MODEL_NAME
+    dimensions_by_backend["cloud"] = OPENAI_EMBEDDING_DIMENSIONS
+
+    try:
+        providers["local"] = FastEmbedProvider()
+    except Exception:
+        log.exception(
+            "embedding_router.local_backend_unavailable",
+            reason="fastembed_model_load_failed",
+        )
+    else:
+        model_by_backend["local"] = FASTEMBED_EMBEDDING_MODEL_NAME
+        dimensions_by_backend["local"] = FASTEMBED_EMBEDDING_DIMENSIONS
+
+    voyage_key = settings.voyage_api_key
+    normalized_voyage_key = voyage_key.get_secret_value().strip() if voyage_key is not None else ""
+    if normalized_voyage_key:
+        providers["voyage"] = VoyageProvider(api_key=normalized_voyage_key)
+        model_by_backend["voyage"] = VOYAGE_EMBEDDING_MODEL_NAME
+        dimensions_by_backend["voyage"] = VOYAGE_EMBEDDING_DIMENSIONS
+
+    log.info(
+        "embedding_router.built",
+        backends=sorted(providers),
+        environment=settings.environment,
+    )
+    return EmbeddingRouter(
+        providers=providers,
+        model_by_backend=model_by_backend,
+        dimensions_by_backend=dimensions_by_backend,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan : logging config, event-bus worker, lifecycle events."""
@@ -206,6 +455,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise
     log.info("archetype_registry_loaded", count=len(app.state.archetype_registry))
 
+    # Story 4.3 T9.1 — load the hybrid-routing rules catalog once at boot,
+    # mirror of `archetype_registry` above (same posture: a broken/missing
+    # YAML is a packaging/config error, so it fails BOOT, not a request —
+    # unlike `_build_embedding_router`'s degrade-quietly-optional-backend
+    # stance, which does not apply here).
+    app.state.routing_rules = load_routing_rules()
+    log.info("routing_rules_loaded", count=len(app.state.routing_rules))
+
+    # Same posture applied to the escalation MODEL: an id absent from the
+    # fallback map boots cleanly today and then kills every escalating run,
+    # much later, with an error that points at the LLM layer rather than at
+    # the misconfigured variable. A deployment knob that can only be wrong is
+    # worth validating where it is cheap to fix — at boot, naming the knob.
+    if settings.routing_escalation_model not in DEFAULT_MODEL_FALLBACK_MAP:
+        raise RuntimeError(
+            f"AGENTIVE_ROUTING_ESCALATION_MODEL={settings.routing_escalation_model!r} is not a "
+            f"known model — expected one of {sorted(DEFAULT_MODEL_FALLBACK_MAP)}"
+        )
+
+    # Story 2.6 — detect sandbox backend once at boot. Stored on app.state
+    # so the m5 service reads it without re-running ``shutil.which`` per call
+    # (avoid TOCTOU + cheap to memoize). Warning logged inside the helper
+    # when bwrap is unavailable.
+    from agentive_backend.infra.mcp.sandbox import detect_sandbox_backend
+
+    app.state.mcp_sandbox_backend = detect_sandbox_backend()
+    log.info(
+        "mcp_sandbox.backend_selected",
+        backend=app.state.mcp_sandbox_backend,
+    )
+    # Audit A-03 (5.3) — refuse (prod) or warn (dev) when MCP registration
+    # is enabled while the sandbox has no network/FS isolation.
+    _enforce_mcp_sandbox_policy(app.state.mcp_sandbox_backend)
+    # P-14 (CR 2026-05-11) — AC3 demands a ``mcp_sandbox_backend{kind=...}``
+    # counter (per-backend invocation count). Stored on app.state as a
+    # plain dict ; Prometheus integration formalized Story 7.x (D65).
+    app.state.mcp_sandbox_invocations = {"bwrap": 0, "setrlimit": 0}
+
     # Build the session factory FIRST so the LLM fallback callback can
     # close over it. The callback is wired into the LLMRouter at
     # construction time (no post-construction private-attribute mutation).
@@ -217,7 +504,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = session_factory
 
     async def _publish_fallback(ctx: FallbackContext) -> None:
-        """Publish ``m3.llm.fallback_triggered`` on the event bus.
+        """Publish ``workflow_engine.llm.fallback_triggered`` on the event bus.
 
         Captures the per-call ``correlation_id`` from the FallbackContext
         (router populates it from the structlog ContextVar at fallback
@@ -244,18 +531,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             token = _correlation_id_var.set(str(cid))
             try:
                 async with session_factory() as session:
+                    # Story 4.6 T4.3 — the SAME event name and the SAME
+                    # payload shape Story 1.6 has published since day one,
+                    # now carried by a Pydantic contract instead of an
+                    # anonymous dict. Consumers (the `llm-usage` runbook, the
+                    # 1.6 test suite) know this event by that exact shape;
+                    # the typing validates it at the publish site, it does
+                    # not redefine it.
                     await publish_and_commit(
                         session,
-                        "m3.llm.fallback_triggered",
-                        {
-                            "failed_provider": ctx.failed_provider,
-                            "next_provider": ctx.next_provider,
-                            "error_class": ctx.error_class,
-                            "error_type": ctx.error_type,
-                            "model_attempted": ctx.model_attempted,
-                            "model_fallback": ctx.model_fallback,
-                            "correlation_id": str(cid),
-                        },
+                        LLMFallbackTriggeredEvent.event_type,
+                        LLMFallbackTriggeredEvent(
+                            failed_provider=ctx.failed_provider,
+                            next_provider=ctx.next_provider,
+                            error_class=ctx.error_class,
+                            error_type=ctx.error_type,
+                            model_attempted=ctx.model_attempted,
+                            model_fallback=ctx.model_fallback,
+                            correlation_id=str(cid),
+                        ).model_dump(mode="json"),
                     )
             finally:
                 _correlation_id_var.reset(token)
@@ -276,6 +570,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     llm_router = _build_llm_router(on_fallback=_publish_fallback)
     app.state.llm_router = llm_router
 
+    # Story 3.1 T1.5 / Story 3.6 T6.2 — memory manager embedding backend,
+    # wired once at boot (same lifetime as llm_router). `embedding_router`
+    # replaces the single-provider `embedder` attribute.
+    app.state.embedding_router = _build_embedding_router()
+
+    # Story 3.5 T11.1 — Push Memory : a full MemoryManagerService, built
+    # here (not via `memory_manager/router.py._build_service`, request-
+    # scoped) because `app` may import several features (Contract 2),
+    # unlike `features.playground` which may not import
+    # `features.memory_manager` directly (Contract 1). Mirrors the import
+    # already at the top of this module for `MemoryArchivalWorker`.
+    app.state.push_memory_provider = MemoryManagerPushMemoryProvider(
+        memory_manager_service=MemoryManagerService(
+            memory_chunk_repo=MemoryChunkRepo(session_factory=session_factory),
+            chunk_embedding_repo=ChunkEmbeddingRepo(session_factory=session_factory),
+            namespace_repo=NamespaceRepo(session_factory=session_factory),
+            embedding_router=app.state.embedding_router,
+        )
+    )
+
     # Background tasks need an explicit correlation_id — there is no HTTP
     # request to inherit from, so the middleware never runs at startup.
     # We bind via a token that is reset before yielding so the value never
@@ -290,6 +604,202 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _correlation_id_var.reset(startup_token)
         raise
     app.state.outbox_worker = worker
+
+    # Story 3.3 T9.1 — same start-up posture as OutboxWorker just above.
+    memory_archival_worker = MemoryArchivalWorker(session_factory=session_factory)
+    try:
+        await memory_archival_worker.start()
+    except Exception:
+        log.exception("agentive_memory_archival_worker_start_failed")
+        # Unlike the OutboxWorker block above, this one is NOT first in the
+        # sequence: the outbox worker is already running with a live LISTEN
+        # connection, and raising here abandons the lifespan before its
+        # `finally` ever runs. Copying that block verbatim therefore leaked
+        # the `_listen_loop` task and its connection (code review Story 3.3, P6).
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.memory_archival_worker = memory_archival_worker
+
+    # Story 4.2 T9.1 — LangGraph checkpointer, opened ONCE for the app's
+    # lifetime (mirror `session_factory`/`llm_router`, not per-request).
+    # `agentive_app` role (DML-only grants, T1.2 migration) — `CREATE TABLE`
+    # already ran there under `agentive_owner`; T9.2 deliberately does NOT
+    # call `checkpointer.setup()` again here (least-privilege posture).
+    # `AsyncExitStack` closes it in the shutdown sequence below.
+    #
+    # A POOL, not `AsyncPostgresSaver.from_conn_string`. T9.1's single
+    # long-lived connection had no recovery path whatsoever: one network
+    # blip, one Postgres restart, one `idle_in_transaction_session_timeout`,
+    # and EVERY subsequent run in the process failed to checkpoint until an
+    # operator restarted it — the checkpointer being the one resource the
+    # whole crash-recovery story rests on. `AsyncConnectionPool` reconnects
+    # on its own, and `AsyncPostgresSaver` accepts one directly (its `conn`
+    # parameter is typed `AsyncConnection | AsyncConnectionPool`).
+    # `kwargs` mirrors `from_conn_string`'s own connection settings exactly —
+    # `autocommit`/`prepare_threshold`/`row_factory` are load-bearing for the
+    # saver, not stylistic.
+    workflow_exit_stack = contextlib.AsyncExitStack()
+    try:
+        workflow_pool: AsyncConnectionPool[Any] = AsyncConnectionPool(
+            conninfo=_workflow_checkpoint_dsn(),
+            min_size=_CHECKPOINT_POOL_MIN_SIZE,
+            max_size=_CHECKPOINT_POOL_MAX_SIZE,
+            max_lifetime=_CHECKPOINT_POOL_MAX_LIFETIME_S,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row,
+            },
+            open=False,
+        )
+        await workflow_exit_stack.enter_async_context(workflow_pool)
+        # Fail fast at boot rather than on the first run: `open()` alone is
+        # lazy, `wait()` proves the credentials and the network actually work.
+        await workflow_pool.wait(timeout=_CHECKPOINT_POOL_OPEN_TIMEOUT_S)
+        workflow_checkpointer = AsyncPostgresSaver(workflow_pool)
+    except Exception:
+        log.exception("agentive_workflow_checkpointer_start_failed")
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.workflow_checkpointer = workflow_checkpointer
+
+    # Story 4.5 T7.1 — `MiseEnPlaceService`'s own `DryRunService` (the
+    # `budget_available` check reuses `DryRunService.dry_run()` as-is,
+    # Story 4.4). Mirrors `router.py::_build_dry_run_service` exactly (same
+    # repos, same `DryRunSettings` fields) rather than reading a shared
+    # instance from `app.state` — no such instance exists today, `DryRunService`
+    # has always been built per-request by the router (AC1's structural
+    # "zero LLM call" guarantee needs no shared state to preserve).
+    mise_en_place_dry_run_service = DryRunService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        settings=DryRunSettings(
+            history_limit=settings.dry_run_history_limit,
+            fallback_input_tokens=settings.dry_run_fallback_input_tokens,
+            fallback_output_tokens=settings.dry_run_fallback_output_tokens,
+            budget_cap_usd=settings.dry_run_budget_cap_usd,
+        ),
+    )
+    mise_en_place_service = MiseEnPlaceService(
+        template_tool_repo=AgentTemplateToolRepo(session_factory=session_factory),
+        tool_server_repo=ToolServerRepo(session_factory=session_factory),
+        namespace_repo=NamespaceRepo(session_factory=session_factory),
+        dry_run_service=mise_en_place_dry_run_service,
+        settings=MiseEnPlaceSettings(
+            tool_ping_timeout_s=settings.mise_en_place_tool_ping_timeout_s,
+            check_timeout_s=settings.mise_en_place_check_timeout_s,
+            # Same global threshold as Dry Run (Story 4.4) — never a second
+            # source of truth (Dev Notes § Budget).
+            budget_cap_usd=settings.dry_run_budget_cap_usd,
+            # Same predicate as `_build_llm_router` above, deliberately not a
+            # second `is not None` test: a blank key must not clear the
+            # `llm_providers_configured` gate for a provider the router will
+            # refuse to build (review P3).
+            anthropic_api_key_present=_api_key_configured(settings.anthropic_api_key),
+            openai_api_key_present=_api_key_configured(settings.openai_api_key),
+            # Resolved from the SAME predicate that decided whether the
+            # router above runs on `MockProvider` (review IG1) — the check
+            # must never refuse a launch the router is perfectly able to
+            # serve.
+            mock_llm_provider_active=_mock_llm_provider_active(),
+        ),
+    )
+
+    # Story 4.2 T9.3 — one shared `WorkflowExecutionService` for BOTH the
+    # recovery worker and the router (`router.py` reads it straight from
+    # `app.state` instead of reconstructing its repos per request).
+    workflow_execution_service = WorkflowExecutionService(
+        workflow_repo=WorkflowRepo(session_factory=session_factory),
+        workflow_run_repo=WorkflowRunRepo(session_factory=session_factory),
+        template_repo=AgentTemplateRepo(session_factory=session_factory),
+        # Story 5.0 (revue P2) — sans ce repo, `_load_node_tools` n'a rien a
+        # interroger et chaque noeud de workflow tourne sans outils.
+        tool_hub_repo=AgentTemplateToolRepo(session_factory=session_factory),
+        llm_router=llm_router,
+        checkpointer=workflow_checkpointer,
+        routing_rules=app.state.routing_rules,
+        mise_en_place_service=mise_en_place_service,
+    )
+    app.state.workflow_execution_service = workflow_execution_service
+
+    workflow_recovery_worker = WorkflowRecoveryWorker(
+        workflow_execution_service=workflow_execution_service,
+        session_factory=session_factory,
+        # Story 4.6, review lot 7 (P-P) — derived from THIS deployment's
+        # retry and escalation settings, not from the module default.
+        #
+        # `recovery.py` used to instruct, in a comment, that "a deployment
+        # that raises those delays must raise `stale_threshold_s=` with
+        # them". This was the only construction site in `src/` and it passed
+        # no such argument, so the instruction was unfollowable — and
+        # `AGENTIVE_ROUTING_ESCALATION_TIMEOUT_S`, which had no ceiling at
+        # all, made it consequential: past ~130s the sweep's window no
+        # longer covered the node it described, so healthy nodes were
+        # claimed and re-executed in parallel on the same `thread_id`.
+        # Deriving here is what makes the invariant true by construction —
+        # `settings` lives in this layer, so the numbers reach the formula
+        # without `recovery` importing config.
+        stale_threshold_s=derive_stale_threshold_s(
+            base_delay_s=settings.workflow_retry_base_delay_s,
+            max_delay_s=settings.workflow_retry_max_delay_s,
+            escalation_timeout_s=settings.routing_escalation_timeout_s,
+            # Story 4.7 T5.6 — `execute_agent_node` now pays a second,
+            # process-wide LLM call (`summarize_handoff`) on top of its own
+            # completion; the sweep's window must grow with it or a node
+            # legitimately still summarizing gets reclaimed and re-executed.
+            handoff_summary_timeout_s=settings.workflow_handoff_summary_timeout_s,
+            # Story 5.0 — depuis la boucle d'outils, ce plafond plat REMPLACE
+            # `NODE_TIMEOUT_S` dans la dérivation : un nœud n'est plus un appel
+            # LLM mais N appels LLM et M appels d'outils, tous enfermés dedans.
+            tool_loop_max_wall_clock_s=settings.tool_loop_max_wall_clock_s,
+        ),
+    )
+    try:
+        await workflow_recovery_worker.start()
+    except Exception:
+        log.exception("agentive_workflow_recovery_worker_start_failed")
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        with contextlib.suppress(Exception):
+            await workflow_exit_stack.aclose()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.workflow_recovery_worker = workflow_recovery_worker
+
+    # Story 4.10 AC1/AC2 — checkpoint blob retention + stale-`paused` alert.
+    # Same `checkpointer` as the recovery worker above, so it needs the same
+    # teardown ordering (stopped before `workflow_exit_stack.aclose()`).
+    checkpoint_retention_worker = CheckpointRetentionWorker(
+        checkpointer=workflow_checkpointer,
+        session_factory=session_factory,
+        interval_s=settings.workflow_checkpoint_retention_interval_s,
+        retention_days=settings.workflow_checkpoint_retention_days,
+        paused_alert_after_days=settings.workflow_paused_run_alert_after_days,
+    )
+    try:
+        await checkpoint_retention_worker.start()
+    except Exception:
+        log.exception("agentive_checkpoint_retention_worker_start_failed")
+        with contextlib.suppress(Exception):
+            await workflow_recovery_worker.stop()
+        with contextlib.suppress(Exception):
+            await memory_archival_worker.stop()
+        with contextlib.suppress(Exception):
+            await worker.stop()
+        with contextlib.suppress(Exception):
+            await workflow_exit_stack.aclose()
+        _correlation_id_var.reset(startup_token)
+        raise
+    app.state.checkpoint_retention_worker = checkpoint_retention_worker
 
     # Best-effort startup event — a transient DB hiccup must not prevent the
     # app from serving traffic (the worker will replay any orphaned writes
@@ -343,6 +853,50 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         timeout=5.0,
                     )
 
+            # Story 4.2 T5.4 — still NO drain of workflow_engine's own
+            # `_background_tasks` (fire-and-forget `start_run`/resume tasks):
+            # an in-flight run interrupted by shutdown IS the AC3 scenario,
+            # and waiting for every run to finish would violate NFR3 (a
+            # restart must not be blocked by a long-running run).
+            #
+            # But "no drain" is not "no handling". These three steps are
+            # ORDER-CRITICAL:
+            #   1. stop the recovery worker first, so it cannot claim a new
+            #      orphan while we are tearing the checkpointer down;
+            #   2. CANCEL the in-flight run tasks — `CancelledError` derives
+            #      from `BaseException`, so `_execute`'s `except Exception`
+            #      lets it through and the run stays `running`, claimable by
+            #      the next process's sweep;
+            #   3. only then close the checkpointer.
+            # Skipping step 2 (the previous behaviour) meant `aclose()` shut
+            # the connection under those tasks, each raised a plain
+            # `Exception`, and `_mark_failed` buried the run in the terminal
+            # `error` status that no recovery sweep ever revisits — the exact
+            # opposite of what this comment used to promise.
+            with contextlib.suppress(Exception):
+                await workflow_recovery_worker.stop()
+            with contextlib.suppress(Exception):
+                # Story 4.10 — same ordering constraint as the recovery
+                # worker above: it holds the same `checkpointer`.
+                await checkpoint_retention_worker.stop()
+            with contextlib.suppress(Exception):
+                # Bounded: this is the one step of the sequence that does
+                # unbounded DB work (a write per in-flight run) with no
+                # budget of its own, while every worker around it caps its
+                # own shutdown. Against a slow or unreachable database it
+                # alone could push the sequence past `stop_grace_period` and
+                # earn a SIGKILL mid-teardown — orphaning exactly the
+                # `running` rows the recovery sweep then has to reclaim, and
+                # which the concurrency cap counts until it does.
+                cancelled = await asyncio.wait_for(
+                    cancel_inflight_runs(), timeout=_CANCEL_INFLIGHT_TIMEOUT_S
+                )
+                if cancelled:
+                    log.info("agentive_cancelled_inflight_runs", count=cancelled)
+            with contextlib.suppress(Exception):
+                await workflow_exit_stack.aclose()
+            with contextlib.suppress(Exception):
+                await memory_archival_worker.stop()
             with contextlib.suppress(Exception):
                 await worker.stop()
             log.info("agentive_shutdown", uptime_seconds=uptime_seconds)
@@ -350,4 +904,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             _correlation_id_var.reset(shutdown_token)
 
 
-__all__ = ["_build_llm_router", "_init_auth_token", "lifespan"]
+__all__ = ["_build_llm_router", "_enforce_mcp_sandbox_policy", "_init_auth_token", "lifespan"]

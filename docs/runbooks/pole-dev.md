@@ -1,0 +1,938 @@
+# Pôle Dev — provisionner, lancer une demande, lire la réponse
+
+> Stories 5.1 → 5.3 et 5.7 (FR43/FR44/FR51). **Sprint 2 : le Pôle Dev se pilote en client HTTP, pas dans une UI** —
+> décision de John du 2026-09-14. Le Chat est l'Epic 6 (Sprint 3) ; quand il arrivera, il se
+> branchera sur exactement les endpoints ci-dessous sans toucher aux agents.
+
+## 1. Quand l'utiliser
+
+- Première mise en service du pôle sur un environnement (dev, staging).
+- Après un changement du catalogue (`features/agent_registry/templates/dev/*.yaml`).
+- Pour lancer une demande au Dev Lead et suivre son run.
+
+## 2. Prérequis
+
+- Le stack tourne (`make up`) et les migrations sont appliquées (`make migrate`).
+- Une clé LLM **valide** (`ANTHROPIC_API_KEY` ou `OPENAI_API_KEY`).
+
+  > ⚠️ **La Mise en Place ne vérifie PAS qu'elle est valide, et ce runbook a affirmé le
+  > contraire jusqu'à la Story 5.7.** Il n'existe aucun check nommé `llm_providers_healthy` :
+  > le vrai s'appelle `llm_providers_configured` et contrôle la **présence** d'une clé, pas sa
+  > validité — il n'y a pas de ping de provider dans ce dépôt, et
+  > [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) le dit depuis toujours.
+  > Conséquence observée, pas supposée (passage du § 7 bis du 2026-09-15) : avec une clé
+  > syntaxiquement présente mais invalide, les **quatre** checks passent, le `201` part avec son
+  > accusé de réception, et le run meurt sur son PREMIER node en `401`. Le symptôme se lit sur
+  > `GET /api/v1/workflows/runs/$RUN` : `status: "error"`, `node_statuses: {"dev_lead": "error"}`,
+  > `last_error` portant le `401` du provider, et `metrics.per_node` **vide**.
+- `AGENTIVE_API_TOKEN` pour l'en-tête `Authorization`.
+
+## 3. Provisionner
+
+```bash
+make seed-dev
+```
+
+> ⚠️ **La PREMIÈRE exécution enregistre un serveur MCP**, ce qui exige
+> `AGENTIVE_ALLOW_MCP_REGISTRATION=true` :
+>
+> ```bash
+> AGENTIVE_ALLOW_MCP_REGISTRATION=true make seed-dev
+> ```
+>
+> Sans ce drapeau, le provisioning **refuse et nomme le réglage**. Les exécutions
+> suivantes, qui ne font que vérifier l'existant, n'en ont **pas** besoin : la garde vit
+> dans `ToolHubService.connect_server`, au point où le sous-processus est spawné. C'est
+> ce qui la rend signifiante — un drapeau de sécurité qu'on demanderait d'activer à
+> chaque re-provisioning ne serait plus qu'une case à cocher. Cf § « Le serveur de
+> lecture de code » ci-dessous pour ce que ce oui engage.
+
+Ce que ça fait, **dans cet ordre** :
+
+1. **Les serveurs MCP** déclarés (`templates/dev/mcp-servers.yaml`), enregistrés via
+   `ToolHubService.connect_server` — c'est la découverte qui peuple la table `tools`.
+2. **Les namespaces mémoire** déclarés par le catalogue (`dev-metier`, type `metier`).
+3. **Les agent-templates**, créés depuis leur archétype puis configurés.
+4. **Les outils MCP** déclarés par chaque template, résolus par nom contre `tools`.
+5. **Le workflow d'entrée** « Pôle Dev — prise de demande (v2 : dev_lead → code_researcher) ».
+
+**Les serveurs d'abord, et c'est la même règle d'ordre une couche plus bas.** Un template
+qui déclare un outil dont aucun serveur n'expose le nom fait échouer le provisioning.
+
+> ⚠️ Cet ordre **réduit** la fenêtre d'état partiel, il ne la supprime pas — la première
+> version de ce paragraphe disait « refuser avant d'écrire », ce qui était plus large que
+> vrai. Provisionner un serveur EST une écriture (une row `tool_servers` + les rows
+> `tools` de la découverte), et une faute de frappe dans un nom d'outil fait toujours
+> échouer l'assignation **après** la création du template. En cas d'échec en cours de
+> route, la sortie liste ce qui a déjà été écrit ; cf § 8 Rollback.
+
+**L'ordre n'est pas cosmétique.** Un template dont le `push_memory.namespace` n'existe pas fait
+**refuser** tout lancement de run par la Mise en Place (`memory_namespaces_accessible`,
+Story 4.5 AC2 — échec permanent, donc `422`). Provisionner les templates d'abord livrerait des
+agents configurés et incapables de démarrer.
+
+**Idempotent**, sous une condition qu'il vaut mieux lire ici que découvrir : tant que le DAG
+du workflow d'entrée et les UUID de templates ne changent pas, une seconde exécution ne crée
+rien, ne duplique rien, et n'émet aucun event d'audit gratuit. La sortie liste
+`créés` / `mis à jour` / `inchangés`. Si un homonyme du workflow d'entrée existe avec un DAG
+différent (templates recréés, base restaurée), le provisioning **refuse avant de créer** et
+nomme les rows concernées — il n'existe aucun chemin de suppression de workflow.
+
+### Si le provisioning échoue sur un outil
+
+```
+Dev Lead déclare des outils introuvables : read_file. Ils doivent être exposés par un
+serveur du catalogue du pôle (`templates/dev/mcp-servers.yaml`) — un outil homonyme
+exposé par un serveur tiers ne compte pas. Enregistrer le serveur, puis rejouer le
+provisioning.
+```
+
+C'est **volontairement bloquant**. Un template silencieusement dépourvu d'outils est
+indiscernable d'un template sans outils — c'est exactement le mensonge par omission que
+`tool_invocations=[]` a entretenu deux epics durant (D80, fermée par la Story 5.0).
+
+Même refus si un nom est **ambigu**, c'est-à-dire exposé par plusieurs serveurs MCP : en choisir
+un ferait dépendre l'assignation de l'ordre de retour de Postgres.
+
+> **État en Sprint 2 : `tools: []` pour le Dev Lead, et c'est documenté plutôt que masqué.**
+> Aucun serveur MCP n'expose le moteur de workflow, et il n'existe pas de chemin légal pour en
+> écrire un aujourd'hui : un serveur **stdio** interne n'a pas de réseau
+> (`SandboxProfile.unshare_net = True`, Story 2.6) donc pas d'accès Postgres, et la seule
+> variante viable — **SSE** — contourne le sandbox et rouvre le défer **D63** (allowlist réseau
+> SSE). Arbitrage à porter à John. Cf [`dev-pole-workflow-tooling.md`](../decisions/dev-pole-workflow-tooling.md).
+>
+> Le **Code Researcher**, lui, porte la première liste d'outils non vide du dépôt — quatre
+> outils de lecture servis par un serveur **interne** écrit ici, pas par un serveur tiers.
+> La phrase « leurs serveurs sont tiers » qui figurait à cet endroit était fausse : l'image
+> backend n'a ni Node, ni `npx`, ni `ripgrep`. Dossier complet dans
+> [`dev-pole-code-search-server.md`](../decisions/dev-pole-code-search-server.md).
+
+## 3 bis. Le serveur de lecture de code (`dev-code-search`)
+
+C'est le serveur MCP qui donne au Code Researcher sa capacité d'exploration. Il est **écrit
+dans ce dépôt** (`infra/mcp/servers/code_search.py`), lancé en sous-processus stdio sandboxé,
+et **en lecture seule par construction** : aucun mode d'ouverture en écriture, aucun
+`subprocess`, aucune exécution. Un test structurel analyse son AST pour que cette propriété ne
+puisse pas se perdre à la relecture.
+
+### Ce qu'il expose
+
+| Outil | Ce qu'il fait |
+|---|---|
+| `find_files(pattern, path?, max_results?)` | Localise des fichiers par motif glob (`**/router.py`). |
+| `search_content(pattern, path?, glob?, max_results?)` | Le « grep/ripgrep » de l'AC1, en `re` pur. Rend chemin + n° de ligne + ligne. |
+| `read_file(path, offset?, max_bytes?)` | Lecture bornée. Rend `next_offset` quand c'est tronqué. |
+| `list_directory(path?)` | Liste un répertoire. |
+
+### Ses racines, et ce que les élargir coûte
+
+`AGENTIVE_DEV_CODE_ROOTS` (défaut `/app`, le volume `./backend`). Ce réglage gouverne **deux**
+gardes, et les deux sont nécessaires :
+
+1. **L'allowlist du serveur lui-même.** Chaque chemin reçu est résolu (`Path.resolve()`, qui
+   **suit les symlinks**) puis vérifié comme descendant d'une racine. Un `..`, un chemin absolu
+   hors racine et un lien vers `/etc` échouent tous les trois, par le même test.
+2. **Les `--ro-bind` du sandbox bwrap.**
+
+La première n'est pas redondante avec la seconde. Sous le repli `setrlimit` — l'état de tout
+poste où bwrap ne fonctionne pas, **y compris l'image de dev de ce projet**, où le binaire
+existe mais où le noyau refuse les user namespaces non privilégiés — il n'y a **aucune**
+isolation filesystem. L'allowlist du serveur est alors la seule frontière qui existe. Un « ça
+marche en local » ne dit donc rien de la production, et réciproquement.
+
+**La politique vit dans `Settings`, jamais dans la base.** `apply_sandbox_policy`
+(`infra/mcp/policy.py`) réécrit la **commande**, l'`argv` et l'`env` du serveur **à chaque
+appel** depuis les réglages : un `UPDATE` sur `tool_servers.connection_config` qui y écrirait
+`--root /`, ou qui remplacerait le binaire lancé, est sans effet. Elle est appliquée par
+`infra/mcp/client.py` lui-même, au point de passage obligé de tout spawn — et non plus par
+chacun de ses appelants, ce qui faisait reposer la garantie sur le fait qu'aucun n'oublie. C'est une divergence assumée vis-à-vis de la forme littérale du défer D62 (qui décrivait
+une colonne `tools.sandbox_profile JSONB`) — une allowlist qui décide de ce qu'un agent LLM
+peut lire doit être lisible dans un diff git.
+
+**Élargir a un coût, et il faut le dire avant de le payer :**
+
+- Tout ce qui est sous une racine ajoutée devient lisible par un agent LLM, et **ce qu'il lit
+  part dans un prompt** facturé, puis dans la sortie qu'un humain lira.
+- La deny-list interne voyage avec le serveur et continue de s'appliquer — `.env*`, `*.env`,
+  `.git`, `.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `*.crt`, `*.p12`, `id_*`, `*.sqlite*`,
+  `secrets*`, `.netrc`, `.npmrc`, `.pypirc`, `credentials*`, **comparés sans tenir compte de
+  la casse**. Mais elle filtre des NOMS, pas des contenus : un secret dans un `config.yaml`
+  n'est protégé par rien.
+- Le fait que `.env` soit aujourd'hui hors de portée tient à ce que le container ne monte que
+  `./backend` — **un accident de configuration, pas une conception**.
+- L'interpréteur Python du backend doit rester **sous une racine**, sinon le serveur ne démarre
+  pas sous bwrap (il ne verrait pas son propre exécutable).
+
+Les trois bornes réglables (`AGENTIVE_DEV_CODE_MAX_READ_BYTES`, `..._MAX_RESULTS`,
+`..._MAX_DEPTH`) sont appliquées **à la source**, pas après coup. `..._MAX_DEPTH` borne le
+**coût** du parcours et non le nombre de résultats — mais, comme les autres, sa coupure est
+**annoncée**.
+
+Quatre chemins peuvent rendre un résultat incomplet, et **les quatre le disent** (`truncated:
+true` + une clé `note` qui n'existe que dans ce cas) : le plafond de résultats, le budget de
+balayage (`MAX_FILES_SCANNED`), la profondeur, et ce qui a été sauté en route — fichier trop
+volumineux ou répertoire illisible. Un résultat coupé en
+silence fait croire au modèle qu'il a tout vu, et un Chercheur qui rend « je n'ai rien trouvé »
+sur une troncature est pire qu'un Chercheur qui échoue.
+
+> ⚠️ **Un seul serveur, mais TROIS templates en dépendent depuis la Story 5.3.** La Mise en
+> Place ping chaque serveur MCP **distinct** avant chaque run et vérifie que chaque outil
+> *assigné* est toujours exposé (`mcp_tools_reachable`). Assigner les mêmes outils à trois
+> templates n'ajoute donc pas trois pings — mais un `dev-code-search` qui ne démarre pas fait
+> désormais refuser le lancement de **tout** le DAG, et non plus du seul Chercheur. C'est la
+> bonne nouvelle de ce check : l'échec est au lancement, bruyamment, pas au milieu d'un run.
+
+### Diagnostiquer les deux échecs attendus
+
+**(a) Le serveur ne démarre pas** → le lancement d'un run est refusé par la Mise en Place, sur
+le check `mcp_tools_reachable`. C'est une bonne nouvelle : l'échec est au **lancement**, pas au
+milieu d'un run.
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/v1/workflows/$WF/runs"   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json"   -d '{"input": {"objective": "x"}}' | jq '.detail, .context'
+```
+
+Rejouer la commande **réellement enregistrée** — et pas une invocation équivalente, parce que
+c'est celle-là qui échoue. Elle est dans la row, et la politique la recalcule à chaque appel :
+
+```bash
+# 1. Ce que la base porte (ce qu'un opérateur voit), et ce que la politique impose.
+docker compose exec -T db psql -qtAX -U postgres -d agentive \
+  -c "SELECT connection_config FROM tool_servers WHERE name = 'dev-code-search';"
+docker compose run --rm backend uv run python -c \
+  "from agentive_backend.infra.mcp.policy import code_search_connection_config as c; print(c())"
+
+# 2. La rejouer telle quelle (remplacer <command> et <args> par la sortie ci-dessus).
+docker compose run --rm backend <command> <args>
+# Attendu : le process reste en attente sur stdin (c'est un serveur JSON-RPC).
+```
+
+Ce que les messages disent :
+
+- `racine autorisée inexistante` → `AGENTIVE_DEV_CODE_ROOTS` pointe à côté.
+- `racine autorisée relative` / `trop large` / `en deny-list` → le réglage est refusé au
+  démarrage du backend, pas ici : relire `AGENTIVE_DEV_CODE_ROOTS`.
+- `No such file or directory` sur la commande → **le mode de panne le plus probable en
+  pratique** : une base réutilisée sur une machine où le venv vit ailleurs porte une commande
+  qui n'existe plus. Rejouer le provisioning sur une base neuve.
+
+> ⚠️ Cette invocation tourne **hors sandbox**. Elle ne reproduit donc pas l'échec propre au
+> repli `setrlimit`, où `RLIMIT_CPU` / `RLIMIT_AS` peuvent tuer le sous-processus au milieu
+> d'un balayage : celui-là se voit en `tool_failures > 0` **avec** `tool_calls > 0`.
+
+**(b) Un chemin est refusé au runtime** → le run ne meurt PAS. Le refus arrive au modèle comme
+un résultat d'erreur exploitable (`isError`), avec son motif, et l'agent peut corriger son
+chemin. On le lit dans les métriques du run :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node.code_researcher | {tool_calls, tool_names, tool_failures}'
+```
+
+`tool_failures > 0` avec `tool_calls > 0` = des refus, des timeouts, ou un sous-processus tué
+par les limites du repli `setrlimit`. Que le run SURVIVE à un refus n'est pas une intention :
+c'est épinglé par
+`tests/integration/workflow_engine/test_dev_lead_e2e.py::test_a_refused_path_inside_a_run_does_not_kill_the_run`. Les motifs sont dans les
+logs serveur (`mcp.tool_executor_tool_error`, `mcp.tool_executor_timeout`).
+
+**`tool_calls == 0` est le symptôme à ne pas rater** : l'agent a répondu sans rien lire, donc
+sa sortie est inventée. Vérifier alors que les outils lui sont bien assignés :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/agents/templates/$TPL/tools" -H "Authorization: Bearer $TOKEN"
+```
+
+## 4. Lancer une demande
+
+```bash
+export TOKEN="$AGENTIVE_API_TOKEN"
+export WF="<workflow_id rendu par make seed-dev>"
+# ⚠️ Depuis la Story 5.3 le workflow d'entrée s'appelle
+# « Pôle Dev — prise de demande (v3 : dev_lead → code_researcher →
+#   architect_analyst → code_producer) » et porte un NOUVEAU `workflow_id`.
+# Les DEUX générations précédentes restent en base, restent lançables, et leurs
+# ids restent valides — la v1 (Story 5.1) exécute le Dev Lead seul, la v2
+# (Story 5.2) s'arrête après le Chercheur. `make seed-dev` les liste toutes les
+# deux dans sa section « inchangés ».
+# Cf § 8 pour pourquoi le nom est versionné plutôt que réutilisé.
+
+curl -sS -X POST "http://localhost:8000/api/v1/workflows/$WF/runs" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"objective": "Scaffold le module paiements pour Acme"}}'
+```
+
+> La clé est **`objective`** : c'est ce que déclare l'`input_contract.core` du Dev Lead, et c'est
+> la clé que son `system_prompt` lui dit de lire. ⚠️ **Rien ne valide `input_contract` au
+> runtime** — `task_input` est du JSON libre sérialisé tel quel dans le prompt. Une clé
+> différente ne produit aucune erreur : juste un agent qui ne voit pas la demande.
+
+Réponse `201`, immédiate (le run tourne en arrière-plan) :
+
+```json
+{
+  "run_id": "...",
+  "status": "running",
+  "acknowledgement": {
+    "message": "Compris. Je mobilise Dev Lead, Code Researcher, Architect Analyst et Code Producer. ETA ~4 min.",
+    "agents": ["Dev Lead", "Code Researcher", "Architect Analyst", "Code Producer"],
+    "eta_minutes": 4,
+    "eta_source": "heuristic"
+  },
+  "mise_en_place": { "...": "..." }
+}
+```
+
+### `eta_source` : `history` ou `heuristic`
+
+- **`history`** — CHAQUE node du DAG avait au moins une durée mesurée sur un run passé
+  (médiane de `metrics.per_node[*].duration_ms`, sur les runs `completed` uniquement).
+- **`heuristic`** — au moins un node est retombé sur `AGENTIVE_ACK_DEFAULT_NODE_DURATION_S`.
+  Trois situations y mènent : aucun historique, un node ajouté depuis, ou une lecture
+  d'historique qui a **dépassé** `AGENTIVE_ACK_HISTORY_TIMEOUT_S`. Cette dernière se voit dans
+  les logs (`workflow_engine.acknowledgement_history_unavailable`, avec le type d'erreur) : un
+  basculement durable de `history` vers `heuristic` sur un workflow qui a de l'historique est le
+  signal qu'il faut regarder la base, pas l'accusé.
+
+La distinction est le point : un chiffre estimé ne doit pas se présenter comme mesuré. C'est ce
+que la revue du Dry Run a imposé à ses propres estimations (`no_execution_history`,
+`node_estimate_from_fallback`).
+
+L'accusé est calculé **sans aucun appel LLM** — l'AC promet une première frame SSE en moins de
+deux secondes, et un appel de modèle y mettrait la latence d'un provider et de sa chaîne de repli.
+
+## 5. Suivre le run
+
+```bash
+curl -sS -N "http://localhost:8000/api/v1/workflows/runs/$RUN/events" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+La **première** frame est un `state` envoyé à la connexion, et porte le même `acknowledgement`
+que le `201` — y compris si le run a déjà progressé (rattrapage). Puis viennent
+`step_completed`, et `completed` / `failed`.
+
+Pilotage : `POST /api/v1/workflows/runs/$RUN/pause|resume|cancel|retract`
+(cf [`run-control-et-fallback.md`](./run-control-et-fallback.md)).
+
+### Lire le détail d'un run (Story 5.7)
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+**Ce qu'elle rend** : `status`, `started_at`/`ended_at`, `correlation_id`, le bloc `metrics`
+(dont `per_node` et ses quatre compteurs d'outils), le rapport `mise_en_place`, l'accusé de
+réception, la progression applicative (`last_node_id`, `node_statuses`, `control_signal`,
+`last_error`), et **un extrait de la sortie de chaque node exécuté**.
+
+**Ce qu'elle NE rend PAS**, et il vaut mieux le savoir avant de le chercher :
+
+- le **checkpoint technique LangGraph** — ni ses versions, ni son historique ;
+- les blocs `routing_decisions` / `handoffs` de `workflow_runs.checkpoint` : ils s'agrègent sur
+  `GET /workflows/{id}/routing-stats` et `GET /workflows/{id}/handoff-stats` ;
+- la **sortie complète** d'un node quand elle dépasse le plafond par node
+  (`AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`, 8 000 par défaut). Elle se lit page par page :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN/nodes/code_researcher/output?offset=0" \
+  -H "Authorization: Bearer $TOKEN" | jq '.output | {truncated, next_offset, returned_chars}'
+```
+
+**Aucune coupure n'est silencieuse** : `truncated`, `total_chars`, `returned_chars` et
+`next_offset` disent ce qui manque et par où reprendre — voir la grille de lecture des quatre
+cas au § 6 bis. Un `limit` au-delà du plafond du déploiement est refusé par un `422` qui
+**nomme le réglage**, jamais rogné en silence.
+
+`404` sur un run inconnu **et** sur un run d'un autre tenant, indistinctement : un `403`
+confirmerait l'existence de la ligne.
+
+## 6. Lire la décomposition
+
+La sortie du Dev Lead est un objet JSON :
+
+```json
+{
+  "status": "done",
+  "summary": "…",
+  "plan": [{"id": "s1", "title": "…", "rationale": "…"}],
+  "delegations": [{"subtask_id": "s1", "target_role": "code_researcher",
+                   "instruction": "…", "rationale": "…"}]
+}
+```
+
+Les `target_role` appartiennent au **jeu fermé** des 8 rôles Dev
+(`shared/contracts/dev_roles.py`) : `code_researcher`, `architect_analyst`, `code_producer`,
+`code_reviewer`, `test_engineer`, `cicd_watcher`, `doc_writer`, `sprint_reporter`. Le prompt du
+Dev Lead est **rendu depuis ce module** (jeton `${DEV_ROLES}`) : ajouter un rôle là-bas change le
+prompt sans édition, et les deux ne peuvent pas diverger.
+
+`validate_delegation_plan(...)` (même module) signale les incohérences : `status` invalide, rôle
+hors du jeu fermé, délégation vers une sous-tâche inexistante, sous-tâche que personne ne prend
+**ou que plusieurs prennent**, `failed` sans `blocking_question`, `done` sans aucune sous-tâche.
+Elle **signale, ne corrige pas** : réécrire un plan incohérent serait décider à la place de
+l'orchestrateur.
+
+**Le moteur applique ce contrôle lui-même** (T6.3, tranchée en revue). Quand un node rend une
+sortie parsable, `agent_node` passe cette sortie au validateur correspondant à son
+`output_contract.core` **déclaré**, et écrit les incohérences dans
+`metrics.per_node[<node_id>].contract_problems` — avec un log
+`workflow_engine.output_contract_incoherent`.
+
+**Trois contrats sont reconnus aujourd'hui** (`shared/contracts/dev_outputs.py`, registre
+`_VALIDATORS`) :
+
+| `output_contract.core` déclare… | …et la sortie est jugée contre |
+|---|---|
+| `plan` + `delegations` | le plan de délégation du Dev Lead (`dev_roles.validate_delegation_plan`) |
+| `approach` + `tradeoffs` + `risks` + `test_strategy` | l'approche de l'Architect Analyst |
+| `code_diffs` + `tests` + `docs_snippets` | la production du Code Producer |
+
+Un template dont le contrat n'est reconnu par aucune entrée n'est **pas jugé** — ni faussement
+conforme, ni faussement fautif.
+
+Trois précisions sur ce choix :
+
+- **Le déclencheur est le CONTRAT déclaré, pas le nom de l'agent.** Ce n'est pas un point
+  d'application inventé pour le Dev Lead : c'est le moteur qui vérifie ce qu'un template a déclaré
+  produire.
+  ⚠️ Cette phrase promettait, dans sa version d'origine, qu'« un agent des Stories 5.2 → 5.6
+  déclarant le même contrat est vérifié sans une ligne de plus ». C'était vrai du *mécanisme* et
+  faux du *résultat* : la Story 5.2 a déclaré quatre clés et **aucune entrée de registre ne les
+  couvrait**, donc son contrat était déclaré et jamais tenu. La Story 5.3 a généralisé le point
+  d'application ; les Stories 5.4 → 5.6 devront **ajouter leur entrée**, pas seulement déclarer
+  leurs clés.
+
+  ⚠️ **Et le contrat du Code Researcher n'est TOUJOURS pas branché** — c'est un fait présent, pas
+  une prévision. Le registre reconnaît trois contrats (Dev Lead, Architect Analyst, Code
+  Producer) ; `{relevant_files, dependencies_graph, existing_patterns, risk_areas}` n'y est pas.
+  La Story 5.3 a branché les deux contrats que ses tasks commandaient (T4.2 : « ajouter deux
+  entrées ») et son AC1 est amendée pour ne plus promettre au-delà. **Porteur :
+  `5-4-code-reviewer-test-engineer`**, qui devra ajouter son entrée *et* celle du Chercheur —
+  donc écrire un `validate_researcher_output` et énoncer les règles dures dans le `system_prompt`
+  du Chercheur, ce qui bumpe sa version et impose de rejouer le protocole du § 7 bis.
+  La dette est nommée dans le code (`_CONTRACTS_NOT_YET_WIRED`) et gardée par deux tests ; la
+  retirer de ce `frozenset` est ce qui la ferme.
+- **Marquer, pas refuser.** T6.3 permettait les deux ; tuer un run sur une maladresse de format
+  serait disproportionné, d'autant que le cas *non parsable* est déjà traité ailleurs (repli
+  `raw_output` + règle `no-parsable-output` à 0.9). Ce qui est traité ici est le cas
+  « parsable mais incohérent ».
+- **Le constat va dans `metrics`, pas dans `node_outputs`.** La sortie du node est la réponse de
+  l'agent ; y injecter un diagnostic du moteur la ferait diverger de son propre contrat.
+
+La clé `contract_problems` est **absente** quand il n'y a rien à dire : c'est sa présence qui est
+le signal.
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node | to_entries[]
+        | select(.value.contract_problems)
+        | {node: .key, problems: .value.contract_problems}'
+```
+
+### 6 bis. Lire l'exploration du Code Researcher
+
+> ℹ️ **Depuis la Story 5.7, tout se lit en `curl`.** `GET /api/v1/workflows/runs/{run_id}` rend
+> l'état du run, ses `metrics` (dont `per_node`) **et la sortie de chaque node**, lue à la
+> demande dans le checkpointer LangGraph. Le flux SSE, lui, n'a pas changé : il ne porte
+> toujours pas les sorties de node, et c'est ce qui garde sa première frame sous les 2 s
+> (arbitrage complet : [`run-node-output-exposure.md`](../decisions/run-node-output-exposure.md)).
+
+Le deuxième node du DAG rend un objet JSON de cette forme :
+
+```json
+{
+  "status": "done",
+  "summary": "…",
+  "relevant_files": [{"path": "/app/src/…/router.py", "role": "…", "why": "…"}],
+  "dependencies_graph": {"features/tool_hub": ["shared/repositories", "infra/mcp"]},
+  "existing_patterns": [{"name": "router/service/schemas", "description": "…",
+                         "examples": ["/app/src/…/service.py"]}],
+  "risk_areas": [{"area": "…", "risk": "…", "evidence": "/app/…"}]
+}
+```
+
+**Les quatre champs sont dans `output_contract.core`**, donc branchables par une edge (la
+validation de la Story 4.1 refuse toute condition portant une variable absente du `core` de
+l'émetteur) et consommables tels quels par l'Architect Analyst — ce qui est vrai **depuis la
+Story 5.3** et ne l'était pas avant : jusque-là le node suivant n'aurait reçu qu'un résumé de
+passage. Cf § 6 ter et [`dev-pole-agent-handoff-contract.md`](../decisions/dev-pole-agent-handoff-contract.md).
+
+**La question à se poser en premier n'est pas « le plan est-il bon » mais « a-t-il lu ? »** :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node.code_researcher | {tool_calls, tool_names, tool_failures}'
+```
+
+`tool_calls: 0` avec des `relevant_files` non vides = **une sortie inventée**. Le prompt
+l'interdit explicitement (« tu n'affirmes jamais l'existence d'un fichier que tu n'as pas vu
+rendu par un outil »), mais un prompt n'est pas une garantie — ces trois compteurs le sont,
+et ils sont la raison pour laquelle l'AC2 les exige.
+
+Vérification du contraire — **elle compte ce qu'elle a vérifié**, parce qu'une sortie vide ne
+doit pas se lire comme un succès :
+
+```bash
+# 1. La sortie du Chercheur, et ce que la réponse dit d'elle. LIRE `truncated`
+#    AVANT de parser : le plafond par défaut est de 8 000 caractères par node.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.node_outputs[] | select(.node_id == "code_researcher")
+        | {source, truncated, total_chars, returned_chars, next_offset}'
+```
+
+**Deux questions, deux champs — ne pas les confondre, la réponse ne les confond plus.**
+
+`checkpointer_reachable` dit si la source faisant autorité a pu être consultée :
+
+- `true` → ce que vous lisez est fiable, quel que soit `node_outputs_source`.
+- `false` → **le checkpointer est injoignable** (lifespan non câblé, pool saturé). Ce n'est
+  **pas** un run qui n'a rien produit, et ce n'est **pas** une purge : réessayer a du sens.
+
+`node_outputs_source` dit seulement d'où vient ce qui est rendu (`checkpointer`, `preview`,
+`none`). Puis, par node, `truncated` et `next_offset` :
+
+- `truncated: false` + `next_offset: null` → c'est tout, passer à l'étape 2.
+- `truncated: true` + un `next_offset` → il en reste, et c'est **reprenable** : paginer sur
+  `GET /workflows/runs/$RUN/nodes/code_researcher/output?offset=<next_offset>` et recoller, ou
+  relever `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`. **Vaut aussi pour un aperçu** : une coupure faite
+  par le serveur est toujours repaginable, quelle que soit la provenance du texte.
+- `truncated: true` + `next_offset: null` → tout ce que le serveur tient a été rendu, **et
+  l'original avait déjà été coupé avant d'arriver**. `source` vaut alors `preview` : le fil
+  LangGraph n'est plus là (`checkpoint_purged_at` le date, cf Story 4.10), et les 500 caractères
+  restants ne sont pas la sortie.
+
+> Un node peut sortir en `source: "preview"` alors que `checkpointer_reachable` vaut `true` :
+> c'est le cas d'un node dont la **décision de routage** a échoué. Il a produit une sortie, mais
+> LangGraph jette l'update d'un node qui lève, donc seul l'aperçu applicatif la porte.
+
+```bash
+# 2. Les chemins cités, extraits puis vérifiés un par un.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "code_researcher") | .output' \
+  | jq -r '.relevant_files[].path' > /tmp/paths.txt
+test -s /tmp/paths.txt || echo "AUCUN CHEMIN À VÉRIFIER — ce n'est PAS un succès"
+n=0; bad=0
+while read -r f; do
+  n=$((n+1))
+  # `< /dev/null` : sans lui, `docker compose exec` consomme stdin et la boucle
+  # s'arrête après le PREMIER fichier en rapportant « tout existe ».
+  docker compose exec -T backend test -f "$f" < /dev/null || { echo "INEXISTANT: $f"; bad=$((bad+1)); }
+done < /tmp/paths.txt
+echo "$n chemin(s) vérifié(s), $bad inexistant(s)"
+```
+
+> ⚠️ L'étape 2 **suppose l'étape 1 verte**. Sur une sortie coupée, le second `jq` échoue sur du
+> JSON incomplet — un échec bruyant, et c'est voulu : il vaut mieux qu'une extraction s'arrête
+> qu'un `relevant_files` amputé se lise comme la liste entière.
+
+> ⚠️ **Ce que le Code Researcher voit du Dev Lead n'est pas son plan complet — et c'est le seul
+> node du DAG dans ce cas.** `agent_node` condense la sortie d'un node amont en un résumé de
+> passage (Story 4.7) avant de la donner au suivant : ce qui arrive au Chercheur est
+> `{decisions, artifacts_refs, blockers, next_questions}`, pas le tableau `delegations`. Son
+> `system_prompt` est écrit POUR cette réalité — il cherche ce qui le concerne dans le résumé,
+> et se rabat sur `objective` sinon.
+>
+> **La Story 5.3 a tranché l'arbitrage que cet encart annonçait.** `UpdateTemplateRequest` porte
+> désormais `include_raw_previous_output`, et les deux nouveaux agents le déclarent à `true` :
+> ils lisent les sorties **brutes** de leurs amonts. Le Chercheur, lui, reste sur les résumés —
+> changer son prompt bumperait sa version et imposerait de rejouer le protocole du § 7 bis, pour
+> un gain nul sur un plan de délégation dont il ne lit qu'une ligne. Dossier complet :
+> [`dev-pole-agent-handoff-contract.md`](../decisions/dev-pole-agent-handoff-contract.md).
+
+### 6 ter. Lire l'approche de l'Analyste et la production du Producteur
+
+Les deux derniers nodes du DAG se lisent par le **même** endpoint, et leurs sorties ont la même
+forme de contrat : quelques clés déclarées dans `output_contract.core`, vérifiées à chaque run.
+
+> ⚠️ **Lire `truncated` AVANT de parser**, comme au § 6 bis — et c'est ici que ça mord le plus :
+> la sortie du Code Producer porte des diffs et des tests, donc c'est **la plus grosse du DAG** et
+> la première à atteindre `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS`. Sur une sortie coupée, les
+> recettes ci-dessous échouent sur du JSON incomplet — un échec bruyant, et c'est voulu. Paginer
+> avec `?offset=<next_offset>` sur `GET /workflows/runs/$RUN/nodes/code_producer/output`, ou
+> relever le plafond :
+>
+> ```bash
+> curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+>   | jq '.node_outputs[] | {node_id, truncated, next_offset, total_chars, returned_chars}'
+> ```
+
+```bash
+# L'approche : ce qui a été retenu, et ce qui a été écarté.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "architect_analyst") | .output' \
+  | jq '{complexity: .approach.complexity,
+         steps: [.approach.steps[] | {id, title}],
+         rejected: [.tradeoffs[] | select(.chosen == false) | {option, rationale}],
+         risks: [.risks[] | {risk, severity}]}'
+```
+
+**La question à se poser en premier n'est pas « l'approche est-elle bonne » mais « y a-t-il un
+arbitrage ? »** : `rejected` vide signifie que l'Analyste a recommandé la première idée venue.
+Le contrat l'interdit (au moins une option `chosen: false`, avec sa raison), et une violation
+apparaît dans `contract_problems` — mais la lire soi-même coûte une commande.
+
+```bash
+# La production : chaque diff, et l'étape d'approche qui le justifie.
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.node_outputs[] | select(.node_id == "code_producer") | .output' \
+  | jq '{diffs: [.code_diffs[] | {path, approach_ref}],
+         tests: [.tests[] | {path, level}],
+         gaps: .unaddressed}'
+```
+
+**Le chaînon qui compte, et il se vérifie en une commande.** Chaque `approach_ref` doit exister
+parmi les `approach.steps[].id` de l'Analyste. Un `approach_ref` inventé est du code que rien ne
+justifie :
+
+```bash
+DETAIL=$(curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN")
+
+# ⚠️ Lire `truncated` AVANT de parser : la sortie du Producteur est la plus
+# grosse du DAG, et `AGENTIVE_RUN_NODE_OUTPUT_MAX_CHARS` vaut 8 000 par défaut.
+# Sans cette garde, `jq` échoue sur un fragment et l'erreur n'a rien à voir.
+echo "$DETAIL" | jq -e '[.node_outputs[]
+  | select(.node_id=="architect_analyst" or .node_id=="code_producer")
+  | select(.truncated)] | length == 0' >/dev/null \
+  || { echo "SORTIE PAGINÉE — recoller par next_offset (§ 6 bis) avant de vérifier"; exit 1; }
+
+STEPS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="architect_analyst") | .output' \
+  | jq -r '[.approach.steps[].id] | sort | .[]')
+REFS=$(echo "$DETAIL" | jq -r '.node_outputs[] | select(.node_id=="code_producer") | .output' \
+  | jq -r '[.code_diffs[].approach_ref] | unique | sort | .[]')
+
+# La COMPARAISON, et pas seulement l'affichage : `comm -13` rend les `refs` qui
+# n'ont aucune étape en face. Le § 6 bis calcule déjà son écart de la même
+# façon ; afficher deux listes triées en laissant l'œil trancher était une
+# recette de moins que ce que son titre annonçait.
+orphans=$(comm -13 <(echo "$STEPS") <(echo "$REFS"))
+n_refs=$(echo "$REFS" | grep -c . || true)
+n_bad=$(echo "$orphans" | grep -c . || true)
+echo "étapes déclarées : $(echo "$STEPS" | paste -sd, -)"
+echo "étapes citées    : $(echo "$REFS" | paste -sd, -)"
+echo "$n_refs référence(s) vérifiée(s), $n_bad orpheline(s)"
+[ "$n_bad" -eq 0 ] || echo "ORPHELINES (code que rien ne justifie) : $(echo "$orphans" | paste -sd, -)"
+```
+
+⚠️ `n_refs` à zéro **n'est pas un succès** : il signifie que le Producteur n'a cité aucune étape,
+donc que l'AC3 n'a rien à vérifier — même posture qu'`AUCUN CHEMIN À VÉRIFIER` au § 6 bis.
+
+> ⚠️ **`unaddressed` non vide n'est PAS un échec.** Le prompt du Producteur lui impose de
+> signaler ce qu'il ne peut pas couvrir plutôt que d'improviser. Une production vide
+> ACCOMPAGNÉE d'écarts déclarés est conforme ; ce qui est refusé, c'est un `status: "done"` sans
+> aucun diff **et** sans aucun écart — une sortie qui ne décrit aucun travail.
+
+> ⚠️ **Le Producteur n'écrit aucun fichier.** Ses outils sont en lecture seule et il n'en a pas
+> d'autres. Ses `code_diffs` sont des propositions ; les appliquer est un geste humain. La raison
+> est mécanique : un nœud rejoué ré-appelle ses outils (§ `rejeu-et-outils.md`), et le moteur ne
+> sait pas distinguer un outil idempotent d'un outil qui ne l'est pas.
+
+### Ce qu'un run coûte, et comment le vérifier
+
+Quatre nodes, mais **cinq** appels LLM — pas sept :
+
+| Appel | Pourquoi |
+|---|---|
+| `dev_lead` | le node |
+| résumé de passage de `dev_lead` | son successeur (`code_researcher`) lit les résumés |
+| `code_researcher` | le node |
+| `architect_analyst` | le node |
+| `code_producer` | le node |
+
+Les arêtes `code_researcher → architect_analyst` et `architect_analyst → code_producer` ne
+produisent **aucun** résumé : leurs cibles déclarent `include_raw_previous_output: true`, et
+`graph_builder._any_successor_reads_summaries` supprime alors la production du résumé — l'appel
+est économisé, pas seulement ignoré.
+
+S'y ajoute **une itération facturée par tour de boucle d'outils** (Story 5.0) :
+
+```bash
+curl -sS "http://localhost:8000/api/v1/workflows/runs/$RUN" -H "Authorization: Bearer $TOKEN" \
+  | jq '.metrics.per_node | to_entries
+        | map({node: .key, tool_calls: .value.tool_calls, iters: .value.tool_loop_iterations,
+               in: .value.input_tokens, out: .value.output_tokens})'
+```
+
+> ⚠️ **La borne qui compte quand on lit du brut est `MAX_UPSTREAM_OUTPUT_CHARS` (50 000).** Sous
+> le régime de résumé, la charge amont était condensée à chaque étape ; en brut, elle
+> s'accumule. Au-delà du plafond, `agent_node` évince **la plus grosse entrée d'abord** — et sur
+> ce DAG, c'est la sortie du Chercheur, celle dont l'Analyste a le plus besoin. L'éviction est
+> loggée (`workflow_engine.upstream_outputs_truncated`), jamais silencieuse : si
+> les analyses se dégradent sans raison apparente, c'est le premier log à chercher.
+
+## 7. Juger la qualité du prompt (manuel)
+
+Les tests E2E tournent sur `MockProvider` : ils prouvent que le contrat survit au moteur, **pas**
+que le modèle produit une bonne décomposition. Ce jugement est manuel, sur les 3 cas de référence
+de l'AC3, avec de vraies clés :
+
+| Cas | Demande |
+|---|---|
+| (a) scaffolding | « Scaffold le module paiements pour Acme » |
+| (b) refactoring | « Refactorer le module paiements pour extraire la logique de reprise » |
+| (c) bug fix | « Le webhook paiement renvoie 500 depuis hier soir » |
+
+Critères de lecture : 2 à 6 sous-tâches ; l'ordre explorer → analyser → produire → reviewer/tester
+→ documenter est respecté ou son écart est justifié ; chaque rôle assigné est le plus proche du
+besoin ; aucune sous-tâche orpheline.
+
+Même posture que `make spike-m3-real` / `make spike-m3-mock` (Story 1.2) : la reproductibilité est
+mockée, le jugement est réel.
+
+### Résultat du dernier passage
+
+| Date | Modèle | (a) scaffolding | (b) refactoring | (c) bug fix |
+|---|---|---|---|---|
+| — | — | non exécuté | non exécuté | non exécuté |
+
+> ⚠️ **Ce protocole n'a encore jamais été exécuté avec de vraies clés.** La tâche T8.3 de la
+> Story 5.1 demandait le protocole « **et ce qu'il a donné** » ; seule la première moitié est
+> faite. Tant que cette table est vide, la qualité du prompt de décomposition est **non
+> vérifiée** — les tests E2E prouvent que le contrat traverse le moteur sans déformation, pas
+> que le modèle produit un bon plan. Remplir la table au premier passage réel.
+
+## 7 bis. Juger la qualité d'exploration du Code Researcher (manuel)
+
+Même limite, même traitement que ci-dessus, et pour la même raison : les tests E2E tournent
+sur `MockProvider`. Ce qu'ils prouvent — et c'est plus que pour le Dev Lead — c'est que le
+node appelle **réellement** ses outils (`tool_calls > 0`, `tool_names` non vide) et que les
+chemins rendus par le serveur **existent sur le disque**
+(`tests/integration/mcp/test_code_search_dogfooding.py` interroge le vrai serveur sur le vrai
+dépôt). Ce qu'ils ne prouvent pas : que le modèle a choisi de regarder au bon endroit, ni que
+ce qu'il en conclut est juste.
+
+### Protocole
+
+Prérequis : `AGENTIVE_ALLOW_MCP_REGISTRATION=true make seed-dev` joué, une vraie clé LLM,
+`AGENTIVE_DEV_CODE_ROOTS=/app`.
+
+Demande de référence — celle de l'**AC3**, à passer telle quelle :
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/v1/workflows/$WF/runs" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"input": {"objective": "Ajouter un nouveau module M13 au backend"}}'
+```
+
+Critères de lecture, dans cet ordre — **le premier est éliminatoire** :
+
+1. **`tool_calls > 0`.** Sinon la sortie est inventée, et les critères suivants n'ont aucun
+   sens à être notés.
+2. **Chaque `path` de `relevant_files` existe** (commande de vérification au § 6 bis).
+3. **Au moins deux modules distincts de `features/` sont couverts.** Un exemple unique est un
+   exemple, pas un pattern.
+4. **`existing_patterns` nomme la structure récurrente** : `router.py` / `service.py` /
+   `schemas.py` par module, le repo dans `shared/repositories/`, les events dans
+   `shared/contracts/events/`.
+5. **`risk_areas` mentionne au moins une contrainte réelle du dépôt** — `.import-linter`, les
+   11 règles d'or, les migrations Alembic — et non un risque générique de développement.
+6. **Méthode** : la trace montre une recherche (`find_files` / `search_content`) **avant** les
+   lectures, pas une enfilade de `read_file` au hasard.
+
+### Résultat du dernier passage
+
+| Date | Modèle | `tool_calls` | (2) chemins réels | (3) ≥ 2 modules | (4) patterns | (5) risques | (6) méthode |
+|---|---|---|---|---|---|---|---|
+| 2026-09-15 | *aucun — aucun appel n'a abouti* | **0 — éliminatoire** | non atteint | non atteint | non atteint | non atteint | non atteint |
+
+**Ce que ce passage a établi, et ce qu'il n'a pas établi.**
+
+Le protocole a été **lancé en le suivant**, pour la première fois, et le diagnostic ci-dessous a
+été produit **sans `psql`** — c'est ce que la Story 5.7 débloque. Le run est
+`419619d2-d2dc-4f42-a6a6-57652d8495b0`, sur le workflow d'entrée v2.
+
+⚠️ **Il n'est PAS allé de bout en bout, et une version antérieure de ce paragraphe l'affirmait.**
+Seule la route de détail a été exercée. Les deux recettes de lecture du § 6 bis — celles qui
+lisent la sortie d'un node, c'est-à-dire l'essentiel de ce que cette story ajoute — n'ont rien eu
+à lire : `metrics.per_node` est vide et `node_outputs` aussi, donc l'étape 1 rend un flux `jq`
+vide et l'étape 2 en dépend. Ce qui est vérifié ici est que le protocole **démarre et diagnostique**
+en `curl` ; ce qui ne l'est pas est qu'il aille jusqu'au jugement.
+
+Il s'est arrêté sur le **critère 1**, qui est éliminatoire, et pour une raison
+d'environnement et non de modèle : la clé `ANTHROPIC_API_KEY` de cet environnement est un
+**bouchon** (`sk-ant-…`, 20 caractères), donc le premier appel LLM est rendu en `401`. Lu sur
+`GET /api/v1/workflows/runs/$RUN` :
+
+```json
+{ "status": "error",
+  "node_statuses": {"dev_lead": "error"},
+  "last_error": "Error code: 401 - … 'authentication_error' … 'API key is invalid.'",
+  "metrics": {"per_node": {}},
+  "node_outputs": [], "node_outputs_source": "checkpointer" }
+```
+
+`per_node` est **vide** : aucun node n'a terminé, donc `tool_calls` n'est pas « à zéro parce que
+l'agent n'a rien lu » — il n'existe pas. Les critères 2 à 6 portent sur une sortie qui n'a jamais
+été produite ; les noter aurait été inventer un résultat, ce que le critère 1 interdit
+précisément pour les suivants.
+
+**La colonne « Modèle » est vide pour la même raison, et une version antérieure y avait écrit
+`claude-haiku-4-5` — un modèle qui n'est celui d'aucun node.** Les deux templates du DAG d'entrée
+omettent `llm_model` **à dessein** (`templates/dev/dev_lead.yaml`, `code_researcher.yaml`) pour
+laisser s'appliquer le défaut du moteur, `agent_node.DEFAULT_LLM_MODEL` = `claude-sonnet-4-6` ;
+`claude-haiku-4-5` est le modèle des appels auxiliaires (`AGENTIVE_ROUTING_ESCALATION_MODEL`,
+`AGENTIVE_WORKFLOW_HANDOFF_SUMMARY_MODEL`). Et de toute façon, un run qui meurt en `401` sur son
+premier appel n'a fait produire aucun modèle : il n'y avait rien à consigner.
+
+> ⚠️ **La qualité du jugement d'exploration reste donc NON VÉRIFIÉE**, et cette ligne le dit
+> plutôt que de le masquer. Ce qui a changé depuis la version vide de cette table : on sait
+> maintenant que le protocole est exécutable en le suivant, et on sait exactement où il bute.
+> **Pour le terminer : rejouer à l'identique avec une vraie clé** — rien d'autre ne manque,
+> le provisioning, le serveur MCP et les quatre outils sont verts (les quatre checks de Mise en
+> Place passent). Remplacer alors cette ligne par le résultat obtenu.
+
+## 7 ter. Juger la qualité de l'approche et de la production (manuel)
+
+Même limite, même traitement que les deux protocoles précédents : les tests E2E tournent sur
+`MockProvider`. Ce qu'ils prouvent — et c'est la nouveauté de la Story 5.3 — c'est que le
+**chaînon** tient : les `approach_ref` du Producteur référencent des étapes que l'Analyste a
+réellement produites, les deux sorties étant lues depuis le moteur et non depuis une constante de
+test. Ce qu'ils ne prouvent pas : que l'approche est la bonne, ni que le code proposé est juste.
+
+### Protocole
+
+Prérequis identiques au § 7 bis, **y compris une vraie clé LLM**. Même demande de référence.
+
+Critères de lecture, dans cet ordre — **les deux premiers sont éliminatoires** :
+
+1. **Le run atteint `code_producer`** (`node_statuses.code_producer == "completed"`). Sinon les
+   critères suivants portent sur une sortie qui n'existe pas.
+2. **`contract_problems` est absent de `architect_analyst` ET de `code_producer`.** Sa présence
+   signale que la sortie ne tient pas son propre contrat déclaré — la commande `jq` est au § 6.
+   Le noter avant les critères suivants évite de juger le fond d'une sortie qui n'a déjà pas la
+   forme qu'elle annonce.
+3. **`tradeoffs` porte une alternative réellement écartée**, avec une raison qui nomme quelque
+   chose de ce dépôt (un module, une règle d'or, une contrainte `.import-linter`) et non un
+   argument générique.
+4. **`approach.complexity` est cohérente avec `approach.steps`** : deux étapes triviales notées
+   `high`, ou huit étapes structurantes notées `low`, sont un signal.
+5. **Chaque `code_diffs[].path` existe, ou est un fichier neuf plausible** au regard des
+   `existing_patterns` que le Chercheur a rendus. Un diff sur un fichier inexistant qui se
+   présente comme une modification est le défaut le plus coûteux de la chaîne : il se lit comme
+   applicable.
+6. **Les conventions du prompt sont respectées dans le code proposé** : pas d'import croisé entre
+   features, accès base par `shared/repositories`, accès LLM par `shared.llm`, `snake_case`.
+7. **`unaddressed` est honnête** : ce qui n'a pas été couvert y figure, avec sa raison, plutôt
+   que d'avoir été improvisé.
+
+### Résultat du dernier passage
+
+| Date | Modèle | (1) run complet | (2) contrats | (3) arbitrage | (4) complexité | (5) chemins | (6) conventions | (7) écarts |
+|---|---|---|---|---|---|---|---|---|
+| — | — | *jamais joué* | — | — | — | — | — | — |
+
+> ⚠️ **Cette table est vide, et c'est une affirmation visible : le protocole n'a jamais tourné.**
+> Il ne le peut pas dans cet environnement, pour exactement la raison consignée au § 7 bis — la
+> clé `ANTHROPIC_API_KEY` y est un bouchon de 20 caractères et le premier appel LLM rend `401`.
+> Le protocole du § 7 bis, qui est en amont de celui-ci, n'a lui-même jamais produit de verdict :
+> **la qualité d'exploration sur laquelle cette approche s'appuie est donc elle aussi non
+> vérifiée.** Pour terminer les deux : rejouer à l'identique avec une vraie clé, dans l'ordre
+> (§ 7 bis puis § 7 ter), et remplacer ces lignes par les résultats obtenus.
+
+## 8. Rollback
+
+- Le provisioning n'efface rien, et c'est une limite à connaître : `update_template` a une
+  sémantique **PATCH**. Re-`make seed-dev` après avoir *modifié* une valeur du YAML la ré-applique
+  bien ; après en avoir **retiré** un champ (`llm_model`, `error_policy`, …), la valeur reste en
+  base — aucun chemin d'API ne la remet à `null`. Le provisioning **refuse alors de continuer** et
+  nomme les champs concernés, plutôt que de rapporter « inchangé » sur une config périmée. Pour
+  repartir d'un template propre : `PUT /api/v1/agents/templates/{id}` avec la config voulue.
+- Un namespace préexistant dont le `type` ou le `department` diffère du catalogue fait aussi
+  **échouer** le provisioning. La Mise en Place ne contrôle que l'existence du nom : sans ce refus,
+  les runs partiraient et écriraient dans un namespace du mauvais type.
+- **Le workflow d'entrée est versionné DANS SON NOM, et ce n'est pas cosmétique.**
+  `create_workflow` est idempotent par empreinte SHA-256 de `{name, dag}`, et `workflows.name`
+  n'est **pas** unique (`infra/db/models.py`). Changer le DAG change l'empreinte : sans changer
+  le nom, la Story 5.2 aurait créé une **seconde** ligne « Dev Lead — prise de demande » à côté
+  de celle de la 5.1, et la Story 5.3 une **troisième**, pendant que le `workflow_id` noté par
+  l'opérateur pointerait toujours sur la première — un seed qui rapporte « créé » à chaque
+  exécution, et des homonymes que rien ne distingue.
+
+  **Le provisioning connaît TROIS générations**, et laisse en place toutes celles qu'il trouve —
+  chacune reste lançable avec son propre `workflow_id` :
+
+  | Génération | Nom | DAG |
+  |---|---|---|
+  | v1 (Story 5.1) | `Dev Lead — prise de demande` | `dev_lead` |
+  | v2 (Story 5.2) | `Pôle Dev — prise de demande (v2 : …)` | `dev_lead → code_researcher` |
+  | v3 (Story 5.3) | `Pôle Dev — prise de demande (v3 : …)` | les quatre nodes |
+
+  ⚠️ **Trois générations connues n'est pas trois générations présentes**, et c'est une
+  distinction que ce runbook affirmait à tort. `_report_legacy_entry_workflows` émet une ligne
+  **par génération effectivement trouvée en base** : sur une base où la v1 n'a jamais été
+  provisionnée, la section « inchangés » n'en portera que deux. C'est le cas de la base de
+  référence du 2026-09-16, dont le rapport de `make seed-dev` ne liste que la v2. Lire la sortie
+  réelle du provisioning plutôt que cette table — la table dit ce que le code sait reconnaître,
+  pas ce que la base contient.
+
+  Le provisioning **liste chaque génération précédente présente** dans sa section « inchangés »,
+  avec tous ses homonymes — ne rapporter que la plus ancienne laisserait la v2 invisible. Les deux autres options ont été
+  écartées : **retirer** l'ancien demanderait un chemin de suppression de workflow qui n'existe
+  nulle part dans le dépôt (constat de la Story 4.15), et se contenter d'une **recherche par
+  nom** laisserait deux homonymes en base. Le provisioning signale explicitement l'ancien
+  workflow dans son rapport — **tous** ses homonymes, la non-unicité du nom étant justement le
+  sujet — et **refuse de continuer AVANT de créer** dès qu'il trouve un homonyme du nouveau nom
+  dont le DAG ne monte pas les templates attendus. C'est une correction de la revue de la
+  Story 5.2 : le contrôle ne levait que sur *deux* homonymes, donc il laissait créer le
+  doublon puis se bloquait à l'exécution suivante — définitivement, faute de chemin de
+  suppression.
+- Les serveurs MCP : le provisioning n'en supprime aucun. Pour forcer une nouvelle découverte
+  (un outil ajouté au serveur, par exemple), supprimer la row `tool_servers` puis rejouer —
+  `connect_server` n'a **aucun** chemin de re-découverte, un nom déjà pris lève `ConflictError`
+  avant même de spawner le serveur.
+
+  > ⚠️ **Ne pas laisser de run partir entre les deux.** `tools.server_id` et
+  > `agent_template_tools.tool_id` sont en `ON DELETE CASCADE` : supprimer la row emporte les
+  > quatre outils **et** les assignations du template. Dans cette fenêtre, le Code Researcher a
+  > `assigned_tools: []`, un run se lance normalement, et il produit exactement le
+  > `tool_calls == 0` que le § 6 bis qualifie de « sortie inventée ». Le rejeu réassigne bien ;
+  > c'est la fenêtre qui est dangereuse. Après rejeu, vérifier :
+  > `GET /api/v1/agents/templates/$TPL/tools` doit rendre les quatre outils.
+- Les migrations : `alembic downgrade` de `20260914000001` retire
+  `workflow_runs.acknowledgement` (les runs existants perdent leur accusé — c'est de la trace, pas
+  de l'état d'exécution).
+
+## 9. Vérifications
+
+```bash
+make seed-dev                                        # 2e exécution : tout "inchangé", SANS le drapeau
+make check-stories                                   # cohérence des statuts de story
+```
+
+**Dev Lead**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "orchestrateur"`, `config.system_prompt` non
+  vide et énumérant les 8 rôles, `config.push_memory.namespace = "dev-metier"`,
+  `config.output_contract.core` = `{plan, delegations, status}`.
+- `GET /api/v1/agents/templates/{id}/tools` → `assigned_tools: []` (état assumé, cf § 3).
+
+**Code Researcher**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "chercheur"`,
+  `config.output_contract.core` = `{relevant_files, dependencies_graph, existing_patterns,
+  risk_areas}`.
+- `GET /api/v1/agents/templates/{id}/tools` → **quatre** outils :
+  `list_directory`, `read_file`, `find_files`, `search_content`. **C'est la première liste non
+  vide du dépôt** — la Story 5.0 a livré la boucle d'outils, la 5.1 le mécanisme d'assignation,
+  et aucun template n'en portait un seul.
+
+**Architect Analyst**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "analyste"`,
+  `config.output_contract.core` = `{approach, tradeoffs, risks, test_strategy}`,
+  `config.include_raw_previous_output = true`.
+- `GET /api/v1/agents/templates/{id}/tools` → **deux** outils : `read_file`, `search_content`.
+
+**Code Producer**
+- `GET /api/v1/agents/templates/{id}` → `archetype: "producteur"`,
+  `config.output_contract.core` = `{code_diffs, tests, docs_snippets}`,
+  `config.include_raw_previous_output = true`,
+  `config.push_memory.namespace = "dev-metier"`.
+- `GET /api/v1/agents/templates/{id}/tools` → **trois** outils : `read_file`, `search_content`,
+  `find_files`. **Aucun outil d'écriture** — c'est vérifiable et c'est le point.
+
+**Le run**
+- Un `POST /runs` rend un `201` avec un `acknowledgement` non vide nommant **quatre** agents.
+- `metrics.per_node.code_researcher.tool_calls > 0` et `tool_names` non vide — la seule preuve
+  que la sortie est appuyée sur une lecture réelle.
+- `metrics.per_node` porte **quatre** entrées, et `contract_problems` n'apparaît sur aucune quand
+  les sorties tiennent leur contrat (l'absence de la clé EST le signal).
+- Le total d'appels LLM d'un run nominal est de **cinq** : quatre nodes plus un unique résumé de
+  passage. Cf § 6 ter.

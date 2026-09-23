@@ -18,12 +18,14 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Final, cast
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable
 from pydantic import SecretStr
 
+from agentive_backend.infra.llm.pricing import ANTHROPIC_MODEL_PRICING, ModelPricing
 from agentive_backend.shared.llm.exceptions import (
     LLMError,
     LLMProviderAuthError,
@@ -33,29 +35,21 @@ from agentive_backend.shared.llm.exceptions import (
     LLMProviderUnavailableError,
 )
 from agentive_backend.shared.llm.redaction import redact_secrets
-from agentive_backend.shared.llm.types import ChatMessage, Completion, FinishReason
+from agentive_backend.shared.llm.types import (
+    ChatMessage,
+    Completion,
+    FinishReason,
+    ToolCall,
+    ToolDefinition,
+)
 
-# Snapshot 2026-05 — verify against
-# https://docs.anthropic.com/claude/docs/models-overview#model-pricing
-# Tuple = (input USD per 1M tokens, output USD per 1M tokens).
-#
-# Long-form aliases — Anthropic returns dated identifiers in
-# ``response_metadata.model_name`` (e.g. ``claude-sonnet-4-6-20250508``).
-# Both forms must be priced or _compute_cost silently returns None for
-# the long form, under-reporting LLM_COST_USD_TOTAL — exactly the case
-# Story 9.4 budget caps need (review fix-batch P1).
-_OPUS_PRICE = (Decimal("15.00"), Decimal("75.00"))
-_SONNET_PRICE = (Decimal("3.00"), Decimal("15.00"))
-_HAIKU_PRICE = (Decimal("0.80"), Decimal("4.00"))
-
-MODEL_PRICING: dict[str, tuple[Decimal, Decimal]] = {
-    "claude-opus-4-7": _OPUS_PRICE,
-    "claude-opus-4-7-20250508": _OPUS_PRICE,
-    "claude-sonnet-4-6": _SONNET_PRICE,
-    "claude-sonnet-4-6-20250508": _SONNET_PRICE,
-    "claude-haiku-4-5": _HAIKU_PRICE,
-    "claude-haiku-4-5-20251001": _HAIKU_PRICE,
-}
+# Re-exported under the historical name — `infra/llm/pricing.py` is now the
+# single source of truth (Story 4.4 T3.5, so `features/*` can read pricing
+# without pulling langchain in transitively past Contract 5). Kept as
+# `MODEL_PRICING` here for every existing call site/test in this module.
+# A read-only view, so this alias cannot become a back door for mutating
+# the table every other reader shares (review fix P21).
+MODEL_PRICING: Final[ModelPricing] = ANTHROPIC_MODEL_PRICING
 
 # Anthropic stop_reason → our normalized FinishReason.
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
@@ -83,9 +77,78 @@ def _to_lc_messages(
         elif m.role == "user":
             converted.append(HumanMessage(content=m.content))
         elif m.role == "assistant":
-            converted.append(AIMessage(content=m.content))
+            # Story 5.0 (revue P1) — les invocations que CE tour a demandées
+            # repartent avec lui. Sans elles, le `ToolMessage` qui suit porte un
+            # `tool_call_id` qui ne référence rien dans le transcript, et les
+            # deux providers refusent l'échange par un 400 — fatal, sans repli
+            # possible côté `LLMRouter`.
+            #
+            # `content` vide est ici NORMAL, pas dégradé : sur un tour purement
+            # `tool_use`, ce sont les blocs d'outils qui portent le tour, et
+            # c'est `AIMessage` qui les rend à partir de `tool_calls`.
+            converted.append(
+                AIMessage(
+                    content=m.content,
+                    tool_calls=[
+                        {
+                            "id": c.id,
+                            "name": c.name,
+                            "args": dict(c.arguments),
+                            "type": "tool_call",
+                        }
+                        for c in m.tool_calls
+                    ],
+                )
+            )
+        elif m.role == "tool":
+            # Story 5.0 — the RESULT of a tool the model asked for.
+            # `tool_call_id` is guaranteed present by `ChatMessage`'s own
+            # validator, so the model can match answer to question.
+            converted.append(ToolMessage(content=m.content, tool_call_id=m.tool_call_id or ""))
+        else:  # pragma: no cover — `ChatRole` is a closed Literal
+            # Loud, not silent. This chain used to end at `assistant` with no
+            # `else`, so an unknown role was DROPPED without a trace: a whole
+            # message vanishing from a prompt, and the model answering a
+            # question it never saw. Adding `"tool"` to `ChatRole` is exactly
+            # the change that would have hit that hole.
+            raise ValueError(f"unsupported ChatMessage role: {m.role!r}")
     system_prompt = "\n\n".join(system_chunks) if system_chunks else None
     return converted, system_prompt
+
+
+def _to_tool_calls(response: BaseMessage) -> tuple[ToolCall, ...]:
+    """Normalize what the model asked to invoke (Story 5.0 AC1).
+
+    LangChain already reconciles Anthropic's ``tool_use`` content blocks and
+    OpenAI's ``tool_calls`` into one ``AIMessage.tool_calls`` shape
+    (``{"id", "name", "args"}``), which is why this adapter does not carry a
+    provider dialect of its own. Verified against the pinned versions.
+
+    Defensive per entry rather than per response: a malformed entry is
+    DROPPED with the rest kept, because losing one requested call degrades
+    the turn while raising would kill a run that is otherwise fine — the same
+    posture the repo takes on every other provider-shaped payload.
+    """
+    raw = getattr(response, "tool_calls", None) or []
+    calls: list[ToolCall] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        call_id, name = entry.get("id"), entry.get("name")
+        if not call_id or not name:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            # Revue P13 — traité comme n'importe quelle autre entrée
+            # malformée, donc ABANDONNÉ, plutôt que coercé en `{}`. Coercer
+            # exécutait l'outil sans arguments : il échouait alors sur la
+            # validation de schéma du serveur MCP, et le modèle recevait une
+            # erreur qui ne ressemblait en rien à sa vraie cause. Une entrée
+            # abandonnée est visible — si toutes le sont, `run_tool_loop`
+            # lève `ToolLoopProtocolError` au lieu de rendre une réponse vide.
+            continue
+        calls.append(ToolCall(id=str(call_id), name=str(name), arguments=args))
+    return tuple(calls)
 
 
 def _merge_system(system_kwarg: str | None, extracted: str | None) -> str | None:
@@ -211,6 +274,7 @@ class AnthropicProvider:
         system: str | None = None,
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         lc_messages, extracted_system = _to_lc_messages(messages)
 
@@ -231,9 +295,30 @@ class AnthropicProvider:
             max_retries=self._max_retries,
         )
 
+        # Story 5.0 AC1 — offer the model its assigned tools. `bind_tools`
+        # is LangChain's provider-agnostic entry point: it emits Anthropic's
+        # `tools` blocks or OpenAI's function schemas from the SAME input, so
+        # no dialect lives in this repo. Not called with an empty sequence:
+        # binding zero tools is not the same as binding none, and some
+        # providers reject it.
+        # `bind_tools` rend un `Runnable`, pas le `ChatX` d'origine : le type
+        # annoté est donc leur borne commune, et non la classe concrète.
+        invoked: Runnable[Any, BaseMessage] = chat
+        if tools:
+            invoked = chat.bind_tools(
+                [
+                    {
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    }
+                    for t in tools
+                ]
+            )
+
         start = time.perf_counter()
         try:
-            response = await chat.ainvoke(lc_messages)
+            response = await invoked.ainvoke(lc_messages)
         except Exception as exc:
             translated = _classify_anthropic_exception(exc)
             if translated is None:
@@ -302,4 +387,5 @@ class AnthropicProvider:
             latency_ms=latency_ms,
             provider_request_id=str(provider_request_id) if provider_request_id else None,
             cost_estimate_usd=cost,
+            tool_calls=_to_tool_calls(response),
         )

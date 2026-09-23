@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 from typing import get_type_hints
 
+from agentive_backend.shared.llm.embedder import Embedder
 from agentive_backend.shared.llm.interface import LLMProvider
 
 
@@ -27,6 +28,9 @@ def test_complete_method_is_async_with_canonical_signature() -> None:
         "system",
         "stop",
         "timeout_s",
+        # Story 5.0 AC1 — `tools` fait partie de la signature canonique :
+        # c'est par lui que le modèle apprend qu'il a des outils.
+        "tools",
     ]
 
     # Default values for the optional kwargs.
@@ -75,3 +79,22 @@ def test_provider_name_is_class_var() -> None:
     hints = get_type_hints(LLMProvider, include_extras=True)
     # ClassVar is preserved as a string in __annotations__ via get_type_hints.
     assert "provider_name" in hints
+
+
+def test_embed_method_is_async_with_canonical_signature() -> None:
+    """Story 3.1 T1.1 — same anti-drift guard as ``Completer.complete``."""
+    sig = inspect.signature(Embedder.embed)
+    assert inspect.iscoroutinefunction(Embedder.embed)
+
+    parameters = list(sig.parameters.keys())
+    assert parameters == ["self", "texts", "model", "timeout_s", "purpose"]
+    assert sig.parameters["timeout_s"].default == 30.0
+    assert sig.parameters["purpose"].default is None
+
+
+def test_embedder_protocol_runtime_checkable() -> None:
+    class _Conforming:
+        async def embed(self, texts, *, model, timeout_s=30.0, purpose=None):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    assert isinstance(_Conforming(), Embedder)

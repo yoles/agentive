@@ -38,7 +38,7 @@ from agentive_backend.shared.llm.exceptions import (
     LLMAllProvidersFailedError,
     LLMNoFallbackModelError,
 )
-from agentive_backend.shared.llm.interface import LLMProvider
+from agentive_backend.shared.llm.interface import Completer, LLMProvider, RawProviderAccess
 from agentive_backend.shared.llm.metrics import (
     LLM_COST_USD_TOTAL,
     LLM_FALLBACK_TRIGGERED_TOTAL,
@@ -47,7 +47,7 @@ from agentive_backend.shared.llm.metrics import (
     LLM_TOKENS_TOTAL,
 )
 from agentive_backend.shared.llm.redaction import redact_secrets
-from agentive_backend.shared.llm.types import ChatMessage, Completion
+from agentive_backend.shared.llm.types import ChatMessage, Completion, ToolDefinition
 from agentive_backend.shared.logging import get_logger
 
 _log = get_logger(__name__)
@@ -190,6 +190,7 @@ class LLMRouter:
         stop: Sequence[str] | None = None,
         timeout_s: float = 30.0,
         provider_chain: Sequence[str] | None = None,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> Completion:
         # P10 — refuse empty messages early instead of letting the SDK
         # round-trip a 400 BadRequest (fatal, no fallback). Same intent
@@ -231,7 +232,9 @@ class LLMRouter:
                 # the misconfig instead of silently skipping.
                 raise
 
-            provider = self._providers[provider_name]
+            # ISP (audit §2.4) — the fallback loop only completes, so it
+            # depends on the narrow `Completer` port, not the full provider.
+            provider: Completer = self._providers[provider_name]
             in_flight = LLM_REQUESTS_IN_FLIGHT.labels(provider=provider_name)
             in_flight.inc()
             attempt_started = time.perf_counter()
@@ -244,6 +247,7 @@ class LLMRouter:
                     system=system,
                     stop=stop,
                     timeout_s=timeout_s,
+                    tools=tools,
                 )
             except Exception as exc:
                 last_error = exc
@@ -367,7 +371,9 @@ class LLMRouter:
         """Direct passthrough to a specific provider's escape hatch."""
         if provider not in self._providers:
             raise ValueError(f"unknown provider {provider!r} (known: {sorted(self._providers)})")
-        return await self._providers[provider].raw_provider_call(**kwargs)
+        # ISP (audit §2.4) — this path only needs the raw escape hatch.
+        target: RawProviderAccess = self._providers[provider]
+        return await target.raw_provider_call(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)

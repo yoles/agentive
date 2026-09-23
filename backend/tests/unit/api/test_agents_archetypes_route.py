@@ -45,7 +45,7 @@ def client(app: FastAPI) -> TestClient:
     """
     from unittest.mock import MagicMock
 
-    from agentive_backend.features.m2_agent_registry import load_registry
+    from agentive_backend.features.agent_registry import load_registry
 
     app.state.archetype_registry = load_registry()
     app.state.session_factory = MagicMock(name="unused-session-factory-stub")

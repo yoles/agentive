@@ -25,18 +25,19 @@ include_external_packages = True
 name = Feature modules must not import from each other
 type = independence
 modules =
-    agentive_backend.features.m1_company_architect
-    agentive_backend.features.m2_agent_registry
-    agentive_backend.features.m3_workflow_engine
-    agentive_backend.features.m4_memory_manager
-    agentive_backend.features.m5_tool_hub
-    agentive_backend.features.m6_dashboard
-    agentive_backend.features.m7_chat
-    agentive_backend.features.m8_agent_configurator
-    agentive_backend.features.m9_topology
-    agentive_backend.features.m10_reporting
-    agentive_backend.features.m11_scheduler
-    agentive_backend.features.m12_trace
+    agentive_backend.features.company_architect
+    agentive_backend.features.agent_registry
+    agentive_backend.features.workflow_engine
+    agentive_backend.features.memory_manager
+    agentive_backend.features.tool_hub
+    agentive_backend.features.dashboard
+    agentive_backend.features.chat
+    agentive_backend.features.playground
+    agentive_backend.features.agent_configurator
+    agentive_backend.features.topology
+    agentive_backend.features.reporting
+    agentive_backend.features.scheduler
+    agentive_backend.features.trace
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Contract 2 — Layered architecture : app → features → infra → shared
@@ -85,7 +86,9 @@ ignore_imports =
     agentive_backend.shared.repositories.memory_chunk_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.namespace_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.outbox_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.ports -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.prompt_repo -> agentive_backend.infra.db.models
+    agentive_backend.shared.repositories.tool_hub_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.user_repo -> agentive_backend.infra.db.models
     agentive_backend.shared.repositories.workflow_repo -> agentive_backend.infra.db.models
 
@@ -94,6 +97,16 @@ ignore_imports =
 # No feature module may import sqlalchemy / psycopg directly.
 # All DB access goes through `agentive_backend.shared.repositories`, which is
 # the ONLY shared module permitted to talk to SQLAlchemy.
+#
+# `allow_indirect_imports = True` — only DIRECT edges from features/* into
+# sqlalchemy/psycopg are violations. The legitimate public path
+# (features → shared.repositories → repositories.<X>_repo → sqlalchemy,
+#  features → shared.event_bus → event_bus.publisher → psycopg)
+# would otherwise be flagged because the wrapper packages re-export their
+# submodules in __init__.py, and import-linter follows package-level imports
+# transitively. The contract's intent — and its English description — is
+# "directly", so we restrict checking to direct edges. A feature that types
+# `from sqlalchemy import select` is still caught (direct edge).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:no-direct-db-access-from-features]
 name = Feature modules must not import sqlalchemy / psycopg directly
@@ -118,6 +131,14 @@ forbidden_modules =
 # are forbidden so we can refactor internals without breaking callers
 # (e.g. the planned Redis Streams migration — see
 # `docs/decisions/event-bus-migration-trigger.md`).
+#
+# `allow_indirect_imports = True` for the same reason as Contract 3:
+# `shared/event_bus/__init__.py` re-exports symbols from .publisher /
+# .outbox / .subscriber / .naming, so features that legitimately use the
+# public API (`from agentive_backend.shared.event_bus import publish`)
+# would otherwise show a transitive chain into the private submodules.
+# A direct `from agentive_backend.shared.event_bus.publisher import publish`
+# is still a violation (direct edge from features → publisher).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:event-bus-only-public-api]
 name = Features must import only the public event_bus API (publish, subscribe)
@@ -140,6 +161,12 @@ forbidden_modules =
 # vendor SDKs directly. Justifies NFR12 (graceful degradation), NFR20
 # (multi-provider) and NFR9 (no API keys in logs/traces) — see
 # `docs/decisions/llm-abstraction.md`.
+#
+# `fastembed`/`voyageai` (Story 3.6, Embedding Router) added alongside the
+# chat SDKs: same rationale — a feature routes through
+# `agentive_backend.shared.llm.embedding_router.EmbeddingRouter`, never a
+# vendor embedding SDK directly. Both adapters live in `infra/llm/` by
+# convention already; this locks it as a checked contract instead.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [importlinter:contract:no-direct-llm-sdk-from-features]
 name = Feature modules and api/* must not import LangChain LLM SDKs directly
@@ -153,3 +180,5 @@ forbidden_modules =
     langchain_core
     anthropic
     openai
+    fastembed
+    voyageai

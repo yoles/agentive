@@ -128,6 +128,147 @@ async def test_isolation_memory_chunks(seed_session_factory, app_session_factory
 The role is created only by the test conftest. Do not add `BYPASSRLS` to
 any production migration.
 
+## Batch reads, and when to lock them (Story 4.8)
+
+`AgentTemplateRepo.list_by_ids` / `list_by_ids_in_session` replaced the
+N sequential `get_by_id` calls that the workflow engine used to make, one
+per DAG node. Both return a `{id: template}` map — every caller needs
+random access by id, and rebuilding that map at each call site is how two
+callers drift apart. Ids absent from the result are ids that do not exist;
+**the caller decides what that means**, and the two callers deliberately
+disagree (a 422 at creation, where the id came from the client's body; a
+500 at execution, where it came from a DAG the server itself validated).
+
+The `lock` parameter is the part worth reading twice:
+
+```python
+# Pre-write validation — the resolved rows must not change before commit.
+async with self._workflow_repo.with_tenant(tenant_id) as session:
+    resolved = await self._template_repo.list_by_ids_in_session(
+        session, [n.agent_template_id for n in dag.nodes], lock=True
+    )
+    ...  # validate against `resolved`, then INSERT in the SAME session
+
+# Hot read — never locks.
+resolved = await template_repo.list_by_ids(ids, tenant_id=tenant_id)
+```
+
+`lock=True` emits `FOR SHARE`, which blocks concurrent `UPDATE`/`DELETE` on
+those rows until **your** transaction commits. Use it only when you are
+about to write something whose correctness depends on what you just read,
+and only when no foreign key can express that dependency — which is the
+case for `workflows.dag`, where the `agent_template_id`s live inside a
+JSONB document Postgres cannot constrain.
+
+Three rules when you reach for it:
+
+1. **`FOR SHARE`, not `FOR UPDATE`.** Shared locks don't conflict with each
+   other, so concurrent workflow creations referencing the same templates
+   still run in parallel; only a template *writer* waits. Mind what that
+   writer waits *on*, though: it waits for the whole holding transaction,
+   including any time that transaction itself spends blocked. Two concurrent
+   replays of the same body make the loser block on
+   `uq_workflow_request_fingerprint` **while still holding its template
+   locks**, so a `PUT /agents/templates/{id}` queues behind that wait too —
+   **bounded** since Story 4.14 (rule 1a below), where it used to be open-ended.
+   1a. **The wait is capped by `lock_timeout`, scoped to the transaction that
+       needs it — never repo-wide.** `create_workflow` opens its transaction
+       via `self._workflow_repo.with_tenant(tenant_id, lock_timeout_ms=...)`
+       (`settings.workflow_create_lock_timeout_s`, default 5.0s,
+       `AGENTIVE_WORKFLOW_CREATE_LOCK_TIMEOUT_S`). `WorkflowRepo.create_in_session`
+       translates the resulting `OperationalError` (SQLSTATE `55P03`,
+       `lock_not_available`) into a domain `DependencyError` (503,
+       retriable) — never let a raw driver exception reach feature code, the
+       same discipline `_is_request_fingerprint_violation` already applies
+       to the unique-violation path next to it.
+       **The translation lives at the `with_tenant` boundary, not only at
+       that one method.** `SET LOCAL` is transaction-scoped, so the bound
+       arms *every* statement in the body — including the
+       `SELECT ... FOR SHARE` that resolves the templates, which is the
+       first statement and the one a concurrent template writer actually
+       contends with. A per-method handler covered the INSERT its author had
+       in mind and let the SELECT escape as a raw `sqlalchemy`
+       `OperationalError`, i.e. a bare 500 (review 4.14, finding 1).
+       `with_tenant` now translates any `55P03` raised under a bound it was
+       asked for; `create_in_session` keeps its own handler only to name the
+       workflow in the message.
+       **Known deployment constraint:** a `statement_timeout` set role-wide
+       or by a pooler *below* this value pre-empts it — Postgres raises
+       `57014 query_canceled` instead, which is deliberately NOT translated
+       (it also fires for slow queries that never waited on a lock), so the
+       caller sees the untyped error. This repo sets no `statement_timeout`
+       anywhere. Pass `lock_timeout_ms` only
+       from the call site that needs the bound: it is opt-in on
+       `with_tenant`, not a default on the method, because a role-wide or
+       method-wide timeout would change every query's behaviour and is not
+       a decision one caller gets to make for everyone.
+2. **No call to an external service runs under the lock.** The window must
+   stay a batch SELECT, pure-CPU validation, and the write. An LLM or MCP
+   call inside it would make template writers wait on a provider. This is
+   not the same as "nothing here blocks" — see rule 1 — but the wait itself
+   is now capped by `lock_timeout` (rule 1a) wherever the caller opts in.
+3. **It guarantees coherence up to the commit, and not one moment further.**
+   A template rewritten a second later leaves the stored DAG stale, and no
+   lock prevents that; that horizon belongs to the run-time checks
+   (`start_run`'s diversity re-evaluation, `_template_fingerprints` drift
+   detection, `_load_templates`' `InternalError`) — but see the honest
+   accounting below (Story 4.14 AC4) of what those three actually cover.
+
+Background: the P-02 note on `WorkflowRunRepo.get_by_id_in_session` (defer
+**D42**) named `with_for_update(read=True)` as the remedy for this exact
+class of race and deferred it "to Story 4.x". This is that application.
+
+**`_load_templates` (the run/dry-run path) deliberately does NOT lock —
+verified, not assumed (Story 4.14 AC4).** Two independent reasons, not one:
+
+- **Locking it would protect nothing on `start_run`'s own path.** The read
+  (`_load_templates`) sits in its own auto-committing transaction that
+  closes immediately — any `FOR SHARE` taken there would already be
+  released before `_gate_on_mise_en_place` runs (MCP pings, a full Dry Run:
+  real external I/O) and long before the eventual `workflow_runs` INSERT, a
+  THIRD, separate transaction. To make the lock cover the actual write it
+  would have to span the Mise en Place gate too — which is precisely the
+  external-I/O-under-a-lock rule 2 above forbids. Query cost was measured
+  and is NOT the blocker (`SELECT ... FOR SHARE` on 100 rows: ~1.2ms vs
+  ~0.9ms plain — negligible); the transaction shape is.
+- **On the dry-run path it would protect literally nothing.** `DryRunService.dry_run`
+  never writes a `workflow_runs` row at all — there is no downstream write
+  for a lock to guard.
+
+**What the three catch-up mechanisms actually cover, checked line by
+line — weaker than the shorthand above suggests:**
+
+- `start_run`'s diversity re-evaluation runs on the SAME in-memory
+  `templates` dict `_load_templates` already returned — it re-evaluates,
+  it does not re-READ. It cannot see an edit that lands after that dict
+  was built.
+- `_template_fingerprints` drift detection (`_resume_run`'s
+  `_report_config_drift`) compares the fingerprint STAMPED into the
+  checkpoint at creation time — itself computed from that same
+  already-read `templates` dict — against a fresh read taken at RESUME
+  time. It only ever runs on a resume — a crash-resume swept up by the
+  recovery worker, or an operator's manual `POST .../resume`; never on a
+  run that simply completes. A run that starts, races
+  a concurrent `PUT /agents/templates/{id}` in the window between
+  `_load_templates` and the `workflow_runs` INSERT, and then completes
+  normally WITHOUT ever crashing, has that edit surfaced NOWHERE — not
+  logged, not in the trace, not anywhere. Verified by reading both call
+  sites (`service.py`, the `TEMPLATE_FINGERPRINTS_KEY` stamp at run
+  creation and the drift comparison in the resume path); this is not
+  hypothetical, it is what the code does today.
+- `_load_templates`' `InternalError` only fires on a MISSING template
+  (deleted or never existed) — a *modified* one still resolves and is
+  silently used.
+
+**Net:** the residual gap for a same-call, no-crash template edit racing
+`start_run` is real and currently open. Closing it would mean moving the
+template read into the SAME transaction as the `workflow_runs` INSERT and
+re-verifying there — after `_gate_on_mise_en_place` (Story 4.8's own rule
+against I/O under a lock, applied here too), not before — a materially
+different, larger change than adding `lock=True` to the existing call.
+Out of Story 4.14's scope (bounding timeouts, not redesigning `start_run`'s
+transaction shape); not yet filed as its own story.
+
 ## When to deviate from the pattern
 
 The only documented exception is `shared/event_bus/`, which uses raw
@@ -146,3 +287,4 @@ cases would be a signal to refactor the base class.
 - Story: `_bmad-output/implementation-artifacts/1-5-core-repositories-migrations.md`.
 - Architecture FMEA Mitigation #1: `_bmad-output/planning-artifacts/architecture.md` lines 497-506.
 - Initial migration RLS declarations: `backend/alembic/versions/20260419_000000_initial.py:441-468`.
+- ADR: [`docs/decisions/workflow-creation-idempotency.md`](../decisions/workflow-creation-idempotency.md) — why `create_in_session` translates `IntegrityError` into `ConflictError` on `workflows`.

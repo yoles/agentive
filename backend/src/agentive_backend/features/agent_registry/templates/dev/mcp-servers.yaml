@@ -1,0 +1,39 @@
+# Serveurs MCP du Pôle Dev — Story 5.2 (FR51).
+#
+# Provisionnés AVANT les namespaces et les templates par `scripts/seed_dev.py` :
+# un template dont un outil n'existe pas fait échouer le provisioning (5.1
+# T2.4), exactement comme un namespace manquant fait refuser le run. C'est la
+# troisième couche du même ordre.
+#
+# ⚠️ Ce fichier ne déclare PAS de commande, PAS d'argv et PAS de racines.
+#   - `launcher` est un jeu FERMÉ (`Literal`) : éditer ce YAML ne peut pas
+#     faire exécuter un module arbitraire dans le sous-processus.
+#   - La commande, l'argv et les racines autorisées sont construits par
+#     `infra/mcp/policy.py` depuis `Settings` (`AGENTIVE_DEV_CODE_ROOTS`), et
+#     RÉÉCRITS à chaque appel — donc ni ce fichier ni un `UPDATE` sur
+#     `tool_servers.connection_config` ne peuvent élargir l'allowlist.
+#     Cf `docs/decisions/dev-pole-code-search-server.md`.
+#
+# ⚠️ `AGENTIVE_ALLOW_MCP_REGISTRATION=false` (défaut de `docker-compose.yml`)
+#   fait REFUSER le provisioning en nommant le réglage. Le drapeau garde le
+#   routeur HTTP, pas le service que ce script appelle : passer dessous parce
+#   qu'on est du bon côté de l'import serait la définition du contournement.
+
+servers:
+  - key: code_search
+    name: dev-code-search
+    transport: stdio
+    launcher: code_search
+    description: >-
+      Lecture du codebase pour le Pôle Dev : listing, lecture bornée,
+      recherche de fichiers par glob et recherche de contenu par regex.
+      Lecture seule par construction — aucun outil d'écriture ni d'exécution.
+    # Ce que le serveur DOIT exposer. Vérifié à chaque exécution du
+    # provisioning, pas seulement à la première : `connect_server` n'a aucun
+    # chemin de re-découverte, donc c'est le seul endroit qui peut constater
+    # qu'un outil a disparu du serveur depuis son enregistrement.
+    tools:
+      - list_directory
+      - read_file
+      - find_files
+      - search_content

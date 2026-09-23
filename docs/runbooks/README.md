@@ -4,12 +4,20 @@ Runbooks opérationnels pour Agentive — procédures concrètes pour des situat
 
 ## Disponibles
 
+- [`dry-run-predictif.md`](./dry-run-predictif.md) — Dry Run predictif : probable_path, estimation coût/tokens, budget cap (Story 4.4)
 - [`event-bus-debug.md`](./event-bus-debug.md) — Debug du bus d'événements LISTEN/NOTIFY (Story 1.4)
+- [`execution-retention-et-volumetrie.md`](./execution-retention-et-volumetrie.md) — Rétention des checkpoints LangGraph, runs `paused` immortels, index du balayage de recovery, bornage `routing-stats` (Story 4.10)
+- [`hybrid-orchestration.md`](./hybrid-orchestration.md) — Orchestration hybride DSL → règles → LLM, seuil, `routing-stats` (Story 4.3)
+- [`concurrent-index-migrations.md`](./concurrent-index-migrations.md) — Construire un index Alembic sans `ACCESS EXCLUSIVE` (`autocommit_block()` + `CREATE INDEX CONCURRENTLY`), confirmé fonctionnel sur ce dépôt sans modification du harnais (Story 4.14)
 - [`llm-usage.md`](./llm-usage.md) — Utilisation `LLMRouter` (Story 1.6)
 - [`m3-checkpoint-inspect.md`](./m3-checkpoint-inspect.md) — Inspection checkpoints LangGraph (Story 1.2)
 - [`m4-bench-rerun.md`](./m4-bench-rerun.md) — Re-run bench M4 pgvector HNSW (Story 1.3)
+- [`mise-en-place-automatique.md`](./mise-en-place-automatique.md) — Hook pré-workflow (4 checks, blocage/bypass `force`) (Story 4.5)
+- [`pole-dev.md`](./pole-dev.md) — Pôle Dev : provisionner (`make seed-dev`), lancer une demande au Dev Lead en HTTP, lire l'accusé de réception et la décomposition (Story 5.1)
 - [`observability.md`](./observability.md) — Guide pratique observabilité : logs JSON, RFC 7807, correlation_id, redaction (Story 1.9)
 - [`repositories-usage.md`](./repositories-usage.md) — Utilisation Repository Pattern + RLS (Story 1.5)
+- [`rejeu-et-outils.md`](./rejeu-et-outils.md) — Rejeu d'un nœud et ré-appel des outils, non-idempotence, contrainte lecture seule en Sprint 2 (Story 5.0)
+- [`run-control-et-fallback.md`](./run-control-et-fallback.md) — Pause/resume/cancel d'un run, `provider_chain` per-agent, retry `error_policy` (Story 4.6)
 
 ## À implémenter (progressivement)
 

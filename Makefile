@@ -191,13 +191,42 @@ migrate-new: _validate-msg ## Crée une nouvelle migration (usage: make migrate-
 migrate-init: ## Crée la migration initiale (manuel, pas autogenerate)
 	$(DC_DEV) run --rm backend uv run alembic revision -m "initial schema"
 
+.PHONY: seed-dev
+seed-dev: ## Provisionne le Pôle Dev (serveurs MCP + namespaces + agent-templates + workflow) — Stories 5.1/5.2/5.3
+	# Idempotent tant que le DAG du workflow d'entrée et les UUID de templates
+	# ne changent pas : une seconde exécution ne crée rien et ne duplique rien.
+	# Suppose les migrations appliquées (`make migrate`).
+	#
+	# AGENTIVE_ALLOW_MCP_REGISTRATION : requis UNIQUEMENT quand un serveur MCP
+	# doit réellement être enregistré (première exécution, ou serveur ajouté au
+	# catalogue). Une exécution qui se contente de vérifier l'existant n'en a
+	# pas besoin — la garde vit dans `ToolHubService.connect_server`, au point
+	# où le sous-processus est spawné. Pour la première exécution :
+	#     AGENTIVE_ALLOW_MCP_REGISTRATION=true make seed-dev
+	$(DC_DEV) run --rm backend uv run python -m scripts.seed_dev
+
 .PHONY: test-backend
-test-backend: ## Exécute les tests Python
-	$(DC_DEV) run --rm backend uv run pytest
+test-backend: ## Exécute les tests Python (parité CI : --network host + docker.sock + .import-linter)
+	# Mirror exact du job CI test-backend (.github/workflows/ci.yml:174-181) :
+	#  - --network host : testcontainers publie ses ports sur l'hôte → le container doit
+	#    résoudre `localhost` (override `host.docker.internal` casse 49 tests sur Linux).
+	#  - docker.sock : `PostgresContainer()` spawn des containers siblings via le daemon hôte.
+	#  - .import-linter : config vit à la racine (hors build context ./backend), nécessaire
+	#    pour `tests/integration/test_import_linter_contract*.py`.
+	docker run --rm \
+	  -e TESTCONTAINERS_RYUK_DISABLED=true \
+	  --network host \
+	  -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v $(PWD)/.import-linter:/.import-linter:ro \
+	  -v $(PWD)/backend:/app \
+	  -v agentive_backend_venv:/app/.venv \
+	  agentive-backend:dev \
+	  uv run pytest
 
 .PHONY: lint-backend
-lint-backend: ## Lint + format check Python (ruff + mypy)
-	$(DC_DEV) run --rm backend sh -c "uv run ruff check . && uv run ruff format --check . && uv run mypy src/"
+lint-backend: ## Lint + format check Python (ruff + mypy + import-linter, parité CI)
+	$(DC_DEV) run --rm backend sh -c "uv run ruff check . && uv run ruff format --check . && uv run mypy src/ scripts/"
+	$(DC_DEV) run --rm -v $(CURDIR)/.import-linter:/.import-linter:ro backend uv run lint-imports --config /.import-linter
 
 .PHONY: format-backend
 format-backend: ## Format Python (ruff format)
@@ -230,6 +259,14 @@ gen-api-types: up ## Génère les types TS depuis le schéma OpenAPI du backend
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AGGREGATES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.PHONY: check-stories
+check-stories: ## Vérifie la cohérence des statuts story <-> sprint-status.yaml
+	# Action 7 de la rétrospective Epic 4. Ce défaut est apparu SEPT fois
+	# (epics 1 et 2) et avait déjà été corrigé à la main en rétro Epic 3 sans
+	# garde-fou — il est donc revenu à l'identique. D'où un contrôle, pas une
+	# bonne intention.
+	@python3 scripts/check_story_status.py
 
 .PHONY: test
 test: test-backend test-frontend ## Tests backend + frontend
@@ -391,8 +428,17 @@ spike-m3-inspect: up ## Spike M3 — inspecte le checkpoint Postgres pour un thr
 	$(DC_DEV) run --rm backend uv run python -m spike.inspect_checkpoint "$(THREAD_ID)"
 
 .PHONY: spike-m3-test
-spike-m3-test: up ## Spike M3 — exécute uniquement les tests pytest tests/spike/
-	$(DC_DEV) run --rm backend uv run pytest tests/spike/ -v
+spike-m3-test: ## Spike M3 — exécute uniquement les tests pytest tests/spike/ (parité CI)
+	# Mirror exact du job CI spike-m3 (.github/workflows/ci.yml:210-216) — voir
+	# justifications dans le bloc commentaires de `test-backend` ci-dessus.
+	docker run --rm \
+	  -e TESTCONTAINERS_RYUK_DISABLED=true \
+	  --network host \
+	  -v /var/run/docker.sock:/var/run/docker.sock \
+	  -v $(PWD)/backend:/app \
+	  -v agentive_backend_venv:/app/.venv \
+	  agentive-backend:dev \
+	  uv run pytest tests/spike/ -v --tb=short --maxfail=1
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STAGING (observe-only wrappers — le deploy réel passe par GitHub Actions)
