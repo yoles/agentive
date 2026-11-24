@@ -292,6 +292,19 @@ describe("/config/agents/new", () => {
           ),
         );
       }
+      // Page détail post-redirect (Story 2.2/2.3) : charge le template via GET.
+      if (url.endsWith(`/api/v1/agents/templates/${newTemplateId}`) && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            template_id: newTemplateId,
+            name: "Unique Producer",
+            archetype: "producteur",
+            version: 1,
+            config: { prompt_base: "Tu es un producteur.", role: "producer" },
+            created_at: new Date().toISOString(),
+          }),
+        );
+      }
       return Promise.resolve(jsonResponse({}, { status: 404 }));
     });
 
@@ -307,7 +320,8 @@ describe("/config/agents/new", () => {
 
     fireEvent.change(nameInput, { target: { value: "Unique Producer" } });
     fireEvent.click(screen.getByRole("button", { name: /créer le template/i }));
-    await screen.findByText(newTemplateId);
+    await screen.findByRole("heading", { name: /configuration de l'agent/i });
+    expect(screen.getByText(/Unique Producer · archétype producteur/)).toBeInTheDocument();
     expect(postCount).toBe(2);
   });
 });
